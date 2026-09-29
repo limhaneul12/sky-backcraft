@@ -1,0 +1,4 @@
+interface:
+  display_name: "Backcraft 실험 실행"
+  short_description: "업비트 데이터 수집부터 정책 버전 관리와 백테스트 실행까지"
+  default_prompt: "$backcraft-experiment로 요청한 정책과 기간을 확인하고 업비트 백테스트를 실행해 주세요."

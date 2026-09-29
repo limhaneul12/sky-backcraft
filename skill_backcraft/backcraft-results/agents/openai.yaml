@@ -1,0 +1,4 @@
+interface:
+  display_name: "Backcraft 결과 분석·수신"
+  short_description: "백테스트 비교 요약과 비용·청산 이유 검토, 전체 파일 수신"
+  default_prompt: "$backcraft-results로 지정한 실행을 비교 요약하고 전체 export 파일을 받아 검증해 주세요."
