@@ -1,0 +1,80 @@
+name: ${COMPOSE_PROJECT_NAME:-sky-backcraft}
+
+services:
+  app:
+    build:
+      context: .
+      target: runtime
+    image: ${SPOT_LAB_IMAGE:-sky-backcraft:local}
+    restart: unless-stopped
+    init: true
+    stop_signal: SIGINT
+    stop_grace_period: 40s
+    environment:
+      PUBLIC_DOMAIN: ${PUBLIC_DOMAIN:-}
+    ports:
+      - "127.0.0.1:${SPOT_LAB_HOST_PORT:-8130}:8130"
+    volumes:
+      - spot-lab-data:/var/lib/spot-lab
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - spot-lab
+
+  ci:
+    build:
+      context: .
+      target: ci
+    image: ${SPOT_LAB_CI_IMAGE:-sky-backcraft-ci:local}
+    profiles:
+      - ci
+    network_mode: none
+    environment:
+      CARGO_NET_OFFLINE: "true"
+
+  quick-tunnel:
+    image: ${CLOUDFLARED_IMAGE:-cloudflare/cloudflared:2026.8.2}
+    profiles:
+      - quick
+    command:
+      - tunnel
+      - --no-autoupdate
+      - --url
+      - http://app:8130
+    restart: "no"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - spot-lab
+
+  managed-tunnel:
+    image: ${CLOUDFLARED_IMAGE:-cloudflare/cloudflared:2026.8.2}
+    profiles:
+      - managed
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    command:
+      - tunnel
+      - --no-autoupdate
+      - run
+    restart: unless-stopped
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - spot-lab
+
+networks:
+  spot-lab:
+    driver: bridge
+
+volumes:
+  spot-lab-data:

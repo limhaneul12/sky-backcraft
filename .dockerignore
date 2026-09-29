@@ -1,0 +1,15 @@
+.git
+.github
+.agents
+.codegraph
+.omx
+.env
+.env.*
+!.env.example
+.cargo-target
+target
+freshdata
+data
+**/.DS_Store
+**/*.tmp
+**/*.bak

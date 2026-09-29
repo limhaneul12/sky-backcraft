@@ -1,0 +1,52 @@
+[workspace]
+members = [
+    "xtask",
+    "crates/lab",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+
+[workspace.dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+chrono = { version = "0.4", features = ["serde"] }
+flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
+rusqlite = { version = "0.40.2", default-features = false, features = ["backup", "bundled"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rmcp = { version = "3.4.1", features = [
+    "server",
+    "macros",
+    "client",
+    "transport-io",
+    "transport-streamable-http-server",
+    "transport-streamable-http-client-reqwest",
+    "reqwest-tls-no-provider",
+] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+rust_decimal = { version = "1.43", features = ["serde-with-str"] }
+schemars = { version = "1", features = ["chrono04"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["arbitrary_precision", "float_roundtrip"] }
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "fs", "time", "sync", "io-util"] }
+tokio-util = "0.7"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "json"] }
+toml = "0.9"
+
+[workspace.lints.rust]
+warnings = "deny"
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
