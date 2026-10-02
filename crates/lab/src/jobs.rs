@@ -566,7 +566,7 @@ impl JobService {
             JobPayload::Export { run_id, market } => {
                 self.export(
                     run_id,
-                    market.as_ref().map(|market| market.base),
+                    market.as_ref().map(|market| market.base.clone()),
                     cancellation,
                 )
                 .await

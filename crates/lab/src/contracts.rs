@@ -41,9 +41,6 @@ pub use presentation::*;
 mod limits;
 pub use limits::*;
 
-/// Supported spot markets for the MVP: `Upbit` `KRW` quote, long/cash only.
-pub const SUPPORTED_ASSETS: [Asset; 3] = [Asset::Btc, Asset::Eth, Asset::Xrp];
-
 /// Domain error taxonomy per F02. Transport failures stay distinct from
 /// economic outcomes; unknown values must surface as errors, never as zero.
 #[derive(Debug, Error)]
@@ -160,36 +157,60 @@ pub enum QuoteCurrency {
     Krw,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum Asset {
-    Btc,
-    Eth,
-    Xrp,
-}
+/// Upbit `KRW` base-asset symbol (for example `BTC`, `ETH`, `SAND`). Every
+/// listed Upbit `KRW` market is representable; symbol existence is validated
+/// against the live market catalog at collection admission, so this type
+/// enforces only the exchange symbol shape.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(with = "String")]
+pub struct Asset(String);
 
 impl Asset {
-    /// Exchange symbol of the base asset (`BTC`, `ETH`, `XRP`).
-    #[must_use]
-    pub fn code(self) -> &'static str {
-        match self {
-            Self::Btc => "BTC",
-            Self::Eth => "ETH",
-            Self::Xrp => "XRP",
-        }
-    }
-
-    /// Parse a base-asset symbol.
+    /// Validate an Upbit base-asset symbol: 1..=15 uppercase ASCII
+    /// letters/digits (for example `BTC`, `1INCH`).
     ///
     /// # Errors
     ///
-    /// [`LabError::InvalidConfig`] when the symbol is not one of the
-    /// supported spot assets for this lab.
-    pub fn from_code(code: &str) -> Result<Self, LabError> {
-        SUPPORTED_ASSETS
-            .into_iter()
-            .find(|asset| asset.code().eq_ignore_ascii_case(code))
-            .ok_or_else(|| LabError::InvalidConfig(format!("unsupported asset: {code}")))
+    /// [`LabError::InvalidConfig`] when the symbol is not in the Upbit
+    /// symbol shape.
+    pub fn new(symbol: impl AsRef<str>) -> Result<Self, LabError> {
+        let symbol = symbol.as_ref();
+        let in_shape = (1..=15).contains(&symbol.len())
+            && symbol
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit());
+        if !in_shape {
+            return Err(LabError::InvalidConfig(format!(
+                "unsupported asset symbol (expected 1..=15 uppercase letters/digits): {symbol}"
+            )));
+        }
+        Ok(Self(symbol.to_owned()))
+    }
+
+    /// Exchange symbol of the base asset, e.g. `BTC`.
+    #[must_use]
+    pub fn code(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for Asset {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl From<Asset> for String {
+    fn from(asset: Asset) -> Self {
+        asset.0
+    }
+}
+
+impl TryFrom<String> for Asset {
+    type Error = LabError;
+
+    fn try_from(symbol: String) -> Result<Self, Self::Error> {
+        Self::new(symbol)
     }
 }
 
@@ -203,31 +224,29 @@ pub struct MarketId {
 }
 
 impl MarketId {
-    /// Parse an `Upbit` market code such as `KRW-BTC`.
+    /// Parse an `Upbit` market code such as `KRW-BTC`. Any listed Upbit
+    /// `KRW` market is representable; symbol existence is validated against
+    /// the live market catalog at collection admission.
     ///
     /// # Errors
     ///
-    /// [`LabError::InvalidConfig`] when the code is not a supported
-    /// `KRW`-quoted spot market on `Upbit`.
+    /// [`LabError::InvalidConfig`] when the code is not a `KRW`-quoted spot
+    /// market code in the Upbit symbol shape.
     pub fn parse_upbit(code: &str) -> Result<Self, LabError> {
         let invalid = || {
             LabError::InvalidConfig(format!(
                 "unsupported market code (expected KRW-<ASSET> on Upbit): {code}"
             ))
         };
-        let mut segments = code.split('-');
-        let quote_valid = segments
-            .next()
-            .is_some_and(|quote| quote.eq_ignore_ascii_case("KRW"));
-        let Some(base_code) = segments.next() else {
+        let Some((quote, base_code)) = code.split_once('-') else {
             return Err(invalid());
         };
-        if !quote_valid || segments.next().is_some() {
+        if !quote.eq_ignore_ascii_case("KRW") {
             return Err(invalid());
         }
         Ok(Self {
             venue: Venue::Upbit,
-            base: Asset::from_code(base_code)?,
+            base: Asset::new(base_code)?,
             quote: QuoteCurrency::Krw,
         })
     }
@@ -235,7 +254,7 @@ impl MarketId {
     /// Market code in exchange notation, e.g. `KRW-BTC`.
     #[must_use]
     pub fn code(&self) -> String {
-        format!("KRW-{}", self.base.code())
+        format!("KRW-{}", self.base.0)
     }
 }
 
@@ -247,7 +266,7 @@ impl fmt::Display for MarketId {
 
 impl From<MarketId> for String {
     fn from(market: MarketId) -> Self {
-        market.code()
+        market.code().clone()
     }
 }
 
@@ -539,11 +558,22 @@ mod tests {
     /// F02 acceptance: out-of-contract inputs are rejected, never coerced.
     #[test]
     fn contract_rejections() {
-        assert!(MarketId::parse_upbit("KRW-DOGE").is_err());
+        // Any listed Upbit KRW symbol is representable (catalog validates
+        // existence at collection admission); shape is still enforced.
+        assert_eq!(
+            MarketId::parse_upbit("KRW-DOGE").unwrap().code(),
+            "KRW-DOGE"
+        );
+        assert_eq!(
+            MarketId::parse_upbit("KRW-1INCH").unwrap().code(),
+            "KRW-1INCH"
+        );
         assert!(MarketId::parse_upbit("BTC-KRW").is_err());
         assert!(MarketId::parse_upbit("KRW-BTC-X").is_err());
         assert!(MarketId::parse_upbit("KRW-").is_err());
-        assert!(Asset::from_code("SOL").is_err());
+        assert!(MarketId::parse_upbit("krw-btc").is_err());
+        assert!(Asset::new("sol").is_err());
+        assert!(Asset::new("DO GE").is_err());
         assert!(CandleInterval::parse_code("1s").is_err());
         assert!(CandleInterval::parse_code("1ms").is_err());
         assert!(PriceKrw::new(Decimal::ZERO).is_err());

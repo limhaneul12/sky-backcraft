@@ -123,7 +123,11 @@ fn pagination_retry_raw_before_parse_and_durable_resume_cover_more_than_200_rows
         let first_page = wire_page(1, 201);
         let retry_body = b"{\"error\":\"temporary\"}".to_vec();
         let malformed_body = b"not-json-after-retry".to_vec();
+        // The catalog admission gate issues one market/all request before the
+        // first candle page of every collect call.
+        let catalog_body = br#"[{"market":"KRW-BTC"}]"#.to_vec();
         let first_server = start_server(vec![
+            (StatusCode::OK, catalog_body.clone()),
             (StatusCode::OK, first_page),
             (StatusCode::INTERNAL_SERVER_ERROR, retry_body.clone()),
             (StatusCode::OK, malformed_body.clone()),
@@ -171,7 +175,11 @@ fn pagination_retry_raw_before_parse_and_durable_resume_cover_more_than_200_rows
         assert_eq!(raw_bodies[1], retry_body);
         assert_eq!(raw_bodies[2], malformed_body);
 
-        let resume_server = start_server(vec![(StatusCode::OK, wire_page(0, 1))]).await?;
+        let resume_server = start_server(vec![
+            (StatusCode::OK, catalog_body),
+            (StatusCode::OK, wire_page(0, 1)),
+        ])
+        .await?;
         let resume_seen = resume_server.seen_to.clone();
         let resume_client = UpbitClient::synthetic_local(&resume_server.base_url)?;
         let resumed_result = tokio::time::timeout(
@@ -197,9 +205,11 @@ fn pagination_retry_raw_before_parse_and_durable_resume_cover_more_than_200_rows
 
         let first_cursors = first_seen.lock().expect("first cursor lock").clone();
         let resume_cursors = resume_seen.lock().expect("resume cursor lock").clone();
-        assert_eq!(first_cursors.len(), 3);
-        assert_eq!(first_cursors[1], first_cursors[2]);
-        assert_eq!(resume_cursors, vec![first_cursors[1].clone()]);
+        // Cursor 0 is the catalog request (no `to`); the retry repeats the
+        // same `to` as its first attempt.
+        assert_eq!(first_cursors.len(), 4);
+        assert_eq!(first_cursors[2], first_cursors[3]);
+        assert_eq!(resume_cursors, vec![None, first_cursors[2].clone()]);
         Ok(())
     });
     owner.shutdown()?;

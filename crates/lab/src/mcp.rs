@@ -239,10 +239,11 @@ fn sanitize_attempt(attempt: &mut JobAttempt) {
     match &mut attempt.state {
         AttemptState::Failed { error, .. } => {
             // RESOURCE_LIMIT records carry the server-generated structured limit
-            // report (limit name, unit, allowed bytes, stage, remedy) with no
-            // internal paths or secrets; masking it would hide exactly the
-            // diagnosis a caller needs, so it passes through bounded.
-            error.message = if error.code == "RESOURCE_LIMIT" {
+            // report (limit name, unit, allowed bytes, stage, remedy) and
+            // INVALID_CONFIG records echo only the caller's own rejected input
+            // with fixed guidance text; masking either would hide exactly the
+            // diagnosis a caller needs, so both pass through bounded.
+            error.message = if matches!(error.code.as_str(), "RESOURCE_LIMIT" | "INVALID_CONFIG") {
                 error.message.chars().take(512).collect()
             } else {
                 public_failure_message(&error.code)
@@ -370,44 +371,47 @@ fn result_page_value(
         ResultPage::Orders(page) => ("orders", serde_json::to_value(page)?),
         ResultPage::OrderEvents(page) => ("order_events", serde_json::to_value(page)?),
         ResultPage::Fills(page) => {
-            let records = page
-                .records
-                .iter()
-                .map(|fill| {
-                    let mut value = serde_json::to_value(fill)?;
-                    value["price_cost_attribution_unit"] = serde_json::json!("KRW_PER_BASE_UNIT");
-                    value["price_difference_per_unit"] =
-                        serde_json::to_value(fill.price_cost_attribution)?;
-                    value["embedded_price_cost_quote"] =
-                        serde_json::to_value(crate::reporting::fill_price_cost_quote(fill)?)?;
-                    value["embedded_price_cost_quote_unit"] = serde_json::json!("KRW");
-                    Ok(value)
-                })
-                .collect::<Result<Vec<_>, LabError>>()?;
-            let mut value = serde_json::to_value(page)?;
-            value["records"] = serde_json::to_value(records)?;
+            let mut value = serde_json::to_value(&page)?;
+            let records = value["records"].as_array_mut().ok_or_else(|| {
+                LabError::Internal("serialized fill page has no record array".into())
+            })?;
+            if records.len() != page.records.len() {
+                return Err(LabError::Internal(
+                    "serialized fill page count changed".into(),
+                ));
+            }
+            for (value, fill) in records.iter_mut().zip(&page.records) {
+                value["price_cost_attribution_unit"] = serde_json::json!("KRW_PER_BASE_UNIT");
+                value["price_difference_per_unit"] =
+                    serde_json::to_value(fill.price_cost_attribution)?;
+                value["embedded_price_cost_quote"] =
+                    serde_json::to_value(crate::reporting::fill_price_cost_quote(fill)?)?;
+                value["embedded_price_cost_quote_unit"] = serde_json::json!("KRW");
+            }
             ("fills", value)
         }
         ResultPage::Episodes(page) => {
-            let records = page
-                .records
-                .iter()
-                .map(|episode| {
-                    let details = store.episode_exit_details(episode)?;
-                    let mut value = serde_json::to_value(episode)?;
-                    value["exit_reason_meaning"] =
-                        serde_json::json!("EXECUTION_RESULT_LEGACY_NAME");
-                    value["exit_details"] = serde_json::to_value(details)?;
-                    Ok(value)
-                })
-                .collect::<Result<Vec<_>, LabError>>()?;
-            let mut value = serde_json::to_value(page)?;
-            value["records"] = serde_json::to_value(records)?;
+            let mut value = serde_json::to_value(&page)?;
+            let records = value["records"].as_array_mut().ok_or_else(|| {
+                LabError::Internal("serialized episode page has no record array".into())
+            })?;
+            if records.len() != page.records.len() {
+                return Err(LabError::Internal(
+                    "serialized episode page count changed".into(),
+                ));
+            }
+            for (value, episode) in records.iter_mut().zip(&page.records) {
+                value["exit_reason_meaning"] = serde_json::json!("EXECUTION_RESULT_LEGACY_NAME");
+                value["exit_details"] = serde_json::to_value(store.episode_exit_details(episode)?)?;
+            }
             ("episodes", value)
         }
         ResultPage::Equity(page) => ("equity", serde_json::to_value(page)?),
     };
-    Ok(serde_json::json!({ "section": section, "page": value }))
+    let mut result = serde_json::Map::new();
+    result.insert("section".into(), serde_json::Value::String(section.into()));
+    result.insert("page".into(), value);
+    Ok(serde_json::Value::Object(result))
 }
 
 fn tagged_schema<T: JsonSchema + 'static>() -> std::sync::Arc<JsonObject> {
@@ -503,7 +507,7 @@ impl LabMcpService {
             },
             "scope": {
                 "venue": "upbit",
-                "markets": ["KRW-BTC", "KRW-ETH", "KRW-XRP"],
+                "markets": "any listed Upbit KRW-<SYMBOL> market (validated against the live market catalog at collection admission)",
                 "quote": "KRW",
                 "position_types": "long/cash only",
                 "private_api": "never",

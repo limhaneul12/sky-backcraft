@@ -48,7 +48,10 @@ python3 scripts/download-export.py \
 
 주소를 과거 Quick Tunnel 값으로 고정하지 않는다. 수신기는 표준 라이브러리만 쓰고
 기존 파일을 덮어쓰지 않는다. 완료 export job의 파일 집합을 함께 받아 manifest와
-review/ledger의 대응 관계를 유지한다.
+review/ledger의 대응 관계를 유지한다. v4에서는 job으로 manifest만 먼저 수신하고
+manifest의 정확한 ID·해시로 나머지 파일을 읽는다. 구버전 수신의
+`manifest_references_followed=false` 경고를 성공적인 manifest 참조 검증으로 보고하지
+않는다. 교정된 참조가 필요하면 원본을 보존한 새 export를 사용한다.
 
 수신기가 없는 환경에서는 `retrieval.read_arguments`로 `artifact_query`를 호출한다.
 `HEX`를 바이트로 디코딩하고 offset·chunk 크기·chunk SHA를 검증하며 `next_offset`을

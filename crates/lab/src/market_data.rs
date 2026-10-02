@@ -48,6 +48,28 @@ impl FetchFailure {
     }
 }
 
+/// Unparsed `v1/market/all` response: a validation gate input, never
+/// archived as raw evidence.
+pub(crate) struct MarketCatalogResponse {
+    pub http_status: u16,
+    pub body: Vec<u8>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpbitMarketWire {
+    market: String,
+}
+
+/// Parse the `v1/market/all` catalog response into market codes.
+///
+/// # Errors
+///
+/// [`LabError::ContractParse`] on malformed catalog JSON.
+pub(crate) fn parse_market_catalog(body: &[u8]) -> Result<Vec<String>, LabError> {
+    let entries: Vec<UpbitMarketWire> = serde_json::from_slice(body)?;
+    Ok(entries.into_iter().map(|entry| entry.market).collect())
+}
+
 /// Thin client over Upbit's public (unauthenticated) REST API only. Private
 /// exchange API surfaces are out of scope by contract.
 #[derive(Clone)]
@@ -80,7 +102,6 @@ impl UpbitClient {
         })
     }
 
-    #[cfg(test)]
     #[cfg(test)]
     pub(crate) fn synthetic_local(base_url: &str) -> Result<Self, LabError> {
         let parsed = reqwest::Url::parse(base_url)
@@ -195,7 +216,7 @@ impl UpbitClient {
         validate_continuity(&candles, interval)?;
 
         Ok(ProbeReport {
-            market: market.code(),
+            market: market.code().clone(),
             interval,
             requested_completed_count: completed_count.get(),
             fetched_at,
@@ -211,6 +232,55 @@ impl UpbitClient {
 
     /// Bounded collection request. Waiting only occurs in the single job runner;
     /// interactive probes still reject immediately. No persistence happens here.
+    /// Fetch the live Upbit market catalog (`v1/market/all`). Validation
+    /// gate only: the response is bounded and never archived as raw
+    /// evidence. Shares the request pacing gate with candle requests.
+    pub(crate) async fn fetch_market_catalog(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<MarketCatalogResponse, FetchFailure> {
+        let operation = async {
+            let mut next_probe = self.next_probe.lock().await;
+            tokio::time::sleep_until(*next_probe).await;
+            *next_probe = Instant::now() + PROBE_SPACING;
+            let url = format!("{}/v1/market/all?isDetails=false", self.base_url);
+            let response = self
+                .http
+                .get(&url)
+                .send()
+                .await
+                .map_err(|error| FetchFailure {
+                    retryable: error.is_timeout(),
+                    error: LabError::NetworkUnavailable(format!(
+                        "upbit market catalog request: {error}"
+                    )),
+                })?;
+            let http_status = response.status().as_u16();
+            let remaining_req = response
+                .headers()
+                .get("Remaining-Req")
+                .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned());
+            if matches!(http_status, 429 | 418)
+                || remaining_req.as_deref().is_some_and(|header| {
+                    header
+                        .split(';')
+                        .any(|part| part.trim().split_once('=') == Some(("sec", "0")))
+                })
+            {
+                *next_probe = Instant::now() + Duration::from_secs(1);
+            }
+            let body = read_body(response).await.map_err(FetchFailure::permanent)?;
+            Ok(MarketCatalogResponse { http_status, body })
+        };
+        tokio::select! {
+            () = cancellation.cancelled() => Err(FetchFailure::permanent(LabError::Cancelled("market catalog request cancelled".into()))),
+            result = tokio::time::timeout_at(deadline, operation) => result.unwrap_or_else(|_| Err(FetchFailure::permanent(
+                LabError::NetworkUnavailable("market catalog deadline elapsed".into())
+            ))),
+        }
+    }
+
     pub(crate) async fn collect_page(
         &self,
         market: &MarketId,

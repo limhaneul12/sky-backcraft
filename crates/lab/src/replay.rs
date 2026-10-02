@@ -41,8 +41,14 @@ pub fn replay_package_with_cancel(
     validate_compiled_provenance(&package.bundle)?;
     validate_frozen_replay_inputs(package)?;
     let replayed_models = replay_models(&package.bundle, cancelled)?;
-    let mut full_replay = package.bundle.clone();
-    full_replay.models = replayed_models;
+    let mut full_replay = RunBundle {
+        manifest: package.bundle.manifest.clone(),
+        plan: package.bundle.plan.clone(),
+        datasets: package.bundle.datasets.clone(),
+        evidence: package.bundle.evidence.clone(),
+        models: replayed_models,
+        semantic_digest: package.bundle.semantic_digest.clone(),
+    };
     full_replay.semantic_digest = semantic_digest(&full_replay)?;
 
     let mut findings = Vec::new();
@@ -244,7 +250,7 @@ mod tests {
         ));
 
         let first_model = bundle.models[0].clone();
-        let included_asset = first_model.market.base;
+        let included_asset = first_model.market.base.clone();
         let excluded = bundle.models[1].model_id.clone();
         let source_digest = bundle.semantic_digest.clone();
         let mut scoped_bundle = bundle.clone();

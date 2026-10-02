@@ -12,7 +12,7 @@ use crate::contracts::{
     RawObjectId, RawObjectRef, RequestId, SCHEMA_VERSION, UtcRange, UtcTimestamp,
 };
 use crate::database::DatabaseHandle;
-use crate::market_data::{CandleResponse, UpbitClient, decode_candles};
+use crate::market_data::{CandleResponse, UpbitClient, decode_candles, parse_market_catalog};
 use crate::storage::{RawObjectInput, dataset_digests, dataset_id, observation_digest};
 use rust_decimal::Decimal;
 use std::collections::{BTreeMap, BTreeSet};
@@ -45,6 +45,30 @@ pub async fn prepare_collection(
     cancellation: &CancellationToken,
 ) -> Result<DatasetSnapshot, LabError> {
     request.validate(UtcTimestamp::now())?;
+    let deadline = Instant::now() + Duration::from_mins(30);
+    let mut calls = 0_u32;
+    // Admission gate: every requested market must exist in the live Upbit
+    // market catalog, so typo'd or non-listed symbols fail with a clear
+    // rejection instead of an empty dataset. Counts against the collection
+    // call budget like any other exchange request.
+    check_cancel(cancellation)?;
+    if calls >= MAX_COLLECTION_CALLS {
+        return Err(LabError::ResourceLimit(format!(
+            "collection_api_calls exhausted at stage=market_catalog_validation: \
+             allowed={MAX_COLLECTION_CALLS} unit=exchange_calls used={calls}"
+        )));
+    }
+    calls += 1;
+    let catalog = fetch_market_catalog(client, deadline, cancellation).await?;
+    for market in &request.markets {
+        if !catalog.contains(&market.code()) {
+            return Err(LabError::InvalidConfig(format!(
+                "unknown or non-KRW Upbit market {} (validated against the live market catalog); \
+                 check the symbol or pick a listed market",
+                market.code()
+            )));
+        }
+    }
     let registered = request.clone();
     database
         .call("begin_collection", move |store| {
@@ -54,11 +78,9 @@ pub async fn prepare_collection(
     let coverage = request
         .range
         .with_warmup(request.warmup_bars, request.data_resolution)?;
-    let deadline = Instant::now() + Duration::from_mins(30);
     let mut all_pages = Vec::new();
     let mut reused_observations: Vec<CandleObservation> = Vec::new();
     let mut reused_raw: Vec<RawObjectRef> = Vec::new();
-    let mut calls = 0_u32;
     for market in &request.markets {
         check_cancel(cancellation)?;
         let request_id = request.request_id.clone();
@@ -275,14 +297,7 @@ async fn publish_response(
     let request_id = request_id.clone();
     database
         .call("publish_collection_raw", move |store| {
-            let used = store
-                .load_collection_raw_objects(&request_id)?
-                .iter()
-                .try_fold(0_u64, |sum, raw| {
-                    sum.checked_add(raw.raw_bytes).ok_or_else(|| {
-                        LabError::ResourceLimit("collection byte count overflow".into())
-                    })
-                })?;
+            let used = store.collection_raw_bytes(&request_id)?;
             let incoming = u64::try_from(response.body.len())
                 .map_err(|_| LabError::ResourceLimit("response length overflow".into()))?;
             if used
@@ -312,6 +327,47 @@ async fn publish_response(
             Ok(published)
         })
         .await
+}
+
+/// Fetch and parse the live Upbit market catalog with the same bounded
+/// retry semantics as candle pages.
+async fn fetch_market_catalog(
+    client: &UpbitClient,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<std::collections::BTreeSet<String>, LabError> {
+    for attempt in 0..3 {
+        check_cancel(cancellation)?;
+        let response = match client.fetch_market_catalog(deadline, cancellation).await {
+            Ok(response) => response,
+            Err(failure) if failure.retryable && attempt < 2 => {
+                retry_delay(deadline, cancellation).await?;
+                continue;
+            }
+            Err(failure) => return Err(failure.error),
+        };
+        let status = response.http_status;
+        if (200..300).contains(&status) {
+            let markets = parse_market_catalog(&response.body)?;
+            return Ok(markets.into_iter().collect());
+        }
+        if status == 418 {
+            return Err(LabError::TemporarilyBlocked(
+                "Upbit HTTP418 while validating the market catalog; wait out the ban before retrying"
+                    .into(),
+            ));
+        }
+        if status == 429 || (500..600).contains(&status) {
+            retry_delay(deadline, cancellation).await?;
+            continue;
+        }
+        return Err(LabError::NetworkUnavailable(format!(
+            "Upbit HTTP{status} while validating the market catalog"
+        )));
+    }
+    Err(LabError::NetworkUnavailable(
+        "market catalog retry budget exhausted".into(),
+    ))
 }
 
 async fn retry_delay(deadline: Instant, cancellation: &CancellationToken) -> Result<(), LabError> {
@@ -368,10 +424,6 @@ fn missing_segments(
 /// Assemble immutable economic/provenance identities from committed and reused rows.
 /// # Errors
 /// Rejects mixed origins or capacity/contract failures; missing/conflicting data is `BLOCKED_DATA`.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one deterministic quality and immutable snapshot assembly pass"
-)]
 pub fn assemble_dataset(
     request: CollectRequest,
     pages: &[CollectionPage],
@@ -381,24 +433,98 @@ pub fn assemble_dataset(
     let coverage = request
         .range
         .with_warmup(request.warmup_bars, request.data_resolution)?;
-    let mut rows: BTreeMap<(String, UtcTimestamp), CandleObservation> = BTreeMap::new();
-    let mut raw: BTreeMap<RawObjectId, RawObjectRef> = raw_objects
-        .iter()
-        .map(|raw| (raw.id.clone(), raw.clone()))
-        .collect();
-    let mut issues = Vec::new();
     let origin = pages
         .first()
         .map_or(MarketDataOrigin::ExchangeObserved, |p| p.raw_object.origin);
+    let raw = merge_raw_sources(origin, pages, raw_objects, reuse.raw_objects)?;
+    let merged = merge_dataset_rows(coverage, pages, reuse.observations)?;
+    let mut assembly = DatasetAssembly {
+        coverage,
+        origin,
+        rows: merged.rows,
+        raw,
+        issues: merged.issues,
+        reused_rows: merged.reused_rows,
+        fetched_rows: merged.fetched_rows,
+    };
+    record_row_issues(&assembly.rows, &mut assembly.issues)?;
+    record_source_gaps(
+        &request,
+        coverage,
+        &assembly.rows,
+        &assembly.raw,
+        &mut assembly.issues,
+    )?;
+    finish_dataset(request, assembly, reuse.api_calls)
+}
+
+fn finish_dataset(
+    request: CollectRequest,
+    assembly: DatasetAssembly,
+    api_calls: u32,
+) -> Result<DatasetSnapshot, LabError> {
+    let status = if assembly
+        .issues
+        .iter()
+        .any(|issue| issue.severity == QualitySeverity::Error)
+        || assembly.rows.is_empty()
+    {
+        DatasetStatus::BlockedData
+    } else {
+        DatasetStatus::Ready
+    };
+    let placeholder = ContentHash::of_bytes(b"unpublished");
+    let mut snapshot = DatasetSnapshot {
+        manifest: DatasetManifest {
+            schema_version: SCHEMA_VERSION.into(),
+            id: DatasetId::from_seed("unpublished"),
+            request,
+            coverage: assembly.coverage,
+            status,
+            row_count: u64::try_from(assembly.rows.len())
+                .map_err(|_| LabError::ResourceLimit("row count overflow".into()))?,
+            normalizer_version: NORMALIZER_VERSION.into(),
+            gap_policy: "REJECT_UNRESOLVED_GAPS".into(),
+            semantic_digest: placeholder.clone(),
+            provenance_digest: placeholder,
+            origin: assembly.origin,
+            raw_objects: assembly.raw.into_values().collect(),
+            quality_issues: assembly.issues,
+            reuse: (assembly.reused_rows > 0).then_some(CollectionReuse {
+                reused_observations: assembly.reused_rows,
+                fetched_observations: assembly.fetched_rows,
+                api_calls,
+            }),
+        },
+        observations: assembly.rows.into_values().collect(),
+    };
+    let digests = dataset_digests(&snapshot)?;
+    snapshot.manifest.id = dataset_id(&digests);
+    snapshot.manifest.semantic_digest = digests.semantic;
+    snapshot.manifest.provenance_digest = digests.provenance;
+    Ok(snapshot)
+}
+
+fn merge_raw_sources(
+    origin: MarketDataOrigin,
+    pages: &[CollectionPage],
+    raw_objects: &[RawObjectRef],
+    reused: &[RawObjectRef],
+) -> Result<BTreeMap<RawObjectId, RawObjectRef>, LabError> {
+    let mut raw: BTreeMap<_, _> = raw_objects
+        .iter()
+        .map(|raw| (raw.id.clone(), raw.clone()))
+        .collect();
     for page in pages {
         if page.raw_object.origin != origin {
             return Err(LabError::DataCorrupt(
                 "mixed synthetic and observed collection origins".into(),
             ));
         }
-        raw.insert(page.raw_object.id.clone(), page.raw_object.clone());
+        let object = &page.raw_object;
+        raw.insert(object.id.clone(), object.clone());
     }
-    for object in reuse.raw_objects {
+    for object in reused {
         if object.origin != origin {
             return Err(LabError::DataCorrupt(
                 "mixed synthetic and observed reuse origins".into(),
@@ -406,27 +532,48 @@ pub fn assemble_dataset(
         }
         raw.insert(object.id.clone(), object.clone());
     }
-    let mut reused_rows = 0_u64;
-    let mut fetched_rows = 0_u64;
-    let merge = |row: &CandleObservation,
-                 reused: bool,
-                 rows: &mut BTreeMap<(String, UtcTimestamp), CandleObservation>,
-                 issues: &mut Vec<QualityIssue>,
-                 reused_rows: &mut u64,
-                 fetched_rows: &mut u64|
-     -> Result<(), LabError> {
+    Ok(raw)
+}
+
+type DatasetRows = BTreeMap<(String, UtcTimestamp), CandleObservation>;
+
+struct DatasetAssembly {
+    coverage: UtcRange,
+    origin: MarketDataOrigin,
+    rows: DatasetRows,
+    raw: BTreeMap<RawObjectId, RawObjectRef>,
+    issues: Vec<QualityIssue>,
+    reused_rows: u64,
+    fetched_rows: u64,
+}
+
+#[derive(Default)]
+struct RowMerge {
+    rows: DatasetRows,
+    issues: Vec<QualityIssue>,
+    reused_rows: u64,
+    fetched_rows: u64,
+}
+
+impl RowMerge {
+    fn merge(
+        &mut self,
+        coverage: UtcRange,
+        row: &CandleObservation,
+        reused: bool,
+    ) -> Result<(), LabError> {
         if !coverage.contains(row.candle.open_time_utc) {
             return Ok(());
         }
         if reused {
-            *reused_rows += 1;
+            self.reused_rows += 1;
         } else {
-            *fetched_rows += 1;
+            self.fetched_rows += 1;
         }
         let key = (row.candle.market.clone(), row.candle.open_time_utc);
-        if let Some(existing) = rows.get_mut(&key) {
+        if let Some(existing) = self.rows.get_mut(&key) {
             let identical = existing.content_digest == row.content_digest;
-            issues.push(issue_for(
+            self.issues.push(issue_for(
                 row,
                 if identical {
                     QualityKind::DuplicateIdentical
@@ -452,37 +599,34 @@ pub fn assemble_dataset(
                 existing.raw_object_ids.dedup();
             }
         } else {
-            rows.insert(key, row.clone());
+            self.rows.insert(key, row.clone());
         }
         Ok(())
-    };
-    for page in pages {
-        for row in &page.observations {
-            merge(
-                row,
-                false,
-                &mut rows,
-                &mut issues,
-                &mut reused_rows,
-                &mut fetched_rows,
-            )?;
-        }
     }
-    for row in reuse.observations {
-        merge(
-            row,
-            true,
-            &mut rows,
-            &mut issues,
-            &mut reused_rows,
-            &mut fetched_rows,
-        )?;
+}
+
+fn merge_dataset_rows(
+    coverage: UtcRange,
+    pages: &[CollectionPage],
+    reused: &[CandleObservation],
+) -> Result<RowMerge, LabError> {
+    let mut merged = RowMerge::default();
+    for (row, is_reused) in pages
+        .iter()
+        .flat_map(|page| page.observations.iter().map(|row| (row, false)))
+        .chain(reused.iter().map(|row| (row, true)))
+    {
+        merged.merge(coverage, row, is_reused)?;
     }
-    if rows.len() > MAX_DATASET_ROWS {
+    if merged.rows.len() > MAX_DATASET_ROWS {
         return Err(LabError::ResourceLimit(
             "dataset row budget exceeded".into(),
         ));
     }
+    Ok(merged)
+}
+
+fn record_row_issues(rows: &DatasetRows, issues: &mut Vec<QualityIssue>) -> Result<(), LabError> {
     for row in rows.values() {
         let candle = &row.candle;
         if !candle.completed {
@@ -514,18 +658,42 @@ pub fn assemble_dataset(
             )?);
         }
     }
+    Ok(())
+}
+
+fn record_source_gaps(
+    request: &CollectRequest,
+    coverage: UtcRange,
+    rows: &DatasetRows,
+    raw: &BTreeMap<RawObjectId, RawObjectRef>,
+    issues: &mut Vec<QualityIssue>,
+) -> Result<(), LabError> {
     for market in &request.markets {
         let code = market.code();
+        let market_rows: BTreeSet<_> = rows
+            .keys()
+            .filter(|(row_market, _)| row_market.as_str() == code)
+            .map(|(_, timestamp)| *timestamp)
+            .collect();
+        let raw_object_ids: Vec<_> = raw
+            .values()
+            .filter(|object| object.source_url.contains(code.as_str()))
+            .map(|object| object.id.clone())
+            .collect();
         let mut cursor = coverage.start();
         let mut gap_start = None;
         let mut gap_count = 0;
         while cursor < coverage.end() {
-            if rows.contains_key(&(code.clone(), cursor)) {
+            if market_rows.contains(&cursor) {
                 if let Some(start) = gap_start.take() {
-                    issues.push(QualityIssue { kind: QualityKind::UnknownSourceGap, severity: QualitySeverity::Error,
-                        market: market.clone(), start, end: cursor, count: gap_count,
-                        raw_object_ids: raw.values().filter(|r| r.source_url.contains(&code)).map(|r| r.id.clone()).collect(),
-                        detail: "Upbit omits no-trade intervals; missing source interval is not synthesized".into() });
+                    issues.push(source_gap_issue(
+                        market,
+                        start,
+                        cursor,
+                        gap_count,
+                        &raw_object_ids,
+                        "Upbit omits no-trade intervals; missing source interval is not synthesized",
+                    ));
                     gap_count = 0;
                 }
             } else {
@@ -540,61 +708,37 @@ pub fn assemble_dataset(
             );
         }
         if let Some(start) = gap_start {
-            issues.push(QualityIssue {
-                kind: QualityKind::UnknownSourceGap,
-                severity: QualitySeverity::Error,
-                market: market.clone(),
+            issues.push(source_gap_issue(
+                market,
                 start,
-                end: coverage.end(),
-                count: gap_count,
-                raw_object_ids: raw
-                    .values()
-                    .filter(|r| r.source_url.contains(&code))
-                    .map(|r| r.id.clone())
-                    .collect(),
-                detail: "source ended before the requested completed grid was covered".into(),
-            });
+                coverage.end(),
+                gap_count,
+                &raw_object_ids,
+                "source ended before the requested completed grid was covered",
+            ));
         }
     }
-    let status = if issues
-        .iter()
-        .any(|issue| issue.severity == QualitySeverity::Error)
-        || rows.is_empty()
-    {
-        DatasetStatus::BlockedData
-    } else {
-        DatasetStatus::Ready
-    };
-    let placeholder = ContentHash::of_bytes(b"unpublished");
-    let mut snapshot = DatasetSnapshot {
-        manifest: DatasetManifest {
-            schema_version: SCHEMA_VERSION.into(),
-            id: DatasetId::from_seed("unpublished"),
-            request,
-            coverage,
-            status,
-            row_count: u64::try_from(rows.len())
-                .map_err(|_| LabError::ResourceLimit("row count overflow".into()))?,
-            normalizer_version: NORMALIZER_VERSION.into(),
-            gap_policy: "REJECT_UNRESOLVED_GAPS".into(),
-            semantic_digest: placeholder.clone(),
-            provenance_digest: placeholder,
-            origin,
-            raw_objects: raw.into_values().collect(),
-            quality_issues: issues,
-            reuse: (reused_rows > 0).then_some(CollectionReuse {
-                reused_observations: reused_rows,
-                fetched_observations: fetched_rows,
-                api_calls: reuse.api_calls,
-            }),
-        },
-        observations: rows.into_values().collect(),
-    };
-    let digests = dataset_digests(&snapshot)?;
-    snapshot.manifest.id = dataset_id(&digests);
-    snapshot.manifest.semantic_digest = digests.semantic;
-    snapshot.manifest.provenance_digest = digests.provenance;
-    Ok(snapshot)
+    Ok(())
+}
+
+fn source_gap_issue(
+    market: &MarketId,
+    start: UtcTimestamp,
+    end: UtcTimestamp,
+    count: u64,
+    raw_object_ids: &[RawObjectId],
+    detail: &str,
+) -> QualityIssue {
+    QualityIssue {
+        kind: QualityKind::UnknownSourceGap,
+        severity: QualitySeverity::Error,
+        market: market.clone(),
+        start,
+        end,
+        count,
+        raw_object_ids: raw_object_ids.to_vec(),
+        detail: detail.into(),
+    }
 }
 
 fn issue_for(
