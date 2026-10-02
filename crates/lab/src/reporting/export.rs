@@ -332,16 +332,32 @@ fn verify_review_projection(
 }
 
 fn scoped_bundle(bundle: &RunBundle, scope: &ExportScope) -> Result<RunBundle, LabError> {
-    let mut scoped = bundle.clone();
-    if let ExportScope::Asset { asset } = scope {
-        scoped.models.retain(|model| model.market.base == *asset);
-        if scoped.models.is_empty() {
-            return Err(LabError::InvalidConfig(format!(
-                "run has no {} models",
-                asset.code()
-            )));
+    let models = match scope {
+        ExportScope::Full => bundle.models.clone(),
+        ExportScope::Asset { asset } => {
+            let models: Vec<_> = bundle
+                .models
+                .iter()
+                .filter(|model| model.market.base == *asset)
+                .cloned()
+                .collect();
+            if models.is_empty() {
+                return Err(LabError::InvalidConfig(format!(
+                    "run has no {} models",
+                    asset.code()
+                )));
+            }
+            models
         }
-    }
+    };
+    let mut scoped = RunBundle {
+        manifest: bundle.manifest.clone(),
+        plan: bundle.plan.clone(),
+        datasets: bundle.datasets.clone(),
+        evidence: bundle.evidence.clone(),
+        models,
+        semantic_digest: bundle.semantic_digest.clone(),
+    };
     scoped.semantic_digest = semantic_digest(&scoped)?;
     Ok(scoped)
 }
@@ -505,12 +521,16 @@ fn exact_artifact<'a>(
     manifest: &'a ExportManifest,
     path: &str,
 ) -> Result<&'a ArtifactRef, LabError> {
-    let matches: Vec<_> = manifest
+    let mut matches = manifest
         .artifacts
         .iter()
-        .filter(|artifact| artifact.relative_path == path)
-        .collect();
-    if matches.len() != 1
+        .filter(|artifact| artifact.relative_path == path);
+    let Some(artifact) = matches.next() else {
+        return Err(LabError::DataCorrupt(
+            "manifest contains missing, duplicate, or unknown artifact paths".into(),
+        ));
+    };
+    if matches.next().is_some()
         || manifest.artifacts.iter().any(|artifact| {
             artifact.relative_path != REVIEW_FILE && artifact.relative_path != LEDGER_FILE
         })
@@ -519,7 +539,6 @@ fn exact_artifact<'a>(
             "manifest contains missing, duplicate, or unknown artifact paths".into(),
         ));
     }
-    let artifact = matches[0];
     if manifest.schema_version == EXPORT_SCHEMA_VERSION
         && artifact.id
             != ArtifactId::for_file(

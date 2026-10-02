@@ -301,6 +301,11 @@ fn frozen_policy_lineage_is_exported_and_trace_corruption_is_rejected() {
 fn semantic_digest_excludes_occurrence_metadata_but_retains_economic_timing() {
     let bundle = fixture();
     let expected = semantic_digest(&bundle).expect("semantic digest");
+    assert_eq!(
+        expected,
+        super::verify::semantic_digest_from_full_clone(&bundle)
+            .expect("full-clone semantic digest")
+    );
     let mut occurrence = bundle.clone();
     occurrence.manifest.run_id = RunId::new("run-other").expect("test ID");
     occurrence.manifest.job_id = JobId::new("job-other").expect("test ID");
@@ -475,6 +480,28 @@ fn review_groups_account_returns_by_recorded_active_regime_labels() {
     assert!(regimes[0].sampled_intervals >= 1);
     assert!(regimes[0].compounded_account_return.value.is_some());
     assert_eq!(review.models[0].active_regime_null_reason, None);
+
+    let mut earlier = bundle.models[0].signals[0].clone();
+    earlier.context.event_seq = 0;
+    earlier.evidence_effect = None;
+    bundle.models[0].signals.push(earlier);
+    let out_of_order = build_review(&bundle).expect("out-of-order signal review");
+    assert_eq!(
+        out_of_order.models[0].active_regime_returns[0].regime_label,
+        "BULL"
+    );
+
+    let mut same_sequence = bundle.models[0].signals[0].clone();
+    same_sequence.evidence_effect = None;
+    bundle.models[0].signals.push(same_sequence);
+    assert!(
+        build_review(&bundle)
+            .expect("same-sequence signal review")
+            .models[0]
+            .active_regime_returns
+            .is_empty(),
+        "the last signal at an equal event sequence remains authoritative"
+    );
 }
 
 #[test]
@@ -611,7 +638,12 @@ fn export_is_deterministic_bounded_and_rejects_trailing_gzip_bytes() {
         export_run(&incompatible, &root, None),
         Err(LabError::Conflict(message)) if message.contains("immutable identity")
     ));
-    let asset_result = export_run(&bundle, &root, Some(Asset::Btc)).expect("asset export");
+    let asset_result = export_run(
+        &bundle,
+        &root,
+        Some(Asset::new("BTC").expect("asset symbol")),
+    )
+    .expect("asset export");
     let asset_package = read_export_package(&asset_result.directory).expect("read asset export");
     let full_ids: std::collections::BTreeSet<_> =
         result.artifacts.iter().map(|item| &item.id).collect();
@@ -1871,7 +1903,7 @@ pub(crate) fn multi_market_fixture() -> RunBundle {
         .cloned()
         .map(|mut observation| {
             let original = observation.id.as_str().to_owned();
-            observation.candle.market = eth_market.code();
+            observation.candle.market = eth_market.code().clone();
             observation.content_digest = crate::contracts::observation_digest(&observation.candle)
                 .expect("ETH observation digest");
             observation.id = ObservationId::from_seed(observation.content_digest.as_str());
@@ -1990,7 +2022,7 @@ fn derived_bundle_fixture() -> (RunBundle, DatasetId, DatasetId) {
                     .expect("M5 open"),
             );
             let candle = CandleRecord {
-                market: market.code(),
+                market: market.code().clone(),
                 interval: CandleInterval::M5,
                 open_time_utc: opened,
                 close_time_utc: UtcTimestamp(
@@ -2087,7 +2119,7 @@ fn candle_observation(
     raw_object_id: &RawObjectId,
 ) -> CandleObservation {
     let candle = CandleRecord {
-        market: market.code(),
+        market: market.code().clone(),
         interval: CandleInterval::H1,
         open_time_utc: ts(open_time),
         close_time_utc: ts(close_time),

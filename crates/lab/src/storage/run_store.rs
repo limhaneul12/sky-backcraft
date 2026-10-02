@@ -213,7 +213,8 @@ impl Store {
             return Err(LabError::Conflict("run is not RUNNING".into()));
         }
         self.ensure_attempt_uncancelled(&run.manifest.attempt_id)?;
-        let stored = self.load_sequenced_model(run_id, &ledger.model_id)?;
+        let source = run_ledger_source(self, run_id)?;
+        let stored = self.load_sequenced_model(run_id, &ledger.model_id, &source)?;
         let empty_facts = ledger.signals.is_empty()
             && ledger.order_events.is_empty()
             && ledger.fills.is_empty()
@@ -373,7 +374,11 @@ impl Store {
         run_id: &RunId,
         model_id: &ModelId,
     ) -> Result<Option<ModelLedger>, LabError> {
-        load_model(self, run_id, model_id)
+        let Some(row) = query_terminal_model_row(self, run_id, model_id)? else {
+            return Ok(None);
+        };
+        let source = run_ledger_source(self, run_id)?;
+        load_model_from_row(self, run_id, model_id, row, &source).map(Some)
     }
 
     /// Load durable run header/status details.
@@ -823,14 +828,15 @@ impl Store {
         &self,
         run_id: &RunId,
         model_id: &ModelId,
+        source: &RunLedgerSource,
     ) -> Result<StoredSequenced, LabError> {
-        if let RunLedgerSource::Sealed(lines) = run_ledger_source(self, run_id)? {
+        if let RunLedgerSource::Sealed(lines) = source {
             let crate::storage::ledger_seal::ModelFactVectors {
                 signals,
                 order_events,
                 fills,
                 account_marks: marks,
-            } = sequenced_from_lines(&lines, model_id)?;
+            } = sequenced_from_lines(lines, model_id)?;
             let last: i64 = self
                 .connection
                 .query_row(
@@ -1042,34 +1048,58 @@ fn nonnegative_u64(value: i64, label: &str) -> Result<u64, LabError> {
     u64::try_from(value).map_err(|_| LabError::DataCorrupt(format!("negative stored {label}")))
 }
 
-fn load_model(
+struct StoredModelRow {
+    market: String,
+    strategy_json: String,
+    status: String,
+    status_reason: Option<String>,
+    last_committed_event_seq: i64,
+    final_digest: Option<String>,
+}
+
+fn query_terminal_model_row(
     store: &Store,
     run_id: &RunId,
     model_id: &ModelId,
-) -> Result<Option<ModelLedger>, LabError> {
-    let row = store.connection.query_row(
-        "SELECT market,strategy_json,status,status_reason,last_committed_event_seq,final_digest FROM run_models WHERE run_id=?1 AND model_id=?2",
-        params![run_id.as_str(), model_id.as_str()],
-        |row| Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, Option<String>>(2)?,row.get::<_, Option<String>>(3)?,row.get::<_, i64>(4)?,row.get::<_, Option<String>>(5)?)),
-    ).optional().map_err(sql_error)?;
-    let Some(row) = row else {
-        return Ok(None);
+) -> Result<Option<StoredModelRow>, LabError> {
+    store
+        .connection
+        .query_row(
+            "SELECT market,strategy_json,status,status_reason,last_committed_event_seq,final_digest FROM run_models WHERE run_id=?1 AND model_id=?2 AND status IS NOT NULL",
+            params![run_id.as_str(), model_id.as_str()],
+            |row| {
+                Ok(StoredModelRow {
+                    market: row.get(0)?,
+                    strategy_json: row.get(1)?,
+                    status: row.get(2)?,
+                    status_reason: row.get(3)?,
+                    last_committed_event_seq: row.get(4)?,
+                    final_digest: row.get(5)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(sql_error)
+}
+
+fn load_model_from_row(
+    store: &Store,
+    run_id: &RunId,
+    model_id: &ModelId,
+    row: StoredModelRow,
+    source: &RunLedgerSource,
+) -> Result<ModelLedger, LabError> {
+    let sequenced = store.load_sequenced_model(run_id, model_id, source)?;
+    let orders: Vec<OrderRecord> = if let RunLedgerSource::Sealed(lines) = source {
+        records_of_kind(lines, model_id, crate::contracts::LedgerSection::Orders)?
+    } else {
+        load_json_records(
+            &store.connection,
+            "SELECT record_json FROM orders WHERE run_id=?1 AND model_id=?2 ORDER BY event_seq",
+            run_id,
+            model_id,
+        )?
     };
-    let Some(status) = row.2 else {
-        return Ok(None);
-    };
-    let sequenced = store.load_sequenced_model(run_id, model_id)?;
-    let orders: Vec<OrderRecord> =
-        if let RunLedgerSource::Sealed(lines) = run_ledger_source(store, run_id)? {
-            records_of_kind(&lines, model_id, crate::contracts::LedgerSection::Orders)?
-        } else {
-            load_json_records(
-                &store.connection,
-                "SELECT record_json FROM orders WHERE run_id=?1 AND model_id=?2 ORDER BY event_seq",
-                run_id,
-                model_id,
-            )?
-        };
     let episodes: Vec<EpisodeRecord> = load_json_records(
         &store.connection,
         "SELECT record_json FROM episodes WHERE run_id=?1 AND model_id=?2 ORDER BY opened_at_ms,episode_id",
@@ -1078,24 +1108,27 @@ fn load_model(
     )?;
     let ledger = ModelLedger {
         model_id: model_id.clone(),
-        market: crate::contracts::MarketId::parse_upbit(&row.0)?,
-        strategy: serde_json::from_str(&row.1).map_err(json_error)?,
-        status: serde_json::from_value(serde_json::Value::String(status)).map_err(json_error)?,
-        status_reason: row.3,
+        market: crate::contracts::MarketId::parse_upbit(&row.market)?,
+        strategy: serde_json::from_str(&row.strategy_json).map_err(json_error)?,
+        status: serde_json::from_value(serde_json::Value::String(row.status))
+            .map_err(json_error)?,
+        status_reason: row.status_reason,
         signals: serde_json::from_value(sequenced.signals).map_err(json_error)?,
         orders,
         order_events: serde_json::from_value(sequenced.order_events).map_err(json_error)?,
         fills: serde_json::from_value(sequenced.fills).map_err(json_error)?,
         episodes,
         account_marks: serde_json::from_value(sequenced.marks).map_err(json_error)?,
-        last_event_seq: nonnegative_u64(row.4, "model last event sequence")?,
+        last_event_seq: nonnegative_u64(row.last_committed_event_seq, "model last event sequence")?,
     };
-    if row.5.as_deref() != Some(crate::contracts::ContentHash::of_value(&ledger)?.as_str()) {
+    if row.final_digest.as_deref()
+        != Some(crate::contracts::ContentHash::of_value(&ledger)?.as_str())
+    {
         return Err(LabError::DataCorrupt(format!(
             "model final digest mismatch: {model_id}"
         )));
     }
-    Ok(Some(ledger))
+    Ok(ledger)
 }
 
 impl Store {
@@ -1128,12 +1161,14 @@ impl Store {
             })?),
             None => None,
         };
+        let ledger_source = run_ledger_source(self, run_id)?;
         let mut models = Vec::with_capacity(plan.resolved.admissions.len());
         for admission in &plan.resolved.admissions {
             let model_id = admission.model_id.clone();
-            let model = self.load_model(run_id, &model_id)?.ok_or_else(|| {
+            let row = query_terminal_model_row(self, run_id, &model_id)?.ok_or_else(|| {
                 LabError::Conflict(format!("run model is not terminal: {model_id}"))
             })?;
+            let model = load_model_from_row(self, run_id, &model_id, row, &ledger_source)?;
             models.push(model);
         }
         Ok(RunBundle {

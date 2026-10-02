@@ -638,19 +638,24 @@ mod tests {
     }
 
     #[test]
-    fn uses_rustup_for_pin() {
-        let policy = ToolchainPolicy {
-            channel: Some("1.98.0".to_owned()),
-        };
-        let command = policy.command("cargo");
-        assert_eq!(command.get_program(), std::ffi::OsStr::new("rustup"));
-    }
-
-    #[test]
-    fn no_pin_uses_cargo() {
-        let policy = ToolchainPolicy { channel: None };
-        let command = policy.command("cargo");
-        assert_eq!(command.get_program(), std::ffi::OsStr::new("cargo"));
+    fn command_uses_the_declared_toolchain_or_ambient_cargo() {
+        for (channel, program, arguments) in [
+            (Some("1.98.0"), "rustup", &["run", "1.98.0", "cargo"][..]),
+            (None, "cargo", &[][..]),
+        ] {
+            let command = ToolchainPolicy {
+                channel: channel.map(str::to_owned),
+            }
+            .command("cargo");
+            assert_eq!(command.get_program(), std::ffi::OsStr::new(program));
+            assert_eq!(
+                command.get_args().collect::<Vec<_>>(),
+                arguments
+                    .iter()
+                    .map(std::ffi::OsStr::new)
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]

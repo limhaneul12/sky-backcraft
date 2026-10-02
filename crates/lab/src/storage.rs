@@ -225,6 +225,7 @@ pub(super) struct PreparedDatasetPublication {
 
 #[derive(Clone, Copy)]
 enum RestoreRootPolicy {
+    #[cfg(test)]
     StrictEmpty,
     HeldOwnerLock,
 }
@@ -550,6 +551,14 @@ impl Store {
         Ok(objects)
     }
 
+    /// Total uncompressed bytes linked to one collection request.
+    ///
+    /// # Errors
+    /// Returns an error for negative/corrupt stored sizes or SQLite failure.
+    pub fn collection_raw_bytes(&self, request_id: &RequestId) -> Result<u64, LabError> {
+        query_collection_raw_bytes(&self.connection, request_id)
+    }
+
     /// Register a normalized collection request before any page is committed.
     ///
     /// # Errors
@@ -763,20 +772,17 @@ impl Store {
             .map_err(sql_error)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(sql_error)?;
-        let slim_indexes: BTreeSet<u32> = slim_pages.iter().map(|(index, _)| *index).collect();
+        let slim_raw_objects: BTreeMap<u32, &RawObjectRef> = slim_pages
+            .iter()
+            .map(|(index, slim)| (*index, &slim.raw_object))
+            .collect();
         let mut bodies: BTreeMap<u32, Vec<CandleObservation>> = BTreeMap::new();
         for (page_index, observation_json) in rows {
-            if !slim_indexes.contains(&page_index) {
+            let Some(raw_object) = slim_raw_objects.get(&page_index) else {
                 continue;
-            }
+            };
             let mut observation: CandleObservation =
                 serde_json::from_str(&observation_json).map_err(json_error)?;
-            let raw_object = &slim_pages
-                .iter()
-                .find(|(index, _)| *index == page_index)
-                .ok_or_else(|| LabError::DataCorrupt("slim page vanished during rebuild".into()))?
-                .1
-                .raw_object;
             observation.raw_object_ids = vec![raw_object.id.clone()];
             observation.constituent_ids = Vec::new();
             validate_observation_identity(&observation)?;
@@ -1028,7 +1034,7 @@ impl Store {
         if markets.is_empty() {
             return Ok(Vec::new());
         }
-        let codes: Vec<String> = markets.iter().map(MarketId::code).collect();
+        let codes: Vec<String> = markets.iter().map(|market| market.code().clone()).collect();
         let mut statement = self.connection.prepare(
             "SELECT DISTINCT r.object_json FROM observation_raw_objects o \
              JOIN candle_observations c ON c.id=o.observation_id \
@@ -1121,9 +1127,7 @@ impl Store {
     ///
     /// SQLite numbers come from the live connection pragmas (allocated =
     /// `page_count * page_size`, reusable = `freelist * page_size`); WAL, raw,
-    /// sealed ledgers and exports are separate on-disk observations. Values
-    /// that cannot be observed report as 0 with `available: false` semantics
-    /// left to the caller.
+    /// sealed ledgers and exports are separate on-disk observations.
     ///
     /// # Errors
     /// Reports SQLite or filesystem read failures.
@@ -1143,23 +1147,29 @@ impl Store {
         let allocated = page_count.saturating_mul(page_size);
         let reusable = freelist.saturating_mul(page_size);
         let wal_path = self.raw.root.join(format!("{DATABASE_FILE}-wal"));
-        let wal_bytes: i64 = if wal_path.exists() {
+        let wal_bytes: i64 = if wal_path
+            .try_exists()
+            .map_err(io_error("inspect SQLite WAL"))?
+        {
             i64::try_from(file_size(&wal_path)?).unwrap_or(i64::MAX)
         } else {
             0
         };
-        let directory = |relative: &str| -> u64 {
+        let directory = |relative: &str| -> Result<u64, LabError> {
             let path = self.raw.root.join(relative);
-            if path.exists() {
-                directory_size(&path).unwrap_or(0)
+            if path
+                .try_exists()
+                .map_err(io_error("inspect storage directory"))?
+            {
+                directory_size(&path)
             } else {
-                0
+                Ok(0)
             }
         };
         let to_i64 = |bytes: u64| i64::try_from(bytes).unwrap_or(i64::MAX);
-        let raw_bytes = to_i64(directory("raw"));
-        let sealed_bytes = to_i64(directory("ledgers"));
-        let exports_bytes = to_i64(directory("exports"));
+        let raw_bytes = to_i64(directory("raw")?);
+        let sealed_bytes = to_i64(directory("ledgers")?);
+        let exports_bytes = to_i64(directory("exports")?);
         Ok(serde_json::json!({
             "sqlite": {
                 "allocated_bytes": allocated,
@@ -1251,6 +1261,7 @@ impl Store {
     ///
     /// # Errors
     /// Rejects nonempty/unsafe roots, corrupt manifests or hashes, and failed copy/SQLite work.
+    #[cfg(test)]
     pub fn restore(backup: impl AsRef<Path>, new_root: impl AsRef<Path>) -> Result<Self, LabError> {
         Self::restore_impl(
             backup.as_ref(),
@@ -1733,7 +1744,7 @@ fn validate_snapshot_observations(
     let mut previous_key = None;
     for observation in &snapshot.observations {
         validate_observation_identity(observation)?;
-        if !request_markets.contains(&observation.candle.market)
+        if !request_markets.contains(observation.candle.market.as_str())
             || observation.candle.interval != snapshot.manifest.request.data_resolution
         {
             return Err(LabError::Conflict(
@@ -1979,15 +1990,7 @@ fn link_collection_raw(
     if existing.is_some() {
         return Ok(());
     }
-    let used: i64 = transaction
-        .query_row(
-            "SELECT COALESCE(SUM(r.raw_bytes),0) FROM collection_raw_objects c JOIN raw_objects r ON r.id=c.raw_object_id WHERE c.request_id=?1",
-            [request_id.as_str()],
-            |row| row.get(0),
-        )
-        .map_err(sql_error)?;
-    let used = u64::try_from(used)
-        .map_err(|_| LabError::DataCorrupt("negative collection byte usage".into()))?;
+    let used = query_collection_raw_bytes(transaction, request_id)?;
     if used.saturating_add(object.raw_bytes) > MAX_COLLECTION_BYTES {
         return Err(LabError::ResourceLimit(format!(
             "collection raw bytes exceed {MAX_COLLECTION_BYTES}"
@@ -2007,6 +2010,20 @@ fn link_collection_raw(
         )
         .map_err(sql_error)?;
     Ok(())
+}
+
+fn query_collection_raw_bytes(
+    connection: &rusqlite::Connection,
+    request_id: &RequestId,
+) -> Result<u64, LabError> {
+    let used: i64 = connection
+        .query_row(
+            "SELECT COALESCE(SUM(r.raw_bytes),0) FROM collection_raw_objects c JOIN raw_objects r ON r.id=c.raw_object_id WHERE c.request_id=?1",
+            [request_id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    u64::try_from(used).map_err(|_| LabError::DataCorrupt("negative collection byte usage".into()))
 }
 
 fn insert_observation(
@@ -2217,6 +2234,7 @@ fn ensure_root(root: &Path) -> Result<(), LabError> {
 fn validate_restore_root(root: &Path, policy: RestoreRootPolicy) -> Result<(), LabError> {
     if !root.exists() {
         return match policy {
+            #[cfg(test)]
             RestoreRootPolicy::StrictEmpty => Ok(()),
             RestoreRootPolicy::HeldOwnerLock => Err(LabError::Conflict(
                 "locked restore root does not exist".into(),
@@ -2229,7 +2247,9 @@ fn validate_restore_root(root: &Path, policy: RestoreRootPolicy) -> Result<(), L
         .collect::<Result<Vec<_>, _>>()
         .map_err(io_error("inspect restore root entry"))?;
     match policy {
+        #[cfg(test)]
         RestoreRootPolicy::StrictEmpty if entries.is_empty() => Ok(()),
+        #[cfg(test)]
         RestoreRootPolicy::StrictEmpty => Err(LabError::Conflict(
             "restore root must be new or empty".into(),
         )),

@@ -851,14 +851,12 @@ fn terminal_matches_dataset(
 }
 
 fn terminal_matches_artifacts(terminal: &AttemptState, artifacts: &[ArtifactRef]) -> bool {
-    let expected = artifacts
-        .iter()
-        .map(|artifact| &artifact.id)
-        .collect::<Vec<_>>();
     matches!(
         terminal_output(terminal),
         Some(JobOutput::Artifacts { artifact_ids })
-            if artifact_ids.iter().collect::<Vec<_>>() == expected
+            if artifact_ids
+                .iter()
+                .eq(artifacts.iter().map(|artifact| &artifact.id))
     )
 }
 

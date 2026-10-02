@@ -56,7 +56,47 @@ class Client:
         return json.loads("".join(item["text"] for item in result["content"] if item["type"] == "text"))
 
 
+def _receive_chunks(client, artifact, args, output):
+    """Follow verified raw-byte cursors while streaming the pinned file to staging."""
+    digest = hashlib.sha256()
+    offset = 0
+    while True:
+        chunk = client.tool("artifact_query", args)["chunk"]
+        if chunk["encoding"] != "HEX" or chunk["offset"] != offset:
+            raise ValueError("invalid chunk encoding or offset")
+        if chunk["artifact"]["artifact_id"] != artifact["artifact_id"] or chunk["artifact"]["sha256"] != artifact["sha256"]:
+            raise ValueError("artifact identity changed during receive")
+        raw = bytes.fromhex(chunk["data_hex"])
+        if len(raw) != chunk["raw_bytes"] or hashlib.sha256(raw).hexdigest() != chunk["chunk_sha256"]:
+            raise ValueError("chunk length/hash mismatch")
+        offset += len(raw)
+        if offset > artifact["bytes"]:
+            raise ValueError("received more bytes than catalogued")
+        output.write(raw)
+        digest.update(raw)
+        if chunk["next_offset"] is None:
+            return offset, digest.hexdigest()
+        if not raw or chunk["next_offset"] != offset:
+            raise ValueError("non-progressing or discontinuous chunk cursor")
+        args["offset"] = offset
+
+
+def _verify_decoded_file(path, artifact):
+    """Check the decoded gzip identity with a bounded streaming working set."""
+    decoded_hash = hashlib.sha256()
+    decoded_size = 0
+    with gzip.open(path, "rb") as source:
+        while block := source.read(65536):
+            decoded_size += len(block)
+            if decoded_size > 512 * 1024 * 1024:
+                raise ValueError("decoded artifact exceeds 512 MiB")
+            decoded_hash.update(block)
+    if decoded_size != artifact["uncompressed_bytes"] or decoded_hash.hexdigest() != artifact["uncompressed_sha256"]:
+        raise ValueError("decoded-file length/SHA-256 mismatch")
+
+
 def receive(client, artifact, destination):
+    """Own temporary-file lifetime and publish only a fully verified immutable file."""
     name = artifact["file_name"]
     if not name or Path(name).name != name or name in (".", ".."):
         raise ValueError("unsafe file name in artifact descriptor")
@@ -69,49 +109,20 @@ def receive(client, artifact, destination):
     if artifact["retrieval"]["tool_name"] != "artifact_query":
         raise ValueError("unexpected retrieval tool")
     args.update(artifact_id=artifact["artifact_id"], expected_sha256=artifact["sha256"], offset=0, limit=131072)
-    digest = hashlib.sha256()
-    offset = 0
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(dir=destination, prefix=".receiving-", delete=False) as output:
             temporary = Path(output.name)
-            while True:
-                chunk = client.tool("artifact_query", args)["chunk"]
-                if chunk["encoding"] != "HEX" or chunk["offset"] != offset:
-                    raise ValueError("invalid chunk encoding or offset")
-                if chunk["artifact"]["artifact_id"] != artifact["artifact_id"] or chunk["artifact"]["sha256"] != artifact["sha256"]:
-                    raise ValueError("artifact identity changed during receive")
-                raw = bytes.fromhex(chunk["data_hex"])
-                if len(raw) != chunk["raw_bytes"] or hashlib.sha256(raw).hexdigest() != chunk["chunk_sha256"]:
-                    raise ValueError("chunk length/hash mismatch")
-                offset += len(raw)
-                if offset > artifact["bytes"]:
-                    raise ValueError("received more bytes than catalogued")
-                output.write(raw)
-                digest.update(raw)
-                if chunk["next_offset"] is None:
-                    break
-                if not raw or chunk["next_offset"] != offset:
-                    raise ValueError("non-progressing or discontinuous chunk cursor")
-                args["offset"] = offset
+            offset, sha256 = _receive_chunks(client, artifact, args, output)
             output.flush()
             os.fsync(output.fileno())
-        if offset != artifact["bytes"] or digest.hexdigest() != artifact["sha256"]:
+        if offset != artifact["bytes"] or sha256 != artifact["sha256"]:
             raise ValueError("complete-file length/SHA-256 mismatch")
         if artifact.get("uncompressed_sha256"):
-            decoded_hash = hashlib.sha256()
-            decoded_size = 0
-            with gzip.open(temporary, "rb") as source:
-                while block := source.read(65536):
-                    decoded_size += len(block)
-                    if decoded_size > 512 * 1024 * 1024:
-                        raise ValueError("decoded artifact exceeds 512 MiB")
-                    decoded_hash.update(block)
-            if decoded_size != artifact["uncompressed_bytes"] or decoded_hash.hexdigest() != artifact["uncompressed_sha256"]:
-                raise ValueError("decoded-file length/SHA-256 mismatch")
+            _verify_decoded_file(temporary, artifact)
         # Atomic no-clobber publication after complete verification.
         os.link(temporary, target)
-        return {"artifact_id": artifact["artifact_id"], "file": str(target), "bytes": offset, "sha256": digest.hexdigest(), "verified": True}
+        return {"artifact_id": artifact["artifact_id"], "file": str(target), "bytes": offset, "sha256": sha256, "verified": True}
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
@@ -179,8 +190,33 @@ def receive_export(client, artifacts, destination, payload):
             "files": files}
 
 
+def _publish_package(staging, destination):
+    """Exclusively claim the output directory and link verified files without clobbering."""
+    destination.mkdir(mode=0o700)  # Atomic no-replace claim, including a directory created mid-receive.
+    published = []
+    try:
+        for source in sorted(staging.iterdir()):
+            target = destination / source.name
+            os.link(source, target)
+            published.append((target, source.stat()))
+    except BaseException:
+        for target, original in reversed(published):
+            try:
+                current = target.lstat()
+                if (current.st_dev, current.st_ino) == (original.st_dev, original.st_ino):
+                    target.unlink()
+            except FileNotFoundError:
+                pass
+        try:
+            destination.rmdir()
+        except OSError:
+            # Preserve other names/replacements observed during best-effort rollback.
+            pass
+        raise
+
+
 def receive_job(client, job, destination):
-    """Publish a complete verified package in one directory rename; failures leave no output."""
+    """Stage and verify all files before exclusively claiming the client output directory."""
     artifacts = job.get("artifacts", [])
     if not artifacts:
         raise ValueError("job has no completed export files; wait for export completion")
@@ -189,7 +225,7 @@ def receive_job(client, job, destination):
     destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=destination.parent, prefix=".backcraft-receiving-") as staging:
         result = receive_export(client, artifacts, Path(staging), job["job"]["payload"])
-        os.rename(staging, destination)
+        _publish_package(Path(staging), destination)
     for file in result["files"]:
         file["file"] = str(destination / Path(file["file"]).name)
     return result

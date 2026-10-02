@@ -32,6 +32,7 @@ pub enum QualityCauseBasis {
 pub struct QualityEvidence {
     pub source_url: String,
     pub announced_start: UtcTimestamp,
+    pub confirmed_start: Option<UtcTimestamp>,
     pub confirmed_resume: UtcTimestamp,
     pub exact_start_unconfirmed: bool,
 }
@@ -139,18 +140,22 @@ fn classify_gap(
     let mut confirmed_interruption = false;
     for source in sources {
         let announced_start = UtcTimestamp::parse_rfc3339(source.announced_start)?;
+        let confirmed_start = source
+            .confirmed_start
+            .map(UtcTimestamp::parse_rfc3339)
+            .transpose()?;
         let confirmed_resume = UtcTimestamp::parse_rfc3339(source.confirmed_resume)?;
         if issue.start < confirmed_resume && issue.end > announced_start {
             let contained = issue.start >= announced_start && issue.end <= confirmed_resume;
             maintenance_match |= contained;
-            if let Some(value) = source.confirmed_start {
-                let confirmed_start = UtcTimestamp::parse_rfc3339(value)?;
+            if let Some(confirmed_start) = confirmed_start {
                 confirmed_interruption |=
                     issue.start >= confirmed_start && issue.end <= confirmed_resume;
             }
             evidence.push(QualityEvidence {
                 source_url: source.source_url.to_owned(),
                 announced_start,
+                confirmed_start,
                 confirmed_resume,
                 exact_start_unconfirmed: source.confirmed_start.is_none(),
             });
@@ -212,6 +217,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one classification boundary fixture covers confirmed/unknown evidence and unchanged blocking"
+    )]
     fn explains_gap_evidence_without_changing_original_severity() {
         for (start, end) in [
             ("2025-12-31T18:00:00Z", "2025-12-31T21:00:00Z"),
@@ -226,6 +235,7 @@ mod tests {
                 Some(QualityCauseBasis::OfficialCompletedMaintenanceMatch)
             );
             assert_eq!(view.evidence.len(), 1);
+            assert!(view.evidence[0].confirmed_start.is_none());
             assert!(view.evidence[0].exact_start_unconfirmed);
             assert_eq!(
                 view.explanation.as_deref(),
@@ -283,6 +293,10 @@ mod tests {
         assert_eq!(
             confirmed.cause,
             Some(QualityCause::ConfirmedTradingInterruption)
+        );
+        assert_eq!(
+            confirmed.evidence[0].confirmed_start,
+            Some(time("2026-08-01T00:05:00Z"))
         );
         assert!(!confirmed.evidence[0].exact_start_unconfirmed);
         assert_eq!(

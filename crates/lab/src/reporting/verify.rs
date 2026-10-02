@@ -9,7 +9,7 @@ use crate::contracts::{
     Side, ValidationReport, ValidationStatus, experiment_config_digest, strategy_binding,
 };
 use rust_decimal::Decimal;
-use serde::Serialize;
+use serde::{Serialize, Serializer, ser::SerializeSeq};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Serialize)]
@@ -35,12 +35,29 @@ struct SemanticManifest<'a> {
 }
 
 #[derive(Serialize)]
-struct SemanticProjection<'a> {
+struct SemanticProjection<'a, Models: Serialize> {
     manifest: SemanticManifest<'a>,
     plan: &'a crate::contracts::ResolvedPlan,
     datasets: &'a [crate::contracts::DatasetSnapshot],
     evidence: &'a Option<crate::contracts::EvidenceSnapshot>,
-    models: Vec<ModelLedger>,
+    models: Models,
+}
+
+struct SemanticModels<'a> {
+    models: &'a [ModelLedger],
+    run_id: &'a RunId,
+}
+
+impl Serialize for SemanticModels<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut sequence = serializer.serialize_seq(Some(self.models.len()))?;
+        for model in self.models {
+            let mut normalized = model.clone();
+            normalize_model_run_id(&mut normalized, self.run_id);
+            sequence.serialize_element(&normalized)?;
+        }
+        sequence.end()
+    }
 }
 
 #[derive(Serialize)]
@@ -71,28 +88,20 @@ pub fn input_digest(bundle: &RunBundle) -> Result<ContentHash, LabError> {
 /// Returns a contract error only if deterministic serialization fails.
 pub fn semantic_digest(bundle: &RunBundle) -> Result<ContentHash, LabError> {
     let semantic_run_id = RunId::from_seed("reporting-semantic-run");
-    let mut models = bundle.models.clone();
-    for model in &mut models {
-        for signal in &mut model.signals {
-            signal.context.run_id = semantic_run_id.clone();
-        }
-        for order in &mut model.orders {
-            order.context.run_id = semantic_run_id.clone();
-        }
-        for order_event in &mut model.order_events {
-            order_event.context.run_id = semantic_run_id.clone();
-        }
-        for fill in &mut model.fills {
-            fill.context.run_id = semantic_run_id.clone();
-        }
-        for mark in &mut model.account_marks {
-            mark.context.run_id = semantic_run_id.clone();
-        }
-        for episode in &mut model.episodes {
-            episode.run_id = semantic_run_id.clone();
-        }
-    }
-    ContentHash::of_value(&SemanticProjection {
+    ContentHash::of_value(&semantic_projection(
+        bundle,
+        SemanticModels {
+            models: &bundle.models,
+            run_id: &semantic_run_id,
+        },
+    ))
+}
+
+fn semantic_projection<Models: Serialize>(
+    bundle: &RunBundle,
+    models: Models,
+) -> SemanticProjection<'_, Models> {
+    SemanticProjection {
         manifest: SemanticManifest {
             schema_version: &bundle.manifest.schema_version,
             code_revision: &bundle.manifest.code_revision,
@@ -117,7 +126,38 @@ pub fn semantic_digest(bundle: &RunBundle) -> Result<ContentHash, LabError> {
         datasets: &bundle.datasets,
         evidence: &bundle.evidence,
         models,
-    })
+    }
+}
+
+fn normalize_model_run_id(model: &mut ModelLedger, run_id: &RunId) {
+    for signal in &mut model.signals {
+        signal.context.run_id = run_id.clone();
+    }
+    for order in &mut model.orders {
+        order.context.run_id = run_id.clone();
+    }
+    for order_event in &mut model.order_events {
+        order_event.context.run_id = run_id.clone();
+    }
+    for fill in &mut model.fills {
+        fill.context.run_id = run_id.clone();
+    }
+    for mark in &mut model.account_marks {
+        mark.context.run_id = run_id.clone();
+    }
+    for episode in &mut model.episodes {
+        episode.run_id = run_id.clone();
+    }
+}
+
+#[cfg(test)]
+pub(super) fn semantic_digest_from_full_clone(bundle: &RunBundle) -> Result<ContentHash, LabError> {
+    let semantic_run_id = RunId::from_seed("reporting-semantic-run");
+    let mut models = bundle.models.clone();
+    for model in &mut models {
+        normalize_model_run_id(model, &semantic_run_id);
+    }
+    ContentHash::of_value(&semantic_projection(bundle, models))
 }
 
 /// Independently verify input identities, links, exact accounting, and sampled MDD.

@@ -1525,8 +1525,12 @@ fn observations_for<'a>(
             observation.candle.market == market.code() && observation.candle.interval == interval
         })
         .collect::<Vec<_>>();
-    observations
-        .sort_by_key(|observation| (observation.candle.open_time_utc, observation.id.clone()));
+    observations.sort_by(|left, right| {
+        left.candle
+            .open_time_utc
+            .cmp(&right.candle.open_time_utc)
+            .then_with(|| left.id.as_str().cmp(right.id.as_str()))
+    });
     if observations.is_empty() {
         return Err(LabError::DataGap(format!(
             "no {interval:?} observations for {market}"

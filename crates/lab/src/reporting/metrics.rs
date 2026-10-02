@@ -558,7 +558,7 @@ fn maximum_drawdown(model: &ModelLedger) -> MetricValue {
 }
 
 fn exposure(model: &ModelLedger) -> MetricValue {
-    weighted_mark_ratio(model, |mark| {
+    weighted_mark_average(model, |mark| {
         let equity = decimal_f64(mark.equity.get())?;
         let position = decimal_f64(mark.position_value.get())?;
         (equity > 0.0).then_some(position / equity)
@@ -577,13 +577,6 @@ fn turnover(model: &ModelLedger) -> MetricValue {
         }
         _ => MetricValue::null(NullReason::ZeroDenominator),
     }
-}
-
-fn weighted_mark_ratio(
-    model: &ModelLedger,
-    value: impl Fn(&crate::contracts::AccountMark) -> Option<f64>,
-) -> MetricValue {
-    weighted_mark_average(model, value)
 }
 
 fn weighted_mark_average(
@@ -845,13 +838,18 @@ fn active_regime_metrics(bundle: &RunBundle, model: &ModelLedger) -> Vec<ActiveR
         })
         .collect();
     let mut grouped: BTreeMap<String, (u64, u64, f64)> = BTreeMap::new();
+    let mut signals: Vec<_> = model.signals.iter().collect();
+    signals.sort_by_key(|signal| signal.context.event_seq);
+    let mut signal_index = 0;
+    let mut active_signal = None;
     for pair in model.account_marks.windows(2) {
-        let Some(signal) = model
-            .signals
-            .iter()
-            .filter(|signal| signal.context.event_seq <= pair[0].context.event_seq)
-            .max_by_key(|signal| signal.context.event_seq)
-        else {
+        while signal_index < signals.len()
+            && signals[signal_index].context.event_seq <= pair[0].context.event_seq
+        {
+            active_signal = Some(signals[signal_index]);
+            signal_index += 1;
+        }
+        let Some(signal) = active_signal else {
             continue;
         };
         let Some(effect) = signal.evidence_effect.as_ref() else {

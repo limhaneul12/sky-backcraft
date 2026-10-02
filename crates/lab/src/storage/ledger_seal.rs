@@ -52,7 +52,7 @@ impl RunLedgerState {
 }
 
 /// One detailed ledger record line inside a sealed chunk.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct LedgerLine {
     pub section: LedgerSection,
     pub model_id: ModelId,
@@ -306,19 +306,21 @@ fn publish_chunk_file(
     Ok(PathBuf::from(relative_path))
 }
 
-/// Verify one published chunk file: compressed hash, decode, line count.
-fn verify_chunk_file(
+/// Read and verify one published chunk file, returning its decoded payload.
+fn read_verified_chunk(
     store: &Store,
     relative_path: &str,
     sha256: &str,
     event_count: u64,
     uncompressed_bytes: u64,
-) -> Result<(), LabError> {
+) -> Result<Vec<u8>, LabError> {
     validate_relative_path(relative_path)?;
     let path = store.raw_objects().root.join(relative_path);
     reject_symlink_chain(&store.raw_objects().root, &path)?;
     let compressed = fs::read(&path).map_err(io_error("read sealed chunk"))?;
-    if compressed.len() as u64 > MAX_CHUNK_COMPRESSED_BYTES {
+    let compressed_bytes = u64::try_from(compressed.len())
+        .map_err(|_| LabError::ResourceLimit("sealed chunk exceeds u64".into()))?;
+    if compressed_bytes > MAX_CHUNK_COMPRESSED_BYTES {
         return Err(LabError::DataCorrupt(
             "sealed chunk exceeds size bound".into(),
         ));
@@ -330,21 +332,103 @@ fn verify_chunk_file(
         ));
     }
     let payload = gunzip_bytes(&compressed)?;
-    if payload.len() as u64 != uncompressed_bytes {
+    let payload_bytes = u64::try_from(payload.len())
+        .map_err(|_| LabError::ResourceLimit("sealed payload exceeds u64".into()))?;
+    if payload_bytes != uncompressed_bytes {
         return Err(LabError::InputHashMismatch(
             "sealed chunk decompressed length mismatch".into(),
         ));
     }
-    let lines = BufReader::new(payload.as_slice())
-        .lines()
-        .filter(|line| !line.as_deref().is_ok_and(str::is_empty))
+    let lines = payload
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.strip_suffix(b"\r").unwrap_or(line).is_empty())
         .count();
-    if lines as u64 != event_count {
+    let lines = u64::try_from(lines)
+        .map_err(|_| LabError::ResourceLimit("sealed line count exceeds u64".into()))?;
+    if lines != event_count {
         return Err(LabError::InputHashMismatch(
             "sealed chunk event count mismatch".into(),
         ));
     }
-    Ok(())
+    Ok(payload)
+}
+
+fn stored_u64(value: i64, label: &str) -> Result<u64, LabError> {
+    u64::try_from(value).map_err(|_| LabError::DataCorrupt(format!("negative stored {label}")))
+}
+
+fn prepare_run_chunks(
+    store: &Store,
+    run_id: &RunId,
+    last_seq: i64,
+) -> Result<(Vec<PreparedChunk>, u64), LabError> {
+    let mut lines = Vec::new();
+    for section in [
+        LedgerSection::Signals,
+        LedgerSection::OrderEvents,
+        LedgerSection::Fills,
+        LedgerSection::Orders,
+        LedgerSection::Equity,
+    ] {
+        lines.extend(section_entries(store, run_id, section)?);
+    }
+    lines.sort_by(|left, right| {
+        (left.event_seq, left.model_id.as_str(), left.kind()).cmp(&(
+            right.event_seq,
+            right.model_id.as_str(),
+            right.kind(),
+        ))
+    });
+    let total_events = u64::try_from(lines.len())
+        .map_err(|_| LabError::ResourceLimit("sealed event count exceeds u64".into()))?;
+    let expected_last = stored_u64(last_seq, "run last sequence")?;
+    if let Some(last_line) = lines.last()
+        && last_line.event_seq > expected_last
+    {
+        return Err(LabError::DataCorrupt(
+            "run ledger extends past its committed sequence".into(),
+        ));
+    }
+
+    let mut chunks = Vec::new();
+    for (chunk_index, group) in lines.chunks(LEDGER_CHUNK_EVENTS).enumerate() {
+        let mut payload = Vec::new();
+        let mut seq_start = u64::MAX;
+        let mut seq_end = 0_u64;
+        for line in group {
+            payload.extend_from_slice(line.to_line()?.as_bytes());
+            payload.push(b'\n');
+            seq_start = seq_start.min(line.event_seq);
+            seq_end = seq_end.max(line.event_seq);
+        }
+        let compressed = gzip_bytes(&payload)?;
+        let sha = ContentHash::of_bytes(&compressed);
+        let relative_path = publish_chunk_file(store, &compressed, &sha)?;
+        let event_count = u64::try_from(group.len())
+            .map_err(|_| LabError::ResourceLimit("chunk event count exceeds u64".into()))?;
+        let uncompressed_bytes = u64::try_from(payload.len())
+            .map_err(|_| LabError::ResourceLimit("chunk payload exceeds u64".into()))?;
+        read_verified_chunk(
+            store,
+            relative_path.to_string_lossy().as_ref(),
+            sha.as_str(),
+            event_count,
+            uncompressed_bytes,
+        )?;
+        chunks.push(PreparedChunk {
+            chunk_index: u64::try_from(chunk_index)
+                .map_err(|_| LabError::Internal("chunk index overflow".into()))?,
+            relative_path: relative_path.to_string_lossy().into_owned(),
+            sha256: sha.as_str().to_owned(),
+            event_seq_start: seq_start,
+            event_seq_end: seq_end,
+            event_count,
+            compressed_bytes: u64::try_from(compressed.len())
+                .map_err(|_| LabError::ResourceLimit("compressed chunk exceeds u64".into()))?,
+            uncompressed_bytes,
+        });
+    }
+    Ok((chunks, total_events))
 }
 
 impl Store {
@@ -356,10 +440,6 @@ impl Store {
     ///
     /// # Errors
     /// Reports unknown runs, unverified chunk files, catalog conflicts, or SQLite failure.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one pass reads the ledger, chunks, compresses, publishes and catalogues files"
-    )]
     pub fn seal_run_ledger(&mut self, run_id: &RunId) -> Result<RunLedgerSealStats, LabError> {
         let (state, last_seq): (String, i64) = self
             .connection
@@ -379,66 +459,7 @@ impl Store {
                     ..stats
                 });
         }
-        let mut lines = Vec::new();
-        for section in [
-            LedgerSection::Signals,
-            LedgerSection::OrderEvents,
-            LedgerSection::Fills,
-            LedgerSection::Orders,
-            LedgerSection::Equity,
-        ] {
-            lines.extend(section_entries(self, run_id, section)?);
-        }
-        lines.sort_by(|left, right| {
-            (left.event_seq, left.model_id.as_str(), left.kind()).cmp(&(
-                right.event_seq,
-                right.model_id.as_str(),
-                right.kind(),
-            ))
-        });
-        let total_events = lines.len() as u64;
-        let expected_last = u64::try_from(last_seq)
-            .map_err(|_| LabError::DataCorrupt("negative run last sequence".into()))?;
-        if let Some(last_line) = lines.last()
-            && last_line.event_seq > expected_last
-        {
-            return Err(LabError::DataCorrupt(
-                "run ledger extends past its committed sequence".into(),
-            ));
-        }
-        let mut chunks: Vec<PreparedChunk> = Vec::new();
-        for (chunk_index, group) in lines.chunks(LEDGER_CHUNK_EVENTS).enumerate() {
-            let mut payload = Vec::new();
-            let mut seq_start = u64::MAX;
-            let mut seq_end = 0_u64;
-            for line in group {
-                payload.extend_from_slice(line.to_line()?.as_bytes());
-                payload.push(b'\n');
-                seq_start = seq_start.min(line.event_seq);
-                seq_end = seq_end.max(line.event_seq);
-            }
-            let compressed = gzip_bytes(&payload)?;
-            let sha = ContentHash::of_bytes(&compressed);
-            let relative_path = publish_chunk_file(self, &compressed, &sha)?;
-            verify_chunk_file(
-                self,
-                relative_path.to_string_lossy().as_ref(),
-                sha.as_str(),
-                group.len() as u64,
-                payload.len() as u64,
-            )?;
-            chunks.push(PreparedChunk {
-                chunk_index: u64::try_from(chunk_index)
-                    .map_err(|_| LabError::Internal("chunk index overflow".into()))?,
-                relative_path: relative_path.to_string_lossy().into_owned(),
-                sha256: sha.as_str().to_owned(),
-                event_seq_start: seq_start,
-                event_seq_end: seq_end,
-                event_count: group.len() as u64,
-                compressed_bytes: compressed.len() as u64,
-                uncompressed_bytes: payload.len() as u64,
-            });
-        }
+        let (chunks, total_events) = prepare_run_chunks(self, run_id, last_seq)?;
         let transaction = self.connection.transaction().map_err(sql_error)?;
         for chunk in &chunks {
             transaction
@@ -472,7 +493,8 @@ impl Store {
         }
         transaction.commit().map_err(sql_error)?;
         Ok(RunLedgerSealStats {
-            chunks: chunks.len() as u64,
+            chunks: u64::try_from(chunks.len())
+                .map_err(|_| LabError::ResourceLimit("sealed chunk count exceeds u64".into()))?,
             events: total_events,
             compressed_bytes: chunks.iter().map(|c| c.compressed_bytes).sum(),
             uncompressed_bytes: chunks.iter().map(|c| c.uncompressed_bytes).sum(),
@@ -494,10 +516,10 @@ impl Store {
             },
         ).map_err(sql_error)?;
         Ok(RunLedgerSealStats {
-            chunks: u64::try_from(row.0).unwrap_or(0),
-            events: u64::try_from(row.1).unwrap_or(0),
-            compressed_bytes: u64::try_from(row.2).unwrap_or(0),
-            uncompressed_bytes: u64::try_from(row.3).unwrap_or(0),
+            chunks: stored_u64(row.0, "sealed chunk count")?,
+            events: stored_u64(row.1, "sealed event count")?,
+            compressed_bytes: stored_u64(row.2, "sealed compressed byte count")?,
+            uncompressed_bytes: stored_u64(row.3, "sealed uncompressed byte count")?,
             already_sealed: true,
         })
     }
@@ -565,12 +587,12 @@ impl Store {
             ));
         }
         for (relative_path, sha256, event_count, uncompressed_bytes) in &files {
-            verify_chunk_file(
+            read_verified_chunk(
                 self,
                 relative_path,
                 sha256,
-                u64::try_from(*event_count).unwrap_or(0),
-                u64::try_from(*uncompressed_bytes).unwrap_or(0),
+                stored_u64(*event_count, "sealed event count")?,
+                stored_u64(*uncompressed_bytes, "sealed uncompressed byte count")?,
             )?;
         }
         // Materialize episode exit details before opening the transaction:
@@ -673,16 +695,13 @@ impl Store {
         }
         let mut lines = Vec::new();
         for (relative_path, sha256, event_count, uncompressed_bytes) in rows {
-            verify_chunk_file(
+            let payload = read_verified_chunk(
                 self,
                 &relative_path,
                 &sha256,
-                u64::try_from(event_count).unwrap_or(0),
-                u64::try_from(uncompressed_bytes).unwrap_or(0),
+                stored_u64(event_count, "sealed event count")?,
+                stored_u64(uncompressed_bytes, "sealed uncompressed byte count")?,
             )?;
-            let compressed = fs::read(self.raw_objects().root.join(&relative_path))
-                .map_err(io_error("read sealed chunk"))?;
-            let payload = gunzip_bytes(&compressed)?;
             for line in BufReader::new(payload.as_slice()).lines() {
                 let line = line.map_err(|error| {
                     LabError::DataCorrupt(format!("sealed chunk line read: {error}"))
@@ -714,7 +733,7 @@ const COMPACT_DELETES: &[&str] = &[
 ];
 
 /// Where a run's detailed ledger rows currently live.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) enum RunLedgerSource {
     Detail,
     Sealed(Vec<LedgerLine>),
@@ -739,9 +758,10 @@ pub(crate) fn run_ledger_source(
         .map_err(sql_error)?
         .ok_or_else(|| LabError::InvalidConfig("unknown run".into()))?;
     match RunLedgerState::from_text(&state)? {
-        RunLedgerState::Compacted => Ok(RunLedgerSource::Sealed(
-            store.load_run_ledger_lines(run_id)?.unwrap_or_default(),
-        )),
+        RunLedgerState::Compacted => store
+            .load_run_ledger_lines(run_id)?
+            .map(RunLedgerSource::Sealed)
+            .ok_or_else(|| LabError::DataCorrupt("compacted run has no ledger chunks".into())),
         _ => Ok(RunLedgerSource::Detail),
     }
 }

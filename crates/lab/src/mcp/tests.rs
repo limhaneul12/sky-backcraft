@@ -5,6 +5,73 @@ use rmcp::{
 };
 
 #[test]
+fn ledger_projection_preserves_page_metadata_cost_units_and_open_exit()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::contracts::{EpisodeStatus, Page, QueryCursor};
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "spot-lab-projection-{}-{nonce}",
+        std::process::id()
+    ));
+    let store = crate::storage::Store::open(&root)?;
+    let outcome = (|| {
+        let bundle = crate::reporting::tests::policy_fixture();
+        let model = &bundle.models[0];
+        let fill = model.fills[0].clone();
+        let fill_page = Page {
+            records: vec![fill.clone()],
+            returned_count: 1,
+            total_count: 3,
+            next_cursor: Some(QueryCursor {
+                model_id: model.model_id.clone(),
+                offset: 1,
+            }),
+            truncated_reason: Some("LIMIT".into()),
+        };
+        let mut expected = serde_json::to_value(&fill_page)?;
+        let record = &mut expected["records"][0];
+        record["price_cost_attribution_unit"] = serde_json::json!("KRW_PER_BASE_UNIT");
+        record["price_difference_per_unit"] = serde_json::to_value(fill.price_cost_attribution)?;
+        record["embedded_price_cost_quote"] =
+            serde_json::to_value(crate::reporting::fill_price_cost_quote(&fill)?)?;
+        record["embedded_price_cost_quote_unit"] = serde_json::json!("KRW");
+        assert_eq!(
+            result_page_value(&store, ResultPage::Fills(fill_page))?,
+            serde_json::json!({"section":"fills", "page":expected})
+        );
+
+        let mut episode = model.episodes[0].clone();
+        episode.status = EpisodeStatus::Open;
+        episode.closed_at = None;
+        episode.exit_reason = None;
+        let episode_page = Page {
+            records: vec![episode],
+            returned_count: 1,
+            total_count: 1,
+            next_cursor: None,
+            truncated_reason: None,
+        };
+        let mut expected = serde_json::to_value(&episode_page)?;
+        expected["records"][0]["exit_reason_meaning"] =
+            serde_json::json!("EXECUTION_RESULT_LEGACY_NAME");
+        expected["records"][0]["exit_details"] = serde_json::json!({
+            "execution_result":null, "closing_signal_id":null, "strategy_exit_reasons":[],
+        });
+        assert_eq!(
+            result_page_value(&store, ResultPage::Episodes(episode_page))?,
+            serde_json::json!({"section":"episodes", "page":expected})
+        );
+        Ok::<(), LabError>(())
+    })();
+    store.close()?;
+    std::fs::remove_dir_all(root)?;
+    outcome?;
+    Ok(())
+}
+
+#[test]
 #[expect(
     clippy::too_many_lines,
     reason = "one SDK journey verifies the complete tool catalog and shared protocol boundary"

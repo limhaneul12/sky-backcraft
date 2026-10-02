@@ -247,6 +247,14 @@ struct IndicatorRuntime {
     kind: IndicatorState,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CandlePrices {
+    open: f64,
+    high: f64,
+    low: f64,
+    close: f64,
+}
+
 #[derive(Debug, Clone)]
 enum IndicatorState {
     Open,
@@ -270,7 +278,7 @@ impl RulesEvaluator {
         market: MarketId,
         interval: CandleInterval,
     ) -> Result<Self, LabError> {
-        definition.validate()?;
+        let warmup_bars = definition.warmup_bars()?;
         let PolicyProgram::Rules { program } = &definition.program else {
             return Err(LabError::InvalidConfig(
                 "rules evaluator requires a RULES policy definition".into(),
@@ -290,7 +298,7 @@ impl RulesEvaluator {
             program: program.clone(),
             market,
             interval,
-            warmup_bars: definition.warmup_bars()?,
+            warmup_bars,
             completed_bars: 0,
             last_close: None,
             indicators,
@@ -308,10 +316,13 @@ impl RulesEvaluator {
     ) -> Result<Option<RuleEvaluation>, LabError> {
         self.validate_observation(observation)?;
         let mut values = BTreeMap::new();
-        for indicator in &mut self.indicators {
-            let value = indicator.update(observation, self.interval)?;
-            if let Some(value) = value {
-                values.insert(indicator.id.clone(), value);
+        if !self.indicators.is_empty() {
+            let prices = CandlePrices::from_observation(observation)?;
+            for indicator in &mut self.indicators {
+                let value = indicator.update(observation, &prices, self.interval)?;
+                if let Some(value) = value {
+                    values.insert(indicator.id.clone(), value);
+                }
             }
         }
         self.completed_bars = self.completed_bars.checked_add(1).ok_or_else(|| {
@@ -378,18 +389,21 @@ impl RulesEvaluator {
             LabError::InvalidConfig(format!("policy target conversion: {error}"))
         })?;
         let target = Weight::new(target_decimal)?;
-        self.state = after.clone();
-        self.crosses = next_crosses;
         if self.completed_bars < self.warmup_bars as u64 {
+            self.state = after;
+            self.crosses = next_crosses;
             return Ok(None);
         }
+        let state_after = named_values(&after);
+        self.state = after;
+        self.crosses = next_crosses;
         Ok(Some(RuleEvaluation {
             decision_time: observation.candle.close_time_utc,
             target,
             trace: PolicyTrace {
                 matched_rule_id,
                 state_before: named_values(&before),
-                state_after: named_values(&after),
+                state_after,
                 evidence: evidence_trace,
             },
             indicator_values: named_values(&values),
@@ -501,18 +515,15 @@ impl IndicatorRuntime {
     fn update(
         &mut self,
         observation: &CandleObservation,
+        prices: &CandlePrices,
         interval: CandleInterval,
     ) -> Result<Option<f64>, LabError> {
         let candle = &observation.candle;
-        let open = decimal_f64(candle.open.get(), "policy open")?;
-        let high = decimal_f64(candle.high.get(), "policy high")?;
-        let low = decimal_f64(candle.low.get(), "policy low")?;
-        let close = decimal_f64(candle.close.get(), "policy close")?;
         match &mut self.kind {
-            IndicatorState::Open => Ok(Some(open)),
-            IndicatorState::High => Ok(Some(high)),
-            IndicatorState::Low => Ok(Some(low)),
-            IndicatorState::Close => Ok(Some(close)),
+            IndicatorState::Open => Ok(Some(prices.open)),
+            IndicatorState::High => Ok(Some(prices.high)),
+            IndicatorState::Low => Ok(Some(prices.low)),
+            IndicatorState::Close => Ok(Some(prices.close)),
             IndicatorState::Volume => Ok(Some(nonnegative_decimal_f64(
                 candle.volume.get(),
                 "policy volume",
@@ -521,17 +532,33 @@ impl IndicatorRuntime {
                 candle.quote_turnover.get(),
                 "policy quote turnover",
             )?)),
-            IndicatorState::Sma(state) => state.update(close),
-            IndicatorState::Ema(state) => state.update(close),
-            IndicatorState::Rsi(state) => state.update(close),
-            IndicatorState::SampleVol(state) => state.update(close),
+            IndicatorState::Sma(state) => state.update(prices.close),
+            IndicatorState::Ema(state) => state.update(prices.close),
+            IndicatorState::Rsi(state) => state.update(prices.close),
+            IndicatorState::SampleVol(state) => state.update(prices.close),
             IndicatorState::AnnualVol(state) => state
-                .update(close)?
+                .update(prices.close)?
                 .map(|sigma| annualize(sigma, interval))
                 .transpose(),
-            IndicatorState::PriorHigh(state) => Ok(state.prior_then_update(high, low)?.0),
-            IndicatorState::PriorLow(state) => Ok(state.prior_then_update(high, low)?.1),
+            IndicatorState::PriorHigh(state) => {
+                Ok(state.prior_then_update(prices.high, prices.low)?.0)
+            }
+            IndicatorState::PriorLow(state) => {
+                Ok(state.prior_then_update(prices.high, prices.low)?.1)
+            }
         }
+    }
+}
+
+impl CandlePrices {
+    fn from_observation(observation: &CandleObservation) -> Result<Self, LabError> {
+        let candle = &observation.candle;
+        Ok(Self {
+            open: decimal_f64(candle.open.get(), "policy open")?,
+            high: decimal_f64(candle.high.get(), "policy high")?,
+            low: decimal_f64(candle.low.get(), "policy low")?,
+            close: decimal_f64(candle.close.get(), "policy close")?,
+        })
     }
 }
 

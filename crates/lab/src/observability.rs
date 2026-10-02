@@ -26,9 +26,7 @@ pub enum LifecyclePhase {
     StopAdmission,
     Cancel,
     Drain,
-    StoreClose,
     Join,
-    Complete,
     Timeout,
 }
 
@@ -40,9 +38,7 @@ impl LifecyclePhase {
             Self::StopAdmission => "stop_admission",
             Self::Cancel => "cancel",
             Self::Drain => "drain",
-            Self::StoreClose => "store_close",
             Self::Join => "join",
-            Self::Complete => "complete",
             Self::Timeout => "timeout",
         }
     }

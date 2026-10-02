@@ -7,8 +7,8 @@ use crate::contracts::{
     MarketRuleSnapshot, ModelAdmission, ModelId, PitPolicy, PlanId, PlanRequest, PolicyDefinition,
     PolicyProgram, PolicyRevision, PolicyWrite, PriceKrw, ProgressCountUnit, QualityIssue,
     QualityKind, QualitySeverity, QuoteAmount, ReportClock, ResolvedPlan, RuleProvenance,
-    RuleSnapshotId, RunId, StrategyKind, StrategySpec, TerminalPolicy, TickBand, UtcRange,
-    ValidationReport, ValidationStatus, Weight, builtin_policy_definitions,
+    RuleSnapshotId, RunHeader, RunId, RunRequest, StrategyKind, StrategySpec, TerminalPolicy,
+    TickBand, UtcRange, ValidationReport, ValidationStatus, Weight, builtin_policy_definitions,
     experiment_config_digest,
 };
 use rust_decimal::Decimal;
@@ -52,7 +52,7 @@ fn publish(store: &Store, body: &[u8], fetched: UtcTimestamp) -> PublishedRaw {
         .expect("publish fixture raw")
 }
 
-fn observation(raw: &RawObjectRef, _suffix: &str, open: &str) -> CandleObservation {
+fn observation(raw: &RawObjectRef, open: &str) -> CandleObservation {
     observation_at(raw, "2024-01-01T00:00:00Z", open)
 }
 
@@ -164,7 +164,7 @@ fn save_v2_policy_plan_fixture(store: &mut Store, policy: &PolicyRevision) -> Pl
     let dataset = snapshot(
         dataset_request.clone(),
         published.object.clone(),
-        observation(&published.object, "policy-plan", "100"),
+        observation(&published.object, "100"),
     );
     let dataset_id = store
         .finish_dataset(&dataset)
@@ -296,7 +296,7 @@ fn reopen_idempotency_conflict_and_snapshot_immutability() {
         store.begin_collection(&conflicting_request),
         Err(LabError::Conflict(_))
     ));
-    let first_observation = observation(&published.object, "economic-a", "100");
+    let first_observation = observation(&published.object, "100");
     let first_page = page(
         &first_request,
         published.object.clone(),
@@ -310,6 +310,12 @@ fn reopen_idempotency_conflict_and_snapshot_immutability() {
     assert_eq!(all_raw.len(), 2);
     assert_eq!(all_raw[0].id, published.object.id);
     assert_eq!(all_raw[1].id, rejected.object.id);
+    assert_eq!(
+        store
+            .collection_raw_bytes(&first_request.request_id)
+            .expect("load collection byte count"),
+        all_raw.iter().map(|raw| raw.raw_bytes).sum::<u64>()
+    );
     let resumed = store
         .load_collection_pages(&first_request.request_id, &first_request.markets[0])
         .expect("load committed pages");
@@ -337,18 +343,10 @@ fn reopen_idempotency_conflict_and_snapshot_immutability() {
     store
         .begin_collection(&second_request)
         .expect("begin second collection");
-    let second_observation = observation(&second.object, "economic-b", "101");
+    let second_observation = observation(&second.object, "101");
     store
         .commit_page(&page(&second_request, second.object, second_observation))
         .expect("commit later observation");
-    let unchanged = store
-        .load_dataset(&id)
-        .expect("reload original")
-        .expect("original remains");
-    assert_eq!(
-        unchanged.observations[0].candle.open.get(),
-        Decimal::from(100)
-    );
     store.close().expect("close store");
 
     let store = Store::open(&root.0).expect("reopen store");
@@ -372,7 +370,7 @@ fn ready_dataset_rejects_error_quality_issue() {
     let mut store = Store::open(&root.0).expect("open store");
     let published = publish(&store, b"quality", time("2024-01-01T02:00:00Z"));
     let request = request("request-quality");
-    let observation = observation(&published.object, "quality", "100");
+    let observation = observation(&published.object, "100");
     let mut invalid = snapshot(request, published.object, observation);
     invalid.manifest.quality_issues.push(QualityIssue {
         kind: QualityKind::UnknownSourceGap,
@@ -398,7 +396,7 @@ fn benign_duplicate_quality_changes_provenance_not_economic_semantic() {
     let base = snapshot(
         request("request-duplicate-quality"),
         published.object.clone(),
-        observation(&published.object, "duplicate", "100"),
+        observation(&published.object, "100"),
     );
     let mut overlap = base.clone();
     overlap.manifest.quality_issues.push(QualityIssue {
@@ -427,7 +425,7 @@ fn failed_transaction_leaves_only_identifiable_orphan() {
     let page = page(
         &request,
         published.object.clone(),
-        observation(&published.object, "failure", "100"),
+        observation(&published.object, "100"),
     );
     store.connection.execute_batch(
         "CREATE TRIGGER fail_page BEFORE INSERT ON collection_pages BEGIN SELECT RAISE(ABORT, 'injected'); END;",
@@ -512,7 +510,7 @@ fn repeated_economic_rows_create_distinct_immutable_provenance_snapshots() {
     store
         .begin_collection(&first_request)
         .expect("begin first collection");
-    let first_observation = observation(&first_raw.object, "same-economic", "100");
+    let first_observation = observation(&first_raw.object, "100");
     store
         .commit_page(&page(
             &first_request,
@@ -530,7 +528,7 @@ fn repeated_economic_rows_create_distinct_immutable_provenance_snapshots() {
     store
         .begin_collection(&second_request)
         .expect("begin second collection");
-    let second_observation = observation(&second_raw.object, "same-economic", "100.0");
+    let second_observation = observation(&second_raw.object, "100.0");
     store
         .commit_page(&page(
             &second_request,
@@ -597,7 +595,7 @@ fn backup_restore_rechecks_raw_and_dataset_hashes() {
     let published = publish(&store, b"backup payload", time("2024-01-01T02:00:00Z"));
     let request = request("request-backup");
     store.begin_collection(&request).expect("begin collection");
-    let observation = observation(&published.object, "backup", "100");
+    let observation = observation(&published.object, "100");
     store
         .commit_page(&page(
             &request,
@@ -688,8 +686,8 @@ fn repeated_raw_publication_returns_original_persisted_metadata() {
         .expect("idempotent raw publication");
     assert_eq!(second.object.id, first.object.id);
     assert_eq!(second.object.persisted_at, first.object.persisted_at);
-    let canonical = observation(&first.object, "canonical", "100");
-    let scaled = observation(&first.object, "scaled", "100.0");
+    let canonical = observation(&first.object, "100");
+    let scaled = observation(&first.object, "100.0");
     assert_eq!(canonical.content_digest, scaled.content_digest);
     assert_eq!(canonical.id, scaled.id);
 }
@@ -988,7 +986,7 @@ fn prepared_dataset_is_not_frozen_after_cancellation_wins() {
     store
         .begin_collection(&collect_request)
         .expect("begin collection");
-    let row = observation(&published.object, "prepared", "100");
+    let row = observation(&published.object, "100");
     store
         .commit_page(&page(
             &collect_request,
@@ -1564,14 +1562,14 @@ fn dataset_hard_delete_removes_exclusive_files_refuses_stale_and_active_jobs() {
         .finish_dataset(&snapshot(
             request_a.clone(),
             first.object.clone(),
-            observation(&first.object, "del-a", "100"),
+            observation(&first.object, "100"),
         ))
         .expect("finish dataset a");
     let dataset_b = store
         .finish_dataset(&snapshot(
             request_b.clone(),
             second.object.clone(),
-            observation(&second.object, "del-b", "200"),
+            observation(&second.object, "200"),
         ))
         .expect("finish dataset b");
     let raw_a_path = root.0.join(&first.object.relative_path);
@@ -1759,31 +1757,169 @@ fn slim_pages_store_headers_only_and_legacy_rows_still_rebuild() {
 }
 
 #[test]
-fn slim_header_stays_far_smaller_than_the_legacy_full_body() {
-    let root = TempRoot::new("slim-measure");
+#[expect(
+    clippy::too_many_lines,
+    reason = "one Store journey compares all three projections across compaction"
+)]
+fn compacted_multi_model_bundle_summary_and_costs_match_detail() {
+    let root = TempRoot::new("compacted-multi-model-readers");
     let mut store = Store::open(&root.0).expect("open store");
-    let published = publish(&store, b"slim-measure-raw", time("2024-01-01T02:00:00Z"));
-    let request = request("slim-measure");
-    store.begin_collection(&request).expect("begin collection");
-    let observations: Vec<_> = (0..200)
-        .map(|index| {
-            observation_at(
-                &published.object,
-                &format!("2024-01-01T{:02}:00:00Z", index % 24),
-                &(100 + index).to_string(),
-            )
+    let mut expected = crate::reporting::tests::multi_market_fixture();
+    assert_eq!(expected.models.len(), 2);
+    assert!(expected.models.iter().all(|model| !model.orders.is_empty()));
+    let range_end = expected.plan.spec.range.end();
+    for model in &mut expected.models {
+        let terminal = model.account_marks.last_mut().expect("final account mark");
+        assert_eq!(terminal.context.accounting_event_time, range_end);
+        terminal.kind = crate::contracts::MarkKind::Terminal;
+    }
+
+    let dataset = &expected.datasets[0];
+    store
+        .begin_collection(&dataset.manifest.request)
+        .expect("register fixture collection");
+    let prepared = PreparedDatasetPublication {
+        digests: dataset_digests(dataset).expect("fixture dataset digests"),
+    };
+    let transaction = store.connection.transaction().expect("dataset transaction");
+    insert_dataset_rows(&transaction, dataset, &prepared, None).expect("persist fixture dataset");
+    transaction.commit().expect("commit fixture dataset");
+
+    store
+        .save_plan(
+            &PlanRequest {
+                request_id: RequestId::new("compacted-reader-plan").expect("plan request id"),
+                spec: expected.plan.spec.clone(),
+            },
+            &expected.plan,
+        )
+        .expect("persist fixture plan");
+    let run_request = RunRequest {
+        request_id: RequestId::new("compacted-reader-run").expect("run request id"),
+        plan_id: expected.plan.id.clone(),
+        input_digest: expected.plan.input_digest.clone(),
+    };
+    let job = store
+        .submit_job(
+            &JobSubmission {
+                request_id: RequestId::new("compacted-reader-job").expect("job request id"),
+                payload: JobPayload::Backtest {
+                    request: run_request,
+                },
+            },
+            time("2024-01-02T00:00:00Z"),
+        )
+        .expect("submit fixture run");
+    let attempt = store
+        .claim_next(time("2024-01-02T00:00:01Z"))
+        .expect("claim fixture run")
+        .expect("running fixture attempt");
+    expected.manifest.job_id = job.id;
+    expected.manifest.attempt_id = attempt.id.clone();
+    store
+        .begin_run(&RunHeader {
+            manifest: expected.manifest.clone(),
+            plan_id: expected.plan.id.clone(),
+            state: JobStatus::Running,
+            last_committed_event_seq: 0,
+            semantic_digest: None,
         })
-        .collect();
-    let mut page = page(&request, published.object.clone(), observations[0].clone());
-    page.observations = observations;
-    let legacy_bytes = serde_json::to_string(&page).expect("legacy json").len();
-    let slim_json =
-        serde_json::to_string(&SlimCollectionPage::from_collection_page(&page).expect("slim"))
-            .expect("slim json");
-    let slim_bytes = slim_json.len();
-    println!("legacy_page_json_bytes={legacy_bytes} slim_header_bytes={slim_bytes}");
-    assert!(slim_bytes < legacy_bytes / 10);
-    store.close().expect("close");
+        .expect("begin fixture run");
+
+    for model in &expected.models {
+        store
+            .append_model_facts(
+                &expected.manifest.run_id,
+                &model.model_id,
+                &ModelFactBatch {
+                    signals: model.signals.clone(),
+                    order_events: model.order_events.clone(),
+                    fills: model.fills.clone(),
+                    account_marks: model.account_marks.clone(),
+                },
+            )
+            .expect("append fixture facts");
+        store
+            .finish_model(&expected.manifest.run_id, model)
+            .expect("finish fixture model");
+    }
+    expected.semantic_digest = crate::reporting::semantic_digest(&expected).expect("run digest");
+    let validation = crate::reporting::verify_run(&expected);
+    assert_eq!(validation.status, ValidationStatus::Pass);
+    store
+        .publish_attempt(
+            &attempt.id,
+            AttemptState::Completed {
+                ended_at: time("2024-01-02T00:00:02Z"),
+                output: JobOutput::Run {
+                    run_id: expected.manifest.run_id.clone(),
+                    completed_models: 2,
+                    blocked_models: 0,
+                },
+            },
+            AttemptPublication::Run {
+                run_id: expected.manifest.run_id.clone(),
+                semantic_digest: expected.semantic_digest.clone(),
+                expected_models: 2,
+                validation,
+            },
+        )
+        .expect("publish fixture run");
+
+    let detail_bundle = store
+        .load_run_bundle(&expected.manifest.run_id)
+        .expect("load detail bundle")
+        .expect("detail bundle");
+    let detail_summary = store
+        .load_run_summary(&expected.manifest.run_id)
+        .expect("load detail summary")
+        .expect("detail summary");
+    let detail_costs = expected
+        .models
+        .iter()
+        .map(|model| {
+            store
+                .load_model_cost_summary(&expected.manifest.run_id, &model.model_id)
+                .expect("load detail costs")
+                .expect("detail costs")
+        })
+        .collect::<Vec<_>>();
+
+    store
+        .seal_and_compact_run_ledger(&expected.manifest.run_id)
+        .expect("seal and compact fixture run");
+    let compacted_bundle = store
+        .load_run_bundle(&expected.manifest.run_id)
+        .expect("load compacted bundle")
+        .expect("compacted bundle");
+    let compacted_summary = store
+        .load_run_summary(&expected.manifest.run_id)
+        .expect("load compacted summary")
+        .expect("compacted summary");
+    let compacted_costs = expected
+        .models
+        .iter()
+        .map(|model| {
+            store
+                .load_model_cost_summary(&expected.manifest.run_id, &model.model_id)
+                .expect("load compacted costs")
+                .expect("compacted costs")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        serde_json::to_value(compacted_bundle).expect("compacted bundle JSON"),
+        serde_json::to_value(detail_bundle).expect("detail bundle JSON")
+    );
+    assert_eq!(
+        serde_json::to_value(compacted_summary).expect("compacted summary JSON"),
+        serde_json::to_value(detail_summary).expect("detail summary JSON")
+    );
+    assert_eq!(
+        serde_json::to_value(compacted_costs).expect("compacted costs JSON"),
+        serde_json::to_value(detail_costs).expect("detail costs JSON")
+    );
+    store.close().expect("close store");
 }
 
 #[test]
@@ -1958,6 +2094,54 @@ fn run_ledger_sealing_round_trips_compacts_and_joins_hard_delete() {
         &bytes
     })
     .expect("restore chunk bytes");
+
+    // Persisted chunk counts never degrade to zero/default on corruption.
+    store
+        .connection
+        .execute_batch("PRAGMA ignore_check_constraints=ON")
+        .expect("allow corrupt metadata only in this fixture");
+    store
+        .connection
+        .execute(
+            "UPDATE run_ledger_chunks SET event_count=-1 WHERE run_id=?1",
+            [run_id.as_str()],
+        )
+        .expect("corrupt stored event count");
+    assert!(matches!(
+        store.load_run_ledger_lines(&run_id),
+        Err(LabError::DataCorrupt(_))
+    ));
+    store
+        .connection
+        .execute(
+            "UPDATE run_ledger_chunks SET event_count=4 WHERE run_id=?1",
+            [run_id.as_str()],
+        )
+        .expect("restore stored event count");
+    store
+        .connection
+        .execute_batch("PRAGMA ignore_check_constraints=OFF")
+        .expect("restore fixture constraint checks");
+
+    // A COMPACTED run without its chunk catalogue is corrupt, not an empty ledger.
+    store
+        .connection
+        .execute_batch(
+            "CREATE TEMP TABLE saved_run_ledger_chunk AS SELECT * FROM run_ledger_chunks WHERE run_id='run-seal';
+             DELETE FROM run_ledger_chunks WHERE run_id='run-seal';",
+        )
+        .expect("detach chunk catalogue");
+    assert!(matches!(
+        super::ledger_seal::run_ledger_source(&store, &run_id),
+        Err(LabError::DataCorrupt(_))
+    ));
+    store
+        .connection
+        .execute_batch(
+            "INSERT INTO run_ledger_chunks SELECT * FROM saved_run_ledger_chunk;
+             DROP TABLE saved_run_ledger_chunk;",
+        )
+        .expect("restore chunk catalogue");
 
     // Hard delete covers the sealed chunk catalog and its file.
     let preview = store

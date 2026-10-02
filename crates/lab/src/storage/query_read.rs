@@ -1,6 +1,7 @@
 //! Bounded read projections for MCP status and result inspection.
 
-use super::{Store, sql_error};
+use super::ledger_seal::{RunLedgerSource, run_ledger_source};
+use super::{Store, enum_text, sql_error};
 use crate::contracts::{
     AccountMark, ContentHash, FillRecord, JobStatus, LabError, LedgerSection, MAX_MODEL_EVENTS,
     MAX_MODELS, MarkKind, MarketId, ModelId, ModelStatus, PlanId, PolicyId, PolicyRevisionId,
@@ -104,12 +105,18 @@ impl Store {
     /// # Errors
     /// Returns an error for corrupt counts or SQLite failure.
     pub fn job_queue_status(&self) -> Result<JobQueueStatus, LabError> {
-        let queued = status_count(&self.connection, JobStatus::Queued)?;
-        let running = status_count(&self.connection, JobStatus::Running)?;
+        let (queued, running): (i64, i64) = self
+            .connection
+            .query_row(
+                "SELECT COUNT(CASE WHEN status=?1 THEN 1 END),COUNT(CASE WHEN status=?2 THEN 1 END) FROM job_attempts WHERE status IN (?1,?2)",
+                params![enum_text(&JobStatus::Queued)?, enum_text(&JobStatus::Running)?],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(sql_error)?;
         Ok(JobQueueStatus {
-            queued_attempts: u32::try_from(queued)
+            queued_attempts: u32::try_from(nonnegative_u64(queued, "queued job count")?)
                 .map_err(|_| LabError::DataCorrupt("queued job count exceeds u32".into()))?,
-            running_attempts: u32::try_from(running)
+            running_attempts: u32::try_from(nonnegative_u64(running, "running job count")?)
                 .map_err(|_| LabError::DataCorrupt("running job count exceeds u32".into()))?,
         })
     }
@@ -125,9 +132,10 @@ impl Store {
         let plan = self
             .load_plan(&header.plan_id)?
             .ok_or_else(|| LabError::DataCorrupt("run summary plan is missing".into()))?;
+        let ledger_source = run_ledger_source(self, run_id)?;
         let mut models = query_models(self, run_id, plan.resolved.spec.initial_cash)?;
         for model in &mut models {
-            self.complete_model_summary(run_id, model)?;
+            self.complete_model_summary(run_id, model, &ledger_source)?;
         }
         if models.len() > MAX_MODELS || models.len() != plan.resolved.admissions.len() {
             return Err(LabError::DataCorrupt(
@@ -178,6 +186,23 @@ impl Store {
         let Some(header) = query_model_cost_header(self, run_id, model_id)? else {
             return Ok(None);
         };
+        if header.status.is_none() {
+            return self
+                .model_cost_summary_from_source(run_id, model_id, header, &RunLedgerSource::Detail)
+                .map(Some);
+        }
+        let source = run_ledger_source(self, run_id)?;
+        self.model_cost_summary_from_source(run_id, model_id, header, &source)
+            .map(Some)
+    }
+
+    fn model_cost_summary_from_source(
+        &self,
+        run_id: &RunId,
+        model_id: &ModelId,
+        header: ModelCostHeader,
+        source: &RunLedgerSource,
+    ) -> Result<ModelCostSummary, LabError> {
         let status = header.status.map(|value| parse_enum(&value)).transpose()?;
         let policy_ref = policy_reference(
             header.policy_id,
@@ -185,9 +210,7 @@ impl Store {
             header.policy_definition_digest,
         )?;
         let expected_fill_count = nonnegative_u64(header.fill_count, "model fill count")?;
-        let (fills, terminal) = if let crate::storage::ledger_seal::RunLedgerSource::Sealed(lines) =
-            crate::storage::ledger_seal::run_ledger_source(self, run_id)?
-        {
+        let (fills, terminal) = if let RunLedgerSource::Sealed(lines) = source {
             let fills: Vec<FillRecord> = lines
                 .iter()
                 .filter(|line| line.section == LedgerSection::Fills && line.model_id == *model_id)
@@ -233,7 +256,7 @@ impl Store {
             ));
         }
         let terminal = terminal.filter(|mark| mark.kind == MarkKind::Terminal);
-        Ok(Some(ModelCostSummary {
+        Ok(ModelCostSummary {
             run_id: run_id.clone(),
             model_id: model_id.clone(),
             policy_ref,
@@ -246,12 +269,13 @@ impl Store {
             price_cost_attribution_unit: crate::contracts::PriceCostAttributionUnit::Krw,
             terminal_equity: terminal.as_ref().map(|mark| mark.equity),
             terminal_mark_seq: terminal.map(|mark| mark.context.event_seq),
-        }))
+        })
     }
     fn complete_model_summary(
         &self,
         run_id: &RunId,
         model: &mut ModelResultSummary,
+        source: &RunLedgerSource,
     ) -> Result<(), LabError> {
         if model.status != Some(ModelStatus::Completed) {
             model.financial_null_reason = Some(
@@ -262,9 +286,9 @@ impl Store {
             );
             return Ok(());
         }
-        let costs = self
-            .load_model_cost_summary(run_id, &model.model_id)?
+        let header = query_model_cost_header(self, run_id, &model.model_id)?
             .ok_or_else(|| LabError::DataCorrupt("summary model costs missing".into()))?;
+        let costs = self.model_cost_summary_from_source(run_id, &model.model_id, header, source)?;
         let terminal = costs.terminal_equity.ok_or_else(|| {
             LabError::DataCorrupt("completed summary has no terminal equity".into())
         })?;
@@ -343,21 +367,6 @@ impl Store {
         ).optional().map_err(sql_error)?.ok_or_else(|| LabError::DataCorrupt("episode closing link missing".into()))?;
         serde_json::from_str(&json).map_err(Into::into)
     }
-}
-
-fn status_count(connection: &rusqlite::Connection, status: JobStatus) -> Result<u64, LabError> {
-    let text = serde_json::to_value(status)?
-        .as_str()
-        .ok_or_else(|| LabError::Internal("job status did not serialize as text".into()))?
-        .to_owned();
-    let value = connection
-        .query_row(
-            "SELECT COUNT(*) FROM job_attempts WHERE status=?1",
-            [text],
-            |row| row.get::<_, i64>(0),
-        )
-        .map_err(sql_error)?;
-    nonnegative_u64(value, "job status count")
 }
 
 fn query_models(

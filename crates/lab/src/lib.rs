@@ -10,7 +10,7 @@ pub mod market_data;
 pub mod mcp;
 pub mod observability;
 pub mod planning;
-pub mod policy_engine;
+mod policy_engine;
 pub mod quality;
 pub mod replay;
 pub mod reporting;

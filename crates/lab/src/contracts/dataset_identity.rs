@@ -23,13 +23,13 @@ pub struct DatasetDigests {
 /// Returns an error when a typed value cannot be represented canonically.
 pub fn dataset_digests(snapshot: &DatasetSnapshot) -> Result<DatasetDigests, LabError> {
     let request = normalized_request_value(&snapshot.manifest.request)?;
-    let normalized_request = normalized_request_digest(&snapshot.manifest.request)?;
+    let normalized_request = ContentHash::of_value(&request)?;
     let mut observations: Vec<_> = snapshot
         .observations
         .iter()
         .map(|observation| {
             Ok((
-                observation.candle.market.clone(),
+                observation.candle.market.as_str(),
                 enum_text(&observation.candle.interval)?,
                 timestamp_ms(observation.candle.open_time_utc),
                 timestamp_ms(observation.candle.close_time_utc),
@@ -105,16 +105,16 @@ fn provenance_digest(
         .iter()
         .map(|observation| {
             (
-                observation.id.as_str().to_owned(),
+                observation.id.as_str(),
                 observation
                     .raw_object_ids
                     .iter()
-                    .map(|id| id.as_str().to_owned())
+                    .map(super::RawObjectId::as_str)
                     .collect::<Vec<_>>(),
                 observation
                     .constituent_ids
                     .iter()
-                    .map(|id| id.as_str().to_owned())
+                    .map(super::ObservationId::as_str)
                     .collect::<Vec<_>>(),
             )
         })
