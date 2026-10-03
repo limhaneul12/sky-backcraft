@@ -37,40 +37,9 @@ services:
     environment:
       CARGO_NET_OFFLINE: "true"
 
-  quick-tunnel:
-    image: ${CLOUDFLARED_IMAGE:-cloudflare/cloudflared:2026.8.2}
-    profiles:
-      - quick
-    command:
-      - tunnel
-      - --no-autoupdate
-      - --url
-      - http://app:8130
-    restart: "no"
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-    networks:
-      - spot-lab
-
-  managed-tunnel:
-    image: ${CLOUDFLARED_IMAGE:-cloudflare/cloudflared:2026.8.2}
-    profiles:
-      - managed
-    environment:
-      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
-    command:
-      - tunnel
-      - --no-autoupdate
-      - run
-    restart: unless-stopped
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-    networks:
-      - spot-lab
+  # Public exposure is operator-managed: route your own Cloudflare Named
+  # Tunnel (or equivalent) to 127.0.0.1:${SPOT_LAB_HOST_PORT:-8130} and set
+  # PUBLIC_DOMAIN. No tunnel containers run inside this compose project.
 
 networks:
   spot-lab:

@@ -241,6 +241,20 @@ fn dispatch(args: &[String]) -> Result<(), LabError> {
             validate_args(&args[1..], &["--out"], &[], &[])?;
             run_schemas(&args[1..])
         }
+        Some("setup-gui") => {
+            validate_args(&args[1..], &["--config", "--listen"], &[], &[])?;
+            let config_path = PathBuf::from(
+                flag_value(&args[1..], "--config")
+                    .unwrap_or_else(|| spot_lab::gui::DEFAULT_CONFIG_FILE.into()),
+            );
+            let listen = flag_value(&args[1..], "--listen")
+                .unwrap_or_else(|| spot_lab::gui::DEFAULT_LISTEN.into());
+            let addr: std::net::SocketAddr = listen
+                .parse()
+                .map_err(|error| LabError::InvalidConfig(format!("--listen {listen}: {error}")))?;
+            println!("설정 GUI: http://{addr} (Ctrl+C로 종료)");
+            spot_lab::gui::serve(addr, config_path)
+        }
         Some("--help" | "-h") if args.len() == 1 => {
             print_help();
             Ok(())
@@ -250,7 +264,7 @@ fn dispatch(args: &[String]) -> Result<(), LabError> {
             Ok(())
         }
         Some(other) => Err(LabError::InvalidConfig(format!(
-            "unknown command: {other} (try: probe | mcp-serve | mcp-selfcheck | schemas)"
+            "unknown command: {other} (try: probe | mcp-serve | mcp-selfcheck | schemas | setup-gui)"
         ))),
     }
 }

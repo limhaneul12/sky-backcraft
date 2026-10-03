@@ -5,6 +5,7 @@ pub mod contracts;
 pub mod database;
 pub mod engine;
 pub mod evidence;
+pub mod gui;
 pub mod jobs;
 pub mod market_data;
 pub mod mcp;
