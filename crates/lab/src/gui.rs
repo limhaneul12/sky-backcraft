@@ -266,7 +266,10 @@ fn query_param(query: &str, key: &str) -> Option<String> {
     })
 }
 
-async fn page(State(state): State<GuiState>, raw_query: axum::extract::RawQuery) -> String {
+async fn page(
+    State(state): State<GuiState>,
+    raw_query: axum::extract::RawQuery,
+) -> axum::response::Html<String> {
     let config = GuiConfig::load(&state.config_path);
     let query = raw_query.0.unwrap_or_default();
     let error = query_param(&query, "error");
@@ -276,7 +279,7 @@ async fn page(State(state): State<GuiState>, raw_query: axum::extract::RawQuery)
         (None, Some(notice)) => (notice, "ok"),
         _ => (String::new(), "ok"),
     };
-    render_page(&config, &message, kind)
+    axum::response::Html(render_page(&config, &message, kind))
 }
 
 async fn save(State(state): State<GuiState>, body: String) -> (StatusCode, &'static str) {
