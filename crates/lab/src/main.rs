@@ -212,7 +212,7 @@ fn dispatch(args: &[String]) -> Result<(), LabError> {
         Some("mcp-serve") => {
             validate_args(
                 &args[1..],
-                &["--bind", "--port", "--data-root"],
+                &["--bind", "--port", "--data-root", "--auth-token"],
                 &["--public-no-auth", "--allow-network-bind"],
                 &["--allow-host"],
             )?;
@@ -707,6 +707,7 @@ async fn run_mcp_serve(
         ));
     }
     let public_no_auth = flag_flag(args, "--public-no-auth");
+    let auth_token = flag_value(args, "--auth-token").filter(|token| !token.is_empty());
     let cancellation = tokio_util::sync::CancellationToken::new();
     let mut config = StreamableHttpServerConfig::default()
         .with_legacy_session_mode(false)
@@ -753,10 +754,64 @@ async fn run_mcp_serve(
         LocalSessionManager::default().into(),
         config,
     );
-    let app = spot_lab::transport::apply_limits(
-        axum::Router::new().nest_service("/mcp", service),
-        state.clone(),
+    let token_guard = auth_token.clone();
+    // The auth page is public; everything under /mcp requires the token.
+    let protected_mcp = axum::Router::new()
+        .nest_service("/mcp", service)
+        .route_layer(axum::middleware::from_fn(
+            move |request: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
+                let token_guard = token_guard.clone();
+                async move {
+                    let authorized = request
+                        .uri()
+                        .query()
+                        .and_then(|query| {
+                            query.split('&').find_map(|pair| {
+                                let (key, value) = pair.split_once('=')?;
+                                (key == "token").then(|| value.to_owned())
+                            })
+                        })
+                        .or_else(|| {
+                            request
+                                .headers()
+                                .get(axum::http::header::AUTHORIZATION)
+                                .and_then(|value| {
+                                    value.to_str().ok().and_then(|value| {
+                                        value.strip_prefix("Bearer ").map(str::to_owned)
+                                    })
+                                })
+                        })
+                        .is_some_and(|present| Some(present) == token_guard);
+                    if authorized {
+                        next.run(request).await
+                    } else {
+                        let redirect = format!("/mcp-auth?target={}", request.uri().path());
+                        axum::http::Response::builder()
+                            .status(axum::http::StatusCode::FOUND)
+                            .header(axum::http::header::LOCATION, redirect)
+                            .body(axum::body::Body::empty())
+                            .unwrap_or_else(|_| axum::response::Response::default())
+                    }
+                }
+            },
+        ));
+    let auth_page = axum::Router::new().route(
+        "/mcp-auth",
+        axum::routing::get(|| async {
+            axum::response::Html(
+                "<!DOCTYPE html><html lang=\"ko\"><head><meta charset=\"utf-8\">\
+             <title>Sky Backcraft 인증</title></head>\
+             <body style=\"font-family:-apple-system,sans-serif;max-width:480px;margin:60px auto\">\
+             <h2>Sky Backcraft 접속 토큰</h2>\
+             <p>이 MCP 서버는 토큰 인증을 요구합니다. 발급받은 토큰을 입력하세요.</p>\
+             <form method=\"get\" action=\"/mcp\">\
+             <input name=\"token\" style=\"width:100%;padding:8px\" placeholder=\"토큰\">\
+             <button style=\"padding:8px 16px;margin-top:8px\">연결</button></form>\
+             </body></html>",
+            )
+        }),
     );
+    let app = spot_lab::transport::apply_limits(auth_page.merge(protected_mcp), state.clone());
     record_lifecycle_phase(LifecyclePhase::Startup, &state);
     tracing::info!(event = "mcp_listening", bind = %bind_address, port, public_no_auth, transport = "STATELESS_JSON");
     let graceful = cancellation.clone();
