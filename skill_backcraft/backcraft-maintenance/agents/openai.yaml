@@ -1,0 +1,4 @@
+interface:
+  display_name: "Backcraft 저장 관리·삭제"
+  short_description: "저장 상태 점검, 삭제 대상 preview, 승인된 hard delete 실행"
+  default_prompt: "$backcraft-maintenance로 저장 상태를 점검하고 정리 대상을 제안해 주세요."
