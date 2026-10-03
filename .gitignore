@@ -37,3 +37,5 @@ docs/
 .DS_Store
 # GUI launcher data root (runtime DB created by spot-lab setup-gui)
 /data-gui/
+# Packaged application output
+/dist/

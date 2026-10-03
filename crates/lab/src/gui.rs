@@ -467,7 +467,24 @@ fn start_launcher(state: &GuiState, config: &GuiConfig) -> Result<(), String> {
 ///
 /// # Errors
 /// Reports bind failures.
-pub fn serve(listen: std::net::SocketAddr, config_path: PathBuf) -> Result<(), LabError> {
+/// Serve the localhost-only setup GUI, optionally opening a browser.
+///
+/// # Errors
+/// Reports bind failures.
+pub fn serve(
+    listen: std::net::SocketAddr,
+    config_path: PathBuf,
+    open_browser: bool,
+) -> Result<(), LabError> {
+    if open_browser {
+        let url = format!("http://{listen}/");
+        let opener = if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
+        let _ignored = std::process::Command::new(opener).arg(&url).spawn();
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

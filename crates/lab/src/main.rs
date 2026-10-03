@@ -253,7 +253,7 @@ fn dispatch(args: &[String]) -> Result<(), LabError> {
                 .parse()
                 .map_err(|error| LabError::InvalidConfig(format!("--listen {listen}: {error}")))?;
             println!("설정 GUI: http://{addr} (Ctrl+C로 종료)");
-            spot_lab::gui::serve(addr, config_path)
+            spot_lab::gui::serve(addr, config_path, true)
         }
         Some("--help" | "-h") if args.len() == 1 => {
             print_help();
