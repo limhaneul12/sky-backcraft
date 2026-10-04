@@ -7,7 +7,8 @@
 //! `deleted_at`/`archived` flags.
 
 use super::{
-    ArtifactId, ContentHash, DatasetId, EvidenceSnapshotId, JobId, PolicyId, RunId, UtcTimestamp,
+    ArtifactId, BackupId, ContentHash, DatasetId, EvidenceSnapshotId, JobId, PolicyId, RunId,
+    ScheduleId, SuiteId, UtcTimestamp,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,9 @@ pub enum DeleteResource {
     Run { run_id: RunId },
     EvidenceSnapshot { snapshot_id: EvidenceSnapshotId },
     Artifact { artifact_id: ArtifactId },
+    Suite { suite_id: SuiteId },
+    Schedule { schedule_id: ScheduleId },
+    Backup { backup_id: BackupId },
 }
 
 impl DeleteResource {
@@ -42,6 +46,9 @@ impl DeleteResource {
                 format!("evidence_snapshot:{}", snapshot_id.as_str())
             }
             Self::Artifact { artifact_id } => format!("artifact:{}", artifact_id.as_str()),
+            Self::Suite { suite_id } => format!("suite:{}", suite_id.as_str()),
+            Self::Schedule { schedule_id } => format!("schedule:{}", schedule_id.as_str()),
+            Self::Backup { backup_id } => format!("backup:{}", backup_id.as_str()),
         }
     }
 }
@@ -64,13 +71,16 @@ pub enum DeleteEntryKind {
     Collection,
     CollectionPage,
     Validation,
+    Suite,
+    Schedule,
+    Backup,
 }
 
 /// One live reference that makes a non-cascade delete impossible.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DeleteBlocker {
-    /// `ACTIVE_JOB` refuses even cascade; `LIVE_REFERENCE` allows cascade.
+    /// Active/protected references refuse even cascade; live references allow cascade.
     pub class: DeleteBlockerClass,
     /// Opaque label of the referencing resource.
     pub reference: String,
@@ -84,6 +94,8 @@ pub enum DeleteBlockerClass {
     ActiveJob,
     /// A surviving resource still references the scope.
     LiveReference,
+    /// Durable automation lineage must be released by deleting its parent first.
+    ProtectedReference,
 }
 
 /// Counted group of resources removed together under explicit cascade.

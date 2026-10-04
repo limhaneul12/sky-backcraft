@@ -4,13 +4,13 @@ mod accounting;
 mod execution;
 
 use crate::contracts::{
-    AccountMark, AdmissionStatus, AssetQuantity, CandleObservation, DatasetSnapshot,
-    ENGINE_VERSION, EpisodeId, EpisodeRecord, EpisodeStatus, EventContext, EvidenceSnapshot,
-    ExecutionPolicy, FillId, FillRecord, FillTiming, LabError, MAX_DATASET_ROWS, MAX_MODEL_EVENTS,
-    MarkKind, ModelAdmission, ModelLedger, ModelStatus, ObservationId, OrderId, OrderRecord,
-    OrderStatus, PriceKrw, QuoteAmount, ReasonCode, ResolvedPlan, RunId, Side, SignalId,
-    SignalOutcome, SignalRecord, SimulatedOrderType, StrategyBinding, TerminalPolicy, UtcTimestamp,
-    Weight,
+    AccountMark, AdmissionStatus, AssetQuantity, CandleObservation, CausalExecutionPolicy,
+    DatasetSnapshot, ENGINE_VERSION, EpisodeId, EpisodeRecord, EpisodeStatus, EventContext,
+    EvidenceSnapshot, ExecutionPolicy, FillId, FillRecord, FillTiming, LabError, MAX_DATASET_ROWS,
+    MAX_MODEL_EVENTS, MarkKind, ModelAdmission, ModelLedger, ModelStatus, ObservationId, OrderId,
+    OrderRecord, OrderStatus, PriceKrw, QuoteAmount, ReasonCode, ResolvedPlan, RunId, Side,
+    SignalId, SignalOutcome, SignalRecord, SimulatedOrderType, StrategyBinding, TerminalPolicy,
+    UtcRange, UtcTimestamp, Weight,
 };
 use crate::evidence::EvidenceEvaluator;
 use crate::policy_engine::PolicyEvaluator;
@@ -64,9 +64,49 @@ pub fn run_model(
         } => participation_cap,
     };
     validate_frozen_inputs(plan, datasets, evidence)?;
-    let decision_bars = observations_for(datasets, &admission.market, plan.spec.decision_interval)?;
-    let execution_bars =
-        observations_for(datasets, &admission.market, plan.spec.execution_resolution)?;
+    let (decision_bars, execution_bars) = match plan.spec.causal_execution {
+        Some(CausalExecutionPolicy::DeclaredPolicyWarmup) => {
+            let decision_warmup = u32::try_from(strategy.warmup_bars(plan)?).map_err(|_| {
+                LabError::ResourceLimit("policy warmup exceeds range arithmetic".into())
+            })?;
+            let decision_range = plan
+                .spec
+                .range
+                .with_warmup(decision_warmup, plan.spec.decision_interval)?;
+            let execution_range = plan
+                .spec
+                .range
+                .with_warmup(1, plan.spec.execution_resolution)?;
+            (
+                observations_for_range(
+                    datasets,
+                    &admission.market,
+                    plan.spec.decision_interval,
+                    Some(decision_range),
+                )?,
+                observations_for_range(
+                    datasets,
+                    &admission.market,
+                    plan.spec.execution_resolution,
+                    Some(execution_range),
+                )?,
+            )
+        }
+        None => (
+            observations_for_range(
+                datasets,
+                &admission.market,
+                plan.spec.decision_interval,
+                None,
+            )?,
+            observations_for_range(
+                datasets,
+                &admission.market,
+                plan.spec.execution_resolution,
+                None,
+            )?,
+        ),
+    };
     let initial_bar = execution_bars
         .iter()
         .copied()
@@ -1513,10 +1553,11 @@ fn validate_frozen_inputs(
     Ok(())
 }
 
-fn observations_for<'a>(
+fn observations_for_range<'a>(
     datasets: &'a [DatasetSnapshot],
     market: &crate::contracts::MarketId,
     interval: crate::contracts::CandleInterval,
+    causal_range: Option<UtcRange>,
 ) -> Result<Vec<&'a CandleObservation>, LabError> {
     let mut observations = datasets
         .iter()
@@ -1531,6 +1572,9 @@ fn observations_for<'a>(
             .cmp(&right.candle.open_time_utc)
             .then_with(|| left.id.as_str().cmp(right.id.as_str()))
     });
+    if let Some(range) = causal_range {
+        observations.retain(|observation| range.contains(observation.candle.open_time_utc));
+    }
     if observations.is_empty() {
         return Err(LabError::DataGap(format!(
             "no {interval:?} observations for {market}"

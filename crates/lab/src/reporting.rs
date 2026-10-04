@@ -4,8 +4,10 @@
 //! arithmetic. Engine replay belongs in a separate adapter once the engine API
 //! is stable; it must never be confused with independent accounting proof.
 
+pub mod comparison;
 pub mod export;
 pub mod metrics;
+pub use comparison::build_comparisons;
 pub mod verify;
 
 pub use export::{

@@ -19,9 +19,10 @@ durable job runner, pure strategy/evidence/engine logic, fact-ledger reporting,
 independent verification/replay, immutable editable policy revisions, bounded
 run/job/policy history, and a stateless JSON-first RMCP adapter.
 
-Native `cargo xtask ci` and Linux Docker `make ci` pass with 90 tests.
-`make rebuild` deploys the persistent container and retains an existing live Quick
-Tunnel address. Public MCP acceptance covers 15 tools, policy create/revise,
+The earlier delivery passed native `cargo xtask ci` and Linux Docker `make ci`
+with 90 tests. Those receipts apply to their recorded source fingerprint.
+`make rebuild` deploys the persistent container; public routing is managed by the
+operator's existing tunnel. Earlier public MCP acceptance covered 15 tools, policy create/revise,
 immutable history, multiple exact policy revisions, frozen execution, JSON export,
 independent verification and replay. The native financial matrix also completed
 50 commands including three assets/resolutions, execution sensitivities and
@@ -33,13 +34,21 @@ not embed or infer external acceptance receipts. Consult the source-matched deli
 record for executed gates; this runtime label is not a profitability claim or an
 independent CI attestation. Missing evidence still blocks S5/control models explicitly.
 
-ChatGPT personal plugin `Sky Backcraft` is registered and its status, policy-list and
-run-history tools were invoked successfully in a real Work conversation.
+The earlier delivery registered a ChatGPT personal plugin and invoked its status,
+policy-list and run-history tools. A new domain or runtime needs fresh connection
+and ChatGPT invocation evidence.
 
 The first-use repairs add complete artifact transfer, all-model comparison summaries,
 quantity-weighted cost reporting, linked exit reasons, truthful terminal progress,
 structured limit reports and evidence-labelled gap classification. Existing run hashes
 and ledger bytes were preserved; see [first-use verification](docs/verification-first-use-2026-09-27.md).
+
+The SQLite research automation extension adds causal walk-forward suites,
+bounded parameter/cost comparisons, persistent collection schedules and managed
+storage/backup/retention tools. See [research automation](docs/research-automation.md)
+for versioning, controls, budgets and execution semantics. Its fresh acceptance
+receipts must match the current source fingerprint; historical receipts above do
+not validate it.
 
 ## Architecture
 
@@ -80,6 +89,61 @@ See [docs/data-dictionary.md](docs/data-dictionary.md) for the public terms and
 [docs/operator-guide.md](docs/operator-guide.md) for command and lifecycle details.
 Docker/Cloudflare operation is documented separately in
 [docs/docker.md](docs/docker.md).
+
+## macOS desktop app
+
+Build the native menu bar app with `make package`, then extract the verified
+`dist/SkyBackcraft-macos.zip` into your local Applications folder and open
+`Sky Backcraft.app` there. Packaging checks signatures, helper byte identity,
+and bounded launch/self-tests both before and after an archive round trip.
+The unpacked `dist/Sky Backcraft.app` is a convenience copy: FileProvider may
+retag it after export, so use the verified ZIP for installation.
+The app bundles the Rust server and uses AppKit controls;
+its settings are the public domain, local port, and OAuth or no authentication.
+No project folder is required. The initial settings are `skybackcraft.store` and
+port `8130`.
+
+The native app is the sole settings/launcher path. The old browser setup server
+and `sky-backcraft-setup` binary have been retired; `setup-gui` reports this
+migration instead of starting another configuration server. Historical
+`data-gui` and old configuration files are preserved separately and are not
+imported into native settings. The legacy `--auth-token` CLI option remains
+available for existing Bearer clients.
+
+Settings, logs, and research data live in
+`~/Library/Application Support/Sky Backcraft`, outside the application bundle.
+The app owns the server it starts. It reports a port conflict instead of stopping
+an unrelated service. If Docker already owns port 8130, stop this repository's
+container with `docker compose stop app` before starting the desktop server; its
+volume remains available for the container.
+
+A configured domain uses your existing named tunnel, routed to
+`http://127.0.0.1:<port>`. Connect ChatGPT to `https://<domain>/mcp` (HTTPS uses
+port 443; 8130 is the local origin port). Leaving the domain empty creates a
+temporary Quick Tunnel URL that changes after restart. DNS delegation and the
+Cloudflare certificate must be active before ChatGPT can connect.
+
+OAuth uses MCP discovery, dynamic client registration, authorization codes and
+S256 PKCE. Copy the OAuth login code from the app menu and enter it only on the
+server's consent page. The code is generated for the running server and is never
+saved in settings. Restarting the server invalidates its sessions, so reconnect
+ChatGPT afterward. No-auth mode uses a separate isolated public research root.
+
+For a read-only protocol check against the running app:
+
+```sh
+python3 scripts/mcp_desktop_smoke.py --url http://127.0.0.1:8130/mcp
+python3 scripts/mcp_desktop_smoke.py --url https://skybackcraft.store/mcp
+```
+
+These checks prove MCP initialization, the tool catalog, `lab_status`, and Host
+rejection. They do not substitute for a tool invocation from ChatGPT itself.
+
+`make native-check` exercises lifecycle transitions and real owned child
+processes in isolated fixtures, including late tunnel output during Stop and
+overlapping Restart/Quit. Packaging compiles the native app with warnings as
+errors; its executable also supports `--self-test` for persisted configuration
+and log bounds.
 
 ## Quick start
 

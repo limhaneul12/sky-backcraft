@@ -173,6 +173,7 @@ fn save_v2_policy_plan_fixture(store: &mut Store, policy: &PolicyRevision) -> Pl
     let zero_bps = BasisPoints::new(Decimal::ZERO).expect("zero bps");
     let spec = ExperimentSpec {
         schema_version: "2.0".into(),
+        causal_execution: None,
         dataset_ids: vec![dataset_id.clone()],
         markets: vec![market.clone()],
         range: dataset_request.range,
@@ -1861,6 +1862,16 @@ fn compacted_multi_model_bundle_summary_and_costs_match_detail() {
                 run_id: expected.manifest.run_id.clone(),
                 semantic_digest: expected.semantic_digest.clone(),
                 expected_models: 2,
+                comparisons: crate::reporting::build_comparisons(
+                    &expected,
+                    &crate::research::causal_input_digest(
+                        &expected.plan,
+                        &expected.datasets,
+                        expected.evidence.as_ref(),
+                    )
+                    .expect("fixture causal digest"),
+                )
+                .expect("fixture comparisons"),
                 validation,
             },
         )

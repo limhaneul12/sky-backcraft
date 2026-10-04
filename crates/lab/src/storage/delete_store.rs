@@ -41,9 +41,15 @@ pub(super) struct DeleteScope {
     datasets: Vec<String>,
     evidence_snapshots: Vec<String>,
     artifacts: Vec<String>,
+    suites: Vec<String>,
+    suite_cases: Vec<String>,
+    schedules: Vec<String>,
+    schedule_fires: Vec<String>,
+    backups: Vec<String>,
     artifact_files: Vec<ScopeFile>,
     ledger_files: Vec<ScopeFile>,
     raw_files: Vec<ScopeFile>,
+    backup_files: Vec<ScopeFile>,
     observations: u64,
     blockers: Vec<DeleteBlocker>,
     counts: Vec<(DeleteEntryKind, u64)>,
@@ -63,6 +69,7 @@ enum JournalFileKind {
     RawDir,
     ExportFile,
     LedgerFile,
+    ManagedBackup,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -109,7 +116,10 @@ impl Store {
             retained_shared: scope.retained_shared.clone(),
             reclaimable_file_bytes: Some(scope.file_bytes),
             exclusive_file_count: u64::try_from(
-                scope.artifact_files.len() + scope.raw_files.len() + scope.ledger_files.len(),
+                scope.artifact_files.len()
+                    + scope.raw_files.len()
+                    + scope.ledger_files.len()
+                    + scope.backup_files.len(),
             )
             .map_err(|_| LabError::Internal("file count overflow".into()))?,
             db_row_estimate: scope.total_rows(),
@@ -167,13 +177,14 @@ impl Store {
                     .into(),
             ));
         }
-        if let Some(blocker) = scope
-            .blockers
-            .iter()
-            .find(|blocker| blocker.class == DeleteBlockerClass::ActiveJob)
-        {
+        if let Some(blocker) = scope.blockers.iter().find(|blocker| {
+            matches!(
+                blocker.class,
+                DeleteBlockerClass::ActiveJob | DeleteBlockerClass::ProtectedReference
+            )
+        }) {
             return Err(LabError::Conflict(format!(
-                "active job refuses deletion: {} ({})",
+                "protected state refuses deletion: {} ({})",
                 blocker.reference, blocker.reason
             )));
         }
@@ -289,6 +300,24 @@ impl Store {
                 artifact_id.as_str(),
                 "artifact",
             )?,
+            R::Suite { suite_id } => self.seeded_id(
+                "SELECT 1 FROM research_suites WHERE id=?1",
+                "INSERT OR IGNORE INTO del_suites(id) VALUES (?1)",
+                suite_id.as_str(),
+                "suite",
+            )?,
+            R::Schedule { schedule_id } => self.seeded_id(
+                "SELECT 1 FROM collection_schedules WHERE id=?1",
+                "INSERT OR IGNORE INTO del_schedules(id) VALUES (?1)",
+                schedule_id.as_str(),
+                "schedule",
+            )?,
+            R::Backup { backup_id } => self.seeded_id(
+                "SELECT 1 FROM managed_backups WHERE id=?1",
+                "INSERT OR IGNORE INTO del_backups(id) VALUES (?1)",
+                backup_id.as_str(),
+                "backup",
+            )?,
         }
         for _ in 0..SCOPE_FIXPOINT_LIMIT {
             let mut added = 0_usize;
@@ -311,6 +340,11 @@ impl Store {
         scope.datasets = self.ordered_ids("del_datasets")?;
         scope.evidence_snapshots = self.ordered_ids("del_snapshots")?;
         scope.artifacts = self.ordered_ids("del_artifacts")?;
+        scope.suites = self.ordered_ids("del_suites")?;
+        scope.suite_cases = self.ordered_ids("del_suite_cases")?;
+        scope.schedules = self.ordered_ids("del_schedules")?;
+        scope.schedule_fires = self.ordered_ids("del_schedule_fires")?;
+        scope.backups = self.ordered_ids("del_backups")?;
         self.connection
             .execute(
                 "INSERT OR IGNORE INTO del_revisions SELECT revision_id FROM policy_revisions WHERE policy_id IN (SELECT id FROM del_policies)",
@@ -318,6 +352,7 @@ impl Store {
             )
             .map_err(sql_error)?;
         scope.policy_revisions = self.ordered_ids("del_revisions")?;
+        self.protected_automation_blockers(&mut scope)?;
         self.compute_scope_dependencies(&mut scope)?;
         self.check_active_jobs(&mut scope)?;
         self.compute_scope_counts(&mut scope)?;
@@ -447,8 +482,44 @@ impl Store {
                     "a job attempt lists this artifact as its output; cascade removes the job history",
                 );
             }
+            R::Suite { .. } | R::Schedule { .. } | R::Backup { .. } => {}
         }
         Ok(blockers)
+    }
+
+    fn protected_automation_blockers(&self, scope: &mut DeleteScope) -> Result<(), LabError> {
+        let queries = [
+            (
+                "SELECT 'suite:' || c.suite_id FROM research_suite_cases c WHERE c.plan_id IN (SELECT id FROM del_plans) OR c.job_id IN (SELECT id FROM del_jobs) OR c.attempt_id IN (SELECT id FROM del_attempts) OR c.run_id IN (SELECT id FROM del_runs) ORDER BY c.suite_id,c.case_index",
+                "a research suite retains this frozen lineage; preview-delete the suite first",
+            ),
+            (
+                "SELECT 'schedule:' || f.schedule_id FROM schedule_fires f WHERE f.job_id IN (SELECT id FROM del_jobs) OR f.attempt_id IN (SELECT id FROM del_attempts) OR f.dataset_id IN (SELECT id FROM del_datasets) ORDER BY f.schedule_id,f.boundary_ms",
+                "a collection schedule retains this fire lineage; preview-delete the schedule first",
+            ),
+            (
+                "SELECT 'schedule:' || s.id FROM collection_schedules s WHERE s.last_success_dataset_id IN (SELECT id FROM del_datasets) ORDER BY s.id",
+                "a collection schedule retains this last-success dataset; preview-delete the schedule first",
+            ),
+        ];
+        for (sql, reason) in queries {
+            let rows = self.string_column(sql)?;
+            for reference in rows.iter().take(DELETE_PREVIEW_EXAMPLES) {
+                scope.blockers.push(DeleteBlocker {
+                    class: DeleteBlockerClass::ProtectedReference,
+                    reference: reference.clone(),
+                    reason: reason.into(),
+                });
+            }
+            if rows.len() > DELETE_PREVIEW_EXAMPLES {
+                scope.blockers.push(DeleteBlocker {
+                    class: DeleteBlockerClass::ProtectedReference,
+                    reference: format!("…({} more)", rows.len() - DELETE_PREVIEW_EXAMPLES),
+                    reason: reason.into(),
+                });
+            }
+        }
+        Ok(())
     }
 
     fn string_column(&self, sql: &str) -> Result<Vec<String>, LabError> {
@@ -617,17 +688,42 @@ impl Store {
             .map_err(sql_error)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(sql_error)?;
+        let mut statement = connection.prepare(
+            "SELECT id,relative_path,bytes FROM managed_backups WHERE id IN (SELECT id FROM del_backups) ORDER BY id",
+        ).map_err(sql_error)?;
+        scope.backup_files = statement
+            .query_map([], |row| {
+                Ok(ScopeFile {
+                    id: row.get(0)?,
+                    relative_path: row.get(1)?,
+                    bytes: row.get::<_, i64>(2)?.max(0).cast_unsigned(),
+                })
+            })
+            .map_err(sql_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sql_error)?;
         // Preview measures the real on-disk size of each exclusive raw directory.
         for file in &mut scope.raw_files {
             file.bytes = directory_size(&self.raw.root.join(&file.relative_path))?;
+        }
+        let backup_root = super::maintenance_store::managed_backup_root(&self.raw.root)?;
+        for file in &mut scope.backup_files {
+            crate::contracts::BackupId::new(file.relative_path.clone())?;
+            if file.relative_path != file.id {
+                return Err(LabError::DataCorrupt(
+                    "managed backup path does not match its opaque backup ID".into(),
+                ));
+            }
+            file.bytes = directory_size(&backup_root.join(&file.relative_path))?;
         }
         scope.file_bytes = scope
             .artifact_files
             .iter()
             .chain(scope.raw_files.iter())
             .chain(scope.ledger_files.iter())
+            .chain(scope.backup_files.iter())
             .map(|file| file.bytes)
-            .sum();
+            .fold(0_u64, u64::saturating_add);
         Ok(())
     }
 
@@ -636,7 +732,11 @@ impl Store {
         let queued = super::enum_text(&JobStatus::Queued)?;
         let running = super::enum_text(&JobStatus::Running)?;
         let mut statement = self.connection.prepare(
-            "SELECT id FROM jobs WHERE current_status IN (?1, ?2) AND id IN (SELECT id FROM del_jobs) ORDER BY id",
+            "SELECT id FROM jobs WHERE current_status IN (?1, ?2) AND (
+                id IN (SELECT id FROM del_jobs)
+                OR id IN (SELECT job_id FROM research_suite_cases WHERE suite_id IN (SELECT id FROM del_suites) AND job_id IS NOT NULL)
+                OR id IN (SELECT job_id FROM schedule_fires WHERE schedule_id IN (SELECT id FROM del_schedules) AND job_id IS NOT NULL)
+             ) ORDER BY id",
         ).map_err(sql_error)?;
         let rows = statement
             .query_map(params![queued, running], |row| row.get::<_, String>(0))
@@ -649,6 +749,56 @@ impl Store {
                 reference: format!("job:{job_id}"),
                 reason: "queued/running work refuses deletion; cancel the job first and wait for a terminal state".into(),
             });
+        }
+        let retained = [
+            (
+                DeleteEntryKind::Plan,
+                "SELECT COUNT(DISTINCT plan_id) FROM research_suite_cases WHERE suite_id IN (SELECT id FROM del_suites) AND plan_id IS NOT NULL",
+            ),
+            (
+                DeleteEntryKind::Job,
+                "SELECT COUNT(DISTINCT job_id) FROM research_suite_cases WHERE suite_id IN (SELECT id FROM del_suites) AND job_id IS NOT NULL",
+            ),
+            (
+                DeleteEntryKind::Attempt,
+                "SELECT COUNT(DISTINCT attempt_id) FROM research_suite_cases WHERE suite_id IN (SELECT id FROM del_suites) AND attempt_id IS NOT NULL",
+            ),
+            (
+                DeleteEntryKind::Run,
+                "SELECT COUNT(DISTINCT run_id) FROM research_suite_cases WHERE suite_id IN (SELECT id FROM del_suites) AND run_id IS NOT NULL",
+            ),
+            (
+                DeleteEntryKind::Job,
+                "SELECT COUNT(DISTINCT job_id) FROM schedule_fires WHERE schedule_id IN (SELECT id FROM del_schedules) AND job_id IS NOT NULL",
+            ),
+            (
+                DeleteEntryKind::Attempt,
+                "SELECT COUNT(DISTINCT attempt_id) FROM schedule_fires WHERE schedule_id IN (SELECT id FROM del_schedules) AND attempt_id IS NOT NULL",
+            ),
+            (
+                DeleteEntryKind::Dataset,
+                "SELECT COUNT(*) FROM (
+                    SELECT dataset_id AS id FROM schedule_fires WHERE schedule_id IN (SELECT id FROM del_schedules) AND dataset_id IS NOT NULL
+                    UNION
+                    SELECT last_success_dataset_id FROM collection_schedules WHERE id IN (SELECT id FROM del_schedules) AND last_success_dataset_id IS NOT NULL
+                 )",
+            ),
+        ];
+        for (kind, sql) in retained {
+            let count = self.scalar(sql)?;
+            if count > 0 {
+                if let Some(group) = scope
+                    .retained_shared
+                    .iter_mut()
+                    .find(|group| group.kind == kind)
+                {
+                    group.count = group.count.saturating_add(count);
+                } else {
+                    scope
+                        .retained_shared
+                        .push(DeleteRetainedGroup { kind, count });
+                }
+            }
         }
         Ok(())
     }
@@ -718,6 +868,13 @@ impl Store {
                 bytes: file.bytes,
             });
         }
+        for file in &scope.backup_files {
+            journal_files.push(JournalFile {
+                kind: JournalFileKind::ManagedBackup,
+                path: file.relative_path.clone(),
+                bytes: file.bytes,
+            });
+        }
         let transaction = self.connection.transaction().map_err(sql_error)?;
         let mut deleted = 0_u64;
         for sql in SCOPE_DELETES {
@@ -775,6 +932,18 @@ fn remove_scope_files(root: &Path, scope: &DeleteScope) -> Result<(usize, u64), 
             root,
             &JournalFile {
                 kind: JournalFileKind::LedgerFile,
+                path: file.relative_path.clone(),
+                bytes: file.bytes,
+            },
+        )?;
+        count += 1;
+        bytes += file.bytes;
+    }
+    for file in &scope.backup_files {
+        remove_journal_file(
+            root,
+            &JournalFile {
+                kind: JournalFileKind::ManagedBackup,
                 path: file.relative_path.clone(),
                 bytes: file.bytes,
             },
@@ -847,14 +1016,29 @@ fn remove_journal_file(root: &Path, file: &JournalFile) -> Result<(), LabError> 
         JournalFileKind::RawDir => file.path.starts_with(RAW_PREFIX),
         JournalFileKind::ExportFile => file.path.starts_with(EXPORT_PREFIX),
         JournalFileKind::LedgerFile => file.path.starts_with(LEDGER_PREFIX),
+        JournalFileKind::ManagedBackup => {
+            crate::contracts::BackupId::new(file.path.clone()).is_ok()
+        }
     };
     if !inside_root {
         return Err(LabError::DataCorrupt(
             "deletion journal names a file outside the server-owned store".into(),
         ));
     }
-    let path = root.join(&file.path);
-    super::reject_symlink_chain(root, &path)?;
+    let owner_root = if file.kind == JournalFileKind::ManagedBackup {
+        super::maintenance_store::managed_backup_root(root)?
+    } else {
+        root.to_path_buf()
+    };
+    let path = owner_root.join(&file.path);
+    if file.kind == JournalFileKind::ManagedBackup
+        && !owner_root
+            .try_exists()
+            .map_err(super::io_error("inspect managed backup root"))?
+    {
+        return Ok(());
+    }
+    super::reject_symlink_chain(&owner_root, &path)?;
     match file.kind {
         JournalFileKind::RawDir => {
             if path.exists() {
@@ -898,6 +1082,12 @@ fn remove_journal_file(root: &Path, file: &JournalFile) -> Result<(), LabError> 
                 }
             }
         }
+        JournalFileKind::ManagedBackup => {
+            if path.exists() {
+                std::fs::remove_dir_all(&path)
+                    .map_err(super::io_error("remove managed backup directory"))?;
+            }
+        }
     }
     Ok(())
 }
@@ -914,9 +1104,15 @@ fn scope_digest(scope: &DeleteScope) -> Result<ContentHash, LabError> {
         "datasets": sorted(scope.datasets.iter()),
         "evidence_snapshots": sorted(scope.evidence_snapshots.iter()),
         "artifacts": sorted(scope.artifacts.iter()),
+        "suites": sorted(scope.suites.iter()),
+        "suite_cases": sorted(scope.suite_cases.iter()),
+        "schedules": sorted(scope.schedules.iter()),
+        "schedule_fires": sorted(scope.schedule_fires.iter()),
+        "backups": sorted(scope.backups.iter()),
         "artifact_files": scope.artifact_files.iter().map(|f| (&f.id, &f.relative_path, f.bytes)).collect::<Vec<_>>(),
         "ledger_files": scope.ledger_files.iter().map(|f| (&f.id, &f.relative_path, f.bytes)).collect::<Vec<_>>(),
         "raw_files": scope.raw_files.iter().map(|f| (&f.id, &f.relative_path, f.bytes)).collect::<Vec<_>>(),
+        "backup_files": scope.backup_files.iter().map(|f| (&f.id, &f.relative_path, f.bytes)).collect::<Vec<_>>(),
         "observations": scope.observations,
         "counts": scope.counts,
         "retained_shared": scope.retained_shared,
@@ -984,6 +1180,13 @@ fn cascade_groups(scope: &DeleteScope) -> Vec<DeleteCascadeGroup> {
                 .map(|f| f.id.clone())
                 .collect::<Vec<_>>(),
         ),
+        group(DeleteEntryKind::Suite, scope.suites.len(), &scope.suites),
+        group(
+            DeleteEntryKind::Schedule,
+            scope.schedules.len(),
+            &scope.schedules,
+        ),
+        group(DeleteEntryKind::Backup, scope.backups.len(), &scope.backups),
         group(
             DeleteEntryKind::Artifact,
             scope.ledger_files.len(),
@@ -1001,6 +1204,13 @@ fn cascade_groups(scope: &DeleteScope) -> Vec<DeleteCascadeGroup> {
 
 /// Ordered child-first delete statements over the temp scope tables.
 const SCOPE_DELETES: &[&str] = &[
+    // automation parents release links but retain ordinary plans/jobs/runs/datasets
+    "DELETE FROM research_suite_cases WHERE id IN (SELECT id FROM del_suite_cases)",
+    "DELETE FROM research_suite_folds WHERE suite_id IN (SELECT id FROM del_suites)",
+    "DELETE FROM research_suites WHERE id IN (SELECT id FROM del_suites)",
+    "DELETE FROM schedule_fires WHERE id IN (SELECT id FROM del_schedule_fires)",
+    "DELETE FROM collection_schedules WHERE id IN (SELECT id FROM del_schedules)",
+    "DELETE FROM managed_backups WHERE id IN (SELECT id FROM del_backups)",
     // run bundles
     "DELETE FROM run_artifacts WHERE id IN (SELECT id FROM del_artifacts) OR run_id IN (SELECT id FROM del_runs)",
     "DELETE FROM validation_results WHERE run_id IN (SELECT id FROM del_runs)",
@@ -1059,6 +1269,12 @@ const SCOPE_DELETES: &[&str] = &[
 
 /// Row-count queries mirroring `SCOPE_DELETES` for exact preview accounting.
 const SCOPE_COUNTS: &[&str] = &[
+    "SELECT COUNT(*) FROM research_suite_cases WHERE id IN (SELECT id FROM del_suite_cases)",
+    "SELECT COUNT(*) FROM research_suite_folds WHERE suite_id IN (SELECT id FROM del_suites)",
+    "SELECT COUNT(*) FROM research_suites WHERE id IN (SELECT id FROM del_suites)",
+    "SELECT COUNT(*) FROM schedule_fires WHERE id IN (SELECT id FROM del_schedule_fires)",
+    "SELECT COUNT(*) FROM collection_schedules WHERE id IN (SELECT id FROM del_schedules)",
+    "SELECT COUNT(*) FROM managed_backups WHERE id IN (SELECT id FROM del_backups)",
     "SELECT COUNT(*) FROM run_artifacts WHERE id IN (SELECT id FROM del_artifacts) OR run_id IN (SELECT id FROM del_runs)",
     "SELECT COUNT(*) FROM validation_results WHERE run_id IN (SELECT id FROM del_runs)",
     "SELECT COUNT(*) FROM signal_source_bars WHERE signal_id IN (SELECT signal_id FROM signals WHERE run_id IN (SELECT id FROM del_runs))",
@@ -1130,10 +1346,23 @@ CREATE TEMP TABLE del_requests(id TEXT PRIMARY KEY);
 DROP TABLE IF EXISTS temp.del_obs;
 CREATE TEMP TABLE del_obs(id TEXT PRIMARY KEY);
 DROP TABLE IF EXISTS temp.del_raws;
-CREATE TEMP TABLE del_raws(id TEXT PRIMARY KEY);";
+CREATE TEMP TABLE del_raws(id TEXT PRIMARY KEY);
+DROP TABLE IF EXISTS temp.del_suites;
+CREATE TEMP TABLE del_suites(id TEXT PRIMARY KEY);
+DROP TABLE IF EXISTS temp.del_suite_cases;
+CREATE TEMP TABLE del_suite_cases(id TEXT PRIMARY KEY);
+DROP TABLE IF EXISTS temp.del_schedules;
+CREATE TEMP TABLE del_schedules(id TEXT PRIMARY KEY);
+DROP TABLE IF EXISTS temp.del_schedule_fires;
+CREATE TEMP TABLE del_schedule_fires(id TEXT PRIMARY KEY);
+DROP TABLE IF EXISTS temp.del_backups;
+CREATE TEMP TABLE del_backups(id TEXT PRIMARY KEY);";
 
 /// Closure-expansion edges; each `INSERT..SELECT` returns newly added rows.
 const SCOPE_EDGES: &[&str] = &[
+    // automation parents own links only; ordinary linked resources survive
+    "INSERT OR IGNORE INTO del_suite_cases SELECT id FROM research_suite_cases WHERE suite_id IN (SELECT id FROM del_suites)",
+    "INSERT OR IGNORE INTO del_schedule_fires SELECT id FROM schedule_fires WHERE schedule_id IN (SELECT id FROM del_schedules)",
     // runs -> owning jobs; plans -> their runs
     "INSERT OR IGNORE INTO del_runs SELECT id FROM runs WHERE plan_id IN (SELECT id FROM del_plans)",
     "INSERT OR IGNORE INTO del_jobs SELECT job_id FROM runs WHERE id IN (SELECT id FROM del_runs)",

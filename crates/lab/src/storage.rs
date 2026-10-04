@@ -9,11 +9,14 @@ mod evidence_store;
 mod history_store;
 mod job_store;
 mod ledger_seal;
+mod maintenance_store;
 mod migrations;
 mod plan_store;
 mod policy_store;
 mod query_read;
+mod research_store;
 mod run_store;
+mod schedule_store;
 pub use crate::contracts::{
     DatasetDigests, dataset_digests, dataset_id, normalized_request_digest, observation_digest,
 };
@@ -1327,9 +1330,14 @@ impl Store {
         }
         sync_directory(new_root)?;
         let store = Self::open(new_root)?;
-        store.verify_database_integrity()?;
-        let restored = store.backup_manifest()?;
-        if serde_json::to_vec(&manifest).map_err(json_error)?
+        store.verify_backup_contents(&manifest)?;
+        Ok(store)
+    }
+
+    fn verify_backup_contents(&self, manifest: &BackupManifest) -> Result<(), LabError> {
+        self.verify_database_integrity()?;
+        let restored = self.backup_manifest()?;
+        if serde_json::to_vec(manifest).map_err(json_error)?
             != serde_json::to_vec(&restored).map_err(json_error)?
         {
             return Err(LabError::DataCorrupt(
@@ -1337,7 +1345,8 @@ impl Store {
             ));
         }
         for raw in &manifest.raw_objects {
-            let object_json: String = store
+            validate_backup_raw(raw)?;
+            let object_json: String = self
                 .connection
                 .query_row(
                     "SELECT object_json FROM raw_objects WHERE id=?1",
@@ -1345,12 +1354,13 @@ impl Store {
                     |row| row.get(0),
                 )
                 .map_err(sql_error)?;
-            store
-                .raw
+            self.raw
                 .verify(&serde_json::from_str(&object_json).map_err(json_error)?)?;
         }
         for artifact in &manifest.artifacts {
-            let bytes = fs::read(new_root.join(&artifact.relative_path))
+            validate_relative_path(&artifact.relative_path)?;
+            reject_symlink_chain(&self.raw.root, &self.raw.root.join(&artifact.relative_path))?;
+            let bytes = fs::read(self.raw.root.join(&artifact.relative_path))
                 .map_err(io_error("read restored artifact"))?;
             if bytes.len() as u64 != artifact.bytes
                 || ContentHash::of_bytes(&bytes).as_str() != artifact.sha256
@@ -1363,7 +1373,7 @@ impl Store {
         }
         for dataset in &manifest.datasets {
             let id = DatasetId::new(dataset.id.clone())?;
-            let snapshot = store.load_dataset(&id)?.ok_or_else(|| {
+            let snapshot = self.load_dataset(&id)?.ok_or_else(|| {
                 LabError::DataCorrupt(format!("restored dataset is missing: {id}"))
             })?;
             let digests = dataset_digests(&snapshot)?;
@@ -1376,8 +1386,86 @@ impl Store {
                 )));
             }
         }
-        store.verify_restored_runs()?;
-        Ok(store)
+        self.verify_restored_runs()?;
+        Ok(())
+    }
+
+    /// Verify an immutable backup without opening a writable Store or changing it.
+    /// # Errors
+    /// Rejects unsafe paths, oversized/incomplete snapshots and integrity failures.
+    pub(super) fn verify_backup_directory(
+        backup: &Path,
+    ) -> Result<(ContentHash, ContentHash, u64), LabError> {
+        use sha2::{Digest, Sha256};
+        use std::io::Read;
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+        reject_symlink_chain(backup, backup)?;
+        let manifest_path = backup.join("backup-manifest.json");
+        let database_path = backup.join(DATABASE_FILE);
+        reject_symlink(&manifest_path)?;
+        reject_symlink(&database_path)?;
+        if file_size(&manifest_path)? > 16 * 1024 * 1024
+            || file_size(&database_path)? > MAX_DATABASE_BYTES
+        {
+            return Err(LabError::ResourceLimit(
+                "backup verification input exceeds bounds".into(),
+            ));
+        }
+        let bytes = directory_size(backup)?;
+        if bytes > MAX_DATA_ROOT_BYTES {
+            return Err(LabError::ResourceLimit(
+                "backup exceeds the source root bound".into(),
+            ));
+        }
+        let encoded = fs::read(&manifest_path).map_err(io_error("read backup manifest"))?;
+        let manifest: BackupManifest = serde_json::from_slice(&encoded).map_err(json_error)?;
+        // Online Backup API publishes a self-contained immutable snapshot. The URI
+        // mode prevents even read-only WAL connections from creating -shm files.
+        let mut uri = String::from("file:");
+        for byte in database_path.as_os_str().as_encoded_bytes() {
+            if byte.is_ascii_alphanumeric() || b"/-._~".contains(byte) {
+                uri.push(char::from(*byte));
+            } else {
+                uri.push('%');
+                uri.push(char::from(HEX[usize::from(*byte >> 4)]));
+                uri.push(char::from(HEX[usize::from(*byte & 15)]));
+            }
+        }
+        uri.push_str("?immutable=1");
+        let connection = Connection::open_with_flags(
+            &uri,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+        .map_err(sql_error)?;
+        let verified = Self {
+            connection,
+            raw: RawObjectStore {
+                root: backup.to_path_buf(),
+                capacity: RootCapacity {
+                    root: backup.to_path_buf(),
+                    reservations: Arc::new(Mutex::new(ReservationState::default())),
+                },
+            },
+        };
+        verified.verify_backup_contents(&manifest)?;
+        let mut file =
+            fs::File::open(&database_path).map_err(io_error("read verified backup database"))?;
+        let mut digest = Sha256::new();
+        let mut buffer = [0_u8; 8_192];
+        loop {
+            let count = file
+                .read(&mut buffer)
+                .map_err(io_error("hash verified backup database"))?;
+            if count == 0 {
+                break;
+            }
+            digest.update(&buffer[..count]);
+        }
+        let database_digest = ContentHash::try_from(format!("{:x}", digest.finalize()))?;
+        let manifest_digest = ContentHash::of_value(&manifest)?;
+        let source_identity = ContentHash::of_value(&(&manifest_digest, &database_digest))?;
+        Ok((manifest_digest, source_identity, bytes))
     }
 
     fn verify_restored_runs(&self) -> Result<(), LabError> {

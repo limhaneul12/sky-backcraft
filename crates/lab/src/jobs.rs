@@ -1,5 +1,8 @@
 //! Durable SQLite queue, one owned runner, and explicit cancellation acknowledgements.
 
+mod coordinator;
+mod research_control;
+
 use crate::contracts::{
     AccountMark, ArtifactId, AttemptState, ContentHash, DatasetStatus, ENGINE_VERSION,
     FailureRecord, FillRecord, INDICATOR_VERSION, JobAttempt, JobControl, JobId, JobOutput,
@@ -25,6 +28,12 @@ use tracing::Instrument;
 pub struct JobService {
     inner: Arc<Inner>,
 }
+#[derive(Clone, Copy)]
+enum CancellationAuthority {
+    Client,
+    RuntimeOwner,
+}
+
 struct Inner {
     database: DatabaseHandle,
     upbit: UpbitClient,
@@ -92,16 +101,39 @@ impl JobRuntime {
             }),
         };
         let owner = service.clone();
+        let producer = service.clone();
         let supervisor = service.clone();
         let runner = tokio::spawn(async move {
-            // The supervisor owns and immediately observes the only execution task,
-            // including panic outcomes; public admission never outlives its worker.
-            let worker = tokio::spawn(async move { owner.run().await });
-            let result = worker
-                .await
-                .map_err(|_| LabError::Internal("job execution task panicked".into()))
-                .and_then(std::convert::identity);
+            let mut worker = tokio::spawn(async move { owner.run().await });
+            let mut coordinator = tokio::spawn(async move { producer.coordinate().await });
+            let (first, worker_finished) = tokio::select! {
+                result = &mut worker => (result, true),
+                result = &mut coordinator => (result, false),
+            };
             supervisor.inner.admitting.store(false, Ordering::Release);
+            supervisor.inner.stop.cancel();
+            let (active, control_poisoned) = match supervisor.inner.active.lock() {
+                Ok(active) => (active.clone(), false),
+                Err(poisoned) => (poisoned.into_inner().clone(), true),
+            };
+            if let Some((id, token)) = active {
+                let cancellation = supervisor
+                    .persist_cancel(id, CancellationAuthority::RuntimeOwner)
+                    .await;
+                token.cancel();
+                if cancellation.is_err() {
+                    tracing::error!(
+                        event = "runtime_cancel_unconfirmed",
+                        recovery = "DURABLE_READBACK_REQUIRED"
+                    );
+                }
+            }
+            // A completed or failed child never detaches its sibling, including blocking work.
+            let second = if worker_finished {
+                coordinator.await
+            } else {
+                worker.await
+            };
             supervisor
                 .inner
                 .runner_available
@@ -109,16 +141,24 @@ impl JobRuntime {
             {
                 let _admitted = supervisor.inner.admission_gate.lock().await;
             }
-            let active = match supervisor.inner.active.lock() {
-                Ok(mut active) => active.take(),
-                Err(error) => error.into_inner().take(),
+            let first = first
+                .map_err(|_| LabError::Internal("research runtime child panicked".into()))
+                .and_then(std::convert::identity);
+            let second = second
+                .map_err(|_| LabError::Internal("research runtime sibling panicked".into()))
+                .and_then(std::convert::identity);
+            if let Err(error) = &second {
+                tracing::error!(event = "research_runtime_sibling_failed", error = %error);
+            }
+            let result = first.and(second);
+            let result = if control_poisoned {
+                Err(LabError::Internal(
+                    "job control lock poisoned; children joined".into(),
+                ))
+            } else {
+                result
             };
             if result.is_err() {
-                // The execution task and its blocking calls have finished. Durable
-                // recovery covers a claim even if active-cache installation failed.
-                if let Some((_, cancellation)) = active {
-                    cancellation.cancel();
-                }
                 let recovered = supervisor
                     .inner
                     .database
@@ -127,12 +167,8 @@ impl JobRuntime {
                     })
                     .await;
                 if recovered.is_err() {
-                    tracing::error!(
-                        event = "runner_interruption_unconfirmed",
-                        recovery = "DURABLE_READBACK_OR_RESTART_REQUIRED"
-                    );
+                    tracing::error!(event = "runner_interruption_unconfirmed");
                 }
-                tracing::error!(event = "job_runner_unavailable", admission = "CLOSED");
             }
             result
         });
@@ -161,7 +197,10 @@ impl JobRuntime {
             .map_err(|_| LabError::Internal("job control lock poisoned".into()));
         let cancellation = match active {
             Ok(Some((job_id, token))) => {
-                let persisted = self.service.persist_cancel(job_id).await;
+                let persisted = self
+                    .service
+                    .persist_cancel(job_id, CancellationAuthority::RuntimeOwner)
+                    .await;
                 if persisted.is_ok() {
                     token.cancel();
                 }
@@ -260,20 +299,8 @@ impl JobService {
             }
             JobPayload::Export { .. } | JobPayload::Verify { .. } => {}
         }
-        let gate = self.inner.admission_gate.clone().lock_owned().await;
-        let owner = self.inner.clone();
         let job = self
-            .inner
-            .database
-            .call("submit_job", move |store| {
-                let _gate = gate;
-                if !owner.admitting.load(Ordering::Acquire)
-                    || !owner.runner_available.load(Ordering::Acquire)
-                {
-                    return Err(LabError::ResourceLimit(
-                        "job runner admission closed".into(),
-                    ));
-                }
+            .admitted("submit_job", move |store| {
                 store.submit_job(&submission, UtcTimestamp::now())
             })
             .await?;
@@ -289,7 +316,9 @@ impl JobService {
         match control {
             JobControl::Get { job_id } => self.get(job_id).await,
             JobControl::Cancel { job_id } => {
-                let job = self.persist_cancel(job_id.clone()).await?;
+                let job = self
+                    .persist_cancel(job_id.clone(), CancellationAuthority::Client)
+                    .await?;
                 let active = self
                     .inner
                     .active
@@ -305,20 +334,8 @@ impl JobService {
                 if !self.inner.admitting.load(Ordering::Acquire) {
                     return Err(LabError::ResourceLimit("job retry stopped".into()));
                 }
-                let gate = self.inner.admission_gate.clone().lock_owned().await;
-                let owner = self.inner.clone();
                 let job = self
-                    .inner
-                    .database
-                    .call("retry_job", move |store| {
-                        let _gate = gate;
-                        if !owner.admitting.load(Ordering::Acquire)
-                            || !owner.runner_available.load(Ordering::Acquire)
-                        {
-                            return Err(LabError::ResourceLimit(
-                                "job runner admission closed".into(),
-                            ));
-                        }
+                    .admitted("retry_job", move |store| {
                         store.retry_job(&job_id, UtcTimestamp::now())
                     })
                     .await?;
@@ -328,13 +345,20 @@ impl JobService {
         }
     }
 
-    async fn persist_cancel(&self, job_id: JobId) -> Result<JobRecord, LabError> {
+    async fn persist_cancel(
+        &self,
+        job_id: JobId,
+        authority: CancellationAuthority,
+    ) -> Result<JobRecord, LabError> {
         let id = job_id.clone();
         match self
             .inner
             .database
-            .call("cancel_job", move |store| {
-                store.request_cancel(&id, UtcTimestamp::now())
+            .call("cancel_job", move |store| match authority {
+                CancellationAuthority::Client => store.request_cancel(&id, UtcTimestamp::now()),
+                CancellationAuthority::RuntimeOwner => {
+                    store.request_cancel_owned(&id, UtcTimestamp::now())
+                }
             })
             .await
         {
@@ -399,7 +423,7 @@ impl JobService {
                 self.inner
                     .database
                     .call("cancel_claim_during_shutdown", move |store| {
-                        store.request_cancel(&id, UtcTimestamp::now())
+                        store.request_cancel_owned(&id, UtcTimestamp::now())
                     })
                     .await?;
                 cancellation.cancel();
@@ -785,38 +809,52 @@ impl JobService {
             models.push(model);
         }
         check_cancel(cancellation)?;
-        let (digest, report, completed, blocked, count) = tokio::task::spawn_blocking(move || {
-            let mut bundle = RunBundle {
-                manifest,
-                plan: Arc::try_unwrap(plan).map_err(|_| {
-                    LabError::Internal("plan worker reference remains after join".into())
-                })?,
-                datasets: Arc::try_unwrap(datasets).map_err(|_| {
-                    LabError::Internal("dataset worker reference remains after join".into())
-                })?,
-                evidence: Arc::try_unwrap(evidence).map_err(|_| {
-                    LabError::Internal("Evidence worker reference remains after join".into())
-                })?,
-                models,
-                semantic_digest: ContentHash::of_bytes(b"not-published"),
-            };
-            bundle.semantic_digest = crate::reporting::semantic_digest(&bundle)?;
-            let report = crate::reporting::verify_run(&bundle);
-            if report.status != ValidationStatus::Pass {
-                return Err(LabError::AccountingInvariant(report.findings.join("; ")));
-            }
-            let completed = bundle
-                .models
-                .iter()
-                .filter(|m| m.status == ModelStatus::Completed)
-                .count();
-            let blocked = bundle.models.len() - completed;
-            let count = u64::try_from(bundle.models.len())
-                .map_err(|_| LabError::ResourceLimit("model count overflow".into()))?;
-            Ok((bundle.semantic_digest, report, completed, blocked, count))
-        })
-        .await
-        .map_err(|_| LabError::Internal("verification worker panicked".into()))??;
+        let (digest, report, completed, blocked, count, comparisons) =
+            tokio::task::spawn_blocking(move || {
+                let mut bundle = RunBundle {
+                    manifest,
+                    plan: Arc::try_unwrap(plan).map_err(|_| {
+                        LabError::Internal("plan worker reference remains after join".into())
+                    })?,
+                    datasets: Arc::try_unwrap(datasets).map_err(|_| {
+                        LabError::Internal("dataset worker reference remains after join".into())
+                    })?,
+                    evidence: Arc::try_unwrap(evidence).map_err(|_| {
+                        LabError::Internal("Evidence worker reference remains after join".into())
+                    })?,
+                    models,
+                    semantic_digest: ContentHash::of_bytes(b"not-published"),
+                };
+                bundle.semantic_digest = crate::reporting::semantic_digest(&bundle)?;
+                let report = crate::reporting::verify_run(&bundle);
+                if report.status != ValidationStatus::Pass {
+                    return Err(LabError::AccountingInvariant(report.findings.join("; ")));
+                }
+                let completed = bundle
+                    .models
+                    .iter()
+                    .filter(|m| m.status == ModelStatus::Completed)
+                    .count();
+                let blocked = bundle.models.len() - completed;
+                let count = u64::try_from(bundle.models.len())
+                    .map_err(|_| LabError::ResourceLimit("model count overflow".into()))?;
+                let causal_digest = crate::research::causal_input_digest(
+                    &bundle.plan,
+                    &bundle.datasets,
+                    bundle.evidence.as_ref(),
+                )?;
+                let comparisons = crate::reporting::build_comparisons(&bundle, &causal_digest)?;
+                Ok((
+                    bundle.semantic_digest,
+                    report,
+                    completed,
+                    blocked,
+                    count,
+                    comparisons,
+                ))
+            })
+            .await
+            .map_err(|_| LabError::Internal("verification worker panicked".into()))??;
         check_cancel(cancellation)?;
         let status = if completed == 0 {
             JobStatus::Blocked
@@ -840,6 +878,7 @@ impl JobService {
                 semantic_digest: digest,
                 expected_models: count,
                 validation: report,
+                comparisons,
             },
             reservation: None,
         })

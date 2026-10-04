@@ -38,6 +38,18 @@ impl StrategyBinding {
             Self::Policy { reference, .. } => Some(reference),
         }
     }
+    /// Return the exact warmup declared by this frozen strategy or policy revision.
+    ///
+    /// # Errors
+    /// Rejects a missing, mismatched or invalid frozen policy definition.
+    pub(crate) fn warmup_bars(&self, plan: &ResolvedPlan) -> Result<usize, LabError> {
+        match self {
+            Self::Legacy(spec) => spec.warmup_bars(),
+            Self::Policy { reference, family } => frozen_policy(plan, reference, *family)?
+                .definition
+                .warmup_bars(),
+        }
+    }
     /// Resolve only the immutable body embedded in this plan, never a registry head.
     /// # Errors
     /// Rejects missing, mismatched or altered frozen definitions.
@@ -46,26 +58,33 @@ impl StrategyBinding {
             Self::Legacy(spec) => Ok(PolicyProgram::Builtin {
                 strategy: spec.clone(),
             }),
-            Self::Policy { reference, family } => {
-                let frozen = plan
-                    .policy_revisions
-                    .iter()
-                    .find(|revision| revision.reference == *reference)
-                    .ok_or_else(|| {
-                        LabError::InputHashMismatch(
-                            "policy revision is not frozen in this plan".into(),
-                        )
-                    })?;
-                validate_frozen_policy(frozen)?;
-                if frozen.family != *family {
-                    return Err(LabError::InputHashMismatch(
-                        "policy family differs from frozen revision".into(),
-                    ));
-                }
-                Ok(frozen.definition.program.clone())
-            }
+            Self::Policy { reference, family } => Ok(frozen_policy(plan, reference, *family)?
+                .definition
+                .program
+                .clone()),
         }
     }
+}
+
+fn frozen_policy<'a>(
+    plan: &'a ResolvedPlan,
+    reference: &PolicyRevisionRef,
+    family: StrategyKind,
+) -> Result<&'a FrozenPolicyRevision, LabError> {
+    let frozen = plan
+        .policy_revisions
+        .iter()
+        .find(|revision| revision.reference == *reference)
+        .ok_or_else(|| {
+            LabError::InputHashMismatch("policy revision is not frozen in this plan".into())
+        })?;
+    validate_frozen_policy(frozen)?;
+    if frozen.family != family {
+        return Err(LabError::InputHashMismatch(
+            "policy family differs from frozen revision".into(),
+        ));
+    }
+    Ok(frozen)
 }
 
 /// Find one exact selected definition for a model admission.
@@ -75,8 +94,12 @@ pub fn strategy_binding(
     plan: &ResolvedPlan,
     admission: &ModelAdmission,
 ) -> Result<StrategyBinding, LabError> {
-    match (&admission.policy_ref, plan.spec.schema_version.as_str()) {
-        (None, "1.0") => plan
+    match (
+        &admission.policy_ref,
+        plan.spec.schema_version.as_str(),
+        plan.spec.causal_execution,
+    ) {
+        (None, "1.0", None) => plan
             .spec
             .strategies
             .iter()
@@ -86,7 +109,8 @@ pub fn strategy_binding(
             .ok_or_else(|| {
                 LabError::InputHashMismatch("legacy admission has no matching strategy".into())
             }),
-        (Some(reference), "2.0") => {
+        (Some(reference), "2.0", None)
+        | (Some(reference), "3.0", Some(super::CausalExecutionPolicy::DeclaredPolicyWarmup)) => {
             let binding = StrategyBinding::Policy {
                 reference: reference.clone(),
                 family: admission.strategy,
@@ -106,7 +130,7 @@ struct ConfigProjection<'a> {
     policy_revisions: &'a [FrozenPolicyRevision],
 }
 
-/// Canonical configuration identity; v1 bytes remain unchanged.
+/// Canonical configuration identity; v1/v2 bytes remain unchanged and v3 commits its causal mode.
 /// # Errors
 /// Rejects version/body disagreement or invalid frozen revisions.
 pub fn experiment_config_digest(
@@ -116,7 +140,7 @@ pub fn experiment_config_digest(
     spec.validate()?;
     match spec.schema_version.as_str() {
         "1.0" if policies.is_empty() => ContentHash::of_value(spec),
-        "2.0" if policies.len() == spec.policy_selections.len() => {
+        "2.0" | "3.0" if policies.len() == spec.policy_selections.len() => {
             for (reference, frozen) in spec.policy_selections.iter().zip(policies) {
                 if *reference != frozen.reference {
                     return Err(LabError::InputHashMismatch(

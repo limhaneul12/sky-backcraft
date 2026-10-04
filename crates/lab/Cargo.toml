@@ -7,10 +7,6 @@ publish = false
 [lints]
 workspace = true
 
-[[bin]]
-name = "sky-backcraft-setup"
-path = "src/bin/setup.rs"
-
 [dependencies]
 axum = { workspace = true }
 chrono = { workspace = true }

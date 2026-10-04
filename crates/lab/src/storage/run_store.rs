@@ -8,8 +8,8 @@ use super::{
 use crate::contracts::{
     AccountMark, ArtifactId, ArtifactRef, AttemptState, EpisodeRecord, FillRecord, JobPayload,
     JobStatus, LabError, LedgerSection, ModelId, ModelLedger, ModelStatus, OrderRecord, Page,
-    PlanId, QueryCursor, ResultQuery, RunBundle, RunHeader, RunId, SignalRecord, UtcTimestamp,
-    ValidationReport, ValidationStatus, strategy_binding,
+    PlanId, QueryCursor, ResultQuery, RunBundle, RunHeader, RunId, RunModelComparison,
+    SignalRecord, UtcTimestamp, ValidationReport, ValidationStatus, strategy_binding,
 };
 use rusqlite::{OptionalExtension, Transaction, params};
 use std::collections::{BTreeMap, BTreeSet};
@@ -291,6 +291,7 @@ impl Store {
         run_id: &RunId,
         semantic_digest: &crate::contracts::ContentHash,
         expected_models: u64,
+        comparisons: &[RunModelComparison],
     ) -> Result<PreparedRunPublication, LabError> {
         let header = self
             .load_run_header(run_id)?
@@ -341,6 +342,20 @@ impl Store {
         .map_err(|_| LabError::ResourceLimit("completed model count overflow".into()))?;
         let total_models = u64::try_from(bundle.models.len())
             .map_err(|_| LabError::ResourceLimit("model count overflow".into()))?;
+        let causal_input_digest = crate::research::causal_input_digest(
+            &bundle.plan,
+            &bundle.datasets,
+            bundle.evidence.as_ref(),
+        )?;
+        let expected_comparisons =
+            crate::reporting::build_comparisons(&bundle, &causal_input_digest)?;
+        if serde_json::to_vec(comparisons).map_err(json_error)?
+            != serde_json::to_vec(&expected_comparisons).map_err(json_error)?
+        {
+            return Err(LabError::InputHashMismatch(
+                "run comparisons differ from the verified run projection".into(),
+            ));
+        }
         Ok(PreparedRunPublication {
             final_state: derive_run_state(&bundle.models),
             validation: verification,
@@ -548,6 +563,19 @@ impl Store {
             }
         }
     }
+}
+
+pub(super) fn insert_run_comparisons(
+    transaction: &Transaction<'_>,
+    comparisons: &[RunModelComparison],
+) -> Result<(), LabError> {
+    for comparison in comparisons {
+        transaction.execute(
+            "INSERT INTO run_model_comparisons(run_id,model_id,comparison_json) VALUES (?1,?2,?3)",
+            params![comparison.run_id.as_str(), comparison.model_id.as_str(), serde_json::to_string(comparison).map_err(json_error)?],
+        ).map_err(sql_error)?;
+    }
+    Ok(())
 }
 
 pub(super) fn insert_artifact_row(

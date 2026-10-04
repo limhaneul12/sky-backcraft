@@ -92,7 +92,40 @@ fn full_tool_catalog_and_malformed_inputs_use_protocol_contract()
         let jobs =
             crate::jobs::JobRuntime::start(database.handle(), upbit.clone(), root.clone(), None)
                 .await?;
-        let service = LabMcpService::new(database.handle(), upbit, None, jobs.service(), true);
+        let service = LabMcpService::new(
+            database.handle(),
+            upbit,
+            None,
+            jobs.service(),
+            McpExposure::PublicNoAuth,
+        );
+        for (exposure, auth, public) in [
+            (McpExposure::Local, "none", false),
+            (McpExposure::PublicNoAuth, "none", true),
+            (McpExposure::Bearer, "bearer", false),
+            (McpExposure::OAuth, "oauth", false),
+        ] {
+            let mut projection = service.clone();
+            projection.exposure = exposure;
+            let status_result = projection
+                .lab_status()
+                .await
+                .map_err(|error| LabError::Internal(format!("status projection: {error:?}")))?;
+            let status: serde_json::Value = serde_json::from_str(&result_text(status_result))?;
+            assert_eq!(
+                status["transport"],
+                serde_json::json!({
+                    "auth": auth, "public_no_auth": public, "progress_stream": false,
+                    "job_results": "poll job_control by opaque job_id",
+                })
+            );
+            assert_eq!(
+                status["deletion"]["public_no_auth_warning"]
+                    .as_str()
+                    .is_some_and(|warning| !warning.is_empty()),
+                public
+            );
+        }
         let (server_transport, client_transport) = tokio::io::duplex(16_384);
         let server_handle = tokio::spawn(async move {
             let server = service
@@ -121,6 +154,7 @@ fn full_tool_catalog_and_malformed_inputs_use_protocol_contract()
             [
                 "artifact_query",
                 "collect_data",
+                "collection_schedule",
                 "dataset_query",
                 "evidence_register",
                 "export_report",
@@ -131,10 +165,12 @@ fn full_tool_catalog_and_malformed_inputs_use_protocol_contract()
                 "policy_query",
                 "policy_write",
                 "probe_upbit",
+                "research_suite",
                 "resource_delete_preview",
                 "resource_hard_delete",
                 "result_query",
                 "run_backtests",
+                "storage_maintenance",
                 "verify_run",
             ]
         );
@@ -158,7 +194,7 @@ fn full_tool_catalog_and_malformed_inputs_use_protocol_contract()
             assert_eq!(annotations.destructive_hint, Some(expected_destructive));
             assert_eq!(
                 annotations.open_world_hint,
-                Some(matches!(tool.name.as_ref(), "probe_upbit" | "collect_data"))
+                Some(matches!(tool.name.as_ref(), "probe_upbit" | "collect_data" | "collection_schedule"))
             );
             assert_eq!(
                 tool.input_schema.get("type"),
@@ -191,6 +227,21 @@ fn full_tool_catalog_and_malformed_inputs_use_protocol_contract()
                 "policy_query",
                 serde_json::json!({"action": "list", "after_policy_id": null, "limit": 0}),
                 "history limit must be in 1..=100",
+            ),
+            (
+                "research_suite",
+                serde_json::json!({"action": "list", "offset": 0, "limit": 0}),
+                "research page limit must be in 1..=100",
+            ),
+            (
+                "collection_schedule",
+                serde_json::json!({"action": "list", "offset": 0, "limit": 101}),
+                "research page limit must be in 1..=100",
+            ),
+            (
+                "storage_maintenance",
+                serde_json::json!({"action": "retention_candidates", "cutoff": "2024-01-01T00:00:00Z", "keep_recent": 1, "offset": 0, "limit": 0}),
+                "research page limit must be in 1..=100",
             ),
         ] {
             let mut request = CallToolRequestParams::default();

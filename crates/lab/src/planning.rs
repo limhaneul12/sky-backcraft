@@ -27,6 +27,16 @@ pub async fn prepare(
     database: &DatabaseHandle,
     request: PlanRequest,
 ) -> Result<ResolvedPlan, LabError> {
+    Ok(prepare_with_causal_digest(database, request).await?.0)
+}
+
+/// Freeze the plan and its actual causal-use witness from one verified input load.
+/// # Errors
+/// Preserves ordinary planning errors and rejects invalid causal input contracts.
+pub(crate) async fn prepare_with_causal_digest(
+    database: &DatabaseHandle,
+    request: PlanRequest,
+) -> Result<(ResolvedPlan, ContentHash), LabError> {
     request.spec.validate()?;
     let (datasets, evidence) = load_inputs(database, &request.spec).await?;
     let references = request.spec.policy_selections.clone();
@@ -44,11 +54,12 @@ pub async fn prepare(
         })
         .await?;
     let plan = resolve_with_policies(&request.spec, &datasets, evidence.as_ref(), &policies)?;
+    let causal_digest = crate::research::causal_input_digest(&plan, &datasets, evidence.as_ref())?;
     let saved = plan.clone();
     database
         .call("save_plan", move |store| store.save_plan(&request, &saved))
         .await?;
-    Ok(plan)
+    Ok((plan, causal_digest))
 }
 
 /// Load immutable datasets and evidence, verifying bytes and economic identities.

@@ -154,6 +154,10 @@ identifier!(ArtifactId, "artifact");
 identifier!(RuleSnapshotId, "rule");
 identifier!(PolicyId, "policy");
 identifier!(PolicyRevisionId, "policy-revision");
+identifier!(SuiteId, "suite");
+identifier!(SuiteCaseId, "suite-case");
+identifier!(ScheduleId, "schedule");
+identifier!(BackupId, "backup");
 
 impl ArtifactId {
     /// Derive an immutable file identity within an explicit package/storage namespace.

@@ -993,6 +993,7 @@ fn fixture() -> RunBundle {
     dataset.manifest.provenance_digest = dataset_digests.provenance;
     let spec = ExperimentSpec {
         schema_version: SCHEMA_VERSION.into(),
+        causal_execution: None,
         dataset_ids: vec![dataset_id.clone()],
         markets: vec![market.clone()],
         range,

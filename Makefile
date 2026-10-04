@@ -1,6 +1,6 @@
 SHELL := /bin/sh
 
-.PHONY: ci rebuild package
+.PHONY: ci rebuild package native-check
 
 ci:
 	docker compose --profile ci build ci
@@ -10,6 +10,8 @@ rebuild:
 	./scripts/docker-rebuild.sh
 
 package:
-	cargo build --release --bin spot-lab --bin sky-backcraft-setup
 	./scripts/package.sh
 
+native-check:
+	./scripts/test-native-lifecycle.sh
+	./scripts/test-native-runtime-integration.sh

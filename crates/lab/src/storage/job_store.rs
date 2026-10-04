@@ -1,15 +1,21 @@
-use super::run_store::{insert_artifact_row, insert_validation_row};
+use super::run_store::{insert_artifact_row, insert_run_comparisons, insert_validation_row};
 use super::{Store, enum_text, json_error, sql_error, timestamp_ms, u64_to_i64};
 use crate::contracts::{
     ArtifactRef, AttemptId, AttemptState, ContentHash, DatasetSnapshot, JobAttempt, JobId,
     JobOutput, JobProgress, JobRecord, JobStatus, JobSubmission, LabError, ProgressCountUnit,
-    RequestId, RunId, UtcTimestamp, ValidationReport,
+    RequestId, RunId, RunModelComparison, UtcTimestamp, ValidationReport,
 };
 use rusqlite::{OptionalExtension, Transaction, params};
 
 const MAX_QUEUED_JOBS: i64 = 8;
 const MAX_JOB_ATTEMPTS: u32 = 32;
 const INITIAL_STAGE: &str = "queued";
+
+#[derive(Debug, Clone)]
+pub(super) struct JobPin {
+    pub job_id: JobId,
+    pub attempt_id: AttemptId,
+}
 
 #[derive(Debug, Clone)]
 pub enum AttemptPublication {
@@ -19,6 +25,7 @@ pub enum AttemptPublication {
         semantic_digest: ContentHash,
         expected_models: u64,
         validation: ValidationReport,
+        comparisons: Vec<RunModelComparison>,
     },
     Dataset(Box<DatasetSnapshot>),
     Artifacts(Vec<ArtifactRef>),
@@ -35,41 +42,10 @@ impl Store {
         submission: &JobSubmission,
         now: UtcTimestamp,
     ) -> Result<JobRecord, LabError> {
-        let input_digest = ContentHash::of_value(&submission.payload)?;
-        if let Some(job_id) = self
-            .connection
-            .query_row(
-                "SELECT id FROM jobs WHERE request_id=?1",
-                [submission.request_id.as_str()],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(sql_error)?
-        {
-            let existing = self.get_job(&JobId::new(job_id)?)?.ok_or_else(|| {
-                LabError::DataCorrupt("job identity disappeared during idempotency check".into())
-            })?;
-            return if existing.normalized_input_digest == input_digest {
-                Ok(existing)
-            } else {
-                Err(LabError::Conflict(
-                    "request id already names a different job payload".into(),
-                ))
-            };
-        }
-        enforce_queue_capacity(&self.connection)?;
-        let job_id = JobId::from_seed(submission.request_id.as_str());
-        let attempt_id = attempt_id(&job_id, 1);
-        let state = AttemptState::Queued { queued_at: now };
-        let payload_json = serde_json::to_string(&submission.payload).map_err(json_error)?;
         let transaction = self.connection.transaction().map_err(sql_error)?;
-        transaction.execute(
-            "INSERT INTO jobs(id,request_id,normalized_input_digest,payload_kind,payload_json,current_attempt_number,current_status,created_at_ms) VALUES (?1,?2,?3,?4,?5,1,?6,?7)",
-            params![job_id.as_str(), submission.request_id.as_str(), input_digest.as_str(), payload_kind(&submission.payload), payload_json, enum_text(&JobStatus::Queued)?, timestamp_ms(now)],
-        ).map_err(sql_error)?;
-        insert_attempt(&transaction, &attempt_id, &job_id, 1, &input_digest, &state)?;
+        let pin = insert_job_tx(&transaction, submission, now)?;
         transaction.commit().map_err(sql_error)?;
-        self.get_job(&job_id)?
+        self.get_job(&pin.job_id)?
             .ok_or_else(|| LabError::Internal("submitted job disappeared".into()))
     }
 
@@ -205,24 +181,26 @@ impl Store {
         job_id: &JobId,
         now: UtcTimestamp,
     ) -> Result<JobRecord, LabError> {
-        let current = self.current_attempt(job_id)?;
-        let current_status = current.state.status();
-        let next = match current.state {
-            AttemptState::Queued { .. } => AttemptState::Cancelled {
-                ended_at: now,
-                reason: "cancel requested before execution".into(),
-            },
-            AttemptState::Running { started_at, .. } => AttemptState::Running {
-                started_at,
-                cancel_requested_at: Some(now),
-            },
-            _ => {
-                return self
-                    .get_job(job_id)?
-                    .ok_or_else(|| LabError::InvalidConfig("unknown job".into()));
-            }
-        };
-        self.replace_attempt_state(&current.id, current_status, &next)?;
+        if self.is_managed_job(job_id)? {
+            return Err(LabError::Conflict(
+                "managed child cancellation requires its suite or schedule owner".into(),
+            ));
+        }
+        self.request_cancel_owned(job_id, now)
+    }
+
+    /// Cancel through an owning runtime/suite/schedule authority.
+    ///
+    /// # Errors
+    /// Returns missing/conflict/corrupt state or SQLite failure.
+    pub(crate) fn request_cancel_owned(
+        &mut self,
+        job_id: &JobId,
+        now: UtcTimestamp,
+    ) -> Result<JobRecord, LabError> {
+        let transaction = self.connection.transaction().map_err(sql_error)?;
+        request_cancel_tx(&transaction, job_id, now)?;
+        transaction.commit().map_err(sql_error)?;
         self.get_job(job_id)?
             .ok_or_else(|| LabError::Internal("cancelled job disappeared".into()))
     }
@@ -232,43 +210,30 @@ impl Store {
     /// # Errors
     /// Rejects nonterminal jobs, full queue, identity overflow, or SQLite failure.
     pub fn retry_job(&mut self, job_id: &JobId, now: UtcTimestamp) -> Result<JobRecord, LabError> {
-        let current = self.current_attempt(job_id)?;
-        if !current.state.is_terminal() {
+        if self.is_managed_job(job_id)? {
             return Err(LabError::Conflict(
-                "only a terminal job can be retried".into(),
+                "managed child retry requires its suite or schedule owner".into(),
             ));
         }
-        if current.number >= MAX_JOB_ATTEMPTS {
-            return Err(LabError::ResourceLimit(format!(
-                "job attempt history limit is {MAX_JOB_ATTEMPTS}"
-            )));
-        }
-        enforce_queue_capacity(&self.connection)?;
-        let next_number = current
-            .number
-            .checked_add(1)
-            .ok_or_else(|| LabError::ResourceLimit("job attempt number overflow".into()))?;
-        let next_id = attempt_id(job_id, next_number);
-        let state = AttemptState::Queued { queued_at: now };
         let transaction = self.connection.transaction().map_err(sql_error)?;
-        insert_attempt(
-            &transaction,
-            &next_id,
-            job_id,
-            next_number,
-            &current.input_digest,
-            &state,
-        )?;
-        let changed = transaction.execute(
-            "UPDATE jobs SET current_attempt_number=?1,current_status=?2 WHERE id=?3 AND current_attempt_number=?4",
-            params![next_number, enum_text(&JobStatus::Queued)?, job_id.as_str(), current.number],
-        ).map_err(sql_error)?;
-        if changed != 1 {
-            return Err(LabError::Conflict("job retry CAS failed".into()));
-        }
+        retry_job_tx(&transaction, job_id, now)?;
         transaction.commit().map_err(sql_error)?;
         self.get_job(job_id)?
             .ok_or_else(|| LabError::Internal("retried job disappeared".into()))
+    }
+
+    /// Whether an ordinary job is owned by a suite case or schedule fire.
+    ///
+    /// # Errors
+    /// Returns an error for SQLite failure.
+    pub fn is_managed_job(&self, job_id: &JobId) -> Result<bool, LabError> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM research_suite_cases WHERE job_id=?1 UNION ALL SELECT 1 FROM schedule_fires WHERE job_id=?1)",
+                [job_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)
     }
 
     /// Mark all process-abandoned running attempts interrupted.
@@ -413,9 +378,14 @@ impl Store {
                 semantic_digest,
                 expected_models,
                 validation,
+                comparisons,
             } => {
-                let prepared =
-                    self.prepare_run_publication(run_id, semantic_digest, *expected_models)?;
+                let prepared = self.prepare_run_publication(
+                    run_id,
+                    semantic_digest,
+                    *expected_models,
+                    comparisons,
+                )?;
                 if serde_json::to_vec(validation).map_err(json_error)?
                     != serde_json::to_vec(&prepared.validation).map_err(json_error)?
                     || !terminal_matches_run(&terminal, run_id, &prepared)
@@ -501,6 +471,7 @@ impl Store {
                     run_id,
                     semantic_digest,
                     validation,
+                    comparisons,
                     ..
                 },
                 Some(prepared),
@@ -513,6 +484,7 @@ impl Store {
                     return Err(LabError::Conflict("run publication CAS failed".into()));
                 }
                 insert_validation_row(&transaction, validation)?;
+                insert_run_comparisons(&transaction, comparisons)?;
             }
             (AttemptPublication::Artifacts(artifacts), None) => {
                 for artifact in artifacts {
@@ -629,15 +601,6 @@ impl Store {
         self.load_attempt(attempt_id)
     }
 
-    fn current_attempt(&self, job_id: &JobId) -> Result<JobAttempt, LabError> {
-        let id = self.connection.query_row(
-            "SELECT a.id FROM jobs j JOIN job_attempts a ON a.job_id=j.id AND a.attempt_number=j.current_attempt_number WHERE j.id=?1",
-            [job_id.as_str()],
-            |row| row.get::<_, String>(0),
-        ).optional().map_err(sql_error)?.ok_or_else(|| LabError::InvalidConfig("unknown job".into()))?;
-        self.load_attempt(&AttemptId::new(id)?)
-    }
-
     pub(super) fn load_attempt(&self, id: &AttemptId) -> Result<JobAttempt, LabError> {
         let row = self.connection.query_row(
             "SELECT a.job_id,a.attempt_number,a.input_digest,a.state_json,a.progress_stage,a.committed_records,a.last_committed_event_seq,j.payload_json FROM job_attempts a JOIN jobs j ON j.id=a.job_id WHERE a.id=?1",
@@ -704,6 +667,158 @@ impl Store {
         ).map_err(sql_error)?;
         transaction.commit().map_err(sql_error)
     }
+}
+
+pub(super) fn insert_job_tx(
+    transaction: &Transaction<'_>,
+    submission: &JobSubmission,
+    now: UtcTimestamp,
+) -> Result<JobPin, LabError> {
+    let input_digest = ContentHash::of_value(&submission.payload)?;
+    if let Some((job_id, stored_digest, attempt_id)) = transaction
+        .query_row(
+            "SELECT j.id,j.normalized_input_digest,a.id FROM jobs j JOIN job_attempts a ON a.job_id=j.id AND a.attempt_number=j.current_attempt_number WHERE j.request_id=?1",
+            [submission.request_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sql_error)?
+    {
+        if stored_digest != input_digest.as_str() {
+            return Err(LabError::Conflict(
+                "request id already names a different job payload".into(),
+            ));
+        }
+        return Ok(JobPin {
+            job_id: JobId::new(job_id)?,
+            attempt_id: AttemptId::new(attempt_id)?,
+        });
+    }
+
+    enforce_queue_capacity(transaction)?;
+    let job_id = JobId::from_seed(submission.request_id.as_str());
+    let attempt_id = attempt_id(&job_id, 1);
+    let state = AttemptState::Queued { queued_at: now };
+    transaction.execute(
+        "INSERT INTO jobs(id,request_id,normalized_input_digest,payload_kind,payload_json,current_attempt_number,current_status,created_at_ms) VALUES (?1,?2,?3,?4,?5,1,?6,?7)",
+        params![job_id.as_str(), submission.request_id.as_str(), input_digest.as_str(), payload_kind(&submission.payload), serde_json::to_string(&submission.payload).map_err(json_error)?, enum_text(&JobStatus::Queued)?, timestamp_ms(now)],
+    ).map_err(sql_error)?;
+    insert_attempt(transaction, &attempt_id, &job_id, 1, &input_digest, &state)?;
+    Ok(JobPin { job_id, attempt_id })
+}
+
+pub(super) fn retry_job_tx(
+    transaction: &Transaction<'_>,
+    job_id: &JobId,
+    now: UtcTimestamp,
+) -> Result<AttemptId, LabError> {
+    let (attempt_number, input_digest, state_json): (u32, String, String) = transaction
+        .query_row(
+            "SELECT a.attempt_number,a.input_digest,a.state_json FROM jobs j JOIN job_attempts a ON a.job_id=j.id AND a.attempt_number=j.current_attempt_number WHERE j.id=?1",
+            [job_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(sql_error)?
+        .ok_or_else(|| LabError::InvalidConfig("unknown job".into()))?;
+    let state: AttemptState = serde_json::from_str(&state_json).map_err(json_error)?;
+    if !state.is_terminal() {
+        return Err(LabError::Conflict(
+            "only a terminal job can be retried".into(),
+        ));
+    }
+    if attempt_number >= MAX_JOB_ATTEMPTS {
+        return Err(LabError::ResourceLimit(format!(
+            "job attempt history limit is {MAX_JOB_ATTEMPTS}"
+        )));
+    }
+    enforce_queue_capacity(transaction)?;
+    let next_number = attempt_number
+        .checked_add(1)
+        .ok_or_else(|| LabError::ResourceLimit("job attempt number overflow".into()))?;
+    let next_id = attempt_id(job_id, next_number);
+    insert_attempt(
+        transaction,
+        &next_id,
+        job_id,
+        next_number,
+        &ContentHash::try_from(input_digest)?,
+        &AttemptState::Queued { queued_at: now },
+    )?;
+    let changed = transaction.execute(
+        "UPDATE jobs SET current_attempt_number=?1,current_status=?2 WHERE id=?3 AND current_attempt_number=?4",
+        params![next_number, enum_text(&JobStatus::Queued)?, job_id.as_str(), attempt_number],
+    ).map_err(sql_error)?;
+    if changed != 1 {
+        return Err(LabError::Conflict("job retry CAS failed".into()));
+    }
+    Ok(next_id)
+}
+
+pub(super) fn request_cancel_tx(
+    transaction: &Transaction<'_>,
+    job_id: &JobId,
+    now: UtcTimestamp,
+) -> Result<AttemptId, LabError> {
+    let (attempt_id_text, state_json, payload_json, records, event_seq): (
+        String,
+        String,
+        String,
+        i64,
+        i64,
+    ) = transaction
+        .query_row(
+            "SELECT a.id,a.state_json,j.payload_json,a.committed_records,a.last_committed_event_seq FROM jobs j JOIN job_attempts a ON a.job_id=j.id AND a.attempt_number=j.current_attempt_number WHERE j.id=?1",
+            [job_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .optional()
+        .map_err(sql_error)?
+        .ok_or_else(|| LabError::InvalidConfig("unknown job".into()))?;
+    let attempt_id = AttemptId::new(attempt_id_text)?;
+    let current: AttemptState = serde_json::from_str(&state_json).map_err(json_error)?;
+    let current_status = current.status();
+    let next = match current {
+        AttemptState::Queued { .. } => AttemptState::Cancelled {
+            ended_at: now,
+            reason: "cancel requested before execution".into(),
+        },
+        AttemptState::Running { started_at, .. } => AttemptState::Running {
+            started_at,
+            cancel_requested_at: Some(now),
+        },
+        _ => return Ok(attempt_id),
+    };
+    update_state(
+        transaction,
+        attempt_id.as_str(),
+        &enum_text(&current_status)?,
+        &next,
+    )?;
+    insert_attempt_output(transaction, &attempt_id, &next)?;
+    let payload = serde_json::from_str(&payload_json).map_err(json_error)?;
+    persist_terminal_progress(
+        transaction,
+        &attempt_id,
+        &next,
+        &payload,
+        records,
+        event_seq,
+    )?;
+    let changed = transaction.execute(
+        "UPDATE jobs SET current_status=?1 WHERE id=?2 AND current_attempt_number=(SELECT attempt_number FROM job_attempts WHERE id=?3)",
+        params![enum_text(&next.status())?, job_id.as_str(), attempt_id.as_str()],
+    ).map_err(sql_error)?;
+    if changed != 1 {
+        return Err(LabError::Conflict("job cancellation CAS failed".into()));
+    }
+    Ok(attempt_id)
 }
 
 fn insert_attempt(

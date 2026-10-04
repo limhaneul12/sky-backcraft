@@ -10,12 +10,14 @@ use crate::contracts::policy::{
 };
 use crate::contracts::{
     AdmissionStatus, AssetQuantity, BasisPoints, CandleInterval, CandleObservation, CandleRecord,
-    CollectRequest, ContentHash, CostPolicy, DatasetId, DatasetManifest, DatasetSnapshot,
-    DatasetStatus, EvidenceUnavailablePolicy, ExecutionPolicy, MarketDataOrigin, MarketId,
-    MarketRuleSnapshot, ModelAdmission, ModelId, ModelStatus, PitPolicy, PlanId, PriceKrw,
-    QuoteAmount, ReportClock, RequestId, ResolvedPlan, RuleProvenance, RuleSnapshotId, RunId,
-    SCHEMA_VERSION, Side, StateParameters, StrategyKind, StrategySpec, TerminalPolicy, TickBand,
-    UtcRange, UtcTimestamp, Weight,
+    CausalExecutionPolicy, CollectRequest, ContentHash, CostPolicy, DatasetId, DatasetManifest,
+    DatasetSnapshot, DatasetStatus, EvidenceId, EvidenceImport, EvidenceProvenance,
+    EvidencePurpose, EvidenceRevisionId, EvidenceUnavailablePolicy, EvidenceVersion,
+    ExecutionPolicy, MarketDataOrigin, MarketId, MarketRuleSnapshot, ModelAdmission, ModelId,
+    ModelStatus, PitPolicy, PlanId, PriceKrw, QuoteAmount, ReportClock, RequestId, ResolvedPlan,
+    RuleProvenance, RuleSnapshotId, RunId, SCHEMA_VERSION, Side, StateParameters, StrategyKind,
+    StrategySpec, TerminalPolicy, TickBand, UtcRange, UtcTimestamp, Weight,
+    experiment_config_digest,
 };
 use rust_decimal::Decimal;
 
@@ -414,6 +416,352 @@ fn frozen_custom_rule_policy_runs_and_records_exact_trace() {
 }
 
 #[test]
+fn causal_execution_ignores_a_gapped_future_suffix() {
+    let (plan, baseline, admission, run_id, _) = causal_s1_fixture();
+    let expected = run_model(
+        &plan,
+        std::slice::from_ref(&baseline),
+        None,
+        &run_id,
+        &admission,
+        820,
+        &|| false,
+    )
+    .expect("bounded causal fixture executes");
+    let mut with_future_gap = baseline;
+    with_future_gap.observations.push(observation(
+        "irrelevant-future",
+        "2025-01-02T04:00:00Z",
+        "999999",
+        "1",
+    ));
+    refresh_dataset_identity(&mut with_future_gap, b"causal-future-gap");
+    let mut future_plan = plan;
+    future_plan.dataset_digests[0].1 = with_future_gap.manifest.semantic_digest.clone();
+
+    let actual = run_model(
+        &future_plan,
+        &[with_future_gap],
+        None,
+        &run_id,
+        &admission,
+        820,
+        &|| false,
+    )
+    .expect("observations after the causal range cannot invalidate training");
+    assert_eq!(
+        serde_json::to_value(actual).expect("actual ledger serializes"),
+        serde_json::to_value(expected).expect("expected ledger serializes")
+    );
+}
+
+#[test]
+fn legacy_v1_and_v2_keep_whole_vector_continuity_validation() {
+    let (mut v1_plan, mut v1_dataset, v1_admission, v1_run_id, _) = buy_and_hold_fixture();
+    v1_dataset.observations.push(observation(
+        "legacy-v1-future-gap",
+        "2025-01-02T04:00:00Z",
+        "999999",
+        "1",
+    ));
+    refresh_dataset_identity(&mut v1_dataset, b"legacy-v1-future-gap");
+    v1_plan.dataset_digests[0].1 = v1_dataset.manifest.semantic_digest.clone();
+    assert!(matches!(
+        run_model(
+            &v1_plan,
+            &[v1_dataset],
+            None,
+            &v1_run_id,
+            &v1_admission,
+            830,
+            &|| false,
+        ),
+        Err(crate::contracts::LabError::DataGap(_))
+    ));
+
+    let (mut v2_plan, mut v2_dataset, v2_admission, v2_run_id, _) = causal_s1_fixture();
+    v2_plan.spec.schema_version = "2.0".into();
+    v2_plan.spec.causal_execution = None;
+    v2_dataset.observations.push(observation(
+        "legacy-v2-future-gap",
+        "2025-01-02T04:00:00Z",
+        "999999",
+        "1",
+    ));
+    refresh_dataset_identity(&mut v2_dataset, b"legacy-v2-future-gap");
+    v2_plan.dataset_digests[0].1 = v2_dataset.manifest.semantic_digest.clone();
+    assert!(matches!(
+        run_model(
+            &v2_plan,
+            &[v2_dataset],
+            None,
+            &v2_run_id,
+            &v2_admission,
+            830,
+            &|| false,
+        ),
+        Err(crate::contracts::LabError::DataGap(_))
+    ));
+}
+
+#[test]
+fn causal_execution_ignores_history_before_declared_policy_warmup() {
+    let (plan, baseline, admission, run_id, _) = causal_s1_fixture();
+    let mut altered_past = baseline.clone();
+    altered_past.observations[0] =
+        observation("past-too-old", "2025-01-01T20:00:00Z", "1000000", "1000000");
+    refresh_dataset_identity(&mut altered_past, b"causal-altered-past");
+    let mut altered_plan = plan.clone();
+    altered_plan.dataset_digests[0].1 = altered_past.manifest.semantic_digest.clone();
+
+    let expected = run_model(&plan, &[baseline], None, &run_id, &admission, 840, &|| {
+        false
+    })
+    .expect("baseline causal fixture executes");
+    let actual = run_model(
+        &altered_plan,
+        &[altered_past],
+        None,
+        &run_id,
+        &admission,
+        840,
+        &|| false,
+    )
+    .expect("past outside declared warmup remains irrelevant");
+    assert_eq!(
+        serde_json::to_value(actual).expect("actual ledger serializes"),
+        serde_json::to_value(expected).expect("expected ledger serializes")
+    );
+}
+
+#[test]
+fn causal_execution_requires_the_declared_warmup_start_boundary() {
+    let (mut plan, mut dataset, admission, run_id, _) = causal_s1_fixture();
+    dataset
+        .observations
+        .retain(|observation| observation.id.as_str() != "warmup-1");
+    refresh_dataset_identity(&mut dataset, b"causal-missing-warmup-start");
+    plan.dataset_digests[0].1 = dataset.manifest.semantic_digest.clone();
+
+    assert!(matches!(
+        run_model(&plan, &[dataset], None, &run_id, &admission, 850, &|| false),
+        Err(crate::contracts::LabError::InsufficientWarmup(_))
+    ));
+}
+
+#[test]
+fn causal_execution_ignores_evidence_available_only_after_the_range() {
+    let (mut plan, dataset, mut admission, run_id, _) = causal_s1_fixture();
+    install_causal_policy(
+        &mut plan,
+        &mut admission,
+        &StrategySpec::S5 {
+            state: StateParameters {
+                ema_length: 2,
+                vol_length: 2,
+                k: 0.0,
+            },
+        },
+        "s5",
+    );
+    let base_version = evidence_version(
+        "evidence-base",
+        "evidence-event",
+        "2025-01-01T23:00:00Z",
+        "1",
+        None,
+    );
+    let base = crate::evidence::build_snapshot(EvidenceImport {
+        public_non_sensitive_ack: true,
+        versions: vec![base_version.clone()],
+    })
+    .expect("base evidence snapshot");
+    let with_future = crate::evidence::build_snapshot(EvidenceImport {
+        public_non_sensitive_ack: true,
+        versions: vec![
+            base_version,
+            evidence_version(
+                "evidence-future",
+                "evidence-event",
+                "2025-01-02T04:00:00Z",
+                "0.1",
+                Some("evidence-base"),
+            ),
+        ],
+    })
+    .expect("future evidence snapshot");
+
+    let mut base_plan = plan.clone();
+    base_plan.evidence_digest = Some(base.digest.clone());
+    base_plan.spec.evidence_snapshot_id = Some(base.id.clone());
+    let mut future_plan = plan;
+    future_plan.evidence_digest = Some(with_future.digest.clone());
+    future_plan.spec.evidence_snapshot_id = Some(with_future.id.clone());
+    let base_ledger = run_model(
+        &base_plan,
+        std::slice::from_ref(&dataset),
+        Some(&base),
+        &run_id,
+        &admission,
+        860,
+        &|| false,
+    )
+    .expect("base evidence executes");
+    let future_ledger = run_model(
+        &future_plan,
+        &[dataset],
+        Some(&with_future),
+        &run_id,
+        &admission,
+        860,
+        &|| false,
+    )
+    .expect("future evidence suffix executes");
+    assert_eq!(base_ledger.signals.len(), future_ledger.signals.len());
+    for (base_signal, future_signal) in base_ledger.signals.iter().zip(&future_ledger.signals) {
+        assert_eq!(
+            base_signal.constrained_target_weight,
+            future_signal.constrained_target_weight
+        );
+        assert_eq!(base_signal.reasons, future_signal.reasons);
+        let eligible_revisions = |signal: &crate::contracts::SignalRecord| {
+            signal
+                .evidence_effect
+                .as_ref()
+                .expect("S5 records evidence")
+                .eligible
+                .iter()
+                .map(|item| item.revision_id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            eligible_revisions(base_signal),
+            eligible_revisions(future_signal)
+        );
+    }
+}
+
+#[test]
+fn causal_schema_is_exact_and_legacy_serialization_stays_omitted() {
+    let (mut v1_plan, v1_dataset, v1_admission, v1_run_id, _) = buy_and_hold_fixture();
+    let v1_bytes = serde_json::to_vec(&v1_plan.spec).expect("v1 spec serializes");
+    assert!(!String::from_utf8_lossy(&v1_bytes).contains("causal_execution"));
+    let v1_digest = experiment_config_digest(&v1_plan.spec, &[]).expect("v1 digest");
+    let v1_replay = run_model(
+        &v1_plan,
+        &[v1_dataset],
+        None,
+        &v1_run_id,
+        &v1_admission,
+        890,
+        &|| false,
+    )
+    .expect("v1 replay executes");
+
+    v1_plan.spec.causal_execution = Some(CausalExecutionPolicy::DeclaredPolicyWarmup);
+    assert!(v1_plan.spec.validate().is_err());
+
+    let (mut v2_plan, v2_dataset, v2_admission_exact, v2_run_id, _) = causal_s1_fixture();
+    let mut v2_admission = v2_admission_exact.clone();
+    v2_plan.spec.schema_version = "2.0".into();
+    v2_plan.spec.causal_execution = None;
+    assert!(v2_plan.spec.validate().is_ok());
+    assert!(
+        !serde_json::to_string(&v2_plan.spec)
+            .expect("v2 spec serializes")
+            .contains("causal_execution")
+    );
+    let v2_digest =
+        experiment_config_digest(&v2_plan.spec, &v2_plan.policy_revisions).expect("v2 digest");
+    let v2_replay = run_model(
+        &v2_plan,
+        &[v2_dataset],
+        None,
+        &v2_run_id,
+        &v2_admission_exact,
+        900,
+        &|| false,
+    )
+    .expect("v2 replay executes");
+    assert_eq!(
+        ContentHash::of_value(&v1_replay)
+            .expect("v1 replay digest")
+            .to_string(),
+        "2b2ce4fec6467c186dcb60e2ee09fedb85f785a2508d16595d445b2a3dcb6e4a"
+    );
+    assert_eq!(
+        ContentHash::of_value(&v2_replay)
+            .expect("v2 replay digest")
+            .to_string(),
+        "b1f531071dab53900a3fe281f1189996c8e67628b785c1ee40ef72e331e3fdcd"
+    );
+
+    v2_plan.spec.schema_version = "3.0".into();
+    assert!(v2_plan.spec.validate().is_err());
+    v2_plan.spec.causal_execution = Some(CausalExecutionPolicy::DeclaredPolicyWarmup);
+    assert!(v2_plan.spec.validate().is_ok());
+    assert!(experiment_config_digest(&v2_plan.spec, &v2_plan.policy_revisions).is_ok());
+    assert!(experiment_config_digest(&v2_plan.spec, &[]).is_err());
+    v2_plan.spec.pit_policy = PitPolicy::LatestVersionProxy;
+    assert!(v2_plan.spec.validate().is_err());
+    v2_plan.spec.pit_policy = PitPolicy::StrictPit;
+    v2_admission.policy_ref = None;
+    assert!(crate::contracts::strategy_binding(&v2_plan, &v2_admission).is_err());
+
+    let mut unknown = serde_json::to_value(&v2_plan.spec).expect("v3 spec serializes");
+    unknown["causal_execution"] = serde_json::Value::String("UNKNOWN".into());
+    assert!(serde_json::from_value::<crate::contracts::ExperimentSpec>(unknown).is_err());
+
+    assert_eq!(v1_digest, ContentHash::of_bytes(&v1_bytes));
+    assert_eq!(
+        v1_digest.to_string(),
+        "f8e9c7b4a02a489414a4ce5dc3970e9473409fb2176fca20d3ba5051aa398ffa"
+    );
+    assert_eq!(
+        v2_digest.to_string(),
+        "3f202d94fd13b0f53b56eeac411406504a178bbde2300fbfcce26e55218846cd"
+    );
+}
+
+#[test]
+fn causal_passive_execution_needs_only_one_pre_range_execution_bar() {
+    let (mut plan, mut dataset, mut admission, run_id, _) = causal_s1_fixture();
+    install_causal_policy(
+        &mut plan,
+        &mut admission,
+        &StrategySpec::BuyAndHold,
+        "passive-buy-hold",
+    );
+    plan.spec.execution = ExecutionPolicy::PassiveBuy {
+        offset_bps: BasisPoints::new(Decimal::ZERO).expect("offset"),
+        penetration_ticks: 0,
+        fill_fraction: crate::contracts::PassiveFraction::Half,
+        ttl_execution_bars: 1,
+        participation_cap: Weight::new(Decimal::ONE).expect("cap"),
+    };
+    dataset.observations = vec![
+        observation("prior", "2025-01-01T23:00:00Z", "100", "100"),
+        observation("first", "2025-01-02T00:00:00Z", "101", "101"),
+        observation("second", "2025-01-02T01:00:00Z", "101", "110"),
+    ];
+    dataset.observations[1].candle.low = price("99");
+    dataset.manifest.coverage =
+        UtcRange::new(time("2025-01-01T23:00:00Z"), time("2025-01-02T02:00:00Z"))
+            .expect("fixture coverage");
+    dataset.manifest.request.warmup_bars = 1;
+    refresh_dataset_identity(&mut dataset, b"causal-passive-one-prior");
+    plan.dataset_digests[0].1 = dataset.manifest.semantic_digest.clone();
+
+    let ledger = run_model(&plan, &[dataset], None, &run_id, &admission, 880, &|| false)
+        .expect("one pre-range execution bar supports passive prior-two-bar indexing");
+    assert_eq!(ledger.fills.len(), 1);
+    assert!(matches!(
+        ledger.fills[0].timing,
+        crate::contracts::FillTiming::Interval { .. }
+    ));
+}
+
+#[test]
 fn rejected_order_keeps_created_and_rejected_events_with_one_final_projection() {
     let (mut plan, dataset, admission, run_id, _) = buy_and_hold_fixture();
     plan.spec.market_rules.min_notional = amount("2000");
@@ -782,6 +1130,7 @@ fn buy_and_hold_fixture() -> (
             range,
             strategies: vec![StrategySpec::BuyAndHold],
             policy_selections: Vec::new(),
+            causal_execution: None,
             decision_interval: CandleInterval::H1,
             execution_resolution: CandleInterval::H1,
             latency_ms: 0,
@@ -818,6 +1167,123 @@ fn buy_and_hold_fixture() -> (
         RunId::new("run-bh").expect("fixture run id"),
         evaluation_start,
     )
+}
+
+fn causal_s1_fixture() -> (
+    ResolvedPlan,
+    DatasetSnapshot,
+    ModelAdmission,
+    RunId,
+    UtcTimestamp,
+) {
+    let (mut plan, mut dataset, mut admission, run_id, evaluation_start) = buy_and_hold_fixture();
+    let strategy = StrategySpec::S1 {
+        state: StateParameters {
+            ema_length: 2,
+            vol_length: 2,
+            k: 0.0,
+        },
+    };
+    install_causal_policy(&mut plan, &mut admission, &strategy, "s1");
+    dataset.observations = vec![
+        observation("too-old", "2025-01-01T20:00:00Z", "1", "1"),
+        observation("warmup-1", "2025-01-01T21:00:00Z", "100", "100"),
+        observation("warmup-2", "2025-01-01T22:00:00Z", "100", "100"),
+        observation("warmup-3", "2025-01-01T23:00:00Z", "100", "110"),
+        observation("oos-1", "2025-01-02T00:00:00Z", "110", "111"),
+        observation("oos-2", "2025-01-02T01:00:00Z", "111", "112"),
+    ];
+    dataset.manifest.request.warmup_bars = 4;
+    dataset.manifest.coverage =
+        UtcRange::new(time("2025-01-01T20:00:00Z"), time("2025-01-02T02:00:00Z"))
+            .expect("fixture coverage");
+    refresh_dataset_identity(&mut dataset, b"causal-s1");
+    plan.dataset_digests[0].1 = dataset.manifest.semantic_digest.clone();
+    (plan, dataset, admission, run_id, evaluation_start)
+}
+
+fn install_causal_policy(
+    plan: &mut ResolvedPlan,
+    admission: &mut ModelAdmission,
+    strategy: &StrategySpec,
+    suffix: &str,
+) {
+    let definition = PolicyDefinition {
+        schema_version: "1.0".into(),
+        name: format!("causal_{suffix}"),
+        description: "SYNTHETIC_TEST_ONLY".into(),
+        program: PolicyProgram::Builtin {
+            strategy: strategy.clone(),
+        },
+    };
+    let reference = PolicyRevisionRef {
+        policy_id: crate::contracts::PolicyId::new(format!("policy-causal-{suffix}"))
+            .expect("policy id"),
+        revision_id: crate::contracts::PolicyRevisionId::new(format!(
+            "policy-revision-causal-{suffix}"
+        ))
+        .expect("revision id"),
+        definition_digest: ContentHash::of_value(&definition).expect("definition digest"),
+    };
+    plan.spec.schema_version = "3.0".into();
+    plan.spec.strategies.clear();
+    plan.spec.policy_selections = vec![reference.clone()];
+    plan.spec.causal_execution = Some(CausalExecutionPolicy::DeclaredPolicyWarmup);
+    plan.policy_revisions = vec![FrozenPolicyRevision {
+        reference: reference.clone(),
+        revision_number: 1,
+        parent_revision_id: None,
+        family: strategy.kind(),
+        origin: PolicyOrigin::Builtin,
+        definition,
+    }];
+    admission.strategy = strategy.kind();
+    admission.policy_ref = Some(reference);
+    plan.admissions = vec![admission.clone()];
+}
+
+fn refresh_dataset_identity(dataset: &mut DatasetSnapshot, seed: &[u8]) {
+    dataset.manifest.row_count = dataset.observations.len() as u64;
+    dataset.manifest.semantic_digest = ContentHash::of_bytes(seed);
+}
+
+fn evidence_version(
+    revision: &str,
+    event: &str,
+    available_at: &str,
+    multiplier: &str,
+    parent: Option<&str>,
+) -> EvidenceVersion {
+    let body = format!("synthetic body {revision}");
+    let body_hash = ContentHash::of_bytes(body.as_bytes());
+    let available_at = time(available_at);
+    EvidenceVersion {
+        evidence_id: EvidenceId::new(format!("evidence-{event}")).expect("evidence id"),
+        revision_id: EvidenceRevisionId::new(revision).expect("revision id"),
+        event_id: event.into(),
+        purpose: EvidencePurpose::StrategyInput,
+        category: "synthetic-boundary".into(),
+        regime_label: None,
+        markets: vec![MarketId::parse_upbit("KRW-BTC").expect("market")],
+        source_refs: vec!["https://example.invalid/synthetic".into()],
+        body,
+        body_hash: body_hash.clone(),
+        event_time: Some(available_at),
+        published_at: Some(available_at),
+        first_seen_at: Some(available_at),
+        content_updated_at: None,
+        declared_available_at: available_at,
+        registered_at: available_at,
+        valid_until: time("2025-01-03T00:00:00Z"),
+        supersedes_revision_id: parent
+            .map(|id| EvidenceRevisionId::new(id).expect("parent revision id")),
+        provenance: EvidenceProvenance::ForwardCaptured {
+            captured_at: available_at,
+            captured_body_hash: body_hash,
+        },
+        mapping_version: "synthetic-v1".into(),
+        weight_multiplier: Weight::new(decimal(multiplier)).expect("evidence multiplier"),
+    }
 }
 
 fn observation(id: &str, open_at: &str, open: &str, close: &str) -> CandleObservation {

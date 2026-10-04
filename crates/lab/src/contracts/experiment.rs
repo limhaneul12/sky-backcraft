@@ -357,6 +357,8 @@ pub struct ExperimentSpec {
     pub strategies: Vec<StrategySpec>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub policy_selections: Vec<super::PolicyRevisionRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub causal_execution: Option<CausalExecutionPolicy>,
     pub decision_interval: CandleInterval,
     pub execution_resolution: CandleInterval,
     pub latency_ms: u64,
@@ -372,17 +374,33 @@ pub struct ExperimentSpec {
     pub seed: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CausalExecutionPolicy {
+    /// Admit only the declared policy warmup and evaluation range into decision state.
+    DeclaredPolicyWarmup,
+}
+
 impl ExperimentSpec {
     fn validate_selections(&self) -> Result<(), LabError> {
-        let selections =
-            match self.schema_version.as_str() {
-                "1.0" if self.policy_selections.is_empty() => self.strategies.len(),
-                "2.0" if self.strategies.is_empty() => self.policy_selections.len(),
-                _ => return Err(LabError::InvalidConfig(
-                    "experiment v1 requires legacy strategies; v2 requires exact policy selections"
+        let selections = match (
+            self.schema_version.as_str(),
+            self.causal_execution,
+            self.strategies.is_empty(),
+            self.policy_selections.is_empty(),
+        ) {
+            ("1.0", None, false, true) => self.strategies.len(),
+            ("2.0", None, true, false)
+            | ("3.0", Some(CausalExecutionPolicy::DeclaredPolicyWarmup), true, false) => {
+                self.policy_selections.len()
+            }
+            _ => {
+                return Err(LabError::InvalidConfig(
+                    "experiment v1 requires legacy strategies without causal execution; v2 requires exact policy selections without causal execution; v3 requires exact policy selections with causal execution"
                         .into(),
-                )),
-            };
+                ));
+            }
+        };
         if self.dataset_ids.is_empty()
             || self.dataset_ids.len() > 6
             || self.markets.is_empty()
@@ -430,6 +448,11 @@ impl ExperimentSpec {
     /// Returns typed configuration/resource/rule errors without changing inputs.
     pub fn validate(&self) -> Result<(), LabError> {
         self.validate_selections()?;
+        if self.schema_version == "3.0" && self.pit_policy != PitPolicy::StrictPit {
+            return Err(LabError::InvalidConfig(
+                "experiment v3 causal execution requires STRICT_PIT".into(),
+            ));
+        }
         self.range.aligned(self.decision_interval)?;
         self.range.aligned(self.execution_resolution)?;
         if self.decision_interval.duration().num_seconds()

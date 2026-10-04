@@ -118,6 +118,9 @@ fn dispatch(args: &[String]) -> Result<(), LabError> {
             finish_database(result, Some(owner))
         }
         Some("policy-write" | "policy-query" | "history-query") => run_policy_command(args),
+        Some("research-suite" | "collection-schedule" | "storage-maintenance") => {
+            run_research_command(args)
+        }
         Some("verify-export" | "replay-export") => {
             validate_args(&args[1..], &["--directory"], &[], &[])?;
             let path = flag_value(&args[1..], "--directory").ok_or_else(|| {
@@ -212,20 +215,23 @@ fn dispatch(args: &[String]) -> Result<(), LabError> {
         Some("mcp-serve") => {
             validate_args(
                 &args[1..],
-                &["--bind", "--port", "--data-root", "--auth-token"],
-                &["--public-no-auth", "--allow-network-bind"],
+                &[
+                    "--bind",
+                    "--port",
+                    "--data-root",
+                    "--auth-token",
+                    "--public-url",
+                ],
+                &["--public-no-auth", "--allow-network-bind", "--oauth"],
                 &["--allow-host"],
             )?;
-            prepare_server_root(&args[1..])?;
+            let config = McpServeConfig::parse(&args[1..])?;
+            prepare_server_root(&config)?;
             let upbit = UpbitClient::new()?;
             let git_revision = mcp::detect_git_revision();
-            let owner = DatabaseOwner::open(data_root(&args[1..]))?;
-            let result = runtime()?.block_on(run_mcp_serve(
-                &args[1..],
-                upbit,
-                git_revision,
-                owner.handle(),
-            ));
+            let owner = DatabaseOwner::open(config.data_root.clone())?;
+            let result =
+                runtime()?.block_on(run_mcp_serve(config, upbit, git_revision, owner.handle()));
             finish_database(result, Some(owner))
         }
         Some("mcp-selfcheck") => {
@@ -241,20 +247,10 @@ fn dispatch(args: &[String]) -> Result<(), LabError> {
             validate_args(&args[1..], &["--out"], &[], &[])?;
             run_schemas(&args[1..])
         }
-        Some("setup-gui") => {
-            validate_args(&args[1..], &["--config", "--listen"], &[], &[])?;
-            let config_path = PathBuf::from(
-                flag_value(&args[1..], "--config")
-                    .unwrap_or_else(|| spot_lab::gui::DEFAULT_CONFIG_FILE.into()),
-            );
-            let listen = flag_value(&args[1..], "--listen")
-                .unwrap_or_else(|| spot_lab::gui::DEFAULT_LISTEN.into());
-            let addr: std::net::SocketAddr = listen
-                .parse()
-                .map_err(|error| LabError::InvalidConfig(format!("--listen {listen}: {error}")))?;
-            println!("설정 GUI: http://{addr} (Ctrl+C로 종료)");
-            spot_lab::gui::serve(addr, config_path, true)
-        }
+        Some("setup-gui") => Err(LabError::InvalidConfig(
+            "the browser setup has been retired; open the native Sky Backcraft.app for settings"
+                .into(),
+        )),
         Some("--help" | "-h") if args.len() == 1 => {
             print_help();
             Ok(())
@@ -264,7 +260,7 @@ fn dispatch(args: &[String]) -> Result<(), LabError> {
             Ok(())
         }
         Some(other) => Err(LabError::InvalidConfig(format!(
-            "unknown command: {other} (try: probe | mcp-serve | mcp-selfcheck | schemas | setup-gui)"
+            "unknown command: {other} (try: probe | mcp-serve | mcp-selfcheck | schemas)"
         ))),
     }
 }
@@ -330,6 +326,413 @@ fn run_policy_command(args: &[String]) -> Result<(), LabError> {
         })
         .and_then(|value| print_json(&value));
     finish_database(result, Some(owner))
+}
+
+enum ResearchCommand {
+    Suite(spot_lab::contracts::ResearchSuiteAction),
+    Schedule(spot_lab::contracts::CollectionScheduleAction),
+    Maintenance(spot_lab::contracts::StorageMaintenanceAction),
+}
+
+fn parse_research_command(args: &[String]) -> Result<(ResearchCommand, bool), LabError> {
+    use spot_lab::contracts::{
+        CollectionScheduleAction, ResearchSuiteAction, StorageMaintenanceAction,
+        validate_research_page,
+    };
+
+    let command = args
+        .first()
+        .ok_or_else(|| LabError::InvalidConfig("research command is missing".into()))?;
+    let switches: &[&str] = if command == "research-suite" {
+        &["--wait"]
+    } else {
+        &[]
+    };
+    validate_args(&args[1..], &["--request", "--data-root"], switches, &[])?;
+    let path = flag_value(&args[1..], "--request")
+        .ok_or_else(|| LabError::InvalidConfig("research command requires --request".into()))?;
+    let request = match command.as_str() {
+        "research-suite" => {
+            let action: ResearchSuiteAction = read_config(&path)?;
+            match &action {
+                ResearchSuiteAction::Create { request } => {
+                    let _geometry = spot_lab::research::expand_geometry(request)?;
+                }
+                ResearchSuiteAction::List { limit, .. }
+                | ResearchSuiteAction::Cases { limit, .. }
+                | ResearchSuiteAction::Comparisons { limit, .. } => {
+                    validate_research_page(*limit)?;
+                }
+                ResearchSuiteAction::Get { .. }
+                | ResearchSuiteAction::Pause { .. }
+                | ResearchSuiteAction::Resume { .. } => {}
+            }
+            ResearchCommand::Suite(action)
+        }
+        "collection-schedule" => {
+            let action: CollectionScheduleAction = read_config(&path)?;
+            match &action {
+                CollectionScheduleAction::Create { request } => request.validate()?,
+                CollectionScheduleAction::List { limit, .. } => {
+                    validate_research_page(*limit)?;
+                }
+                CollectionScheduleAction::Get { .. }
+                | CollectionScheduleAction::Pause { .. }
+                | CollectionScheduleAction::Resume { .. }
+                | CollectionScheduleAction::Freshness { .. } => {}
+            }
+            ResearchCommand::Schedule(action)
+        }
+        "storage-maintenance" => {
+            let action: StorageMaintenanceAction = read_config(&path)?;
+            if let StorageMaintenanceAction::RetentionCandidates {
+                keep_recent, limit, ..
+            } = &action
+            {
+                if *keep_recent == 0 {
+                    return Err(LabError::InvalidConfig(
+                        "retention keep_recent must be at least 1".into(),
+                    ));
+                }
+                validate_research_page(*limit)?;
+            }
+            ResearchCommand::Maintenance(action)
+        }
+        _ => return Err(LabError::Internal("unknown research command".into())),
+    };
+    let wait = flag_flag(&args[1..], "--wait");
+    if wait
+        && !matches!(
+            &request,
+            ResearchCommand::Suite(
+                ResearchSuiteAction::Create { .. } | ResearchSuiteAction::Resume { .. }
+            )
+        )
+    {
+        return Err(LabError::InvalidConfig(
+            "--wait is supported only for research-suite create or resume".into(),
+        ));
+    }
+    Ok((request, wait))
+}
+
+fn run_research_command(args: &[String]) -> Result<(), LabError> {
+    let (request, wait) = parse_research_command(args)?;
+    let root = data_root(&args[1..]);
+    let owner = DatabaseOwner::open(root.clone())?;
+    let outcome = if wait {
+        let ResearchCommand::Suite(action) = request else {
+            return Err(LabError::Internal(
+                "validated wait request was not a research suite".into(),
+            ));
+        };
+        let upbit = UpbitClient::new()?;
+        runtime()?.block_on(run_waiting_suite(
+            action,
+            owner.handle(),
+            upbit,
+            root,
+            mcp::detect_git_revision(),
+        ))
+    } else {
+        runtime()?.block_on(run_offline_research_command(request, owner.handle()))
+    };
+    finish_database(outcome, Some(owner))
+}
+
+async fn run_waiting_suite(
+    action: spot_lab::contracts::ResearchSuiteAction,
+    database: DatabaseHandle,
+    upbit: UpbitClient,
+    root: PathBuf,
+    revision: Option<String>,
+) -> Result<(), LabError> {
+    use spot_lab::contracts::ResearchSuiteAction;
+
+    let runtime = spot_lab::jobs::JobRuntime::start(database, upbit, root, revision).await?;
+    let service = runtime.service();
+    let result = async {
+        let mut value = service.research_suite(action).await?;
+        let id = value
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| LabError::DataCorrupt("suite result omitted id".into()))?;
+        let suite_id = spot_lab::contracts::SuiteId::new(id)?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1900);
+        while value.get("status").and_then(serde_json::Value::as_str) == Some("running") {
+            if tokio::time::Instant::now() >= deadline {
+                service
+                    .research_suite(ResearchSuiteAction::Pause {
+                        suite_id: suite_id.clone(),
+                    })
+                    .await?;
+                return Err(LabError::ResourceLimit(
+                    "suite CLI wait expired; pause requested".into(),
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            value = service
+                .research_suite(ResearchSuiteAction::Get {
+                    suite_id: suite_id.clone(),
+                })
+                .await?;
+        }
+        print_json(&value)
+    }
+    .await;
+    result.and(runtime.shutdown().await)
+}
+
+async fn run_offline_research_command(
+    request: ResearchCommand,
+    database: DatabaseHandle,
+) -> Result<(), LabError> {
+    let value = match request {
+        ResearchCommand::Suite(action) => run_offline_suite(action, &database).await?,
+        ResearchCommand::Schedule(action) => run_offline_schedule(action, &database).await?,
+        ResearchCommand::Maintenance(action) => run_offline_maintenance(action, &database).await?,
+    };
+    print_json(&value)
+}
+
+async fn run_offline_suite(
+    action: spot_lab::contracts::ResearchSuiteAction,
+    database: &DatabaseHandle,
+) -> Result<serde_json::Value, LabError> {
+    use spot_lab::contracts::ResearchSuiteAction;
+
+    match action {
+        ResearchSuiteAction::Create { request } => create_offline_suite(*request, database).await,
+        ResearchSuiteAction::Get { suite_id } => {
+            database
+                .call("get_research_suite_cli", move |store| {
+                    let record = store
+                        .get_research_suite(&suite_id)?
+                        .ok_or_else(|| LabError::InvalidConfig("unknown research suite".into()))?;
+                    Ok(serde_json::to_value(spot_lab::research::summarize(
+                        &record,
+                    ))?)
+                })
+                .await
+        }
+        ResearchSuiteAction::List { offset, limit } => {
+            database
+                .call("list_research_suites_cli", move |store| {
+                    Ok(serde_json::to_value(
+                        store.list_research_suites(offset, limit)?,
+                    )?)
+                })
+                .await
+        }
+        ResearchSuiteAction::Cases {
+            suite_id,
+            offset,
+            limit,
+        } => {
+            database
+                .call("list_suite_cases_cli", move |store| {
+                    Ok(serde_json::to_value(
+                        store.list_suite_cases(&suite_id, offset, limit)?,
+                    )?)
+                })
+                .await
+        }
+        ResearchSuiteAction::Comparisons {
+            suite_id,
+            offset,
+            limit,
+        } => {
+            database
+                .call("list_suite_comparisons_cli", move |store| {
+                    Ok(serde_json::to_value(
+                        store.list_suite_comparisons(&suite_id, offset, limit)?,
+                    )?)
+                })
+                .await
+        }
+        ResearchSuiteAction::Pause { suite_id } => {
+            database
+                .call("pause_research_suite_cli", move |store| {
+                    let (record, _running_jobs) =
+                        store.pause_research_suite(&suite_id, UtcTimestamp::now())?;
+                    Ok(serde_json::to_value(spot_lab::research::summarize(
+                        &record,
+                    ))?)
+                })
+                .await
+        }
+        ResearchSuiteAction::Resume { suite_id } => {
+            database
+                .call("resume_research_suite_cli", move |store| {
+                    let record = store.resume_research_suite(&suite_id, UtcTimestamp::now())?;
+                    Ok(serde_json::to_value(spot_lab::research::summarize(
+                        &record,
+                    ))?)
+                })
+                .await
+        }
+    }
+}
+
+async fn create_offline_suite(
+    request: spot_lab::contracts::ResearchSuiteRequest,
+    database: &DatabaseHandle,
+) -> Result<serde_json::Value, LabError> {
+    let _verified_inputs = spot_lab::planning::load_inputs(database, &request.template).await?;
+    let references = request.template.policy_selections.clone();
+    let policies = database
+        .call("suite_cli_frozen_policies", move |store| {
+            references
+                .iter()
+                .map(|reference| {
+                    store
+                        .load_policy_revision(reference)?
+                        .map(|revision| revision.snapshot)
+                        .ok_or_else(|| {
+                            LabError::InvalidConfig("unknown suite policy revision".into())
+                        })
+                })
+                .collect::<Result<Vec<_>, LabError>>()
+        })
+        .await?;
+    let frozen = spot_lab::research::freeze(request, policies)?;
+    let cases = spot_lab::research::initial_cases(&frozen)?;
+    let record = database
+        .call("create_research_suite_cli", move |store| {
+            store.create_research_suite(&frozen, &cases, UtcTimestamp::now())
+        })
+        .await?;
+    Ok(serde_json::to_value(spot_lab::research::summarize(
+        &record,
+    ))?)
+}
+
+async fn run_offline_schedule(
+    action: spot_lab::contracts::CollectionScheduleAction,
+    database: &DatabaseHandle,
+) -> Result<serde_json::Value, LabError> {
+    use spot_lab::contracts::CollectionScheduleAction;
+
+    match action {
+        CollectionScheduleAction::Create { request } => {
+            let record = spot_lab::scheduling::create_schedule(*request, UtcTimestamp::now())?;
+            database
+                .call("create_collection_schedule_cli", move |store| {
+                    Ok(serde_json::to_value(
+                        store.create_collection_schedule(&record)?,
+                    )?)
+                })
+                .await
+        }
+        CollectionScheduleAction::Get { schedule_id } => {
+            database
+                .call("get_collection_schedule_cli", move |store| {
+                    let record = store
+                        .get_collection_schedule(&schedule_id)?
+                        .ok_or_else(|| {
+                            LabError::InvalidConfig("unknown collection schedule".into())
+                        })?;
+                    Ok(serde_json::to_value(record)?)
+                })
+                .await
+        }
+        CollectionScheduleAction::List { offset, limit } => {
+            database
+                .call("list_collection_schedules_cli", move |store| {
+                    Ok(serde_json::to_value(
+                        store.list_collection_schedules(offset, limit)?,
+                    )?)
+                })
+                .await
+        }
+        CollectionScheduleAction::Pause { schedule_id } => {
+            database
+                .call("pause_collection_schedule_cli", move |store| {
+                    let (record, _running_jobs) =
+                        store.pause_collection_schedule(&schedule_id, UtcTimestamp::now())?;
+                    Ok(serde_json::to_value(record)?)
+                })
+                .await
+        }
+        CollectionScheduleAction::Resume { schedule_id } => {
+            database
+                .call("resume_collection_schedule_cli", move |store| {
+                    Ok(serde_json::to_value(store.resume_collection_schedule(
+                        &schedule_id,
+                        UtcTimestamp::now(),
+                    )?)?)
+                })
+                .await
+        }
+        CollectionScheduleAction::Freshness { schedule_id } => {
+            database
+                .call("collection_freshness_cli", move |store| {
+                    Ok(serde_json::to_value(store.collection_freshness(
+                        &schedule_id,
+                        UtcTimestamp::now(),
+                    )?)?)
+                })
+                .await
+        }
+    }
+}
+
+async fn run_offline_maintenance(
+    action: spot_lab::contracts::StorageMaintenanceAction,
+    database: &DatabaseHandle,
+) -> Result<serde_json::Value, LabError> {
+    use spot_lab::contracts::{StorageMaintenanceAction, StorageMaintenanceResult};
+
+    let result = match action {
+        StorageMaintenanceAction::Usage => {
+            database
+                .call("maintenance_usage_cli", |store| {
+                    Ok(StorageMaintenanceResult::Usage {
+                        usage: store.maintenance_usage()?,
+                    })
+                })
+                .await?
+        }
+        StorageMaintenanceAction::CreateBackup { request_id } => {
+            database
+                .call("create_managed_backup_cli", move |store| {
+                    Ok(StorageMaintenanceResult::Backup {
+                        receipt: store.create_managed_backup(&request_id, UtcTimestamp::now())?,
+                    })
+                })
+                .await?
+        }
+        StorageMaintenanceAction::ListBackups => {
+            database
+                .call("list_managed_backups_cli", |store| {
+                    Ok(StorageMaintenanceResult::Backups {
+                        page: store.list_managed_backups()?,
+                    })
+                })
+                .await?
+        }
+        StorageMaintenanceAction::RetentionCandidates {
+            cutoff,
+            keep_recent,
+            offset,
+            limit,
+        } => {
+            database
+                .call("retention_candidates_cli", move |store| {
+                    Ok(StorageMaintenanceResult::RetentionCandidates {
+                        page: store.retention_candidates(
+                            cutoff,
+                            keep_recent,
+                            offset,
+                            limit,
+                            UtcTimestamp::now(),
+                        )?,
+                    })
+                })
+                .await?
+        }
+    };
+    Ok(serde_json::to_value(result)?)
 }
 
 enum LocalRequest {
@@ -459,22 +862,11 @@ async fn run_local_request(
     }
 }
 
-fn prepare_server_root(args: &[String]) -> Result<(), LabError> {
-    let public = flag_flag(args, "--public-no-auth");
-    if args.iter().any(|arg| arg == "--allow-host") && !public {
-        return Err(LabError::InvalidConfig(
-            "additional hosts require explicit --public-no-auth".into(),
-        ));
-    }
-    if !public {
+fn prepare_server_root(config: &McpServeConfig) -> Result<(), LabError> {
+    if !config.auth.exposure().public_no_auth() {
         return Ok(());
     }
-    if flag_value(args, "--data-root").is_none() {
-        return Err(LabError::InvalidConfig(
-            "public mode requires an explicit isolated --data-root".into(),
-        ));
-    }
-    let root = data_root(args);
+    let root = &config.data_root;
     let marker = root.join(".public-no-auth");
     if marker.is_file() {
         if std::fs::read_to_string(&marker)
@@ -488,7 +880,7 @@ fn prepare_server_root(args: &[String]) -> Result<(), LabError> {
         return Ok(());
     }
     if root.exists()
-        && std::fs::read_dir(&root)
+        && std::fs::read_dir(root)
             .map_err(|e| LabError::InvalidConfig(format!("public root: {e}")))?
             .next()
             .is_some()
@@ -497,10 +889,154 @@ fn prepare_server_root(args: &[String]) -> Result<(), LabError> {
             "public mode requires a new empty root or an explicitly marked public root".into(),
         ));
     }
-    std::fs::create_dir_all(&root)
+    std::fs::create_dir_all(root)
         .map_err(|e| LabError::InvalidConfig(format!("create public root: {e}")))?;
     std::fs::write(marker, "PUBLIC_UPBIT_RESEARCH_ONLY\n")
         .map_err(|e| LabError::InvalidConfig(format!("write public marker: {e}")))
+}
+
+enum ServerAuth {
+    None,
+    PublicNoAuth,
+    Bearer(String),
+    OAuth(spot_lab::oauth::OAuthState),
+}
+
+impl ServerAuth {
+    const fn exposure(&self) -> mcp::McpExposure {
+        match self {
+            Self::None => mcp::McpExposure::Local,
+            Self::PublicNoAuth => mcp::McpExposure::PublicNoAuth,
+            Self::Bearer(_) => mcp::McpExposure::Bearer,
+            Self::OAuth(_) => mcp::McpExposure::OAuth,
+        }
+    }
+}
+
+struct McpServeConfig {
+    bind_address: std::net::IpAddr,
+    port: u16,
+    data_root: PathBuf,
+    allow_hosts: Vec<String>,
+    auth: ServerAuth,
+}
+
+impl McpServeConfig {
+    fn parse(args: &[String]) -> Result<Self, LabError> {
+        let bind_address: std::net::IpAddr = flag_value(args, "--bind")
+            .unwrap_or_else(|| "127.0.0.1".into())
+            .parse()
+            .map_err(|_| LabError::InvalidConfig("--bind must be an IP address".into()))?;
+        if !bind_address.is_loopback() && !flag_flag(args, "--allow-network-bind") {
+            return Err(LabError::InvalidConfig(
+                "non-loopback bind requires explicit --allow-network-bind; publish container ports on loopback unless public exposure is intended".into(),
+            ));
+        }
+        let port = flag_value(args, "--port")
+            .map(|raw| {
+                raw.parse::<u16>()
+                    .map_err(|error| LabError::InvalidConfig(format!("--port: {error}")))
+            })
+            .transpose()?
+            .unwrap_or(8130);
+        if port == 0 {
+            return Err(LabError::InvalidConfig(
+                "--port must be in 1..=65535".into(),
+            ));
+        }
+        let allow_hosts = args
+            .windows(2)
+            .filter(|window| window[0] == "--allow-host")
+            .map(|window| {
+                let authority = window[1]
+                    .parse::<axum::http::uri::Authority>()
+                    .map_err(|_| {
+                        LabError::InvalidConfig("--allow-host must be an HTTP authority".into())
+                    })?;
+                if authority.as_str().contains('@')
+                    || authority.host().is_empty()
+                    || authority
+                        .port()
+                        .is_some_and(|_| authority.port_u16().is_none_or(|port| port == 0))
+                {
+                    return Err(LabError::InvalidConfig(
+                        "invalid --allow-host authority".into(),
+                    ));
+                }
+                Ok(window[1].clone())
+            })
+            .collect::<Result<Vec<_>, LabError>>()?;
+        let auth = server_auth_config(args)?;
+        if !allow_hosts.is_empty()
+            && !matches!(auth, ServerAuth::PublicNoAuth | ServerAuth::OAuth(_))
+        {
+            return Err(LabError::InvalidConfig(
+                "additional hosts require explicit --public-no-auth or --oauth".into(),
+            ));
+        }
+        if auth.exposure().public_no_auth() && flag_value(args, "--data-root").is_none() {
+            return Err(LabError::InvalidConfig(
+                "public mode requires an explicit isolated --data-root".into(),
+            ));
+        }
+        Ok(Self {
+            bind_address,
+            port,
+            data_root: data_root(args),
+            allow_hosts,
+            auth,
+        })
+    }
+}
+
+fn server_auth_config(args: &[String]) -> Result<ServerAuth, LabError> {
+    let public = flag_flag(args, "--public-no-auth");
+    let oauth = flag_flag(args, "--oauth");
+    let auth_token = flag_value(args, "--auth-token");
+    let public_url = flag_value(args, "--public-url");
+    if usize::from(public) + usize::from(oauth) + usize::from(auth_token.is_some()) > 1 {
+        return Err(LabError::InvalidConfig(
+            "--public-no-auth, --oauth, and --auth-token are mutually exclusive".into(),
+        ));
+    }
+    if !oauth && public_url.is_some() {
+        return Err(LabError::InvalidConfig(
+            "--public-url requires --oauth".into(),
+        ));
+    }
+    if public {
+        return Ok(ServerAuth::PublicNoAuth);
+    }
+    if let Some(token) = auth_token {
+        if token.len() < 16 {
+            return Err(LabError::InvalidConfig(
+                "--auth-token must contain at least 16 characters".into(),
+            ));
+        }
+        return Ok(ServerAuth::Bearer(token));
+    }
+    if !oauth {
+        return Ok(ServerAuth::None);
+    }
+    let public_url = public_url.ok_or_else(|| {
+        LabError::InvalidConfig("--oauth requires --public-url https://HOST".into())
+    })?;
+    let owner_code = std::env::var("SPOT_LAB_OAUTH_OWNER_CODE").map_err(|_| {
+        LabError::InvalidConfig(
+            "--oauth requires SPOT_LAB_OAUTH_OWNER_CODE in the environment".into(),
+        )
+    })?;
+    let oauth = spot_lab::oauth::OAuthState::new(&public_url, owner_code)
+        .map_err(LabError::InvalidConfig)?;
+    if !args
+        .windows(2)
+        .any(|window| window[0] == "--allow-host" && window[1] == oauth.public_host())
+    {
+        return Err(LabError::InvalidConfig(
+            "--oauth requires --allow-host matching the --public-url host".into(),
+        ));
+    }
+    Ok(ServerAuth::OAuth(oauth))
 }
 
 fn read_config<T: serde::de::DeserializeOwned>(path: &str) -> Result<T, LabError> {
@@ -567,6 +1103,10 @@ fn print_help() {
         "            [--allow-host <host>]  # repeatable: extra Host headers to accept (e.g. a tunnel domain)"
     );
     println!(
+        "            [--oauth --public-url https://HOST] # owner code comes from SPOT_LAB_OAUTH_OWNER_CODE"
+    );
+    println!("            [--auth-token <secret>] # legacy Bearer header only");
+    println!(
         "  mcp-selfcheck [--url http://127.0.0.1:8130/mcp] [--market KRW-BTC] [--interval h1] [--count 2]"
     );
     println!(
@@ -586,6 +1126,9 @@ fn print_help() {
     println!(
         "  policy-write | policy-query | history-query --request <json-or-toml> [--data-root data]"
     );
+    println!("  research-suite --request <json-or-toml> [--wait] [--data-root data]");
+    println!("  collection-schedule --request <json-or-toml> [--data-root data]");
+    println!("  storage-maintenance --request <json-or-toml> [--data-root data]");
     println!("  schemas [--out docs/schema]");
 }
 
@@ -675,7 +1218,7 @@ async fn run_probe(
     reason = "single owner visibly composes startup, stop admission, cancel and joined shutdown"
 )]
 async fn run_mcp_serve(
-    args: &[String],
+    server: McpServeConfig,
     upbit: UpbitClient,
     git_revision: Option<String>,
     database: DatabaseHandle,
@@ -684,30 +1227,15 @@ async fn run_mcp_serve(
         StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
     };
 
-    let bind = flag_value(args, "--bind").unwrap_or_else(|| "127.0.0.1".into());
-    let port: u16 = flag_value(args, "--port")
-        .map(|raw| {
-            raw.parse::<u16>()
-                .map_err(|error| LabError::InvalidConfig(format!("--port: {error}")))
-        })
-        .transpose()?
-        .unwrap_or(8130);
-    let allow_hosts: Vec<String> = args
-        .windows(2)
-        .filter(|window| window[0] == "--allow-host")
-        .map(|window| window[1].clone())
-        .collect();
-
-    let bind_address: std::net::IpAddr = bind
-        .parse()
-        .map_err(|_| LabError::InvalidConfig("bind must be a loopback IP address".into()))?;
-    if !bind_address.is_loopback() && !flag_flag(args, "--allow-network-bind") {
-        return Err(LabError::InvalidConfig(
-            "non-loopback bind requires explicit --allow-network-bind; publish container ports on loopback unless public exposure is intended".into(),
-        ));
-    }
-    let public_no_auth = flag_flag(args, "--public-no-auth");
-    let auth_token = flag_value(args, "--auth-token").filter(|token| !token.is_empty());
+    let McpServeConfig {
+        bind_address,
+        port,
+        data_root,
+        allow_hosts,
+        auth: server_auth,
+    } = server;
+    let exposure = server_auth.exposure();
+    let public_no_auth = exposure.public_no_auth();
     let cancellation = tokio_util::sync::CancellationToken::new();
     let mut config = StreamableHttpServerConfig::default()
         .with_legacy_session_mode(false)
@@ -724,10 +1252,11 @@ async fn run_mcp_serve(
     config
         .allowed_origins
         .extend(allow_hosts.iter().map(|host| format!("https://{host}")));
-    config.allowed_hosts.extend(allow_hosts);
+    config.allowed_hosts.extend(allow_hosts.iter().cloned());
+    let allowed_origins: std::sync::Arc<[String]> = config.allowed_origins.clone().into();
     let listener = tokio::net::TcpListener::bind((bind_address, port))
         .await
-        .map_err(|error| LabError::InvalidConfig(format!("bind {bind}:{port}: {error}")))?;
+        .map_err(|error| LabError::InvalidConfig(format!("bind {bind_address}:{port}: {error}")))?;
     let listener = spot_lab::transport::BoundedListener::new(
         listener,
         spot_lab::transport::TransportLimits::default(),
@@ -736,7 +1265,7 @@ async fn run_mcp_serve(
     let jobs = spot_lab::jobs::JobRuntime::start(
         database.clone(),
         upbit.clone(),
-        data_root(args),
+        data_root,
         git_revision.clone(),
     )
     .await?;
@@ -748,72 +1277,95 @@ async fn run_mcp_serve(
                 upbit.clone(),
                 git_revision.clone(),
                 job_service.clone(),
-                public_no_auth,
+                exposure,
             ))
         },
         LocalSessionManager::default().into(),
         config,
     );
-    let token_guard = auth_token.clone();
-    // The auth page is public; everything under /mcp requires the token.
+    let server_auth = std::sync::Arc::new(server_auth);
+    let auth_guard = server_auth.clone();
     let protected_mcp = axum::Router::new()
         .nest_service("/mcp", service)
         .route_layer(axum::middleware::from_fn(
             move |request: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
-                let token_guard = token_guard.clone();
+                let auth = auth_guard.clone();
                 async move {
-                    let authorized = request
-                        .uri()
-                        .query()
-                        .and_then(|query| {
-                            query.split('&').find_map(|pair| {
-                                let (key, value) = pair.split_once('=')?;
-                                (key == "token").then(|| value.to_owned())
-                            })
-                        })
-                        .or_else(|| {
-                            request
-                                .headers()
-                                .get(axum::http::header::AUTHORIZATION)
-                                .and_then(|value| {
-                                    value.to_str().ok().and_then(|value| {
-                                        value.strip_prefix("Bearer ").map(str::to_owned)
-                                    })
-                                })
-                        })
-                        .is_some_and(|present| Some(present) == token_guard);
+                    let authorized = match auth.as_ref() {
+                        ServerAuth::None | ServerAuth::PublicNoAuth => true,
+                        ServerAuth::Bearer(expected) => {
+                            spot_lab::oauth::accepts_legacy_bearer(request.headers(), expected)
+                        }
+                        ServerAuth::OAuth(state) => state.accepts_bearer(request.headers()),
+                    };
                     if authorized {
                         next.run(request).await
                     } else {
-                        let redirect = format!("/mcp-auth?target={}", request.uri().path());
-                        axum::http::Response::builder()
-                            .status(axum::http::StatusCode::FOUND)
-                            .header(axum::http::header::LOCATION, redirect)
+                        let mut response = axum::http::Response::builder()
+                            .status(axum::http::StatusCode::UNAUTHORIZED);
+                        if let ServerAuth::OAuth(state) = auth.as_ref() {
+                            response = response.header(
+                                axum::http::header::WWW_AUTHENTICATE,
+                                format!(
+                                    "Bearer resource_metadata=\"{}\", scope=\"mcp\"",
+                                    state.resource_metadata_url()
+                                ),
+                            );
+                        }
+                        response
                             .body(axum::body::Body::empty())
                             .unwrap_or_else(|_| axum::response::Response::default())
                     }
                 }
             },
         ));
-    let auth_page = axum::Router::new().route(
-        "/mcp-auth",
-        axum::routing::get(|| async {
-            axum::response::Html(
-                "<!DOCTYPE html><html lang=\"ko\"><head><meta charset=\"utf-8\">\
-             <title>Sky Backcraft 인증</title></head>\
-             <body style=\"font-family:-apple-system,sans-serif;max-width:480px;margin:60px auto\">\
-             <h2>Sky Backcraft 접속 토큰</h2>\
-             <p>이 MCP 서버는 토큰 인증을 요구합니다. 발급받은 토큰을 입력하세요.</p>\
-             <form method=\"get\" action=\"/mcp\">\
-             <input name=\"token\" style=\"width:100%;padding:8px\" placeholder=\"토큰\">\
-             <button style=\"padding:8px 16px;margin-top:8px\">연결</button></form>\
-             </body></html>",
-            )
-        }),
-    );
-    let app = spot_lab::transport::apply_limits(auth_page.merge(protected_mcp), state.clone());
+    let oauth_routes = match server_auth.as_ref() {
+        ServerAuth::OAuth(oauth) => oauth.router(),
+        _ => axum::Router::new(),
+    };
+    let allowed_hosts: std::sync::Arc<[String]> = [
+        format!("127.0.0.1:{port}"),
+        format!("localhost:{port}"),
+        format!("[::1]:{port}"),
+    ]
+    .into_iter()
+    .chain(allow_hosts)
+    .collect::<Vec<_>>()
+    .into();
+    let app = oauth_routes
+        .merge(protected_mcp)
+        .layer(axum::middleware::from_fn(
+            move |request: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
+                let allowed_hosts = allowed_hosts.clone();
+                let allowed_origins = allowed_origins.clone();
+                async move {
+                    let host_ok = request
+                        .headers()
+                        .get(axum::http::header::HOST)
+                        .and_then(|value| value.to_str().ok())
+                        .is_some_and(|host| allowed_hosts.iter().any(|allowed| allowed == host));
+                    let origin_ok = request
+                        .headers()
+                        .get(axum::http::header::ORIGIN)
+                        .is_none_or(|value| {
+                            value.to_str().is_ok_and(|origin| {
+                                allowed_origins.iter().any(|allowed| allowed == origin)
+                            })
+                        });
+                    if host_ok && origin_ok {
+                        next.run(request).await
+                    } else {
+                        axum::http::Response::builder()
+                            .status(axum::http::StatusCode::FORBIDDEN)
+                            .body(axum::body::Body::empty())
+                            .unwrap_or_else(|_| axum::response::Response::default())
+                    }
+                }
+            },
+        ));
+    let app = spot_lab::transport::apply_limits(app, state.clone());
     record_lifecycle_phase(LifecyclePhase::Startup, &state);
-    tracing::info!(event = "mcp_listening", bind = %bind_address, port, public_no_auth, transport = "STATELESS_JSON");
+    tracing::info!(event = "mcp_listening", bind = %bind_address, port, public_no_auth, auth = exposure.auth_name(), transport = "STATELESS_JSON");
     let graceful = cancellation.clone();
     let server = axum::serve(listener, app)
         .with_graceful_shutdown(graceful.cancelled_owned())
@@ -993,6 +1545,62 @@ fn run_schemas(args: &[String]) -> Result<(), LabError> {
         .map_err(|error| LabError::InvalidConfig(format!("create {}: {error}", out.display())))?;
     let schemas = [
         (
+            "research-suite-action",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::ResearchSuiteAction
+            ))?,
+        ),
+        (
+            "research-suite-request",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::ResearchSuiteRequest
+            ))?,
+        ),
+        (
+            "research-suite-summary",
+            schema_json(&schemars::schema_for!(spot_lab::contracts::SuiteSummary))?,
+        ),
+        (
+            "research-suite-case",
+            schema_json(&schemars::schema_for!(spot_lab::contracts::SuiteCase))?,
+        ),
+        (
+            "research-comparison-row",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::SuiteComparisonRow
+            ))?,
+        ),
+        (
+            "collection-schedule-action",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::CollectionScheduleAction
+            ))?,
+        ),
+        (
+            "collection-schedule-record",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::CollectionScheduleRecord
+            ))?,
+        ),
+        (
+            "collection-freshness",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::CollectionFreshness
+            ))?,
+        ),
+        (
+            "storage-maintenance-action",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::StorageMaintenanceAction
+            ))?,
+        ),
+        (
+            "storage-maintenance-result",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::StorageMaintenanceResult
+            ))?,
+        ),
+        (
             "artifact-query",
             schema_json(&schemars::schema_for!(spot_lab::contracts::ArtifactQuery))?,
         ),
@@ -1171,6 +1779,26 @@ mod tests {
     use super::*;
     use rmcp::model::{CallToolResult, ContentBlock};
 
+    struct TempRoot(PathBuf);
+
+    impl TempRoot {
+        fn new(label: &str) -> Result<Self, Box<dyn std::error::Error>> {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos();
+            let path = std::env::temp_dir()
+                .join(format!("spot-lab-{label}-{}-{nonce}", std::process::id()));
+            std::fs::create_dir_all(&path)?;
+            Ok(Self(path))
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ignored = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
     }
@@ -1189,6 +1817,270 @@ mod tests {
 
         let hosts = strings(&["--allow-host", "one", "--allow-host", "two"]);
         assert!(validate_args(&hosts, &[], &[], &["--allow-host"]).is_ok());
+    }
+
+    #[test]
+    fn invalid_listener_configuration_does_not_create_research_storage()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "spot-lab-invalid-listener-{}-{nonce}",
+            std::process::id()
+        ));
+        let args = vec![
+            "mcp-serve".into(),
+            "--public-no-auth".into(),
+            "--port".into(),
+            "not-a-port".into(),
+            "--data-root".into(),
+            root.to_string_lossy().into_owned(),
+        ];
+        let result = dispatch(&args);
+        let storage_created = root.exists();
+        if storage_created {
+            std::fs::remove_dir_all(&root)?;
+        }
+        assert!(result.is_err());
+        assert!(!storage_created, "invalid listener settings opened storage");
+        Ok(())
+    }
+
+    #[test]
+    fn server_auth_modes_reject_conflicts_before_runtime_effects() {
+        assert!(server_auth_config(&strings(&["--public-no-auth", "--oauth"])).is_err());
+        assert!(
+            server_auth_config(&strings(&["--public-url", "https://skybackcraft.store"])).is_err()
+        );
+        assert!(
+            server_auth_config(&strings(&[
+                "--oauth",
+                "--public-url",
+                "https://skybackcraft.store",
+                "--allow-host",
+                "other.example",
+            ]))
+            .is_err()
+        );
+        assert!(server_auth_config(&strings(&["--auth-token", "too-short"])).is_err());
+        assert!(matches!(
+            server_auth_config(&strings(&["--auth-token", "long-enough-secret"])),
+            Ok(ServerAuth::Bearer(_))
+        ));
+    }
+
+    #[test]
+    fn suite_wait_rejects_read_only_actions_before_storage_open()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempRoot::new("invalid-suite-wait")?;
+        let data_root = temporary.0.join("data");
+        let request = temporary.0.join("request.json");
+        std::fs::write(
+            &request,
+            serde_json::to_vec(&spot_lab::contracts::ResearchSuiteAction::Get {
+                suite_id: spot_lab::contracts::SuiteId::new("suite-read-only")?,
+            })?,
+        )?;
+        let result = dispatch(&[
+            "research-suite".into(),
+            "--request".into(),
+            request.to_string_lossy().into_owned(),
+            "--wait".into(),
+            "--data-root".into(),
+            data_root.to_string_lossy().into_owned(),
+        ]);
+        assert!(result.is_err());
+        assert!(!data_root.exists(), "invalid --wait opened storage");
+        Ok(())
+    }
+
+    #[test]
+    fn readonly_research_cli_child() -> Result<(), Box<dyn std::error::Error>> {
+        let (Ok(command), Ok(request), Ok(root)) = (
+            std::env::var("SPOT_LAB_READONLY_CHILD_COMMAND"),
+            std::env::var("SPOT_LAB_READONLY_CHILD_REQUEST"),
+            std::env::var("SPOT_LAB_READONLY_CHILD_ROOT"),
+        ) else {
+            return Ok(());
+        };
+        dispatch(&[
+            command,
+            "--request".into(),
+            request,
+            "--data-root".into(),
+            root,
+        ])?;
+        Ok(())
+    }
+
+    #[test]
+    fn readonly_research_cli_preserves_stale_and_queued_work_across_processes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use spot_lab::contracts::{CollectionScheduleAction, StorageMaintenanceAction};
+
+        let temporary = TempRoot::new("readonly-research-cli")?;
+        let data_root = temporary.0.join("data");
+        let (first_id, second_id, schedule_id) = seed_readonly_research_cli(&data_root)?;
+
+        let before = research_cli_state(&data_root, &first_id, &second_id, &schedule_id)?;
+        let cases = [
+            (
+                "storage-maintenance",
+                serde_json::to_value(StorageMaintenanceAction::Usage)?,
+            ),
+            (
+                "collection-schedule",
+                serde_json::to_value(CollectionScheduleAction::Get {
+                    schedule_id: schedule_id.clone(),
+                })?,
+            ),
+            (
+                "collection-schedule",
+                serde_json::to_value(CollectionScheduleAction::List {
+                    offset: 0,
+                    limit: 10,
+                })?,
+            ),
+            (
+                "collection-schedule",
+                serde_json::to_value(CollectionScheduleAction::Freshness {
+                    schedule_id: schedule_id.clone(),
+                })?,
+            ),
+        ];
+        for (index, (command, action)) in cases.into_iter().enumerate() {
+            run_readonly_research_cli_child(&temporary.0, &data_root, index, command, &action)?;
+            let after = research_cli_state(&data_root, &first_id, &second_id, &schedule_id)?;
+            assert_eq!(
+                before, after,
+                "read-only {command} changed attempts or producer state"
+            );
+        }
+        Ok(())
+    }
+
+    fn seed_readonly_research_cli(
+        data_root: &std::path::Path,
+    ) -> Result<
+        (
+            spot_lab::contracts::JobId,
+            spot_lab::contracts::JobId,
+            spot_lab::contracts::ScheduleId,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        use spot_lab::contracts::{
+            CandleInterval, CollectRequest, CollectionScheduleRequest, JobPayload, JobSubmission,
+            MarketId, RequestId, ScheduleRetryPolicy, UtcRange,
+        };
+
+        let now = UtcTimestamp::parse_rfc3339("2024-01-02T00:00:00Z")?;
+        let range = UtcRange::new(
+            UtcTimestamp::parse_rfc3339("2024-01-01T00:00:00Z")?,
+            UtcTimestamp::parse_rfc3339("2024-01-01T01:00:00Z")?,
+        )?;
+        let market = MarketId::parse_upbit("KRW-BTC")?;
+        let queued = |seed: &str| -> Result<JobSubmission, LabError> {
+            Ok(JobSubmission {
+                request_id: RequestId::new(format!("readonly-job-{seed}"))?,
+                payload: JobPayload::Collect {
+                    request: CollectRequest {
+                        request_id: RequestId::new(format!("readonly-collect-{seed}"))?,
+                        markets: vec![market.clone()],
+                        range,
+                        data_resolution: CandleInterval::H1,
+                        warmup_bars: 0,
+                        completed_only: true,
+                    },
+                },
+            })
+        };
+        let first = queued("running")?;
+        let second = queued("queued")?;
+        let schedule = spot_lab::scheduling::create_schedule(
+            CollectionScheduleRequest {
+                request_id: RequestId::new("readonly-schedule")?,
+                markets: vec![market],
+                interval: CandleInterval::H1,
+                lookback_bars: 1,
+                cadence_seconds: 60,
+                retry: ScheduleRetryPolicy {
+                    max_retries: 1,
+                    backoff_seconds: 60,
+                },
+            },
+            now,
+        )?;
+        let schedule_id = schedule.id.clone();
+        let owner = DatabaseOwner::open(data_root.to_path_buf())?;
+        let (first_id, second_id) =
+            owner
+                .handle()
+                .call_blocking("seed_readonly_research_cli", move |store| {
+                    let first = store.submit_job(&first, now)?;
+                    let second = store.submit_job(&second, now)?;
+                    let _claimed = store.claim_next(now)?.ok_or_else(|| {
+                        LabError::Internal("seeded queued attempt was not claimable".into())
+                    })?;
+                    store.create_collection_schedule(&schedule)?;
+                    Ok((first.id, second.id))
+                })?;
+        owner.shutdown()?;
+        Ok((first_id, second_id, schedule_id))
+    }
+
+    fn run_readonly_research_cli_child(
+        temporary: &std::path::Path,
+        data_root: &std::path::Path,
+        index: usize,
+        command: &str,
+        action: &serde_json::Value,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let request_path = temporary.join(format!("request-{index}.json"));
+        std::fs::write(&request_path, serde_json::to_vec(action)?)?;
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "tests::readonly_research_cli_child",
+                "--nocapture",
+            ])
+            .env("SPOT_LAB_READONLY_CHILD_COMMAND", command)
+            .env("SPOT_LAB_READONLY_CHILD_REQUEST", &request_path)
+            .env("SPOT_LAB_READONLY_CHILD_ROOT", data_root)
+            .output()?;
+        assert!(
+            output.status.success(),
+            "read-only {command} subprocess failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    }
+
+    fn research_cli_state(
+        root: &std::path::Path,
+        first: &spot_lab::contracts::JobId,
+        second: &spot_lab::contracts::JobId,
+        schedule: &spot_lab::contracts::ScheduleId,
+    ) -> Result<serde_json::Value, LabError> {
+        let owner = DatabaseOwner::open(root.to_path_buf())?;
+        let first = first.clone();
+        let second = second.clone();
+        let schedule = schedule.clone();
+        let value =
+            owner
+                .handle()
+                .call_blocking("snapshot_readonly_research_cli", move |store| {
+                    Ok(serde_json::json!({
+                        "queue": store.job_queue_status()?,
+                        "first": store.get_job(&first)?,
+                        "second": store.get_job(&second)?,
+                        "schedule": store.get_collection_schedule(&schedule)?,
+                    }))
+                })?;
+        owner.shutdown()?;
+        Ok(value)
     }
 
     #[test]

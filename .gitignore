@@ -35,7 +35,10 @@ freshdata/
 docs/
 # macOS Finder metadata
 .DS_Store
-# GUI launcher data root (runtime DB created by spot-lab setup-gui)
+# Preserved data from the retired browser setup runtime
 /data-gui/
 # Packaged application output
 /dist/
+
+# Local Python verification bytecode
+__pycache__/

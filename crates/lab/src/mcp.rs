@@ -424,6 +424,33 @@ fn tagged_schema<T: JsonSchema + 'static>() -> std::sync::Arc<JsonObject> {
     std::sync::Arc::new(schema)
 }
 
+/// Credential-free projection of the transport owner's authentication decision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum McpExposure {
+    Local,
+    PublicNoAuth,
+    Bearer,
+    OAuth,
+}
+
+impl McpExposure {
+    /// Stable wire name used by `lab_status.transport.auth`.
+    #[must_use]
+    pub const fn auth_name(self) -> &'static str {
+        match self {
+            Self::Local | Self::PublicNoAuth => "none",
+            Self::Bearer => "bearer",
+            Self::OAuth => "oauth",
+        }
+    }
+
+    /// Whether the server owns an explicitly isolated public research root.
+    #[must_use]
+    pub const fn public_no_auth(self) -> bool {
+        matches!(self, Self::PublicNoAuth)
+    }
+}
+
 #[derive(Clone)]
 pub struct LabMcpService {
     tool_router: ToolRouter<Self>,
@@ -431,7 +458,7 @@ pub struct LabMcpService {
     database: DatabaseHandle,
     git_revision: Option<String>,
     jobs: JobService,
-    public_no_auth: bool,
+    exposure: McpExposure,
 }
 
 #[tool_router]
@@ -443,7 +470,7 @@ impl LabMcpService {
         upbit: UpbitClient,
         git_revision: Option<String>,
         jobs: JobService,
-        public_no_auth: bool,
+        exposure: McpExposure,
     ) -> Self {
         Self {
             tool_router: Self::tool_router(),
@@ -451,7 +478,7 @@ impl LabMcpService {
             database,
             git_revision,
             jobs,
-            public_no_auth,
+            exposure,
         }
     }
 
@@ -515,8 +542,8 @@ impl LabMcpService {
                 "fill_observed": false,
             },
             "transport": {
-                "auth": "none",
-                "public_no_auth": self.public_no_auth,
+                "auth": self.exposure.auth_name(),
+                "public_no_auth": self.exposure.public_no_auth(),
                 "progress_stream": false,
                 "job_results": "poll job_control by opaque job_id",
             },
@@ -525,7 +552,7 @@ impl LabMcpService {
                 "preview_ttl_seconds": crate::contracts::DELETE_PREVIEW_TTL_SECONDS,
                 "shared_by_all_callers": true,
                 "mode": "HARD_DELETE_ROWS_AND_EXCLUSIVE_FILES",
-                "public_no_auth_warning": if self.public_no_auth {
+                "public_no_auth_warning": if self.exposure.public_no_auth() {
                     "any caller reaching this unauthenticated URL can delete with the same contract"
                 } else {
                     ""
@@ -1093,6 +1120,61 @@ impl LabMcpService {
             .await;
         result_or_error(result)
     }
+
+    #[tool(
+        description = "Create, pause, resume or page durable batch/walk-forward suites. Candidates are exact policy revisions; selection uses past data, evaluation uses the committed winner, and results retain scenario/fold context.",
+        input_schema = tagged_schema::<crate::contracts::ResearchSuiteAction>(),
+        annotations(title = "Research Suite", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
+    )]
+    async fn research_suite(&self, arguments: JsonObject) -> Result<CallToolResult, McpError> {
+        let action: crate::contracts::ResearchSuiteAction = parse_arguments(arguments)?;
+        match &action {
+            crate::contracts::ResearchSuiteAction::Create { request } => {
+                crate::research::expand_geometry(request).map_err(|e| invalid_params(&e))?;
+            }
+            crate::contracts::ResearchSuiteAction::List { limit, .. }
+            | crate::contracts::ResearchSuiteAction::Cases { limit, .. }
+            | crate::contracts::ResearchSuiteAction::Comparisons { limit, .. } => {
+                crate::contracts::validate_research_page(*limit).map_err(|e| invalid_params(&e))?;
+            }
+            _ => {}
+        }
+        result_or_error(self.jobs.research_suite(action).await)
+    }
+
+    #[tool(
+        description = "Manage persistent completed-candle collection schedules and per-market freshness. Cadence coalesces missed ticks; collection and bounded retries use the owned durable runner.",
+        input_schema = tagged_schema::<crate::contracts::CollectionScheduleAction>(),
+        annotations(title = "Collection Schedule", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = true)
+    )]
+    async fn collection_schedule(&self, arguments: JsonObject) -> Result<CallToolResult, McpError> {
+        let action: crate::contracts::CollectionScheduleAction = parse_arguments(arguments)?;
+        match &action {
+            crate::contracts::CollectionScheduleAction::Create { request } => {
+                request.validate().map_err(|e| invalid_params(&e))?;
+            }
+            crate::contracts::CollectionScheduleAction::List { limit, .. } => {
+                crate::contracts::validate_research_page(*limit).map_err(|e| invalid_params(&e))?;
+            }
+            _ => {}
+        }
+        result_or_error(self.jobs.collection_schedule(action).await)
+    }
+
+    #[tool(
+        description = "Inspect DB/raw/export/backup capacity, create a verified bounded backup, list backup receipts or propose retention candidates with the existing delete previews. This tool never deletes resources or accepts filesystem paths.",
+        input_schema = tagged_schema::<crate::contracts::StorageMaintenanceAction>(),
+        annotations(title = "Storage Maintenance", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
+    )]
+    async fn storage_maintenance(&self, arguments: JsonObject) -> Result<CallToolResult, McpError> {
+        let action: crate::contracts::StorageMaintenanceAction = parse_arguments(arguments)?;
+        if let crate::contracts::StorageMaintenanceAction::RetentionCandidates { limit, .. } =
+            &action
+        {
+            crate::contracts::validate_research_page(*limit).map_err(|e| invalid_params(&e))?;
+        }
+        result_or_error(self.jobs.storage_maintenance(action).await)
+    }
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
@@ -1226,7 +1308,7 @@ impl ServerHandler for LabMcpService {
             .with_server_info(Implementation::from_build_env())
             .with_protocol_version(ProtocolVersion::V_2025_06_18)
             .with_instructions(
-                "Upbit public-data research lab. Quant policies use immutable revisions; runs and jobs expose bounded JSON history. Durable jobs are polled by ID. No trading, private API, auth, arbitrary SQL, URL, path, or code execution. Public-no-auth exposure is explicit in lab_status."
+                "Upbit public-data research lab. Quant policies use immutable revisions; runs and jobs expose bounded JSON history. Durable jobs are polled by ID. No trading, private exchange API, arbitrary SQL, URL, path, or code execution. The configured HTTP authentication mode and public-no-auth exposure are explicit in lab_status."
                     .to_owned(),
             )
     }

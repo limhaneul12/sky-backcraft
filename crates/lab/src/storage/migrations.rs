@@ -47,6 +47,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "0009_run_ledger_sealing",
         include_str!("migrations/0009_run_ledger_sealing.sql"),
     ),
+    (
+        10,
+        "0010_research_automation",
+        include_str!("migrations/0010_research_automation.sql"),
+    ),
 ];
 
 pub(super) fn apply(connection: &mut Connection) -> Result<(), LabError> {

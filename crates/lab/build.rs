@@ -57,7 +57,11 @@ fn gather(root: &Path, output: &mut Vec<PathBuf>) -> std::io::Result<()> {
         let entry = entry?;
         if entry.file_type()?.is_dir() {
             gather(&entry.path(), output)?;
-        } else if entry.path().extension().is_some_and(|ext| ext == "rs") {
+        } else if entry
+            .path()
+            .extension()
+            .is_some_and(|ext| ext == "rs" || ext == "sql")
+        {
             output.push(entry.path());
         }
     }
