@@ -2,7 +2,7 @@
 
 use super::{
     ArtifactId, AttemptId, CollectRequest, ContentHash, DatasetId, JobId, MarketId, PlanId,
-    RequestId, RunId, RunRequest, UtcTimestamp, ValidationReport,
+    PortfolioRunRequest, RequestId, RunId, RunRequest, UtcTimestamp, ValidationReport,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -28,6 +28,9 @@ pub enum JobPayload {
     },
     Backtest {
         request: RunRequest,
+    },
+    PortfolioBacktest {
+        request: Box<PortfolioRunRequest>,
     },
     Export {
         run_id: RunId,
@@ -77,6 +80,9 @@ pub enum JobOutput {
         run_id: RunId,
         completed_models: u64,
         blocked_models: u64,
+    },
+    Portfolio {
+        run_id: RunId,
     },
     Artifacts {
         artifact_ids: Vec<ArtifactId>,

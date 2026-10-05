@@ -206,6 +206,9 @@ pub struct FillRecord {
     pub fill_observed: bool,
     pub model_version: String,
     pub artificial_terminal_exit: bool,
+    /// Proxy liquidity inputs behind a dynamic cost model; absent for fixed bps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_provenance: Option<super::CostProvenance>,
     /// The exact after-fill account mark is committed in the same fact batch.
     pub accounting_mark_seq: u64,
 }

@@ -528,6 +528,7 @@ fn fixture_request() -> (ResearchSuiteRequest, Vec<FrozenPolicyRevision>) {
             slippage_bps: zero,
             impact_bps: zero,
             assumption_label: "base cost assumptions".into(),
+            dynamic: None,
         },
         execution: ExecutionPolicy::NextBarOpen {
             participation_cap: Weight::new(Decimal::ONE).expect("weight"),
@@ -545,7 +546,11 @@ fn fixture_request() -> (ResearchSuiteRequest, Vec<FrozenPolicyRevision>) {
                 lower_bound: quote("0"),
                 tick: crate::contracts::PriceKrw::new(Decimal::ONE).expect("tick"),
             }],
+            fee_schedule: None,
+            trading_state: None,
+            maintenance_windows: Vec::new(),
         },
+        market_rules_history: Vec::new(),
         terminal_policy: TerminalPolicy::MarkToMarket,
         evidence_snapshot_id: None,
         pit_policy: PitPolicy::StrictPit,
@@ -812,4 +817,184 @@ fn bps(value: i64) -> BasisPoints {
 
 fn quote(value: &str) -> QuoteAmount {
     QuoteAmount::new(value.parse().expect("decimal quote")).expect("quote amount")
+}
+
+/// Planner fixture with controllable geometry axes.
+fn plan_request(
+    markets: usize,
+    candidates: usize,
+    fee_count: usize,
+    slip_count: usize,
+    folds: Option<(u32, u32, u32, u32)>,
+) -> ResearchSuiteRequest {
+    let refs = (0..candidates).map(policy_reference).collect::<Vec<_>>();
+    let full_range = range("2024-01-01T00:00:00Z", "2024-01-02T00:00:00Z");
+    let zero = bps(0);
+    let mut template_markets = Vec::new();
+    for index in 0..markets {
+        template_markets.push(market(&format!("KRW-M{index}")));
+    }
+    let template = ExperimentSpec {
+        schema_version: "3.0".into(),
+        dataset_ids: vec![crate::contracts::DatasetId::new("dataset-plan").expect("dataset")],
+        markets: template_markets,
+        range: full_range,
+        strategies: Vec::new(),
+        policy_selections: refs,
+        causal_execution: Some(CausalExecutionPolicy::DeclaredPolicyWarmup),
+        decision_interval: CandleInterval::H1,
+        execution_resolution: CandleInterval::H1,
+        latency_ms: 0,
+        initial_cash: quote("1000"),
+        costs: CostPolicy {
+            buy_fee_bps: zero,
+            sell_fee_bps: zero,
+            maker_fee_bps: zero,
+            half_spread_bps: zero,
+            slippage_bps: zero,
+            impact_bps: zero,
+            assumption_label: "planner fixture".into(),
+            dynamic: None,
+        },
+        execution: ExecutionPolicy::NextBarOpen {
+            participation_cap: Weight::new(Decimal::ONE).expect("weight"),
+        },
+        market_rules: crate::contracts::MarketRuleSnapshot {
+            id: RuleSnapshotId::new("planner-rules").expect("rules"),
+            provenance: RuleProvenance::ExplicitScenario,
+            valid_range: full_range,
+            observed_at: full_range.start(),
+            source_refs: vec!["planner-fixture".into()],
+            assumption_label: "planner fixture rules".into(),
+            min_notional: quote("1"),
+            quantity_step: AssetQuantity::new(Decimal::new(1, 2)).expect("quantity"),
+            ticks: vec![crate::contracts::TickBand {
+                lower_bound: quote("0"),
+                tick: crate::contracts::PriceKrw::new(Decimal::ONE).expect("tick"),
+            }],
+            fee_schedule: None,
+            trading_state: None,
+            maintenance_windows: Vec::new(),
+        },
+        market_rules_history: Vec::new(),
+        terminal_policy: TerminalPolicy::MarkToMarket,
+        evidence_snapshot_id: None,
+        pit_policy: PitPolicy::StrictPit,
+        evidence_unavailable: EvidenceUnavailablePolicy::CashWithMatchedControl,
+        report_clock: ReportClock {
+            timezone: "UTC".into(),
+            min_annualization_days: 1,
+            risk_free_annual: 0.0,
+        },
+        seed: 3,
+    };
+    ResearchSuiteRequest {
+        request_id: RequestId::new("research-plan-request").expect("request"),
+        template,
+        design: match folds {
+            None => ResearchDesign::Batch,
+            Some((selection, evaluation, step, embargo)) => ResearchDesign::WalkForward {
+                selection_bars: selection,
+                evaluation_bars: evaluation,
+                step_bars: step,
+                embargo_bars: embargo,
+            },
+        },
+        cost_sweep: CostSweep {
+            fee_bps: (1_i64..=i64::try_from(fee_count).unwrap_or(i64::MAX))
+                .map(bps)
+                .collect(),
+            slippage_bps: (10_i64..10_i64 + i64::try_from(slip_count).unwrap_or(i64::MAX))
+                .map(bps)
+                .collect(),
+        },
+    }
+}
+
+#[test]
+fn planner_admits_the_exact_cell_limit_and_rejects_one_more_fold() {
+    // cells = folds x scenarios x markets x (candidates + 1) = 8 x 2 x 2 x 8 = 256.
+    let exact = plan_request(2, 7, 1, 2, Some((2, 2, 2, 0)));
+    let report = plan_suite(&exact).expect("planner runs");
+    assert_eq!(report.folds, 11, "24-hour range yields 11 folds of span 4");
+    assert_eq!(report.cost_scenarios, 2);
+    // 11 folds make 352 cells; the suite stays rejected.
+    assert!(matches!(
+        report.admission,
+        crate::contracts::SuitePlanAdmission::Rejected { .. }
+    ));
+    // One fold fewer keeps the suite inside the cell limit and matches create.
+    let within = plan_request(2, 7, 1, 2, Some((2, 2, 2, 0)));
+    let mut within = within;
+    within.template.range = range("2024-01-01T00:00:00Z", "2024-01-01T20:00:00Z");
+    let report = plan_suite(&within).expect("planner runs");
+    assert_eq!(report.folds, 9);
+    // 9 x 2 x 2 x 8 = 288 cells -> still rejected.
+    assert!(matches!(
+        report.admission,
+        crate::contracts::SuitePlanAdmission::Rejected { violations: _ }
+    ));
+    let limited = plan_request(2, 7, 1, 2, Some((2, 2, 2, 0)));
+    let mut limited = limited;
+    limited.template.range = range("2024-01-01T00:00:00Z", "2024-01-01T18:00:00Z");
+    let report = plan_suite(&limited).expect("planner runs");
+    assert_eq!(report.folds, 8);
+    assert_eq!(report.comparison_cells, 256);
+    assert_eq!(
+        report.admission,
+        crate::contracts::SuitePlanAdmission::Admitted
+    );
+    // Planner/create consistency: the same request passes create geometry.
+    expand_geometry(&limited).expect("create geometry admits the planned suite");
+}
+
+#[test]
+fn planner_rejection_matches_create_rejection_with_numeric_violations() {
+    let request = plan_request(3, 7, 1, 2, Some((2, 2, 2, 0)));
+    let report = plan_suite(&request).expect("planner runs");
+    let crate::contracts::SuitePlanAdmission::Rejected { violations } = &report.admission else {
+        panic!("oversized suite must be rejected");
+    };
+    assert!(
+        violations.iter().any(|violation| violation.item
+            == crate::contracts::SuitePlanLimitKind::SuiteCells
+            && violation.allowed == 256
+            && violation.requested > 256),
+        "cell violation carries the numeric excess: {violations:?}"
+    );
+    assert!(
+        report
+            .suggestions
+            .iter()
+            .any(|suggestion| suggestion.contains("split markets")),
+        "market split is suggested: {:?}",
+        report.suggestions
+    );
+    assert!(
+        report
+            .suggestions
+            .iter()
+            .any(|suggestion| suggestion.contains("warning")),
+        "semantic warnings accompany meaning-changing splits"
+    );
+    assert!(expand_geometry(&request).is_err(), "create rejects too");
+}
+
+#[test]
+fn planner_reports_invalid_templates_like_create_would() {
+    let mut request = plan_request(1, 2, 1, 1, None);
+    request.template.schema_version = "1.0".into();
+    let report = plan_suite(&request).expect("planner runs");
+    assert!(matches!(
+        report.admission,
+        crate::contracts::SuitePlanAdmission::Invalid { .. }
+    ));
+    // Duplicate sweep axes are invalid, not a limit violation.
+    let mut duplicate = plan_request(1, 2, 2, 1, None);
+    duplicate.cost_sweep.fee_bps = vec![bps(1), bps(1)];
+    let report = plan_suite(&duplicate).expect("planner runs");
+    assert!(matches!(
+        report.admission,
+        crate::contracts::SuitePlanAdmission::Invalid { .. }
+    ));
 }

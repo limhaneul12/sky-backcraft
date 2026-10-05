@@ -1,7 +1,8 @@
 //! Bounded policy authoring and immutable execution-history JSON interfaces.
 use super::{
     AttemptId, ContentHash, JobId, JobStatus, PlanId, PolicyDefinition, PolicyId, PolicyOrigin,
-    PolicyRevisionId, PolicyRevisionRef, RequestId, RunId, StrategyKind, UtcTimestamp,
+    PolicyRevisionId, PolicyRevisionRef, RequestId, RunId, StrategyKind, StrategySpec,
+    UtcTimestamp,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -19,6 +20,22 @@ pub enum PolicyWrite {
         expected_parent_revision_id: PolicyRevisionId,
         definition: PolicyDefinition,
     },
+    /// Expand a deterministic parameter sweep into one immutable policy per
+    /// candidate; identical parameter sets reuse the existing policy.
+    Sweep {
+        request_id: RequestId,
+        family: StrategyKind,
+        template: StrategySpec,
+        mode: super::ParameterSweepMode,
+    },
+}
+
+/// Sweep plan plus the exact policy revisions it froze or reused.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PolicySweepResult {
+    pub plan: super::SweepPlan,
+    pub revisions: Vec<PolicyRevisionSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

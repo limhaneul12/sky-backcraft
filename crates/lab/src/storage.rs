@@ -13,6 +13,7 @@ mod maintenance_store;
 mod migrations;
 mod plan_store;
 mod policy_store;
+mod portfolio_store;
 mod query_read;
 mod research_store;
 mod run_store;

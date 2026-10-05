@@ -9,7 +9,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-const POLICY_SCHEMA_VERSION: &str = "1.0";
+pub const POLICY_SCHEMA_VERSION: &str = "1.0";
 const MAX_DEFINITION_BYTES: usize = 64 * 1024;
 const MAX_AST_NODES: usize = 128;
 const MAX_AST_DEPTH: usize = 12;

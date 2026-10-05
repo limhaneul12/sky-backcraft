@@ -1,16 +1,17 @@
 //! Pure deterministic model execution and exact spot-account accounting.
 
-mod accounting;
-mod execution;
+pub(crate) mod accounting;
+pub(crate) mod execution;
 
 use crate::contracts::{
     AccountMark, AdmissionStatus, AssetQuantity, CandleObservation, CausalExecutionPolicy,
-    DatasetSnapshot, ENGINE_VERSION, EpisodeId, EpisodeRecord, EpisodeStatus, EventContext,
-    EvidenceSnapshot, ExecutionPolicy, FillId, FillRecord, FillTiming, LabError, MAX_DATASET_ROWS,
-    MAX_MODEL_EVENTS, MarkKind, ModelAdmission, ModelLedger, ModelStatus, ObservationId, OrderId,
-    OrderRecord, OrderStatus, PriceKrw, QuoteAmount, ReasonCode, ResolvedPlan, RunId, Side,
-    SignalId, SignalOutcome, SignalRecord, SimulatedOrderType, StrategyBinding, TerminalPolicy,
-    UtcRange, UtcTimestamp, Weight,
+    CostFeatureInputs, CostPolicy, CostProvenance, CostProxyInputs, DatasetSnapshot,
+    ENGINE_VERSION, EpisodeId, EpisodeRecord, EpisodeStatus, EventContext, EvidenceSnapshot,
+    ExecutionPolicy, FillId, FillRecord, FillTiming, LabError, MAX_DATASET_ROWS, MAX_MODEL_EVENTS,
+    MarkKind, ModelAdmission, ModelLedger, ModelStatus, ObservationId, OrderId, OrderRecord,
+    OrderStatus, PriceKrw, QuoteAmount, ReasonCode, ResolvedPlan, RunId, Side, SignalId,
+    SignalOutcome, SignalRecord, SimulatedOrderType, StrategyBinding, TerminalPolicy, UtcRange,
+    UtcTimestamp, Weight,
 };
 use crate::evidence::EvidenceEvaluator;
 use crate::policy_engine::PolicyEvaluator;
@@ -248,6 +249,8 @@ pub fn run_model(
                     state.cancel_pending(&cancelled, now, ReasonCode::Cancelled)?;
                 }
                 if pending.is_none() && target != position.actual_weight {
+                    let decision_at = decision_bar.candle.close_time_utc;
+                    let tradable = plan.spec.rules_at(decision_at)?.tradable_at(decision_at);
                     let effective_at = add_millis(now, plan.spec.latency_ms)?;
                     let order_expiry = passive_order_expiry(
                         &plan.spec.execution,
@@ -257,14 +260,42 @@ pub fn run_model(
                         effective_at,
                         expiry,
                     );
-                    pending = state.create_pending(
-                        signal_index,
-                        target,
-                        decision_bar,
-                        effective_at,
-                        order_expiry,
-                        plan,
-                    )?;
+                    if tradable {
+                        let position_value = checked_mul(
+                            state.account.qty(),
+                            decision_bar.candle.close.get(),
+                            "reference position",
+                        )?;
+                        let reference_equity = checked_add(
+                            state.account.cash_free()?,
+                            position_value,
+                            "reference equity",
+                        )?;
+                        let target_value =
+                            checked_mul(reference_equity, target.get(), "target value")?;
+                        let requested_notional =
+                            checked_sub(target_value, position_value, "target gap")?.abs();
+                        pending = state.create_pending(
+                            signal_index,
+                            target,
+                            decision_bar,
+                            liquidity_source,
+                            requested_notional,
+                            effective_at,
+                            order_expiry,
+                            plan,
+                        )?;
+                    } else {
+                        state.push_rejected_order(
+                            signal_index,
+                            decision_at,
+                            effective_at,
+                            order_expiry,
+                            ReasonCode::RuleBlocked,
+                            plan,
+                        )?;
+                        state.signals[signal_index].outcome = SignalOutcome::RuleBlocked;
+                    }
                 } else if pending.is_some() {
                     state.signals[signal_index].outcome = SignalOutcome::OrderUnfilled;
                 }
@@ -493,18 +524,28 @@ impl EngineState {
         Ok(self.signals.len() - 1)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one ordered request-planning phase needs signal, liquidity, sizing and timing inputs"
+    )]
     fn create_pending(
         &mut self,
         signal_index: usize,
         target: Weight,
         decision_bar: &CandleObservation,
+        liquidity_source: &CandleObservation,
+        requested_notional: Decimal,
         effective_at: UtcTimestamp,
         expires_at: UtcTimestamp,
         plan: &ResolvedPlan,
     ) -> Result<Option<PendingExecution>, LabError> {
+        let decision_at = decision_bar.candle.close_time_utc;
+        let (costs, provenance) =
+            effective_costs(plan, decision_at, liquidity_source, requested_notional)?;
+        let rules = plan.spec.rules_at(decision_at)?;
         let passive_buy = matches!(plan.spec.execution, ExecutionPolicy::PassiveBuy { .. })
             && self.signals[signal_index].intended_side == Some(Side::Buy);
-        let decision = if passive_buy {
+        let mut decision = if passive_buy {
             let ExecutionPolicy::PassiveBuy { offset_bps, .. } = &plan.spec.execution else {
                 return Err(LabError::Internal(
                     "passive execution policy disappeared".into(),
@@ -515,18 +556,21 @@ impl EngineState {
                 target,
                 decision_bar.candle.close,
                 *offset_bps,
-                plan.spec.costs.maker_fee_bps,
-                &plan.spec.market_rules,
+                costs.maker_fee_bps,
+                rules,
             )?
         } else {
             plan_market_request(
                 &self.account,
                 target,
                 decision_bar.candle.close,
-                &plan.spec.costs,
-                &plan.spec.market_rules,
+                &costs,
+                rules,
             )?
         };
+        if let Some(fill) = decision.fill.as_mut() {
+            fill.cost_provenance = provenance;
+        }
         let Some(request) = decision.fill else {
             self.push_rejected_order(
                 signal_index,
@@ -569,7 +613,7 @@ impl EngineState {
             created_at: decision_bar.candle.close_time_utc,
             effective_at,
             expires_at,
-            rule_snapshot_id: plan.spec.market_rules.id.clone(),
+            rule_snapshot_id: rules.id.clone(),
             policy_version: if passive_buy {
                 PASSIVE_POLICY_VERSION.into()
             } else {
@@ -628,15 +672,29 @@ impl EngineState {
         if order.request.side == Side::Buy {
             self.account.release(order.request.reserved_cash)?;
         }
-        let decision = plan_market_arrival(
-            &self.account,
-            order.request,
-            execution_bar.candle.open,
-            &plan.spec.costs,
-            &plan.spec.market_rules,
-            liquidity_source.candle.volume,
-            participation_cap,
-        )?;
+        let rules = plan.spec.rules_at(now)?;
+        let decision = if rules.tradable_at(now) {
+            let (arrival_costs, arrival_provenance) =
+                effective_costs(plan, now, liquidity_source, order.request.notional.get())?;
+            let mut arrival = plan_market_arrival(
+                &self.account,
+                &order.request,
+                execution_bar.candle.open,
+                &arrival_costs,
+                rules,
+                liquidity_source.candle.volume,
+                participation_cap,
+            )?;
+            if let Some(fill) = arrival.fill.as_mut() {
+                fill.cost_provenance = arrival_provenance;
+            }
+            arrival
+        } else {
+            ExecutionDecision {
+                fill: None,
+                reason: ReasonCode::RuleBlocked,
+            }
+        };
         self.record_execution(
             &order,
             decision,
@@ -669,6 +727,12 @@ impl EngineState {
                 .ok_or_else(|| LabError::Internal("pending passive order disappeared".into()))?;
             return self.expire_pending(&expired, expires_at);
         }
+        let rules = plan.spec.rules_at(completed_bar.candle.close_time_utc)?;
+        if !rules.tradable_at(completed_bar.candle.close_time_utc) {
+            // A suspended or maintained market leaves the passive order pending;
+            // the bounded TTL still expires it deterministically.
+            return Ok(());
+        }
         let order = pending
             .take()
             .ok_or_else(|| LabError::Internal("pending passive order disappeared".into()))?;
@@ -684,14 +748,14 @@ impl EngineState {
             ));
         };
         let decision = plan_passive_arrival(
-            order.request,
+            &order.request,
             completed_bar.candle.open,
             completed_bar.candle.low,
             liquidity_source.candle.volume,
             participation_cap,
             *fill_fraction,
             *penetration_ticks,
-            &plan.spec.market_rules,
+            rules,
         )?;
         self.record_execution(
             &order,
@@ -768,6 +832,8 @@ impl EngineState {
                 signal_index,
                 zero,
                 bar,
+                bar,
+                Decimal::ZERO,
                 bar.candle.close_time_utc,
                 expiry,
                 plan,
@@ -780,15 +846,22 @@ impl EngineState {
                 "terminal liquidation produced a buy request".into(),
             ));
         }
-        let decision = plan_market_arrival(
+        let terminal_at = bar.candle.close_time_utc;
+        let (terminal_costs, provenance) =
+            effective_costs(plan, terminal_at, bar, pending.request.notional.get())?;
+        let rules = plan.spec.rules_at(terminal_at)?;
+        let mut decision = plan_market_arrival(
             &self.account,
-            pending.request,
+            &pending.request,
             bar.candle.close,
-            &plan.spec.costs,
-            &plan.spec.market_rules,
+            &terminal_costs,
+            rules,
             bar.candle.volume,
             participation_cap,
         )?;
+        if let Some(fill) = decision.fill.as_mut() {
+            fill.cost_provenance = provenance;
+        }
         self.last_target = zero;
         self.record_execution(&pending, decision, bar, bar, ExecutionMoment::TerminalClose)
     }
@@ -972,10 +1045,11 @@ impl EngineState {
             fill_observed: false,
             model_version: ENGINE_VERSION.into(),
             artificial_terminal_exit,
+            cost_provenance: fill.cost_provenance.clone(),
             accounting_mark_seq,
         });
         self.update_episode(
-            fill,
+            &fill,
             fill_id,
             pending.order.order_id.clone(),
             applied.removed_basis,
@@ -1029,6 +1103,7 @@ impl EngineState {
         plan: &ResolvedPlan,
     ) -> Result<(), LabError> {
         self.ensure_capacity(3)?;
+        let rule_snapshot_id = plan.spec.rules_at(created_at)?.id.clone();
         let created_context = self.next_context(created_at)?;
         let side = self.signals[signal_index].intended_side.ok_or_else(|| {
             LabError::AccountingInvariant("rejected order has no intended side".into())
@@ -1051,7 +1126,7 @@ impl EngineState {
             created_at,
             effective_at,
             expires_at,
-            rule_snapshot_id: plan.spec.market_rules.id.clone(),
+            rule_snapshot_id,
             policy_version: EXECUTION_POLICY_VERSION.into(),
             reserved_cash: QuoteAmount::new(Decimal::ZERO)?,
             cumulative_filled_qty: AssetQuantity::new(Decimal::ZERO)?,
@@ -1129,7 +1204,7 @@ impl EngineState {
     #[allow(clippy::too_many_arguments)]
     fn update_episode(
         &mut self,
-        fill: PlannedFill,
+        fill: &PlannedFill,
         fill_id: FillId,
         order_id: OrderId,
         removed_basis: Decimal,
@@ -1553,7 +1628,7 @@ fn validate_frozen_inputs(
     Ok(())
 }
 
-fn observations_for_range<'a>(
+pub(crate) fn observations_for_range<'a>(
     datasets: &'a [DatasetSnapshot],
     market: &crate::contracts::MarketId,
     interval: crate::contracts::CandleInterval,
@@ -1643,6 +1718,66 @@ fn slippage_bps(side: Side, fill: Decimal, reference: Decimal) -> Result<Decimal
         Side::Sell => -ratio,
     };
     checked_mul(signed, Decimal::from(10_000), "slippage bps")
+}
+
+/// Proxy liquidity features of one completed bar: `(high-low)/close` range
+/// fraction and the observed `quote_turnover`. Zero-close bars are flat.
+fn liquidity_features(liquidity: &CandleObservation) -> Result<(Decimal, Decimal), LabError> {
+    let close = liquidity.candle.close.get();
+    let turnover = liquidity.candle.quote_turnover.get();
+    if close.is_zero() {
+        return Ok((Decimal::ZERO, turnover));
+    }
+    let range = checked_sub(
+        liquidity.candle.high.get(),
+        liquidity.candle.low.get(),
+        "bar range",
+    )?;
+    let fraction = checked_div(range, close, "bar range fraction")?;
+    Ok((fraction, turnover))
+}
+
+/// Fees and slippage in effect at `at`, resolved from the point-in-time rule
+/// snapshot and the optional dynamic OHLCV-proxy cost model. The dynamic model
+/// only reads the completed liquidity-source bar, never the execution bar.
+fn effective_costs(
+    plan: &ResolvedPlan,
+    at: UtcTimestamp,
+    liquidity: &CandleObservation,
+    requested_notional: Decimal,
+) -> Result<(CostPolicy, Option<CostProvenance>), LabError> {
+    let mut costs = plan.spec.costs.clone();
+    let fees = plan.spec.fee_policy_at(at)?;
+    costs.buy_fee_bps = fees.buy;
+    costs.sell_fee_bps = fees.sell;
+    costs.maker_fee_bps = fees.maker;
+    let Some(dynamic) = &plan.spec.costs.dynamic else {
+        return Ok((costs, None));
+    };
+    let (range_fraction, turnover) = liquidity_features(liquidity)?;
+    let effective = dynamic.effective_slippage_bps(CostFeatureInputs {
+        bar_range_fraction: range_fraction,
+        quote_turnover: turnover,
+        requested_notional,
+    })?;
+    costs.slippage_bps = effective;
+    let participation_rate = if turnover.is_zero() {
+        Decimal::ZERO
+    } else {
+        checked_div(requested_notional, turnover, "participation rate")?
+    };
+    let provenance = CostProvenance {
+        model_kind: dynamic.kind(),
+        effective_slippage_bps: effective,
+        proxy_inputs: CostProxyInputs {
+            liquidity_bar_id: liquidity.id.clone(),
+            bar_range_bps: checked_mul(range_fraction, Decimal::from(10_000), "bar range bps")?,
+            quote_turnover: QuoteAmount::new(turnover)?,
+            requested_notional: QuoteAmount::new(requested_notional)?,
+            participation_rate,
+        },
+    };
+    Ok((costs, Some(provenance)))
 }
 
 fn check_cancelled(cancelled: &dyn Fn() -> bool) -> Result<(), LabError> {

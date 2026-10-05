@@ -1,13 +1,13 @@
 use super::accounting::{Account, checked_add, checked_div, checked_mul, checked_sub};
 use crate::contracts::{
-    AssetQuantity, BasisPoints, CostPolicy, LabError, MarketRuleSnapshot, PassiveFraction,
-    PriceKrw, QuoteAmount, ReasonCode, Side, Weight,
+    AssetQuantity, BasisPoints, CostPolicy, CostProvenance, LabError, MarketRuleSnapshot,
+    PassiveFraction, PriceKrw, QuoteAmount, ReasonCode, Side, Weight,
 };
 use rust_decimal::{Decimal, RoundingStrategy};
 
 const BPS_DENOMINATOR: Decimal = Decimal::from_parts(10_000, 0, 0, false, 0);
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(super) struct PlannedFill {
     pub(super) side: Side,
     pub(super) price: PriceKrw,
@@ -18,9 +18,11 @@ pub(super) struct PlannedFill {
     pub(super) reserved_cash: QuoteAmount,
     pub(super) price_cost_attribution: Decimal,
     pub(super) reason: ReasonCode,
+    /// Present only for taker fills priced by a dynamic proxy cost model.
+    pub(super) cost_provenance: Option<CostProvenance>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(super) struct ExecutionDecision {
     pub(super) fill: Option<PlannedFill>,
     pub(super) reason: ReasonCode,
@@ -136,6 +138,7 @@ pub(super) fn plan_market_request(
             reserved_cash: QuoteAmount::new(reserved_cash)?,
             price_cost_attribution,
             reason,
+            cost_provenance: None,
         }),
         reason,
     })
@@ -143,7 +146,7 @@ pub(super) fn plan_market_request(
 
 pub(super) fn plan_market_arrival(
     account: &Account,
-    request: PlannedFill,
+    request: &PlannedFill,
     execution_open: PriceKrw,
     costs: &CostPolicy,
     rules: &MarketRuleSnapshot,
@@ -210,6 +213,7 @@ pub(super) fn plan_market_arrival(
             reserved_cash: QuoteAmount::new(reserved_cash)?,
             price_cost_attribution,
             reason,
+            cost_provenance: None,
         }),
         reason,
     })
@@ -284,6 +288,7 @@ pub(super) fn plan_passive_buy_request(
                 "passive price attribution",
             )?,
             reason: ReasonCode::MarketFilled,
+            cost_provenance: None,
         }),
         reason: ReasonCode::MarketFilled,
     })
@@ -291,7 +296,7 @@ pub(super) fn plan_passive_buy_request(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn plan_passive_arrival(
-    request: PlannedFill,
+    request: &PlannedFill,
     bar_open: PriceKrw,
     bar_low: PriceKrw,
     prior_volume: AssetQuantity,
@@ -353,6 +358,7 @@ pub(super) fn plan_passive_arrival(
             } else {
                 ReasonCode::MarketFilled
             },
+            cost_provenance: request.cost_provenance.clone(),
         }),
         reason: if qty < request.qty.get() {
             ReasonCode::PassivePartial
@@ -362,7 +368,7 @@ pub(super) fn plan_passive_arrival(
     })
 }
 
-fn market_price(
+pub(crate) fn market_price(
     reference: PriceKrw,
     side: Side,
     costs: &CostPolicy,
@@ -392,7 +398,7 @@ fn market_price(
     Ok((PriceKrw::new(rounded)?, signed_attribution))
 }
 
-fn tick_for(value: Decimal, rules: &MarketRuleSnapshot) -> Result<Decimal, LabError> {
+pub(crate) fn tick_for(value: Decimal, rules: &MarketRuleSnapshot) -> Result<Decimal, LabError> {
     let tick = rules
         .ticks
         .iter()
@@ -419,7 +425,7 @@ fn round_to_tick(value: Decimal, tick: Decimal, side: Side) -> Result<Decimal, L
     checked_mul(rounded_units, tick, "tick-rounded price")
 }
 
-fn floor_to_step(value: Decimal, step: Decimal) -> Result<Decimal, LabError> {
+pub(crate) fn floor_to_step(value: Decimal, step: Decimal) -> Result<Decimal, LabError> {
     if step <= Decimal::ZERO {
         return Err(LabError::InvalidConfig(
             "quantity step must be positive".into(),
@@ -430,7 +436,7 @@ fn floor_to_step(value: Decimal, step: Decimal) -> Result<Decimal, LabError> {
     checked_mul(units, step, "step-rounded quantity")
 }
 
-fn bps_rate(bps: BasisPoints) -> Result<Decimal, LabError> {
+pub(crate) fn bps_rate(bps: BasisPoints) -> Result<Decimal, LabError> {
     checked_div(bps.get(), BPS_DENOMINATOR, "basis-point rate")
 }
 

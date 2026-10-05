@@ -234,22 +234,22 @@ pub(super) fn aggregate_identity_within_tolerance(
     Ok(checked_sub(actual, expected, "aggregate identity residual")?.abs() <= NUMERIC_TOLERANCE)
 }
 
-pub(super) fn checked_add(a: Decimal, b: Decimal, label: &str) -> Result<Decimal, LabError> {
+pub(crate) fn checked_add(a: Decimal, b: Decimal, label: &str) -> Result<Decimal, LabError> {
     a.checked_add(b)
         .ok_or_else(|| invariant(format!("{label} overflow")))
 }
 
-pub(super) fn checked_sub(a: Decimal, b: Decimal, label: &str) -> Result<Decimal, LabError> {
+pub(crate) fn checked_sub(a: Decimal, b: Decimal, label: &str) -> Result<Decimal, LabError> {
     a.checked_sub(b)
         .ok_or_else(|| invariant(format!("{label} overflow")))
 }
 
-pub(super) fn checked_mul(a: Decimal, b: Decimal, label: &str) -> Result<Decimal, LabError> {
+pub(crate) fn checked_mul(a: Decimal, b: Decimal, label: &str) -> Result<Decimal, LabError> {
     a.checked_mul(b)
         .ok_or_else(|| invariant(format!("{label} overflow")))
 }
 
-pub(super) fn checked_div(a: Decimal, b: Decimal, label: &str) -> Result<Decimal, LabError> {
+pub(crate) fn checked_div(a: Decimal, b: Decimal, label: &str) -> Result<Decimal, LabError> {
     a.checked_div(b)
         .ok_or_else(|| invariant(format!("{label} division failed")))
 }

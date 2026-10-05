@@ -1,5 +1,8 @@
 use super::*;
-use crate::contracts::{CandleInterval, MarketId, ScheduleRetryPolicy};
+use crate::contracts::{
+    CandleInterval, FailureRecord, FreshnessPolicy, FreshnessState, MarketId, ScheduleRetryPolicy,
+    SourceProbeResult,
+};
 
 fn time(value: &str) -> UtcTimestamp {
     UtcTimestamp::parse_rfc3339(value).expect("valid fixture time")
@@ -12,6 +15,7 @@ fn request() -> CollectionScheduleRequest {
         interval: CandleInterval::H1,
         lookback_bars: 24,
         cadence_seconds: 300,
+        freshness_policy: None,
         retry: ScheduleRetryPolicy {
             max_retries: 2,
             backoff_seconds: 60,
@@ -143,4 +147,97 @@ fn an_in_flight_fire_prevents_parallel_admission() {
         schedule_tick(&schedule, time("2024-01-01T10:00:00Z")).expect("tick"),
         ScheduleTick::NotDue
     ));
+}
+
+#[test]
+fn freshness_classifier_separates_finalization_publication_and_true_gaps() {
+    let expected = time("2024-01-01T02:00:00Z");
+    let latest = Some(time("2024-01-01T01:00:00Z"));
+    let policy = FreshnessPolicy {
+        grace_seconds: 600,
+        source_delay_seconds: 3_600,
+        consecutive_gap_threshold: 2,
+    };
+    let probe = |has: bool| SourceProbeResult {
+        attempted: true,
+        source_has_boundary: Some(has),
+        note: "classifier fixture".into(),
+    };
+    let classify = |now: UtcTimestamp, consecutive: u64, probe: Option<&SourceProbeResult>| {
+        classify_market_freshness(
+            expected,
+            latest,
+            now,
+            consecutive,
+            3_600,
+            &policy,
+            probe,
+            None,
+        )
+        .state
+    };
+    // A covered boundary is fresh regardless of age.
+    assert_eq!(
+        classify_market_freshness(
+            expected,
+            Some(time("2024-01-01T02:00:00Z")),
+            time("2024-01-01T09:00:00Z"),
+            0,
+            3_600,
+            &policy,
+            None,
+            None,
+        )
+        .state,
+        FreshnessState::Fresh
+    );
+    // Boundary directly behind us: still finalizing inside the grace window.
+    assert_eq!(
+        classify(expected, 1, None),
+        FreshnessState::WaitingForFinalization
+    );
+    // A source probe that exposes the boundary is a collector problem.
+    assert_eq!(
+        classify(time("2024-01-01T02:20:00Z"), 1, Some(&probe(true))),
+        FreshnessState::CollectorDelay
+    );
+    // Past grace but inside the publication window: source delay, not a gap.
+    assert_eq!(
+        classify(time("2024-01-01T02:30:00Z"), 1, None),
+        FreshnessState::SourceDelay
+    );
+    // Past the publication window with enough consecutive absence: true gap.
+    assert_eq!(
+        classify(time("2024-01-01T03:30:00Z"), 3, None),
+        FreshnessState::TrueGap
+    );
+    // Only one historical boundary below the threshold stays recoverable.
+    assert_eq!(
+        classify(time("2024-01-01T03:30:00Z"), 2, None),
+        FreshnessState::SourceDelay
+    );
+    // One missing boundary below the threshold stays a recoverable delay.
+    assert_eq!(
+        classify(time("2024-01-01T03:30:00Z"), 1, None),
+        FreshnessState::SourceDelay
+    );
+    // A blocked schedule fails freshness classification outright.
+    let failure = FailureRecord {
+        code: "COLLECTION_BLOCKED".into(),
+        message: "fixture".into(),
+    };
+    assert_eq!(
+        classify_market_freshness(
+            expected,
+            latest,
+            expected,
+            1,
+            3_600,
+            &policy,
+            None,
+            Some(&failure)
+        )
+        .state,
+        FreshnessState::Failed
+    );
 }

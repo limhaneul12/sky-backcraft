@@ -723,6 +723,70 @@ impl LabMcpService {
     }
 
     #[tool(
+        description = "Run and query shared-capital portfolio backtests over frozen plans",
+        input_schema = tagged_schema::<crate::contracts::PortfolioAction>(),
+        annotations(
+            title = "Portfolio Backtest",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn portfolio_backtest(&self, arguments: JsonObject) -> Result<CallToolResult, McpError> {
+        let action: crate::contracts::PortfolioAction = parse_arguments(arguments)?;
+        match action {
+            crate::contracts::PortfolioAction::Create { request } => {
+                let submission = JobSubmission {
+                    request_id: request.request_id.clone(),
+                    payload: JobPayload::PortfolioBacktest { request },
+                };
+                let job = self
+                    .jobs
+                    .submit(submission)
+                    .await
+                    .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+                result_or_error(Ok(job))
+            }
+            crate::contracts::PortfolioAction::Get { run_id } => {
+                let summary = self
+                    .database
+                    .call("portfolio_summary", move |store| {
+                        store.portfolio_run_summary(&run_id)
+                    })
+                    .await
+                    .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+                result_or_error(Ok(summary))
+            }
+            crate::contracts::PortfolioAction::Facts {
+                run_id,
+                kind,
+                offset,
+                limit,
+            } => {
+                let facts = self
+                    .database
+                    .call("portfolio_facts", move |store| {
+                        store.portfolio_facts(&run_id, &kind, offset, limit)
+                    })
+                    .await
+                    .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+                result_or_error(Ok(facts))
+            }
+            crate::contracts::PortfolioAction::List { offset, limit } => {
+                let runs = self
+                    .database
+                    .call("portfolio_list", move |store| {
+                        store.list_portfolio_runs(offset, limit)
+                    })
+                    .await
+                    .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+                result_or_error(Ok(runs))
+            }
+        }
+    }
+
+    #[tool(
         description = "Create or revise one validated immutable quant policy revision",
         input_schema = tagged_schema::<PolicyWrite>(),
         annotations(
@@ -735,21 +799,43 @@ impl LabMcpService {
     )]
     async fn policy_write(&self, arguments: JsonObject) -> Result<CallToolResult, McpError> {
         let write: PolicyWrite = parse_arguments(arguments)?;
-        let definition = match &write {
+        match &write {
             PolicyWrite::Create { definition, .. } | PolicyWrite::Revise { definition, .. } => {
                 definition
+                    .validate()
+                    .map_err(|error| invalid_params(&error))?;
+            }
+            // Sweep definitions are validated during expansion.
+            PolicyWrite::Sweep { .. } => {}
+        }
+        let now = crate::contracts::UtcTimestamp::now();
+        let result = match write {
+            PolicyWrite::Sweep {
+                request_id,
+                family,
+                template,
+                mode,
+            } => {
+                self.database
+                    .call("mcp_policy_sweep", move |store| {
+                        Ok(serde_json::to_value(store.sweep_policy(
+                            &request_id,
+                            family,
+                            &template,
+                            &mode,
+                            now,
+                        )?)?)
+                    })
+                    .await
+            }
+            write => {
+                self.database
+                    .call("mcp_policy_write", move |store| {
+                        Ok(serde_json::to_value(store.write_policy(&write, now)?)?)
+                    })
+                    .await
             }
         };
-        definition
-            .validate()
-            .map_err(|error| invalid_params(&error))?;
-        let now = crate::contracts::UtcTimestamp::now();
-        let result = self
-            .database
-            .call("mcp_policy_write", move |store| {
-                store.write_policy(&write, now)
-            })
-            .await;
         result_or_error(result)
     }
 

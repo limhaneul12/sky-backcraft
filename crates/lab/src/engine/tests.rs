@@ -11,13 +11,13 @@ use crate::contracts::policy::{
 use crate::contracts::{
     AdmissionStatus, AssetQuantity, BasisPoints, CandleInterval, CandleObservation, CandleRecord,
     CausalExecutionPolicy, CollectRequest, ContentHash, CostPolicy, DatasetId, DatasetManifest,
-    DatasetSnapshot, DatasetStatus, EvidenceId, EvidenceImport, EvidenceProvenance,
-    EvidencePurpose, EvidenceRevisionId, EvidenceUnavailablePolicy, EvidenceVersion,
-    ExecutionPolicy, MarketDataOrigin, MarketId, MarketRuleSnapshot, ModelAdmission, ModelId,
-    ModelStatus, PitPolicy, PlanId, PriceKrw, QuoteAmount, ReportClock, RequestId, ResolvedPlan,
-    RuleProvenance, RuleSnapshotId, RunId, SCHEMA_VERSION, Side, StateParameters, StrategyKind,
-    StrategySpec, TerminalPolicy, TickBand, UtcRange, UtcTimestamp, Weight,
-    experiment_config_digest,
+    DatasetSnapshot, DatasetStatus, DynamicCostKind, DynamicCostModel, EvidenceId, EvidenceImport,
+    EvidenceProvenance, EvidencePurpose, EvidenceRevisionId, EvidenceUnavailablePolicy,
+    EvidenceVersion, ExecutionPolicy, HistoricalFeeSchedule, MarkKind, MarketDataOrigin, MarketId,
+    MarketRuleSnapshot, ModelAdmission, ModelId, ModelStatus, OrderStatus, PitPolicy, PlanId,
+    PriceKrw, QuoteAmount, ReasonCode, ReportClock, RequestId, ResolvedPlan, RuleProvenance,
+    RuleSnapshotId, RunId, SCHEMA_VERSION, Side, StateParameters, StrategyKind, StrategySpec,
+    TerminalPolicy, TickBand, UtcRange, UtcTimestamp, Weight, experiment_config_digest,
 };
 use rust_decimal::Decimal;
 
@@ -147,6 +147,7 @@ fn market_sizing_keeps_post_fee_cash_and_applies_price_cost_once() {
         slippage_bps: BasisPoints::new(decimal("5")).expect("valid bps"),
         impact_bps: BasisPoints::new(decimal("0")).expect("valid bps"),
         assumption_label: "synthetic fixture".into(),
+        dynamic: None,
     };
     let market_rules = rules("0.01", "0.1", "1");
     let decision = plan_market_request(
@@ -184,7 +185,7 @@ fn market_sizing_floors_quantity_to_prior_volume_cap_and_blocks_min_notional() {
     .expect("request is valid");
     let capped = plan_market_arrival(
         &account,
-        request,
+        &request,
         price("10"),
         &costs,
         &market_rules,
@@ -199,7 +200,7 @@ fn market_sizing_floors_quantity_to_prior_volume_cap_and_blocks_min_notional() {
     let blocked_rules = rules("100", "0.1", "1");
     let blocked = plan_market_arrival(
         &account,
-        request,
+        &request,
         price("10"),
         &costs,
         &blocked_rules,
@@ -921,7 +922,7 @@ fn passive_cross_touch_and_strict_penetration_are_distinct() {
     .expect("passive request exists");
     let cap = Weight::new(Decimal::ONE).expect("cap");
     let crossing = plan_passive_arrival(
-        request,
+        &request,
         price("100"),
         price("90"),
         qty("100"),
@@ -937,7 +938,7 @@ fn passive_cross_touch_and_strict_penetration_are_distinct() {
         crate::contracts::ReasonCode::WouldTakeOrUnknown
     );
     let touch = plan_passive_arrival(
-        request,
+        &request,
         price("101"),
         price("100"),
         qty("100"),
@@ -953,7 +954,7 @@ fn passive_cross_touch_and_strict_penetration_are_distinct() {
         crate::contracts::ReasonCode::PassiveNotPenetrated
     );
     let penetrated = plan_passive_arrival(
-        request,
+        &request,
         price("101"),
         price("99"),
         qty("100"),
@@ -1045,6 +1046,7 @@ fn zero_costs() -> CostPolicy {
         slippage_bps: zero,
         impact_bps: zero,
         assumption_label: "synthetic zero-cost fixture".into(),
+        dynamic: None,
     }
 }
 
@@ -1064,6 +1066,9 @@ fn rules(min_notional: &str, quantity_step: &str, tick: &str) -> MarketRuleSnaps
             lower_bound: amount("0"),
             tick: price(tick),
         }],
+        fee_schedule: None,
+        trading_state: None,
+        maintenance_windows: Vec::new(),
     }
 }
 
@@ -1140,6 +1145,7 @@ fn buy_and_hold_fixture() -> (
                 participation_cap: Weight::new(Decimal::ONE).expect("fixture cap"),
             },
             market_rules: rules("1", "0.1", "1"),
+            market_rules_history: Vec::new(),
             terminal_policy: TerminalPolicy::MarkToMarket,
             evidence_snapshot_id: None,
             pit_policy: PitPolicy::StrictPit,
@@ -1331,4 +1337,217 @@ fn remove_occurrence_run_ids(value: &mut serde_json::Value) {
         }
         _ => {}
     }
+}
+
+#[test]
+fn verified_historical_fee_boundary_switches_execution_costs_pit() {
+    let (mut plan, dataset, admission, run_id, _start) = buy_and_hold_fixture();
+    let full = plan.spec.range;
+    let mid = time("2025-01-02T01:00:00Z");
+    let verified = |id: &str, start: UtcTimestamp, end: UtcTimestamp, taker: &str| {
+        let mut snapshot = rules("1", "0.1", "1");
+        snapshot.id = RuleSnapshotId::new(id).expect("valid rule id");
+        snapshot.valid_range = UtcRange::new(start, end).expect("segment range");
+        snapshot.provenance = RuleProvenance::VerifiedHistorical;
+        snapshot.source_refs = vec!["exchange-notice://2025-01".into()];
+        snapshot.fee_schedule = Some(HistoricalFeeSchedule {
+            taker_fee_bps: BasisPoints::new(decimal(taker)).expect("valid fee"),
+            maker_fee_bps: BasisPoints::new(decimal("1")).expect("valid fee"),
+            assumption_label: "verified historical fee schedule".into(),
+        });
+        snapshot
+    };
+    let segment_a = verified("rule-a", full.start(), mid, "10");
+    let segment_b = verified("rule-b", mid, full.end(), "100");
+    plan.spec.costs.buy_fee_bps = BasisPoints::new(decimal("500")).expect("scenario fee");
+    plan.spec.costs.sell_fee_bps = BasisPoints::new(decimal("500")).expect("scenario fee");
+    plan.spec.terminal_policy = TerminalPolicy::LiquidateScenario;
+    plan.spec.market_rules = segment_a.clone();
+    plan.spec.market_rules_history = vec![segment_a.clone(), segment_b.clone()];
+    let ledger = run_model(
+        &plan,
+        std::slice::from_ref(&dataset),
+        None,
+        &run_id,
+        &admission,
+        10,
+        &|| false,
+    )
+    .expect("pit run completes");
+    let buy = ledger
+        .fills
+        .iter()
+        .find(|fill| fill.side == Side::Buy)
+        .expect("entry buy fill exists");
+    let sell = ledger
+        .fills
+        .iter()
+        .find(|fill| fill.artificial_terminal_exit)
+        .expect("terminal sell fill exists");
+    assert_eq!(
+        buy.fee_bps.get(),
+        decimal("10"),
+        "segment A taker fee applies"
+    );
+    assert_eq!(
+        sell.fee_bps.get(),
+        decimal("100"),
+        "segment B verified fee overrides the 500bps scenario proxy"
+    );
+    assert_eq!(buy.context.market, ledger.market);
+
+    // Control: without history the scenario fee applies to every fill.
+    let mut control_plan = plan.clone();
+    control_plan.spec.market_rules_history = Vec::new();
+    control_plan.spec.market_rules = rules("1", "0.1", "1");
+    let control = run_model(
+        &control_plan,
+        std::slice::from_ref(&dataset),
+        None,
+        &run_id,
+        &admission,
+        10,
+        &|| false,
+    )
+    .expect("control run completes");
+    for fill in &control.fills {
+        assert_eq!(fill.fee_bps.get(), decimal("500"), "current-rule proxy fee");
+    }
+}
+
+#[test]
+fn suspended_market_rejects_the_order_and_never_fills() {
+    let (mut plan, dataset, admission, run_id, _start) = buy_and_hold_fixture();
+    let full = plan.spec.range;
+    plan.spec.market_rules.maintenance_windows =
+        vec![UtcRange::new(full.start(), full.end()).expect("maintenance window")];
+    let ledger = run_model(
+        &plan,
+        std::slice::from_ref(&dataset),
+        None,
+        &run_id,
+        &admission,
+        10,
+        &|| false,
+    )
+    .expect("suspended run completes");
+    assert!(
+        ledger.fills.is_empty(),
+        "no fill may occur during maintenance"
+    );
+    let rejected = ledger
+        .order_events
+        .iter()
+        .find(|event| event.status == OrderStatus::Rejected)
+        .expect("order is explicitly rejected");
+    assert_eq!(rejected.reason, ReasonCode::RuleBlocked);
+    let terminal = ledger
+        .account_marks
+        .iter()
+        .find(|mark| mark.kind == MarkKind::Terminal)
+        .expect("terminal mark exists");
+    assert_eq!(terminal.state.cash_total.get(), decimal("1000"));
+}
+
+#[test]
+fn dynamic_volatility_cost_uses_only_the_completed_liquidity_bar() {
+    let (mut plan, mut dataset, admission, run_id, _start) = buy_and_hold_fixture();
+    let zero = BasisPoints::new(Decimal::ZERO).expect("zero bps");
+    plan.spec.costs = CostPolicy {
+        buy_fee_bps: zero,
+        sell_fee_bps: zero,
+        maker_fee_bps: zero,
+        half_spread_bps: zero,
+        slippage_bps: zero,
+        impact_bps: zero,
+        assumption_label: "dynamic causality fixture".into(),
+        dynamic: Some(DynamicCostModel::VolatilityAware {
+            base_slippage_bps: zero,
+            range_weight: Decimal::from(10_000),
+            max_slippage_bps: BasisPoints::new(decimal("5000")).expect("bound"),
+        }),
+    };
+    // The liquidity source bar is flat (range 0); the execution bar itself has a
+    // huge range that must never enter the next-bar-open cost.
+    let mut prior = observation("prior", "2025-01-01T23:00:00Z", "100", "100");
+    prior.candle.high = price("100");
+    prior.candle.low = price("100");
+    let mut first = observation("first", "2025-01-02T00:00:00Z", "100", "101");
+    first.candle.high = price("150");
+    first.candle.low = price("50");
+    dataset.observations = vec![
+        prior,
+        first,
+        observation("second", "2025-01-02T01:00:00Z", "101", "110"),
+    ];
+    let ledger = run_model(
+        &plan,
+        std::slice::from_ref(&dataset),
+        None,
+        &run_id,
+        &admission,
+        10,
+        &|| false,
+    )
+    .expect("dynamic run completes");
+    let fill = ledger
+        .fills
+        .iter()
+        .find(|fill| fill.side == Side::Buy)
+        .expect("entry fill exists");
+    assert_eq!(
+        fill.price.get(),
+        decimal("100"),
+        "flat liquidity bar means zero dynamic slippage despite the wide execution bar"
+    );
+    let provenance = fill
+        .cost_provenance
+        .as_ref()
+        .expect("proxy provenance recorded");
+    assert_eq!(provenance.model_kind, DynamicCostKind::VolatilityAware);
+    assert_eq!(provenance.effective_slippage_bps.get(), Decimal::ZERO);
+    assert_eq!(provenance.proxy_inputs.bar_range_bps, Decimal::ZERO);
+    assert_eq!(
+        provenance.proxy_inputs.quote_turnover.get(),
+        decimal("10000")
+    );
+
+    // A wide liquidity bar raises the fill price by the bounded range component.
+    let mut wide_prior = observation("prior", "2025-01-01T23:00:00Z", "100", "100");
+    wide_prior.candle.high = price("101");
+    wide_prior.candle.low = price("99");
+    dataset.observations = vec![
+        wide_prior,
+        observation("first", "2025-01-02T00:00:00Z", "100", "101"),
+        observation("second", "2025-01-02T01:00:00Z", "101", "110"),
+    ];
+    let wide = run_model(
+        &plan,
+        std::slice::from_ref(&dataset),
+        None,
+        &run_id,
+        &admission,
+        10,
+        &|| false,
+    )
+    .expect("wide-liquidity run completes");
+    let wide_fill = wide
+        .fills
+        .iter()
+        .find(|fill| fill.side == Side::Buy)
+        .expect("wide entry fill exists");
+    let wide_provenance = wide_fill
+        .cost_provenance
+        .as_ref()
+        .expect("wide provenance recorded");
+    assert_eq!(
+        wide_provenance.proxy_inputs.bar_range_bps,
+        decimal("200"),
+        "2% range of the completed liquidity bar"
+    );
+    // 2% range fraction x 10000 weight = 200bps, buy price rounds up to the tick.
+    assert!(
+        wide_fill.price.get() > decimal("100"),
+        "prior-bar volatility raises the buy price"
+    );
 }

@@ -329,6 +329,7 @@ fn suite_fixture(seed: &str) -> (FrozenResearchSuite, Vec<SuiteCase>) {
         slippage_bps: zero,
         impact_bps: zero,
         assumption_label: "suite storage fixture".into(),
+        dynamic: None,
     };
     let definition = PolicyDefinition {
         schema_version: "1.0".into(),
@@ -388,7 +389,11 @@ fn suite_fixture(seed: &str) -> (FrozenResearchSuite, Vec<SuiteCase>) {
                 lower_bound: QuoteAmount::new(Decimal::ZERO).expect("lower"),
                 tick: crate::contracts::PriceKrw::new(Decimal::ONE).expect("tick"),
             }],
+            fee_schedule: None,
+            trading_state: None,
+            maintenance_windows: Vec::new(),
         },
+        market_rules_history: Vec::new(),
         terminal_policy: TerminalPolicy::MarkToMarket,
         evidence_snapshot_id: None,
         pit_policy: PitPolicy::StrictPit,

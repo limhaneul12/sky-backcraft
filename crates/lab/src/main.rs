@@ -287,6 +287,18 @@ fn run_policy_command(args: &[String]) -> Result<(), LabError> {
         .handle()
         .call_blocking("policy_cli", move |store| {
             let value = match request {
+                Request::Write(PolicyWrite::Sweep {
+                    request_id,
+                    family,
+                    template,
+                    mode,
+                }) => serde_json::to_value(store.sweep_policy(
+                    &request_id,
+                    family,
+                    &template,
+                    &mode,
+                    UtcTimestamp::now(),
+                )?)?,
                 Request::Write(write) => {
                     serde_json::to_value(store.write_policy(&write, UtcTimestamp::now())?)?
                 }
@@ -357,6 +369,9 @@ fn parse_research_command(args: &[String]) -> Result<(ResearchCommand, bool), La
             match &action {
                 ResearchSuiteAction::Create { request } => {
                     let _geometry = spot_lab::research::expand_geometry(request)?;
+                }
+                ResearchSuiteAction::Plan { request } => {
+                    let _plan = spot_lab::research::plan_suite(request)?;
                 }
                 ResearchSuiteAction::List { limit, .. }
                 | ResearchSuiteAction::Cases { limit, .. }
@@ -502,6 +517,12 @@ async fn run_offline_suite(
     use spot_lab::contracts::ResearchSuiteAction;
 
     match action {
+        ResearchSuiteAction::Plan { request } => {
+            // Read-only preview works without a database handle.
+            Ok(serde_json::to_value(spot_lab::research::plan_suite(
+                &request,
+            )?)?)
+        }
         ResearchSuiteAction::Create { request } => create_offline_suite(*request, database).await,
         ResearchSuiteAction::Get { suite_id } => {
             database
@@ -664,12 +685,22 @@ async fn run_offline_schedule(
                 })
                 .await
         }
-        CollectionScheduleAction::Freshness { schedule_id } => {
+        CollectionScheduleAction::Freshness {
+            schedule_id,
+            probe_source,
+        } => {
+            let probes = if probe_source {
+                // The offline CLI has no live client; freshness stays time-based.
+                std::collections::BTreeMap::new()
+            } else {
+                std::collections::BTreeMap::new()
+            };
             database
                 .call("collection_freshness_cli", move |store| {
                     Ok(serde_json::to_value(store.collection_freshness(
                         &schedule_id,
                         UtcTimestamp::now(),
+                        &probes,
                     )?)?)
                 })
                 .await
@@ -1946,6 +1977,7 @@ mod tests {
                 "collection-schedule",
                 serde_json::to_value(CollectionScheduleAction::Freshness {
                     schedule_id: schedule_id.clone(),
+                    probe_source: false,
                 })?,
             ),
         ];
@@ -2005,6 +2037,7 @@ mod tests {
                 interval: CandleInterval::H1,
                 lookback_bars: 1,
                 cadence_seconds: 60,
+                freshness_policy: None,
                 retry: ScheduleRetryPolicy {
                     max_retries: 1,
                     backoff_seconds: 60,

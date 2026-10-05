@@ -297,6 +297,29 @@ impl JobService {
                     ));
                 }
             }
+            JobPayload::PortfolioBacktest { request } => {
+                request.portfolio.validate()?;
+                if let Some(regime) = &request.regime {
+                    regime.validate()?;
+                }
+                if request.request_id != submission.request_id {
+                    return Err(LabError::InvalidConfig(
+                        "portfolio request identity mismatch".into(),
+                    ));
+                }
+                let id = request.plan_id.clone();
+                let plan = self
+                    .inner
+                    .database
+                    .call("admit_portfolio", move |store| store.load_plan(&id))
+                    .await?
+                    .ok_or_else(|| LabError::InvalidConfig("unknown frozen plan".into()))?;
+                if plan.resolved.input_digest != request.input_digest {
+                    return Err(LabError::InputHashMismatch(
+                        "submitted plan digest mismatch".into(),
+                    ));
+                }
+            }
             JobPayload::Export { .. } | JobPayload::Verify { .. } => {}
         }
         let job = self
@@ -587,6 +610,10 @@ impl JobService {
             JobPayload::Backtest { request } => {
                 self.backtest(job, attempt, request, cancellation).await
             }
+            JobPayload::PortfolioBacktest { request } => {
+                self.portfolio_backtest(job, attempt, request, cancellation)
+                    .await
+            }
             JobPayload::Export { run_id, market } => {
                 self.export(
                     run_id,
@@ -683,6 +710,88 @@ impl JobService {
             },
             status: JobStatus::Completed,
             publication: AttemptPublication::Validation(report),
+            reservation: None,
+        })
+    }
+
+    /// Execute one shared-capital portfolio run and publish it atomically.
+    /// # Errors
+    /// Rejects unknown plans, mismatched digests, execution or invariant failures.
+    async fn portfolio_backtest(
+        &self,
+        _job: &JobRecord,
+        attempt: &JobAttempt,
+        request: &crate::contracts::PortfolioRunRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<PreparedOutcome, LabError> {
+        let id = request.plan_id.clone();
+        let stored = self
+            .inner
+            .database
+            .call("portfolio_plan", move |store| store.load_plan(&id))
+            .await?
+            .ok_or_else(|| LabError::InvalidConfig("unknown plan".into()))?;
+        if stored.resolved.input_digest != request.input_digest {
+            return Err(LabError::InputHashMismatch("frozen plan mismatch".into()));
+        }
+        let (datasets, _evidence) =
+            crate::planning::load_inputs(&self.inner.database, &stored.resolved.spec).await?;
+        let run_id = RunId::from_seed(attempt.id.as_str());
+        let plan = stored.resolved.clone();
+        let spec = request.portfolio.clone();
+        let regime = request.regime.clone();
+        let worker_run = run_id.clone();
+        let token = cancellation.clone();
+        let (ledger, benchmarks) = tokio::task::spawn_blocking(move || {
+            let cancelled = || token.is_cancelled();
+            let ledger = crate::portfolio::run_portfolio(
+                &plan,
+                &datasets,
+                &spec,
+                regime.as_ref(),
+                &worker_run,
+                1,
+                &cancelled,
+            )?;
+            let benchmarks = crate::portfolio::portfolio_benchmarks(&plan, &datasets, &spec)?;
+            Ok::<_, LabError>((
+                ledger,
+                serde_json::to_value(&benchmarks).map_err(|error| {
+                    LabError::Internal(format!("benchmark serialization: {error}"))
+                })?,
+            ))
+        })
+        .await
+        .map_err(|_| LabError::Internal("portfolio worker panicked".into()))??;
+        check_cancel(cancellation)?;
+        let published = ledger;
+        let fill_count = published.fills.len();
+        let rejection_count = published.rejections.len();
+        let publish_request = crate::contracts::PortfolioRunRequest {
+            request_id: request.request_id.clone(),
+            plan_id: request.plan_id.clone(),
+            input_digest: request.input_digest.clone(),
+            portfolio: published.spec.clone(),
+            regime: None,
+        };
+        self.inner
+            .database
+            .call("publish_portfolio", move |store| {
+                store.publish_portfolio_run(&publish_request, &published, &benchmarks)
+            })
+            .await?;
+        tracing::info!(
+            event = "portfolio_published",
+            run_id = %run_id,
+            fills = fill_count,
+            rejections = rejection_count
+        );
+        Ok(PreparedOutcome {
+            output: JobOutput::Portfolio {
+                run_id: run_id.clone(),
+            },
+            status: JobStatus::Completed,
+            publication: AttemptPublication::None,
             reservation: None,
         })
     }

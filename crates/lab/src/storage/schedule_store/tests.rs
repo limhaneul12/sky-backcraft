@@ -1,7 +1,7 @@
 use super::*;
 use crate::contracts::{
-    ArtifactId, CandleInterval, CollectionScheduleRequest, JobSubmission, MarketId,
-    ScheduleRetryPolicy,
+    ArtifactId, CandleInterval, CollectionScheduleRequest, FreshnessState, JobSubmission, MarketId,
+    ScheduleRetryPolicy, SourceProbeResult,
 };
 use crate::scheduling::{ScheduleTick, create_schedule, schedule_tick};
 use rusqlite::params;
@@ -41,6 +41,7 @@ fn request(id: &str) -> CollectionScheduleRequest {
         interval: CandleInterval::H1,
         lookback_bars: 24,
         cadence_seconds: 300,
+        freshness_policy: None,
         retry: ScheduleRetryPolicy {
             max_retries: 2,
             backoff_seconds: 60,
@@ -81,7 +82,7 @@ fn sqlite_create_is_idempotent_and_freshness_keeps_absence_typed() {
     assert_eq!(created.id, repeated.id);
 
     let freshness = store
-        .collection_freshness(&schedule.id, now)
+        .collection_freshness(&schedule.id, now, &std::collections::BTreeMap::new())
         .expect("freshness");
     assert_eq!(freshness.markets.len(), 1);
     assert_eq!(freshness.markets[0].latest_completed_end, None);
@@ -191,7 +192,11 @@ fn freshness_reports_latest_completed_boundary_and_real_grid_gaps() {
         .expect("link schedule fixture dataset");
 
     let current = store
-        .collection_freshness(&schedule.id, time("2024-01-01T03:00:00Z"))
+        .collection_freshness(
+            &schedule.id,
+            time("2024-01-01T03:00:00Z"),
+            &std::collections::BTreeMap::new(),
+        )
         .expect("current freshness");
     assert_eq!(
         current.markets[0].latest_completed_end,
@@ -202,7 +207,11 @@ fn freshness_reports_latest_completed_boundary_and_real_grid_gaps() {
     assert_eq!(current.markets[0].missing, None);
 
     let stale = store
-        .collection_freshness(&schedule.id, time("2024-01-01T04:00:00Z"))
+        .collection_freshness(
+            &schedule.id,
+            time("2024-01-01T04:00:00Z"),
+            &std::collections::BTreeMap::new(),
+        )
         .expect("stale freshness");
     assert_eq!(
         stale.markets[0].latest_completed_end,
@@ -453,4 +462,108 @@ fn full_job_queue_leaves_schedule_and_fire_boundary_unchanged() {
     assert_eq!(after.next_action_at, before.next_action_at);
     assert_eq!(after.last_success_boundary, None);
     assert!(after.in_flight.is_none());
+}
+
+#[test]
+fn freshness_classifies_waiting_source_delay_collector_delay_and_true_gap()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = TempRoot::new("freshness-states");
+    let mut store = Store::open(&root.0)?;
+    let created_at = time("2024-01-01T01:30:00Z");
+    let mut input = request("schedule-states");
+    input.lookback_bars = 4;
+    let schedule = create_schedule(input, created_at)?;
+    store.create_collection_schedule(&schedule)?;
+    let digest = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    store.connection.execute(
+        "INSERT INTO collections(request_id,normalized_request_digest,request_json) \
+         VALUES ('states-dataset-request',?1,'{}')",
+        [digest],
+    )?;
+    store.connection.execute(
+        "INSERT INTO datasets(id,request_id,normalized_request_digest,schema_version,status,\
+         coverage_start_ms,coverage_end_ms,row_count,normalizer_version,gap_policy,\
+         semantic_digest,provenance_digest,origin,manifest_json) \
+         VALUES ('dataset-states','states-dataset-request',?1,'1','READY',\
+         ?2,?3,1,'fixture','fixture',?1,?1,'SYNTHETIC_TEST_ONLY','{}')",
+        params![
+            digest,
+            timestamp_ms(time("2024-01-01T00:00:00Z")),
+            timestamp_ms(time("2024-01-01T01:00:00Z"))
+        ],
+    )?;
+    store.connection.execute(
+        "INSERT INTO candle_observations(id,market,interval,open_time_ms,close_time_ms,\
+         open_decimal,high_decimal,low_decimal,close_decimal,volume_decimal,\
+         quote_turnover_decimal,completed,content_digest,observation_json) \
+         VALUES ('obs-states-0','KRW-BTC','h1',?1,?2,'1','1','1','1','1','1',1,?3,'{}')",
+        params![
+            timestamp_ms(time("2024-01-01T00:00:00Z")),
+            timestamp_ms(time("2024-01-01T01:00:00Z")),
+            digest
+        ],
+    )?;
+    store.connection.execute(
+        "INSERT INTO dataset_members(dataset_id,observation_id,position) \
+         VALUES ('dataset-states','obs-states-0',0)",
+        [],
+    )?;
+    store.connection.execute(
+        "UPDATE collection_schedules SET last_success_dataset_id='dataset-states',\
+         last_success_boundary_ms=?1 WHERE id=?2",
+        params![
+            timestamp_ms(time("2024-01-01T01:00:00Z")),
+            schedule.id.as_str()
+        ],
+    )?;
+
+    let empty = std::collections::BTreeMap::new();
+    // expected_end = 02:00 at both observation points; the boundary candle may
+    // still be finalizing inside the default 600s H1 grace.
+    let waiting = store.collection_freshness(&schedule.id, time("2024-01-01T02:00:00Z"), &empty)?;
+    assert_eq!(
+        waiting.markets[0].state,
+        FreshnessState::WaitingForFinalization
+    );
+    assert_eq!(waiting.markets[0].consecutive_missing, 1);
+    // Past grace but within the two-bar source publication window.
+    let delayed = store.collection_freshness(&schedule.id, time("2024-01-01T02:20:00Z"), &empty)?;
+    assert_eq!(delayed.markets[0].state, FreshnessState::SourceDelay);
+    // A live source probe that exposes the boundary turns delay into collector delay.
+    let mut probes = std::collections::BTreeMap::new();
+    probes.insert(
+        "KRW-BTC".to_string(),
+        SourceProbeResult {
+            attempted: true,
+            source_has_boundary: Some(true),
+            note: "fixture probe".into(),
+        },
+    );
+    let collector =
+        store.collection_freshness(&schedule.id, time("2024-01-01T02:20:00Z"), &probes)?;
+    assert_eq!(collector.markets[0].state, FreshnessState::CollectorDelay);
+    assert_eq!(
+        collector.markets[0]
+            .source_probe
+            .as_ref()
+            .and_then(|probe| probe.source_has_boundary),
+        Some(true)
+    );
+    // Past the source window with 3 consecutive missing boundaries: a true gap.
+    let gap = store.collection_freshness(&schedule.id, time("2024-01-01T05:30:00Z"), &empty)?;
+    assert_eq!(gap.markets[0].state, FreshnessState::TrueGap);
+    assert_eq!(gap.markets[0].consecutive_missing, 4);
+    assert_eq!(
+        gap.markets[0].missing,
+        Some(FreshnessMissingReason::ExpectedBoundaryMissing)
+    );
+    // A blocked schedule reports FAILED before any timing classification.
+    store.connection.execute(
+        "UPDATE collection_schedules SET failure_json='{\"code\":\"COLLECTION_BLOCKED\",\"message\":\"fixture\"}' \
+         WHERE id=?1",
+        [schedule.id.as_str()],
+    )?;
+    let failed = store.collection_freshness(&schedule.id, time("2024-01-01T05:30:00Z"), &empty)?;
+    assert_eq!(failed.markets[0].state, FreshnessState::Failed);
+    Ok(())
 }

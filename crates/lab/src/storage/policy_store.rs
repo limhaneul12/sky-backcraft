@@ -2,13 +2,23 @@ use super::{Store, enum_text, json_error, sql_error, timestamp_from_ms, timestam
 use crate::contracts::{
     ContentHash, FrozenPolicyRevision, HistoryPage, LabError, PolicyDefinition, PolicyHeader,
     PolicyId, PolicyOrigin, PolicyRevision, PolicyRevisionId, PolicyRevisionRef,
-    PolicyRevisionSummary, PolicyWrite, RequestId, StrategyKind, UtcTimestamp,
+    PolicyRevisionSummary, PolicySweepResult, PolicyWrite, RequestId, StrategyKind, UtcTimestamp,
 };
 use rusqlite::{OptionalExtension, Transaction, params};
 
 const MAX_HISTORY_LIMIT: u32 = 100;
 
 const BUILTIN_SEEDED_FLAG: &str = "builtin_policies_seeded";
+
+/// One sweep candidate resolved to its persisted (or reused) revision.
+struct ResolvedSweepRevision {
+    reference: PolicyRevisionRef,
+    revision_number: u32,
+    parent_revision_id: Option<PolicyRevisionId>,
+    name: String,
+    request_id: RequestId,
+    created_at: UtcTimestamp,
+}
 
 impl Store {
     /// Read a persisted one-time marker from `application_metadata`.
@@ -87,6 +97,10 @@ impl Store {
             });
         }
         match write {
+            PolicyWrite::Sweep { .. } => Err(LabError::InvalidConfig(
+                "parameter sweeps must use sweep_policy; a single write expects one definition"
+                    .into(),
+            )),
             PolicyWrite::Create {
                 request_id,
                 definition,
@@ -176,6 +190,123 @@ impl Store {
                 Ok(revision)
             }
         }
+    }
+
+    /// Expand a parameter sweep into one immutable policy per candidate.
+    ///
+    /// Identical parameter sets reuse the existing policy (deterministic ids
+    /// derived from the definition digest), so reruns never multiply revisions.
+    /// # Errors
+    /// Rejects invalid sweeps, conflicting request reuse or SQLite failure.
+    pub fn sweep_policy(
+        &mut self,
+        request_id: &RequestId,
+        family: StrategyKind,
+        template: &crate::contracts::StrategySpec,
+        mode: &crate::contracts::ParameterSweepMode,
+        now: UtcTimestamp,
+    ) -> Result<PolicySweepResult, LabError> {
+        let plan = crate::contracts::expand_parameter_sweep(family, template, mode)?;
+        let request_digest =
+            ContentHash::of_value(&("policy-sweep-v1", request_id, family, template, mode))?;
+        let mut resolved = Vec::new();
+        {
+            let transaction = self.connection.transaction().map_err(sql_error)?;
+            for candidate in &plan.candidates {
+                let policy_id =
+                    PolicyId::from_seed(&format!("sweep:{}", candidate.definition_digest.as_str()));
+                let candidate_request_id =
+                    RequestId::from_seed(&format!("{request_id}:{}", candidate.definition_digest));
+                let existing: Option<String> = transaction
+                    .query_row(
+                        "SELECT head_revision_id FROM policies WHERE policy_id=?1",
+                        [policy_id.as_str()],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(sql_error)?;
+                if existing.is_some() {
+                    // Duplicate-safe reuse: the identical definition already
+                    // exists. The reference carries the persisted definition
+                    // digest, which is also baked into the revision identity.
+                    let (
+                        revision_id,
+                        revision_number,
+                        definition_digest,
+                        name,
+                        created_ms,
+                        request,
+                    ): (String, i64, String, String, i64, String) = transaction
+                        .query_row(
+                            "SELECT revision_id,revision_number,definition_digest,name,\
+                             created_at_ms,request_id \
+                             FROM policy_revisions WHERE policy_id=?1 \
+                             ORDER BY revision_number DESC LIMIT 1",
+                            [policy_id.as_str()],
+                            |row| {
+                                Ok((
+                                    row.get(0)?,
+                                    row.get(1)?,
+                                    row.get(2)?,
+                                    row.get(3)?,
+                                    row.get(4)?,
+                                    row.get(5)?,
+                                ))
+                            },
+                        )
+                        .map_err(sql_error)?;
+                    resolved.push(ResolvedSweepRevision {
+                        reference: PolicyRevisionRef {
+                            policy_id,
+                            revision_id: PolicyRevisionId::new(revision_id)?,
+                            definition_digest: ContentHash::try_from(definition_digest)?,
+                        },
+                        revision_number: u32::try_from(revision_number).map_err(|_| {
+                            LabError::DataCorrupt("policy revision number overflow".into())
+                        })?,
+                        parent_revision_id: None,
+                        name,
+                        request_id: RequestId::new(request)?,
+                        created_at: timestamp_from_ms(created_ms)?,
+                    });
+                } else {
+                    let revision = insert_policy_revision(
+                        &transaction,
+                        &policy_id,
+                        family,
+                        PolicyOrigin::User,
+                        &candidate_request_id,
+                        &request_digest,
+                        None,
+                        1,
+                        &candidate.definition,
+                        now,
+                        true,
+                    )?;
+                    resolved.push(ResolvedSweepRevision {
+                        reference: revision.snapshot.reference.clone(),
+                        revision_number: revision.snapshot.revision_number,
+                        parent_revision_id: revision.snapshot.parent_revision_id.clone(),
+                        name: revision.snapshot.definition.name.clone(),
+                        request_id: revision.request_id.clone(),
+                        created_at: revision.created_at,
+                    });
+                }
+            }
+            transaction.commit().map_err(sql_error)?;
+        }
+        let revisions = resolved
+            .into_iter()
+            .map(|row| PolicyRevisionSummary {
+                reference: row.reference,
+                revision_number: row.revision_number,
+                parent_revision_id: row.parent_revision_id,
+                name: row.name,
+                created_at: row.created_at,
+                request_id: row.request_id,
+            })
+            .collect();
+        Ok(PolicySweepResult { plan, revisions })
     }
 
     /// Seed canonical built-ins once without replacing an existing edited head.
@@ -448,9 +579,9 @@ fn insert_policy_revision(
 
 fn policy_write_request_id(write: &PolicyWrite) -> &RequestId {
     match write {
-        PolicyWrite::Create { request_id, .. } | PolicyWrite::Revise { request_id, .. } => {
-            request_id
-        }
+        PolicyWrite::Create { request_id, .. }
+        | PolicyWrite::Revise { request_id, .. }
+        | PolicyWrite::Sweep { request_id, .. } => request_id,
     }
 }
 

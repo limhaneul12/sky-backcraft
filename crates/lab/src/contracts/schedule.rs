@@ -33,6 +33,80 @@ pub struct CollectionScheduleRequest {
     pub lookback_bars: u32,
     pub cadence_seconds: u32,
     pub retry: ScheduleRetryPolicy,
+    /// Optional freshness classification knobs; absent uses the interval defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freshness_policy: Option<FreshnessPolicy>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FreshnessPolicy {
+    /// A boundary younger than this is still publishing, never a gap.
+    pub grace_seconds: u32,
+    /// Maximum plausible source publication lag before a missing boundary
+    /// becomes a candidate true gap.
+    pub source_delay_seconds: u32,
+    /// Consecutive absent historical boundaries (after the source delay)
+    /// required before classifying `TRUE_GAP`.
+    pub consecutive_gap_threshold: u32,
+}
+
+impl FreshnessPolicy {
+    /// # Errors
+    /// Rejects unbounded or inverted classification windows.
+    pub fn validate(&self) -> Result<(), super::LabError> {
+        if self.grace_seconds > 3_600 || self.source_delay_seconds > 86_400 {
+            return Err(super::LabError::InvalidConfig(
+                "freshness grace must be <= 3600s and source delay <= 86400s".into(),
+            ));
+        }
+        if !(1..=100).contains(&self.consecutive_gap_threshold) {
+            return Err(super::LabError::InvalidConfig(
+                "consecutive gap threshold must be in 1..=100".into(),
+            ));
+        }
+        if self.source_delay_seconds < self.grace_seconds {
+            return Err(super::LabError::InvalidConfig(
+                "source delay must not be shorter than the finalization grace".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Conservative defaults derived from the candle width: half a bar of
+    /// finalization grace and up to two bars of publication lag.
+    #[must_use]
+    pub fn for_interval(interval: CandleInterval) -> Self {
+        let seconds = u32::try_from(interval.duration().num_seconds()).unwrap_or(86_400);
+        Self {
+            grace_seconds: (seconds / 2).clamp(30, 600),
+            source_delay_seconds: seconds.saturating_mul(2).min(3_600),
+            consecutive_gap_threshold: 2,
+        }
+    }
+}
+
+/// Classified freshness of one market boundary; `expected boundary missing`
+/// alone never implies a true gap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FreshnessState {
+    Fresh,
+    WaitingForFinalization,
+    SourceDelay,
+    CollectorDelay,
+    TrueGap,
+    Failed,
+}
+
+/// Result of an optional live source probe taken during freshness evaluation.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SourceProbeResult {
+    pub attempted: bool,
+    /// Whether the source API exposed the expected boundary candle.
+    pub source_has_boundary: Option<bool>,
+    pub note: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -103,6 +177,29 @@ pub struct MarketFreshness {
     pub age_seconds: Option<u64>,
     pub gap_count: u64,
     pub missing: Option<FreshnessMissingReason>,
+    /// Consecutive absent historical boundaries immediately before `expected_end`.
+    pub consecutive_missing: u64,
+    pub state: FreshnessState,
+    pub state_reason: String,
+    /// Present only when the freshness request asked for a live source probe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_probe: Option<SourceProbeResult>,
+}
+
+/// Distinguishable result of one schedule mutation (pause/resume).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ScheduleMutationOutcome {
+    /// The schedule was already in the requested state; nothing changed.
+    NotApplied,
+    /// The mutation was applied and acknowledged in this call.
+    Applied,
+    /// The mutation probably applied but its response was lost; confirmed by read-back.
+    AppliedResponseLost,
+    /// A conflicting mutation won; the read-back shows the requested state.
+    Conflicted,
+    /// Neither the prior nor the requested state was confirmed; reconciliation required.
+    ReconciliationRequired,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -135,6 +232,9 @@ pub enum CollectionScheduleAction {
     },
     Freshness {
         schedule_id: ScheduleId,
+        /// Probe the live source to distinguish collector delay from source delay.
+        #[serde(default)]
+        probe_source: bool,
     },
 }
 
@@ -205,6 +305,9 @@ impl CollectionScheduleRequest {
             return Err(super::LabError::InvalidConfig(format!(
                 "collection schedule backoff_seconds must be in {MIN_SCHEDULE_BACKOFF_SECONDS}..={MAX_SCHEDULE_BACKOFF_SECONDS}"
             )));
+        }
+        if let Some(policy) = &self.freshness_policy {
+            policy.validate()?;
         }
         Ok(())
     }

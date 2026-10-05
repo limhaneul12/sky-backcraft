@@ -2,7 +2,8 @@
 
 use super::JobService;
 use crate::contracts::{
-    CollectionScheduleAction, JobId, LabError, ResearchSuiteAction, ResearchSuiteRequest,
+    CollectionScheduleAction, JobId, LabError, ProbeCount, ResearchSuiteAction,
+    ResearchSuiteRequest, ScheduleId, ScheduleMutationOutcome, SourceProbeResult,
     StorageMaintenanceAction, StorageMaintenanceResult, SuiteId, UtcTimestamp,
     validate_research_page,
 };
@@ -44,6 +45,10 @@ impl JobService {
     /// Rejects invalid inputs, closed admission and storage failures.
     pub async fn research_suite(&self, action: ResearchSuiteAction) -> Result<Value, LabError> {
         let value = match action {
+            // Read-only admission preview; touches no durable state.
+            ResearchSuiteAction::Plan { request } => {
+                serde_json::to_value(crate::research::plan_suite(&request)?)?
+            }
             ResearchSuiteAction::Create { request } => self.create_research_suite(*request).await?,
             ResearchSuiteAction::Get { suite_id } => {
                 let record = self
@@ -220,61 +225,217 @@ impl JobService {
                     .await?
             }
             CollectionScheduleAction::Pause { schedule_id } => {
-                let key = schedule_id.clone();
-                let paused = self
-                    .admitted("pause_collection_schedule", move |store| {
-                        store.pause_collection_schedule(&key, UtcTimestamp::now())
-                    })
-                    .await;
-                let (record, jobs) = match paused {
-                    Ok(result) => result,
-                    Err(LabError::OutcomeUnknown(_)) => {
-                        self.admitted("pause_schedule_readback", move |store| {
-                            store.pause_collection_schedule(&schedule_id, UtcTimestamp::now())
-                        })
-                        .await?
-                    }
-                    Err(error) => return Err(error),
-                };
-                self.signal_managed_cancellation(&jobs)?;
-                serde_json::to_value(record)?
+                self.mutate_collection_schedule(schedule_id, ScheduleMutationTarget::Paused)
+                    .await?
             }
             CollectionScheduleAction::Resume { schedule_id } => {
-                let key = schedule_id.clone();
-                let resumed = self
-                    .admitted("resume_collection_schedule", move |store| {
-                        Ok(serde_json::to_value(
-                            store.resume_collection_schedule(&key, UtcTimestamp::now())?,
-                        )?)
-                    })
-                    .await;
-                match resumed {
-                    Ok(value) => value,
-                    Err(LabError::OutcomeUnknown(_)) => {
-                        self.admitted("resume_schedule_readback", move |store| {
-                            Ok(serde_json::to_value(store.resume_collection_schedule(
-                                &schedule_id,
-                                UtcTimestamp::now(),
-                            )?)?)
-                        })
-                        .await?
-                    }
-                    Err(error) => return Err(error),
-                }
+                self.mutate_collection_schedule(schedule_id, ScheduleMutationTarget::Active)
+                    .await?
             }
-            CollectionScheduleAction::Freshness { schedule_id } => {
+            CollectionScheduleAction::Freshness {
+                schedule_id,
+                probe_source,
+            } => {
+                let probes = if probe_source {
+                    self.probe_schedule_source(&schedule_id).await?
+                } else {
+                    std::collections::BTreeMap::new()
+                };
                 self.inner
                     .database
                     .call("collection_freshness", move |store| {
                         Ok(serde_json::to_value(store.collection_freshness(
                             &schedule_id,
                             UtcTimestamp::now(),
+                            &probes,
                         )?)?)
                     })
                     .await?
             }
         };
         Ok(value)
+    }
+
+    /// Apply one schedule mutation with a distinguishable outcome receipt.
+    ///
+    /// The response keeps every record field and adds a bounded
+    /// `mutation_outcome` projection, so existing readers stay compatible.
+    /// # Errors
+    /// Rejects unknown schedules, storage failures and unresolved conflicts.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one mutation covers apply, lost-response read-back and conflict receipts"
+    )]
+    async fn mutate_collection_schedule(
+        &self,
+        schedule_id: ScheduleId,
+        target: ScheduleMutationTarget,
+    ) -> Result<Value, LabError> {
+        let key = schedule_id.clone();
+        let prior = self
+            .inner
+            .database
+            .call("load_schedule_mutation_state", move |store| {
+                store.reconcile_collection_schedule(&key, UtcTimestamp::now())
+            })
+            .await?;
+        let already = matches!(
+            (target, prior.status),
+            (
+                ScheduleMutationTarget::Paused,
+                crate::contracts::CollectionScheduleStatus::Paused
+            ) | (
+                ScheduleMutationTarget::Active,
+                crate::contracts::CollectionScheduleStatus::Active
+            )
+        );
+        if already {
+            return mutation_receipt(&prior, ScheduleMutationOutcome::NotApplied);
+        }
+        match target {
+            ScheduleMutationTarget::Paused => {
+                let key = schedule_id.clone();
+                match self
+                    .admitted("pause_collection_schedule", move |store| {
+                        store.pause_collection_schedule(&key, UtcTimestamp::now())
+                    })
+                    .await
+                {
+                    Ok((record, jobs)) => {
+                        self.signal_managed_cancellation(&jobs)?;
+                        return mutation_receipt(&record, ScheduleMutationOutcome::Applied);
+                    }
+                    Err(LabError::OutcomeUnknown(_)) => {}
+                    Err(conflict @ LabError::Conflict(_)) => {
+                        let key = schedule_id.clone();
+                        let record = self
+                            .admitted("pause_schedule_conflict_readback", move |store| {
+                                store.reconcile_collection_schedule(&key, UtcTimestamp::now())
+                            })
+                            .await?;
+                        if record.status == crate::contracts::CollectionScheduleStatus::Paused {
+                            return mutation_receipt(&record, ScheduleMutationOutcome::Conflicted);
+                        }
+                        return Err(conflict);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            ScheduleMutationTarget::Active => {
+                let key = schedule_id.clone();
+                match self
+                    .admitted("resume_collection_schedule", move |store| {
+                        store.resume_collection_schedule(&key, UtcTimestamp::now())
+                    })
+                    .await
+                {
+                    Ok(record) => {
+                        return mutation_receipt(&record, ScheduleMutationOutcome::Applied);
+                    }
+                    Err(LabError::OutcomeUnknown(_)) => {}
+                    Err(conflict @ LabError::Conflict(_)) => {
+                        let key = schedule_id.clone();
+                        let record = self
+                            .admitted("resume_schedule_conflict_readback", move |store| {
+                                store.reconcile_collection_schedule(&key, UtcTimestamp::now())
+                            })
+                            .await?;
+                        if record.status == crate::contracts::CollectionScheduleStatus::Active {
+                            return mutation_receipt(&record, ScheduleMutationOutcome::Conflicted);
+                        }
+                        return Err(conflict);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        // The mutation outcome was lost: classify from a fresh read-back.
+        let key = schedule_id.clone();
+        let confirmed = self
+            .inner
+            .database
+            .call("schedule_mutation_readback", move |store| {
+                store.reconcile_collection_schedule(&key, UtcTimestamp::now())
+            })
+            .await?;
+        let reached = matches!(
+            (target, confirmed.status),
+            (
+                ScheduleMutationTarget::Paused,
+                crate::contracts::CollectionScheduleStatus::Paused
+            ) | (
+                ScheduleMutationTarget::Active,
+                crate::contracts::CollectionScheduleStatus::Active
+            )
+        );
+        let outcome = if reached {
+            ScheduleMutationOutcome::AppliedResponseLost
+        } else {
+            ScheduleMutationOutcome::ReconciliationRequired
+        };
+        mutation_receipt(&confirmed, outcome)
+    }
+
+    /// Probe the live source for every scheduled market to separate collector
+    /// delay from source delay. Probe failures degrade to attempted probes
+    /// with a note; freshness classification never fails because of them.
+    /// # Errors
+    /// Rejects unknown schedules or persistence failures.
+    async fn probe_schedule_source(
+        &self,
+        schedule_id: &ScheduleId,
+    ) -> Result<std::collections::BTreeMap<String, crate::contracts::SourceProbeResult>, LabError>
+    {
+        let key = schedule_id.clone();
+        let record = self
+            .inner
+            .database
+            .call("load_schedule_probe_state", move |store| {
+                store.reconcile_collection_schedule(&key, UtcTimestamp::now())
+            })
+            .await?;
+        let expected_end = crate::scheduling::latest_completed_boundary(
+            UtcTimestamp::now(),
+            record.request.interval,
+        )?;
+        let boundary_open = expected_end
+            .0
+            .checked_sub_signed(record.request.interval.duration())
+            .ok_or_else(|| LabError::InvalidConfig("probe boundary overflow".into()))?;
+        let mut probes = std::collections::BTreeMap::new();
+        for market in &record.request.markets {
+            let outcome =
+                match self
+                    .inner
+                    .upbit
+                    .fetch_completed_candles(
+                        market,
+                        record.request.interval,
+                        ProbeCount::try_from(1)?,
+                        None,
+                    )
+                    .await
+                {
+                    Ok(report) => SourceProbeResult {
+                        attempted: true,
+                        source_has_boundary: Some(report.candles.iter().any(|candle| {
+                            candle.completed && candle.open_time_utc.0 == boundary_open
+                        })),
+                        note: format!(
+                            "probe http_status={} candles={}",
+                            report.http_status,
+                            report.candles.len()
+                        ),
+                    },
+                    Err(error) => SourceProbeResult {
+                        attempted: true,
+                        source_has_boundary: None,
+                        note: format!("probe unavailable: {}", bounded_note(&error)),
+                    },
+                };
+            probes.insert(market.code(), outcome);
+        }
+        Ok(probes)
     }
 
     /// Query bounded storage or produce a verified backup in its fixed namespace.
@@ -349,4 +510,31 @@ impl JobService {
         }
         Ok(())
     }
+}
+
+/// Requested target state of a schedule mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScheduleMutationTarget {
+    Paused,
+    Active,
+}
+
+/// Wrap the schedule record with its bounded mutation outcome, keeping every
+/// existing record field at the top level for backward-compatible readers.
+/// # Errors
+/// Propagates serialization failures.
+fn mutation_receipt(
+    record: &crate::contracts::CollectionScheduleRecord,
+    outcome: ScheduleMutationOutcome,
+) -> Result<Value, LabError> {
+    let mut value = serde_json::to_value(record)?;
+    if let serde_json::Value::Object(fields) = &mut value {
+        fields.insert("mutation_outcome".into(), serde_json::to_value(outcome)?);
+    }
+    Ok(value)
+}
+
+/// Bounded single-line error note for probe diagnostics.
+fn bounded_note(error: &LabError) -> String {
+    error.to_string().chars().take(200).collect()
 }

@@ -164,6 +164,7 @@ fn full_tool_catalog_and_malformed_inputs_use_protocol_contract()
                 "plan_backtest",
                 "policy_query",
                 "policy_write",
+                "portfolio_backtest",
                 "probe_upbit",
                 "research_suite",
                 "resource_delete_preview",

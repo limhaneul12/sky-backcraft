@@ -219,6 +219,10 @@ pub struct ResearchPage<T> {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ResearchSuiteAction {
+    /// Read-only admission preview; never creates state.
+    Plan {
+        request: Box<ResearchSuiteRequest>,
+    },
     Create {
         request: Box<ResearchSuiteRequest>,
     },
@@ -245,4 +249,60 @@ pub enum ResearchSuiteAction {
     Resume {
         suite_id: SuiteId,
     },
+}
+
+/// Bounded suite resource axis the planner reports against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SuitePlanLimitKind {
+    SuiteRuns,
+    SuiteCells,
+    SuiteFolds,
+    SuiteScenarios,
+    RunEvents,
+}
+
+/// One numeric admission violation with the requested and allowed magnitude.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SuitePlanViolation {
+    pub item: SuitePlanLimitKind,
+    pub requested: u64,
+    pub allowed: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SuitePlanAdmission {
+    Admitted,
+    Rejected {
+        violations: Vec<SuitePlanViolation>,
+    },
+    /// The template/design itself is invalid; `create` would fail the same way.
+    Invalid {
+        message: String,
+    },
+}
+
+/// Read-only resource estimate for one research suite request. The planner
+/// shares the create-time formulas, so an `Admitted` plan only fails create
+/// on mutable state such as unknown policy revisions or duplicate suites.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SuitePlanReport {
+    pub candidates: u32,
+    pub markets: u32,
+    pub folds: u32,
+    pub cost_scenarios: u32,
+    pub planned_runs: u64,
+    pub comparison_cells: u64,
+    /// Estimated events of the largest single run (selection case).
+    pub estimated_model_events: u64,
+    /// Estimated aggregate events across all planned runs.
+    pub estimated_run_events: u64,
+    /// Conservative byte estimate; ledger facts compress below this.
+    pub estimated_storage_bytes: u64,
+    pub admission: SuitePlanAdmission,
+    pub suggestions: Vec<String>,
+    pub notes: Vec<String>,
 }

@@ -920,7 +920,10 @@ fn insert_attempt_output(
                 ).map_err(sql_error)?;
             }
         }
-        Some(JobOutput::Validation { .. }) | None => {}
+        // Portfolio runs persist in portfolio_runs (their own table); the
+        // attempt-level run outputs table keeps its runs(id) foreign key.
+        // Validation outputs carry no extra rows.
+        Some(JobOutput::Portfolio { .. } | JobOutput::Validation { .. }) | None => {}
     }
     Ok(())
 }
@@ -1011,6 +1014,7 @@ fn payload_kind(payload: &crate::contracts::JobPayload) -> &'static str {
     match payload {
         crate::contracts::JobPayload::Collect { .. } => "COLLECT",
         crate::contracts::JobPayload::Backtest { .. } => "BACKTEST",
+        crate::contracts::JobPayload::PortfolioBacktest { .. } => "PORTFOLIO_BACKTEST",
         crate::contracts::JobPayload::Export { .. } => "EXPORT",
         crate::contracts::JobPayload::Verify { .. } => "VERIFY",
     }
@@ -1152,6 +1156,27 @@ fn terminal_output_progress(
                 last_committed_event_seq: Some(nonnegative_u64(last, "run last event sequence")?),
             })
         }
+        JobOutput::Portfolio { run_id } => {
+            let facts: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM portfolio_facts WHERE run_id=?1",
+                    [run_id.as_str()],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error)?;
+            Ok(JobProgress {
+                stage: match status {
+                    JobStatus::Completed => "portfolio_completed",
+                    JobStatus::Partial => "portfolio_partial",
+                    JobStatus::Blocked => "portfolio_blocked",
+                    _ => "portfolio_terminal",
+                }
+                .into(),
+                committed_records: Some(nonnegative_u64(facts, "portfolio fact count")?),
+                count_unit: Some(ProgressCountUnit::LedgerFacts),
+                last_committed_event_seq: None,
+            })
+        }
         JobOutput::Artifacts { artifact_ids } => {
             Ok(JobProgress {
                 stage: match status {
@@ -1184,7 +1209,7 @@ fn terminal_output_progress(
 fn count_unit_for_kind(kind: &str) -> Result<ProgressCountUnit, LabError> {
     match kind {
         "COLLECT" => Ok(ProgressCountUnit::DatasetRows),
-        "BACKTEST" => Ok(ProgressCountUnit::LedgerFacts),
+        "BACKTEST" | "PORTFOLIO_BACKTEST" => Ok(ProgressCountUnit::LedgerFacts),
         "EXPORT" => Ok(ProgressCountUnit::Artifacts),
         "VERIFY" => Ok(ProgressCountUnit::CheckedModels),
         _ => Err(LabError::DataCorrupt(format!("unknown job kind {kind}"))),

@@ -1011,6 +1011,7 @@ fn fixture() -> RunBundle {
             slippage_bps: bps("100"),
             impact_bps: bps("0"),
             assumption_label: "SYNTHETIC_TEST_ONLY F07 fixture".into(),
+            dynamic: None,
         },
         execution: ExecutionPolicy::NextBarOpen {
             participation_cap: weight("1"),
@@ -1028,7 +1029,11 @@ fn fixture() -> RunBundle {
                 lower_bound: quote("0"),
                 tick: price("0.01"),
             }],
+            fee_schedule: None,
+            trading_state: None,
+            maintenance_windows: Vec::new(),
         },
+        market_rules_history: Vec::new(),
         terminal_policy: TerminalPolicy::MarkToMarket,
         evidence_snapshot_id: None,
         pit_policy: PitPolicy::StrictPit,
@@ -1212,6 +1217,7 @@ fn fixture() -> RunBundle {
             fill_observed: false,
             model_version: "execution-v1".into(),
             artificial_terminal_exit: false,
+            cost_provenance: None,
             accounting_mark_seq: 8,
         },
         FillRecord {
@@ -1243,6 +1249,7 @@ fn fixture() -> RunBundle {
             fill_observed: false,
             model_version: "execution-v1".into(),
             artificial_terminal_exit: false,
+            cost_provenance: None,
             accounting_mark_seq: 15,
         },
     ];
@@ -1629,6 +1636,7 @@ fn passive_fixture() -> RunBundle {
         fill_observed: false,
         model_version: "passive-fill-v1".into(),
         artificial_terminal_exit: false,
+        cost_provenance: None,
         accounting_mark_seq: 10,
     };
     let state = |cash, free, reserved, quantity, basis, fees| AccountState {

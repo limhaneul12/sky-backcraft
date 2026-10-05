@@ -2,7 +2,8 @@
 
 use crate::contracts::{
     CollectRequest, CollectionScheduleRecord, CollectionScheduleRequest, CollectionScheduleStatus,
-    FailureRecord, LabError, RequestId, ScheduleId, ScheduleRetryPolicy, UtcRange, UtcTimestamp,
+    FailureRecord, FreshnessPolicy, FreshnessState, LabError, RequestId, ScheduleId,
+    ScheduleRetryPolicy, SourceProbeResult, UtcRange, UtcTimestamp,
 };
 use chrono::{DateTime, Duration, Utc};
 
@@ -25,6 +26,103 @@ pub enum ScheduleFailureAction {
         retry_at: UtcTimestamp,
     },
     Block,
+}
+
+/// Classified freshness outcome with its bounded, deterministic reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FreshnessClassification {
+    pub state: FreshnessState,
+    pub reason: String,
+}
+
+/// Classify one market boundary without assuming that a missing boundary is a
+/// true gap: finalization grace, publication lag and consecutive absence are
+/// separated before `TRUE_GAP` may be declared. `interval_seconds` is the
+/// candle width; historical boundaries older than the current one only count
+/// as a true gap once their own publication window has expired.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one typed classification needs the boundary, lag, policy, probe and failure inputs"
+)]
+#[must_use]
+pub fn classify_market_freshness(
+    expected_end: UtcTimestamp,
+    latest_completed_end: Option<UtcTimestamp>,
+    observed_at: UtcTimestamp,
+    consecutive_missing: u64,
+    interval_seconds: u64,
+    policy: &FreshnessPolicy,
+    probe: Option<&SourceProbeResult>,
+    schedule_failure: Option<&FailureRecord>,
+) -> FreshnessClassification {
+    if let Some(failure) = schedule_failure {
+        return FreshnessClassification {
+            state: FreshnessState::Failed,
+            reason: format!("schedule blocked: {} ({})", failure.code, failure.message),
+        };
+    }
+    if latest_completed_end.is_some_and(|latest| latest >= expected_end) {
+        return FreshnessClassification {
+            state: FreshnessState::Fresh,
+            reason: "latest completed boundary covers the expected boundary".into(),
+        };
+    }
+    if probe.is_some_and(|probe| probe.source_has_boundary == Some(true)) {
+        return FreshnessClassification {
+            state: FreshnessState::CollectorDelay,
+            reason: "source exposes the expected boundary; the collector has not committed it"
+                .into(),
+        };
+    }
+    let missing_for =
+        u64::try_from((observed_at.0 - expected_end.0).num_seconds()).unwrap_or(u64::MAX);
+    if missing_for < u64::from(policy.grace_seconds) {
+        return FreshnessClassification {
+            state: FreshnessState::WaitingForFinalization,
+            reason: format!(
+                "boundary is within the {}s finalization grace",
+                policy.grace_seconds
+            ),
+        };
+    }
+    // Boundaries before the current expected one; the expected boundary itself
+    // may still be publishing, so only its predecessors prove a real hole.
+    let historical_missing = consecutive_missing.saturating_sub(1);
+    let oldest_historical_age =
+        missing_for.saturating_add(historical_missing.saturating_mul(interval_seconds));
+    let consecutive_gap = historical_missing >= u64::from(policy.consecutive_gap_threshold)
+        && oldest_historical_age >= u64::from(policy.source_delay_seconds);
+    if consecutive_gap {
+        return FreshnessClassification {
+            state: FreshnessState::TrueGap,
+            reason: format!(
+                "{historical_missing} consecutive historical boundaries are absent past the source delay"
+            ),
+        };
+    }
+    if missing_for < u64::from(policy.source_delay_seconds) {
+        return FreshnessClassification {
+            state: FreshnessState::SourceDelay,
+            reason: format!(
+                "boundary is within the {}s source publication window",
+                policy.source_delay_seconds
+            ),
+        };
+    }
+    if consecutive_gap || historical_missing >= u64::from(policy.consecutive_gap_threshold) {
+        return FreshnessClassification {
+            state: FreshnessState::TrueGap,
+            reason: format!(
+                "{historical_missing} consecutive historical boundaries are absent past the source delay"
+            ),
+        };
+    }
+    FreshnessClassification {
+        state: FreshnessState::SourceDelay,
+        reason: format!(
+            "{historical_missing} consecutive historical boundaries are absent but below the gap threshold"
+        ),
+    }
 }
 
 /// Freeze a validated public request into its initial durable state.

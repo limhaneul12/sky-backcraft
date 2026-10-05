@@ -898,7 +898,15 @@ impl<'a> Verifier<'a> {
                     model.model_id, order.order_id
                 ));
             }
-            if order.rule_snapshot_id != self.bundle.plan.spec.market_rules.id {
+            if order.rule_snapshot_id != self.bundle.plan.spec.market_rules.id
+                && !self
+                    .bundle
+                    .plan
+                    .spec
+                    .market_rules_history
+                    .iter()
+                    .any(|segment| segment.id == order.rule_snapshot_id)
+            {
                 self.finding(format!(
                     "{} order {} references an unfrozen rule snapshot",
                     model.model_id, order.order_id
@@ -1577,11 +1585,14 @@ impl<'a> Verifier<'a> {
             ));
             return;
         };
-        let tick = self
-            .bundle
-            .plan
-            .spec
-            .market_rules
+        let Ok(rules) = self.bundle.plan.spec.rules_at(order.created_at) else {
+            self.finding(format!(
+                "{} passive fill {} order time has no covering rule segment",
+                model.model_id, fill.fill_id
+            ));
+            return;
+        };
+        let tick = rules
             .ticks
             .iter()
             .rev()
@@ -1593,10 +1604,7 @@ impl<'a> Verifier<'a> {
             .and_then(|offset| Decimal::ONE.checked_sub(offset))
             .and_then(|multiplier| fill.decision_reference.get().checked_mul(multiplier))
             .and_then(|unrounded| {
-                self.bundle
-                    .plan
-                    .spec
-                    .market_rules
+                rules
                     .ticks
                     .iter()
                     .rev()
@@ -1620,15 +1628,15 @@ impl<'a> Verifier<'a> {
                 && candidate.candle.open_time_utc < source.candle.open_time_utc
                 && candidate.candle.close_time_utc <= order.expires_at
         });
-        let step = self.bundle.plan.spec.market_rules.quantity_step.get();
-        let fee_rate = self
-            .bundle
-            .plan
-            .spec
-            .costs
-            .maker_fee_bps
-            .get()
-            .checked_div(Decimal::from(10_000_u32));
+        let step = rules.quantity_step.get();
+        let Ok(fees) = self.bundle.plan.spec.fee_policy_at(order.created_at) else {
+            self.finding(format!(
+                "{} passive fill {} order time has no resolvable fee schedule",
+                model.model_id, fill.fill_id
+            ));
+            return;
+        };
+        let fee_rate = fees.maker.get().checked_div(Decimal::from(10_000_u32));
         let fraction_cap = order
             .requested_qty
             .get()

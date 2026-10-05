@@ -4,7 +4,7 @@ use super::{Store, enum_text, json_error, sql_error, timestamp_from_ms, timestam
 use crate::contracts::{
     AttemptId, AttemptState, CollectRequest, CollectionFreshness, CollectionSchedulePage,
     CollectionScheduleRecord, CollectionScheduleStatus, ContentHash, DatasetId, FailureRecord,
-    FreshnessMissingReason, JobId, JobOutput, JobPayload, JobSubmission, LabError,
+    FreshnessMissingReason, FreshnessPolicy, JobId, JobOutput, JobPayload, JobSubmission, LabError,
     MAX_ACTIVE_SCHEDULES, MAX_RESEARCH_PAGE, MarketFreshness, RequestId, ScheduleFire,
     ScheduleFireStatus, ScheduleId, UtcTimestamp,
 };
@@ -551,12 +551,14 @@ impl Store {
 
     /// Project freshness from the last successful dataset without inventing observations.
     ///
+    /// `probes` carries optional live source-probe outcomes keyed by market code.
     /// # Errors
     /// Returns unknown schedule, invalid stored data, arithmetic overflow, or SQLite failure.
     pub fn collection_freshness(
         &self,
         schedule_id: &ScheduleId,
         observed_at: UtcTimestamp,
+        probes: &std::collections::BTreeMap<String, crate::contracts::SourceProbeResult>,
     ) -> Result<CollectionFreshness, LabError> {
         let schedule = required_schedule(&self.connection, schedule_id)?;
         let expected_end = latest_completed_boundary(observed_at, schedule.request.interval)?;
@@ -577,16 +579,26 @@ impl Store {
             .ok_or_else(|| {
                 LabError::InvalidConfig("schedule freshness timestamp overflow".into())
             })?;
+        let policy = schedule
+            .request
+            .freshness_policy
+            .clone()
+            .unwrap_or_else(|| FreshnessPolicy::for_interval(schedule.request.interval));
         let mut markets = Vec::with_capacity(schedule.request.markets.len());
         for market in &schedule.request.markets {
+            let interval_seconds =
+                u64::try_from(schedule.request.interval.duration().num_seconds())
+                    .map_err(|_| LabError::InvalidConfig("schedule interval overflow".into()))?;
             markets.push(project_market_freshness(
                 &self.connection,
-                schedule.last_success_dataset_id.as_ref(),
+                &schedule,
                 market,
-                schedule.request.interval,
                 UtcTimestamp(start),
                 expected_end,
-                schedule.request.lookback_bars,
+                interval_seconds,
+                &policy,
+                probes.get(market.code().as_str()),
+                observed_at,
             )?);
         }
         Ok(CollectionFreshness {
@@ -1023,26 +1035,48 @@ fn load_fire(
     }))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the freshness projection needs the frozen schedule, window, policy and probe outcome"
+)]
 fn project_market_freshness(
     connection: &Connection,
-    dataset_id: Option<&DatasetId>,
+    schedule: &CollectionScheduleRecord,
     market: &crate::contracts::MarketId,
-    interval: crate::contracts::CandleInterval,
     start: UtcTimestamp,
     expected_end: UtcTimestamp,
-    expected_bars: u32,
+    interval_seconds: u64,
+    policy: &FreshnessPolicy,
+    probe: Option<&crate::contracts::SourceProbeResult>,
+    observed_at: UtcTimestamp,
 ) -> Result<MarketFreshness, LabError> {
+    let dataset_id = schedule.last_success_dataset_id.as_ref();
     let Some(dataset_id) = dataset_id else {
+        let classification = crate::scheduling::classify_market_freshness(
+            expected_end,
+            None,
+            observed_at,
+            u64::from(schedule.request.lookback_bars),
+            interval_seconds,
+            policy,
+            probe,
+            schedule.failure.as_ref(),
+        );
         return Ok(MarketFreshness {
             market: market.clone(),
             expected_end,
             latest_completed_end: None,
             age_seconds: None,
-            gap_count: u64::from(expected_bars),
+            gap_count: u64::from(schedule.request.lookback_bars),
             missing: Some(FreshnessMissingReason::NeverCollected),
+            consecutive_missing: u64::from(schedule.request.lookback_bars),
+            state: classification.state,
+            state_reason: classification.reason,
+            source_probe: probe.cloned(),
         });
     };
-    let interval_text = enum_text(&interval)?;
+    let interval_text = enum_text(&schedule.request.interval)?;
     let latest: Option<i64> = connection
         .query_row(
             "SELECT MAX(o.close_time_ms) \
@@ -1077,7 +1111,7 @@ fn project_market_freshness(
     let latest_completed_end = latest.map(timestamp_from_ms).transpose()?;
     let present = u64::try_from(rows)
         .map_err(|_| LabError::DataCorrupt("negative schedule freshness row count".into()))?;
-    let gap_count = u64::from(expected_bars).saturating_sub(present);
+    let gap_count = u64::from(schedule.request.lookback_bars).saturating_sub(present);
     let age_seconds = latest_completed_end
         .map(|latest| {
             u64::try_from((expected_end.0 - latest.0).num_seconds()).map_err(|_| {
@@ -1092,6 +1126,30 @@ fn project_market_freshness(
         }
         Some(_) => None,
     };
+    // The candle grid is gap-free up to `latest`, so consecutive missing
+    // boundaries right before the expected end follow from the boundary math.
+    let consecutive_missing = match latest_completed_end {
+        Some(latest) => {
+            let seconds = (expected_end.0 - latest.0).num_seconds();
+            let width = schedule.request.interval.duration().num_seconds();
+            if width <= 0 || seconds <= 0 {
+                0
+            } else {
+                u64::try_from(seconds / width).unwrap_or(u64::MAX)
+            }
+        }
+        None => u64::from(schedule.request.lookback_bars),
+    };
+    let classification = crate::scheduling::classify_market_freshness(
+        expected_end,
+        latest_completed_end,
+        observed_at,
+        consecutive_missing,
+        interval_seconds,
+        policy,
+        probe,
+        schedule.failure.as_ref(),
+    );
     Ok(MarketFreshness {
         market: market.clone(),
         expected_end,
@@ -1099,6 +1157,10 @@ fn project_market_freshness(
         age_seconds,
         gap_count,
         missing,
+        consecutive_missing,
+        state: classification.state,
+        state_reason: classification.reason,
+        source_probe: probe.cloned(),
     })
 }
 

@@ -178,16 +178,7 @@ pub fn resolve_with_policies(
         }
     }
     validate_run_budget(spec, admissions.len(), max_model_events, estimated_events)?;
-    let mut warnings = vec![
-        "HISTORICAL_REPLAY / BAR_CLOSE_ASSUMED; all fills are SIMULATED_ONLY".into(),
-        "independent cash account for each asset-strategy; not a shared-capital portfolio".into(),
-    ];
-    if spec.market_rules.provenance == RuleProvenance::ExplicitScenario {
-        warnings.push(
-            "UNVERIFIED_HISTORICAL_RULES: explicit rule scenario, not verified historical rules"
-                .into(),
-        );
-    }
+    let warnings = base_plan_warnings(spec);
     Ok(ResolvedPlan {
         id: PlanId::from_seed(input_digest.as_str()),
         spec: spec.clone(),
@@ -200,6 +191,36 @@ pub fn resolve_with_policies(
         warnings,
         estimated_events,
     })
+}
+
+/// Bounded, deterministic plan warnings; the shared-capital note stays until a
+/// native portfolio surface replaces the independent-account default.
+fn base_plan_warnings(spec: &ExperimentSpec) -> Vec<String> {
+    let mut warnings = vec![
+        "HISTORICAL_REPLAY / BAR_CLOSE_ASSUMED; all fills are SIMULATED_ONLY".into(),
+        "independent cash account for each asset-strategy; not a shared-capital portfolio".into(),
+    ];
+    if spec.market_rules_history.is_empty() {
+        if spec.market_rules.provenance == RuleProvenance::ExplicitScenario {
+            warnings.push(
+                "UNVERIFIED_HISTORICAL_RULES: explicit rule scenario, not verified historical rules"
+                    .into(),
+            );
+        }
+    } else {
+        let segments = spec.market_rules_history.len();
+        let explicit = spec
+            .market_rules_history
+            .iter()
+            .filter(|segment| segment.provenance == RuleProvenance::ExplicitScenario)
+            .count();
+        if explicit > 0 {
+            warnings.push(format!(
+                "UNVERIFIED_HISTORICAL_RULES: {explicit}/{segments} rule segments are explicit scenarios, not verified historical rules"
+            ));
+        }
+    }
+    warnings
 }
 
 fn validate_run_budget(

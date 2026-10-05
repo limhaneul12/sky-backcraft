@@ -191,6 +191,7 @@ fn save_v2_policy_plan_fixture(store: &mut Store, policy: &PolicyRevision) -> Pl
             slippage_bps: zero_bps,
             impact_bps: zero_bps,
             assumption_label: "policy fixture".into(),
+            dynamic: None,
         },
         execution: ExecutionPolicy::NextBarOpen {
             participation_cap: Weight::new(Decimal::ONE).expect("weight"),
@@ -208,7 +209,11 @@ fn save_v2_policy_plan_fixture(store: &mut Store, policy: &PolicyRevision) -> Pl
                 lower_bound: QuoteAmount::new(Decimal::ZERO).expect("lower bound"),
                 tick: PriceKrw::new(Decimal::ONE).expect("tick"),
             }],
+            fee_schedule: None,
+            trading_state: None,
+            maintenance_windows: Vec::new(),
         },
+        market_rules_history: Vec::new(),
         terminal_policy: TerminalPolicy::MarkToMarket,
         evidence_snapshot_id: None,
         pit_policy: PitPolicy::StrictPit,
@@ -2257,4 +2262,243 @@ fn sealed_writes_shrink_per_run_sqlite_growth() {
     assert!(freelist > 0, "compaction must return pages for reuse");
     assert!(pages_after <= pages_before);
     store.close().expect("close");
+}
+
+#[test]
+fn parameter_sweep_freezes_deterministic_policies_and_reuses_duplicates()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::contracts::{ParameterSweepMode, PolicyRevisionRef, StrategySpec, SweepValue};
+    let root = TempRoot::new("policy-sweep");
+    let mut store = Store::open(&root.0)?;
+    let template = StrategySpec::S2 {
+        entry_length: 20,
+        exit_length: 10,
+    };
+    let tuple = |entry: u32, exit: u32| {
+        std::collections::BTreeMap::from([
+            ("entry_length".to_string(), SweepValue::Integer(entry)),
+            ("exit_length".to_string(), SweepValue::Integer(exit)),
+        ])
+    };
+    let mode = ParameterSweepMode::Tuples {
+        tuples: vec![tuple(20, 10), tuple(55, 20), tuple(20, 10)],
+    };
+    let now = time("2024-01-01T00:00:00Z");
+    let first = store.sweep_policy(
+        &RequestId::new("sweep-one")?,
+        StrategyKind::S2,
+        &template,
+        &mode,
+        now,
+    )?;
+    assert_eq!(first.plan.candidates.len(), 2, "duplicate tuple suppressed");
+    assert_eq!(first.plan.duplicates_suppressed, 1);
+    assert_eq!(first.revisions.len(), 2);
+    for revision in &first.revisions {
+        assert_eq!(revision.revision_number, 1);
+    }
+    // Rerunning the same request is idempotent and reuses the policies.
+    let rerun = store.sweep_policy(
+        &RequestId::new("sweep-one")?,
+        StrategyKind::S2,
+        &template,
+        &mode,
+        now,
+    )?;
+    let references = |result: &crate::contracts::PolicySweepResult| {
+        result
+            .revisions
+            .iter()
+            .map(|revision| revision.reference.clone())
+            .collect::<std::collections::BTreeSet<PolicyRevisionRef>>()
+    };
+    assert_eq!(references(&first), references(&rerun));
+    // A different request with the same candidates reuses the same policies.
+    let reused = store.sweep_policy(
+        &RequestId::new("sweep-two")?,
+        StrategyKind::S2,
+        &template,
+        &mode,
+        now,
+    )?;
+    assert_eq!(references(&first), references(&reused));
+    // The frozen definitions differ per candidate and stay loadable.
+    let loaded = store
+        .load_policy_revision(&first.revisions[1].reference)?
+        .expect("reused revision loads");
+    let crate::contracts::FrozenPolicyRevision {
+        definition, family, ..
+    } = loaded.snapshot;
+    assert_eq!(family, StrategyKind::S2);
+    let crate::contracts::PolicyDefinition {
+        program: crate::contracts::PolicyProgram::Builtin { strategy },
+        ..
+    } = definition
+    else {
+        panic!("sweep candidates are builtin definitions");
+    };
+    assert!(matches!(
+        strategy,
+        StrategySpec::S2 {
+            entry_length: 55,
+            exit_length: 20
+        }
+    ));
+    Ok(())
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one seeded ledger journey proves publish, paging, rejection and failure rows"
+)]
+fn portfolio_run_publishes_atomically_and_pages_facts() -> Result<(), Box<dyn std::error::Error>> {
+    use crate::contracts::{
+        ArbitrationPolicy, AssetQuantity, BasisPoints, ContentHash, PortfolioAssetSpec,
+        PortfolioFillRecord, PortfolioMarkRecord, PortfolioRejectionReason,
+        PortfolioRejectionRecord, PortfolioRiskPolicy, PortfolioRunRequest, PortfolioSpec,
+        PortfolioTotals, PriceKrw, QuoteAmount, RunId, Side, Weight,
+    };
+    use std::str::FromStr;
+    let root = TempRoot::new("portfolio-store");
+    let mut store = Store::open(&root.0)?;
+    let market = MarketId::parse_upbit("KRW-BTC")?;
+    let request = PortfolioRunRequest {
+        request_id: RequestId::new("portfolio-store-request")?,
+        plan_id: crate::contracts::PlanId::new("portfolio-plan")?,
+        input_digest: ContentHash::of_bytes(b"portfolio-store-input"),
+        portfolio: PortfolioSpec {
+            initial_cash: QuoteAmount::new(Decimal::from(300_000))?,
+            assets: vec![PortfolioAssetSpec {
+                market: market.clone(),
+                max_weight: Weight::new(Decimal::new(45, 2))?,
+            }],
+            risk: PortfolioRiskPolicy {
+                max_gross_exposure: Weight::new(Decimal::new(70, 2))?,
+                min_cash_weight: Weight::new(Decimal::new(20, 2))?,
+                drawdown_stop: Weight::new(Decimal::new(15, 3))?,
+            },
+            arbitration: ArbitrationPolicy::Priority,
+        },
+        regime: None,
+    };
+    let run_id = RunId::new("run-portfolio-store")?;
+    // portfolio_runs.plan_id references the frozen plan row.
+    store.connection.execute(
+        "INSERT INTO plans(id,request_id,config_digest,input_digest,original_request_json,resolved_plan_json)          VALUES ('portfolio-plan','portfolio-plan-request','cfg','in','{}','{}')",
+        [],
+    )?;
+    let ledger = crate::contracts::PortfolioLedger {
+        run_id: run_id.clone(),
+        model_ids: Vec::new(),
+        spec: request.portfolio.clone(),
+        decision_interval: crate::contracts::CandleInterval::H1,
+        execution_resolution: crate::contracts::CandleInterval::H1,
+        status: crate::contracts::PortfolioStatus::Completed,
+        status_reason: None,
+        intents: Vec::new(),
+        fills: vec![PortfolioFillRecord {
+            event_seq: 1,
+            market: market.clone(),
+            side: Side::Buy,
+            price: PriceKrw::new(Decimal::from(100))?,
+            qty: AssetQuantity::new(Decimal::ONE)?,
+            notional: QuoteAmount::new(Decimal::from(100))?,
+            fee: QuoteAmount::new(Decimal::ZERO)?,
+            fee_bps: BasisPoints::new(Decimal::ZERO)?,
+            price_cost: crate::contracts::SignedAmount::new(Decimal::ZERO)?,
+            reserved_cash: QuoteAmount::new(Decimal::ZERO)?,
+            decision_time: time("2025-01-01T01:00:00Z"),
+            execution_time: time("2025-01-01T01:00:00Z"),
+            source_bar_id: "obs-1".into(),
+            liquidity_source_bar_id: "obs-0".into(),
+            cash_after: QuoteAmount::new(Decimal::from(299_900))?,
+        }],
+        rejections: vec![PortfolioRejectionRecord {
+            event_seq: 2,
+            decision_time: time("2025-01-01T02:00:00Z"),
+            market: market.clone(),
+            side: Side::Buy,
+            target_weight: Weight::new(Decimal::new(30, 2))?,
+            requested_notional: QuoteAmount::new(Decimal::from(1_000))?,
+            reason: PortfolioRejectionReason::GrossExposureCap,
+        }],
+        marks: vec![PortfolioMarkRecord {
+            event_seq: 3,
+            time: time("2025-01-01T02:00:00Z"),
+            cash: QuoteAmount::new(Decimal::from(299_900))?,
+            position_value: QuoteAmount::new(Decimal::from(100))?,
+            gross_exposure_weight: Weight::new(Decimal::ZERO)?,
+            equity: QuoteAmount::new(Decimal::from(300_000))?,
+            peak_equity: QuoteAmount::new(Decimal::from(300_000))?,
+            drawdown: Weight::new(Decimal::ZERO)?,
+            stopped: false,
+            weights: std::collections::BTreeMap::from([("KRW-BTC".into(), Decimal::ZERO)]),
+        }],
+        attribution: Vec::new(),
+        totals: PortfolioTotals {
+            terminal_equity: QuoteAmount::new(Decimal::from(300_000))?,
+            total_return: Decimal::ZERO,
+            max_drawdown: Weight::new(Decimal::ZERO)?,
+            turnover: Decimal::ZERO,
+            total_fees: QuoteAmount::new(Decimal::ZERO)?,
+            price_cost_drag: crate::contracts::SignedAmount::new(Decimal::ZERO)?,
+            exposure_seconds: 0,
+            rejected_signals: 1,
+            rejection_reasons: std::collections::BTreeMap::from([("GROSS_EXPOSURE_CAP".into(), 1)]),
+        },
+        regime_observations: Vec::new(),
+        last_event_seq: 3,
+    };
+    let benchmarks = serde_json::json!([{"kind": "CASH"}]);
+    store.publish_portfolio_run(&request, &ledger, &benchmarks)?;
+    // Idempotent duplicate run id is rejected (primary key).
+    assert!(
+        store
+            .publish_portfolio_run(&request, &ledger, &benchmarks)
+            .is_err()
+    );
+    let summary = store
+        .portfolio_run_summary(&run_id)?
+        .expect("published summary");
+    assert_eq!(summary.status, "completed");
+    assert_eq!(summary.fact_count, 3);
+    assert_eq!(summary.totals["rejected_signals"], 1);
+    assert_eq!(summary.benchmarks[0]["kind"], "CASH");
+    let marks = store.portfolio_facts(&run_id, "mark", 0, 10)?;
+    assert_eq!(marks.len(), 1);
+    assert_eq!(marks[0]["event_seq"], 3);
+    let rejections = store.portfolio_facts(&run_id, "rejection", 0, 10)?;
+    assert_eq!(
+        rejections[0]["reason"],
+        serde_json::json!("GROSS_EXPOSURE_CAP")
+    );
+    assert!(store.portfolio_facts(&run_id, "bogus", 0, 10).is_err());
+    assert!(store.portfolio_facts(&run_id, "mark", 0, 0).is_err());
+    let runs = store.list_portfolio_runs(0, 10)?;
+    assert_eq!(runs, vec![run_id.as_str().to_string()]);
+    // Failure rows are recorded for observability.
+    let failed_id = RunId::new("run-portfolio-failed")?;
+    let failed_request = PortfolioRunRequest {
+        request_id: RequestId::new("portfolio-store-failed")?,
+        ..request
+    };
+    store.record_portfolio_failure(
+        &failed_request,
+        &failed_id,
+        &LabError::InvalidConfig("fixture failure".into()),
+        time("2025-01-02T00:00:00Z"),
+    )?;
+    let failed = store
+        .portfolio_run_summary(&failed_id)?
+        .expect("failed summary");
+    assert_eq!(failed.status, "failed");
+    assert!(
+        failed
+            .error
+            .as_deref()
+            .is_some_and(|text| text.contains("fixture"))
+    );
+    let _ = Decimal::from_str("0");
+    Ok(())
 }
