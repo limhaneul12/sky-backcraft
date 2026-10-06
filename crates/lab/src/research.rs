@@ -67,6 +67,12 @@ pub fn plan_suite(
     if let Err(error) = request.template.validate() {
         return invalid(failure_message(&error));
     }
+    if request.template.costs.dynamic.is_some() {
+        return invalid(
+            "cost sweep is not supported with a dynamic cost model; sweep the fixed model or omit the sweep"
+                .into(),
+        );
+    }
     if request.template.schema_version != "3.0"
         || request.template.causal_execution
             != Some(crate::contracts::CausalExecutionPolicy::DeclaredPolicyWarmup)
@@ -950,6 +956,15 @@ pub fn summarize(record: &SuiteRecord) -> SuiteSummary {
 }
 
 fn scenarios(request: &ResearchSuiteRequest) -> Result<Vec<CostPolicy>, LabError> {
+    if request.template.costs.dynamic.is_some() {
+        // The engine derives slippage from the dynamic model, so swept
+        // slippage_bps values would produce identical scenarios that only
+        // differ in their label — a sweep must not pretend to vary cost.
+        return Err(LabError::InvalidConfig(
+            "cost sweep is not supported with a dynamic cost model; sweep the fixed model or omit the sweep"
+                .into(),
+        ));
+    }
     let fees = &request.cost_sweep.fee_bps;
     let slippages = &request.cost_sweep.slippage_bps;
     if fees.is_empty() || slippages.is_empty() {

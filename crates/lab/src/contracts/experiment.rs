@@ -857,6 +857,14 @@ impl ExperimentSpec {
         }
         if let Some(dynamic) = &self.costs.dynamic {
             dynamic.validate()?;
+            // The dynamic model owns the slippage component; a nonzero fixed
+            // value would be a second, silently-ignored source of truth.
+            if self.costs.slippage_bps.get() != Decimal::ZERO {
+                return Err(LabError::InvalidConfig(
+                    "dynamic cost model owns the slippage component; slippage_bps must be zero"
+                        .into(),
+                ));
+            }
         }
         if self.market_rules_history.is_empty() {
             self.market_rules.validate(self.range)?;
@@ -1170,17 +1178,17 @@ mod tests {
         ));
     }
 
-    /// Minimal spec shell so `rules_at` can run without a full experiment fixture.
+    /// Minimal but fully valid spec shell so `rules_at` and `validate` both run.
     fn reference_spec_for_rules() -> ExperimentSpec {
         let range = UtcRange::new(at("2025-01-01T00:00:00Z"), at("2025-01-03T00:00:00Z"))
             .expect("valid range");
         let first = segment("a", "2025-01-01T00:00:00Z", "2025-01-02T00:00:00Z");
         ExperimentSpec {
             schema_version: "1.0".into(),
-            dataset_ids: Vec::new(),
-            markets: Vec::new(),
+            dataset_ids: vec![super::DatasetId::new("dataset-rules").expect("valid dataset")],
+            markets: vec![super::MarketId::parse_upbit("KRW-BTC").expect("valid market")],
             range,
-            strategies: Vec::new(),
+            strategies: vec![StrategySpec::BuyAndHold],
             policy_selections: Vec::new(),
             causal_execution: None,
             decision_interval: super::CandleInterval::H1,
@@ -1314,6 +1322,32 @@ mod tests {
             .validate(),
             Err(LabError::InvalidConfig(_))
         ));
+    }
+
+    #[test]
+    fn dynamic_model_owns_slippage_and_rejects_a_second_fixed_value() {
+        let mut spec = reference_spec_for_rules();
+        spec.costs.slippage_bps = bps("25");
+        spec.costs.dynamic = Some(DynamicCostModel::VolatilityAware {
+            base_slippage_bps: bps("10"),
+            range_weight: Decimal::from(1_000),
+            max_slippage_bps: bps("200"),
+        });
+        assert!(
+            matches!(
+                spec.validate(),
+                Err(LabError::InvalidConfig(message))
+                if message.contains("owns the slippage component")
+            ),
+            "fixed slippage next to a dynamic model is a second authority"
+        );
+        spec.costs.slippage_bps = bps("0");
+        // Widen the single snapshot so validation reaches the cost rules.
+        spec.market_rules.valid_range =
+            UtcRange::new(at("2025-01-01T00:00:00Z"), at("2025-01-03T00:00:00Z"))
+                .expect("valid range");
+        spec.validate()
+            .expect("zero fixed slippage is the dynamic model's contract");
     }
 
     #[test]

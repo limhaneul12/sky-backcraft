@@ -998,3 +998,35 @@ fn planner_reports_invalid_templates_like_create_would() {
         crate::contracts::SuitePlanAdmission::Invalid { .. }
     ));
 }
+
+#[test]
+fn dynamic_cost_templates_reject_cost_sweeps_at_create_and_planner() {
+    let request = plan_request(1, 2, 1, 1, None);
+    let mut dynamic = request;
+    dynamic.template.costs.dynamic = Some(crate::contracts::DynamicCostModel::VolatilityAware {
+        base_slippage_bps: bps(5),
+        range_weight: Decimal::from(1_000),
+        max_slippage_bps: bps(100),
+    });
+    dynamic.template.costs.slippage_bps = bps(0);
+    assert!(
+        matches!(
+            expand_geometry(&dynamic),
+            Err(LabError::InvalidConfig(message))
+            if message.contains("dynamic cost model")
+        ),
+        "create rejects a swept dynamic template"
+    );
+    let report = plan_suite(&dynamic).expect("planner runs");
+    assert!(matches!(
+        report.admission,
+        crate::contracts::SuitePlanAdmission::Invalid { .. }
+    ));
+    // Single-scenario sweeps are still sweeps and stay rejected.
+    let mut single = dynamic;
+    single.cost_sweep = CostSweep {
+        fee_bps: vec![bps(1)],
+        slippage_bps: vec![bps(2)],
+    };
+    assert!(expand_geometry(&single).is_err());
+}

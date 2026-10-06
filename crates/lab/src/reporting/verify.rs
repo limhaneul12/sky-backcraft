@@ -1715,7 +1715,7 @@ impl<'a> Verifier<'a> {
         });
         if *ttl_execution_bars != 1
             || fill.side != Side::Buy
-            || fill.fee_bps != self.bundle.plan.spec.costs.maker_fee_bps
+            || fill.fee_bps != fees.maker
             || !price_path_valid
             || !first_eligible
             || !size_valid
