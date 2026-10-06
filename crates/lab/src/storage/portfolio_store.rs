@@ -2,7 +2,9 @@
 //! append-only fact rows published atomically at completion.
 
 use super::{Store, json_error, sql_error, timestamp_from_ms, timestamp_ms};
-use crate::contracts::{LabError, PortfolioLedger, PortfolioRunRequest, RunId, UtcTimestamp};
+use crate::contracts::{
+    LabError, PortfolioFactKind, PortfolioLedger, PortfolioRunRequest, RunId, UtcTimestamp,
+};
 use rusqlite::{OptionalExtension, params};
 
 pub(crate) const MAX_PORTFOLIO_FACT_PAGE: u32 = 500;
@@ -36,6 +38,28 @@ impl Store {
     ) -> Result<(), LabError> {
         let totals = serde_json::to_value(&ledger.totals).map_err(json_error)?;
         let transaction = self.connection.transaction().map_err(sql_error)?;
+        // Idempotent publication: the same (request, run) pair is a no-op, a
+        // reused request id under a different run is a conflict. This keeps
+        // job retries safe without multiplying run rows.
+        if let Some((existing_request, existing_run)) = transaction
+            .query_row(
+                "SELECT request_id,id FROM portfolio_runs WHERE id=?1 OR request_id=?2 LIMIT 1",
+                params![ledger.run_id.as_str(), request.request_id.as_str()],
+                |row| -> rusqlite::Result<(String, String)> { Ok((row.get(0)?, row.get(1)?)) },
+            )
+            .optional()
+            .map_err(sql_error)?
+        {
+            let same = existing_request == request.request_id.as_str()
+                && existing_run == ledger.run_id.as_str();
+            return if same {
+                Ok(())
+            } else {
+                Err(LabError::Conflict(
+                    "portfolio request id already published for another run".into(),
+                ))
+            };
+        }
         transaction
             .execute(
                 "INSERT INTO portfolio_runs(id,request_id,plan_id,input_digest,spec_json,status,\
@@ -46,7 +70,9 @@ impl Store {
                     request.request_id.as_str(),
                     request.plan_id.as_str(),
                     request.input_digest.as_str(),
-                    serde_json::to_string(&request.portfolio).map_err(json_error)?,
+                    // The full request freezes portfolio AND regime gate for
+                    // byte-level reproducibility of the run inputs.
+                    serde_json::to_string(request).map_err(json_error)?,
                     timestamp_ms(UtcTimestamp::now()),
                     serde_json::to_value(totals)
                         .map_err(json_error)?
@@ -65,36 +91,6 @@ impl Store {
                 .map_err(sql_error)?;
         }
         transaction.commit().map_err(sql_error)?;
-        Ok(())
-    }
-
-    /// Record one failed portfolio attempt durably for observability.
-    ///
-    /// # Errors
-    /// Rejects SQLite failure.
-    pub fn record_portfolio_failure(
-        &mut self,
-        request: &PortfolioRunRequest,
-        run_id: &RunId,
-        error: &LabError,
-        now: UtcTimestamp,
-    ) -> Result<(), LabError> {
-        self.connection
-            .execute(
-                "INSERT INTO portfolio_runs(id,request_id,plan_id,input_digest,spec_json,status,\
-                 created_at_ms,completed_at_ms,error_json,totals_json,benchmarks_json) \
-                 VALUES (?1,?2,?3,?4,?5,'failed',?6,?6,?7,NULL,NULL)",
-                params![
-                    run_id.as_str(),
-                    request.request_id.as_str(),
-                    request.plan_id.as_str(),
-                    request.input_digest.as_str(),
-                    serde_json::to_string(&request.portfolio).map_err(json_error)?,
-                    timestamp_ms(now),
-                    format!("{error}"),
-                ],
-            )
-            .map_err(sql_error)?;
         Ok(())
     }
 
@@ -180,7 +176,7 @@ impl Store {
     pub fn portfolio_facts(
         &self,
         run_id: &RunId,
-        kind: &str,
+        kind: PortfolioFactKind,
         offset: u64,
         limit: u32,
     ) -> Result<Vec<serde_json::Value>, LabError> {
@@ -188,11 +184,6 @@ impl Store {
             return Err(LabError::InvalidConfig(format!(
                 "portfolio fact page must be in 1..={MAX_PORTFOLIO_FACT_PAGE}"
             )));
-        }
-        if !matches!(kind, "intent" | "fill" | "rejection" | "mark") {
-            return Err(LabError::InvalidConfig(
-                "portfolio fact kind must be intent, fill, rejection or mark".into(),
-            ));
         }
         let mut statement = self
             .connection
@@ -205,7 +196,7 @@ impl Store {
             .query_map(
                 params![
                     run_id.as_str(),
-                    kind,
+                    kind.as_str(),
                     i64::from(limit),
                     i64::try_from(offset)
                         .map_err(|_| LabError::InvalidConfig("fact offset overflow".into()))?

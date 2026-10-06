@@ -795,8 +795,18 @@ async fn real_runtime_runs_shared_capital_portfolio_and_publishes_ledger()
             let summary = store
                 .portfolio_run_summary(&run_id)?
                 .ok_or_else(|| LabError::DataCorrupt("portfolio run disappeared".into()))?;
-            let marks = store.portfolio_facts(&run_id, "mark", 0, 500)?;
-            let fills = store.portfolio_facts(&run_id, "fill", 0, 500)?;
+            let marks = store.portfolio_facts(
+                &run_id,
+                crate::contracts::PortfolioFactKind::Mark,
+                0,
+                500,
+            )?;
+            let fills = store.portfolio_facts(
+                &run_id,
+                crate::contracts::PortfolioFactKind::Fill,
+                0,
+                500,
+            )?;
             Ok((summary, (marks.len(), fills.len())))
         })
         .await?;

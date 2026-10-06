@@ -109,14 +109,6 @@ pub fn classify_market_freshness(
             ),
         };
     }
-    if consecutive_gap || historical_missing >= u64::from(policy.consecutive_gap_threshold) {
-        return FreshnessClassification {
-            state: FreshnessState::TrueGap,
-            reason: format!(
-                "{historical_missing} consecutive historical boundaries are absent past the source delay"
-            ),
-        };
-    }
     FreshnessClassification {
         state: FreshnessState::SourceDelay,
         reason: format!(

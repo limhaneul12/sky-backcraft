@@ -772,7 +772,7 @@ impl JobService {
             plan_id: request.plan_id.clone(),
             input_digest: request.input_digest.clone(),
             portfolio: published.spec.clone(),
-            regime: None,
+            regime: request.regime.clone(),
         };
         self.inner
             .database

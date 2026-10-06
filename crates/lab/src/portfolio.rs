@@ -6,6 +6,9 @@
 //! `equity - initial == realized + unrealized - fees` is re-checked at every
 //! completed mark. Long/cash only; no leverage, short or margin.
 
+use crate::contracts::checked::{
+    add as checked_add, div as checked_div, mul as checked_mul, sub as checked_sub,
+};
 use crate::contracts::{
     AdmissionStatus, ArbitrationPolicy, AssetQuantity, BasisPoints, BenchmarkKind, BenchmarkResult,
     CandleObservation, ContentHash, DatasetSnapshot, LabError, MAX_PORTFOLIO_EVENTS, MarketId,
@@ -15,7 +18,6 @@ use crate::contracts::{
     RegimeLabel, RegimeObservation, ResolvedPlan, RunId, Side, StrategyBinding, StrategyKind,
     TerminalPolicy, UtcTimestamp, Weight,
 };
-use crate::engine::accounting::{checked_add, checked_div, checked_mul, checked_sub};
 use crate::engine::execution::{bps_rate, floor_to_step, tick_for};
 use crate::policy_engine::PolicyEvaluator;
 use crate::regime::{RegimeClassifier, gate_action};
@@ -23,7 +25,6 @@ use crate::strategy::PositionView;
 use rust_decimal::Decimal;
 use std::collections::BTreeMap;
 
-const PORTFOLIO_POLICY_VERSION: &str = "portfolio-shared-cash-v1-priority-default";
 /// Aggregate equity identity tolerance; mirrors the single-model engine.
 const NUMERIC_TOLERANCE: Decimal = crate::contracts::NUMERIC_TOLERANCE;
 
@@ -508,8 +509,6 @@ pub fn run_portfolio(
         last_event_seq: state.seq.saturating_sub(1),
     })
 }
-
-const _: &str = PORTFOLIO_POLICY_VERSION;
 
 fn check_cancelled(cancelled: &dyn Fn() -> bool) -> Result<(), LabError> {
     if cancelled() {

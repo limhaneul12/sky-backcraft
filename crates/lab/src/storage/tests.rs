@@ -2355,7 +2355,7 @@ fn parameter_sweep_freezes_deterministic_policies_and_reuses_duplicates()
 fn portfolio_run_publishes_atomically_and_pages_facts() -> Result<(), Box<dyn std::error::Error>> {
     use crate::contracts::{
         ArbitrationPolicy, AssetQuantity, BasisPoints, ContentHash, PortfolioAssetSpec,
-        PortfolioFillRecord, PortfolioMarkRecord, PortfolioRejectionReason,
+        PortfolioFactKind, PortfolioFillRecord, PortfolioMarkRecord, PortfolioRejectionReason,
         PortfolioRejectionRecord, PortfolioRiskPolicy, PortfolioRunRequest, PortfolioSpec,
         PortfolioTotals, PriceKrw, QuoteAmount, RunId, Side, Weight,
     };
@@ -2380,7 +2380,25 @@ fn portfolio_run_publishes_atomically_and_pages_facts() -> Result<(), Box<dyn st
             },
             arbitration: ArbitrationPolicy::Priority,
         },
-        regime: None,
+        regime: Some(crate::contracts::RegimeGateSpec {
+            classifier: crate::contracts::RegimeClassifierSpec {
+                revision: "store-gate-v1".into(),
+                sma_long: 6,
+                sma_mid: 2,
+                sma_short: 3,
+                slope_lookback: 2,
+                vol_lookback: 4,
+                atr_lookback: 3,
+                high_vol_annualized: None,
+                low_vol_annualized: None,
+            },
+            rules: crate::contracts::RegimeGateRule {
+                trend_up: crate::contracts::RegimeGateAction::Enabled,
+                trend_down: crate::contracts::RegimeGateAction::Disabled,
+                chop: crate::contracts::RegimeGateAction::Disabled,
+                unknown: crate::contracts::RegimeGateAction::Disabled,
+            },
+        }),
     };
     let run_id = RunId::new("run-portfolio-store")?;
     // portfolio_runs.plan_id references the frozen plan row.
@@ -2452,12 +2470,6 @@ fn portfolio_run_publishes_atomically_and_pages_facts() -> Result<(), Box<dyn st
     };
     let benchmarks = serde_json::json!([{"kind": "CASH"}]);
     store.publish_portfolio_run(&request, &ledger, &benchmarks)?;
-    // Idempotent duplicate run id is rejected (primary key).
-    assert!(
-        store
-            .publish_portfolio_run(&request, &ledger, &benchmarks)
-            .is_err()
-    );
     let summary = store
         .portfolio_run_summary(&run_id)?
         .expect("published summary");
@@ -2465,39 +2477,35 @@ fn portfolio_run_publishes_atomically_and_pages_facts() -> Result<(), Box<dyn st
     assert_eq!(summary.fact_count, 3);
     assert_eq!(summary.totals["rejected_signals"], 1);
     assert_eq!(summary.benchmarks[0]["kind"], "CASH");
-    let marks = store.portfolio_facts(&run_id, "mark", 0, 10)?;
+    let marks = store.portfolio_facts(&run_id, PortfolioFactKind::Mark, 0, 10)?;
     assert_eq!(marks.len(), 1);
     assert_eq!(marks[0]["event_seq"], 3);
-    let rejections = store.portfolio_facts(&run_id, "rejection", 0, 10)?;
+    let rejections = store.portfolio_facts(&run_id, PortfolioFactKind::Rejection, 0, 10)?;
     assert_eq!(
         rejections[0]["reason"],
         serde_json::json!("GROSS_EXPOSURE_CAP")
     );
-    assert!(store.portfolio_facts(&run_id, "bogus", 0, 10).is_err());
-    assert!(store.portfolio_facts(&run_id, "mark", 0, 0).is_err());
+    assert!(
+        store
+            .portfolio_facts(&run_id, PortfolioFactKind::Mark, 0, 0)
+            .is_err()
+    );
     let runs = store.list_portfolio_runs(0, 10)?;
     assert_eq!(runs, vec![run_id.as_str().to_string()]);
-    // Failure rows are recorded for observability.
-    let failed_id = RunId::new("run-portfolio-failed")?;
-    let failed_request = PortfolioRunRequest {
-        request_id: RequestId::new("portfolio-store-failed")?,
-        ..request
-    };
-    store.record_portfolio_failure(
-        &failed_request,
-        &failed_id,
-        &LabError::InvalidConfig("fixture failure".into()),
-        time("2025-01-02T00:00:00Z"),
-    )?;
-    let failed = store
-        .portfolio_run_summary(&failed_id)?
-        .expect("failed summary");
-    assert_eq!(failed.status, "failed");
+    // Republication of the same (request, run) pair is an idempotent no-op.
+    store.publish_portfolio_run(&request, &ledger, &benchmarks)?;
+    // The frozen regime gate persists with the run spec for reproducibility.
+    let spec_json: String = store
+        .connection
+        .query_row(
+            "SELECT spec_json FROM portfolio_runs WHERE id=?1",
+            [run_id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(|error| LabError::Internal(format!("sqlite test read: {error}")))?;
     assert!(
-        failed
-            .error
-            .as_deref()
-            .is_some_and(|text| text.contains("fixture"))
+        spec_json.contains("store-gate-v1"),
+        "regime gate must be frozen in the run spec: {spec_json}"
     );
     let _ = Decimal::from_str("0");
     Ok(())

@@ -234,25 +234,11 @@ pub(super) fn aggregate_identity_within_tolerance(
     Ok(checked_sub(actual, expected, "aggregate identity residual")?.abs() <= NUMERIC_TOLERANCE)
 }
 
-pub(crate) fn checked_add(a: Decimal, b: Decimal, label: &str) -> Result<Decimal, LabError> {
-    a.checked_add(b)
-        .ok_or_else(|| invariant(format!("{label} overflow")))
-}
-
-pub(crate) fn checked_sub(a: Decimal, b: Decimal, label: &str) -> Result<Decimal, LabError> {
-    a.checked_sub(b)
-        .ok_or_else(|| invariant(format!("{label} overflow")))
-}
-
-pub(crate) fn checked_mul(a: Decimal, b: Decimal, label: &str) -> Result<Decimal, LabError> {
-    a.checked_mul(b)
-        .ok_or_else(|| invariant(format!("{label} overflow")))
-}
-
-pub(crate) fn checked_div(a: Decimal, b: Decimal, label: &str) -> Result<Decimal, LabError> {
-    a.checked_div(b)
-        .ok_or_else(|| invariant(format!("{label} division failed")))
-}
+// The checked arithmetic authority lives in `contracts::checked`; these
+// aliases keep the engine call sites and error labels unchanged.
+pub(crate) use crate::contracts::checked::{
+    add as checked_add, div as checked_div, mul as checked_mul, sub as checked_sub,
+};
 
 fn invariant(message: impl Into<String>) -> LabError {
     LabError::AccountingInvariant(message.into())

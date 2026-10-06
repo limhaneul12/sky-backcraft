@@ -767,7 +767,7 @@ impl LabMcpService {
                 let facts = self
                     .database
                     .call("portfolio_facts", move |store| {
-                        store.portfolio_facts(&run_id, &kind, offset, limit)
+                        store.portfolio_facts(&run_id, kind, offset, limit)
                     })
                     .await
                     .map_err(|error| McpError::internal_error(error.to_string(), None))?;

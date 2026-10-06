@@ -291,6 +291,29 @@ pub struct PortfolioRunRequest {
     pub regime: Option<super::RegimeGateSpec>,
 }
 
+/// Closed ledger fact kinds exposed by the facts query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PortfolioFactKind {
+    Intent,
+    Fill,
+    Rejection,
+    Mark,
+}
+
+impl PortfolioFactKind {
+    /// Persisted column spelling for this fact kind.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Intent => "intent",
+            Self::Fill => "fill",
+            Self::Rejection => "rejection",
+            Self::Mark => "mark",
+        }
+    }
+}
+
 /// Bounded actions over durable portfolio runs.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
@@ -303,8 +326,7 @@ pub enum PortfolioAction {
     },
     Facts {
         run_id: RunId,
-        /// One of `intent`, `fill`, `rejection`, `mark`.
-        kind: String,
+        kind: PortfolioFactKind,
         offset: u64,
         limit: u32,
     },

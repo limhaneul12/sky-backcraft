@@ -610,8 +610,9 @@ pub struct CostProvenance {
     pub proxy_inputs: CostProxyInputs,
 }
 
-/// Checked decimal arithmetic shared by cost provenance helpers.
-pub(super) mod checked {
+/// Checked decimal arithmetic shared by cost provenance helpers and the
+/// execution/portfolio accounting paths (single authority, no duplicates).
+pub(crate) mod checked {
     use rust_decimal::Decimal;
 
     use super::LabError;
