@@ -284,6 +284,15 @@ pub fn run_portfolio(
             "portfolio v1 requires zero configured latency".into(),
         ));
     }
+    if matches!(
+        plan.spec.execution,
+        crate::contracts::ExecutionPolicy::PassiveBuy { .. }
+    ) {
+        return Err(LabError::InvalidConfig(
+            "portfolio v1 executes every fill as a next-bar-open taker; passive execution is not supported"
+                .into(),
+        ));
+    }
     validate_frozen_inputs(plan, datasets)?;
     let participation_cap = match plan.spec.execution {
         crate::contracts::ExecutionPolicy::NextBarOpen { participation_cap }
@@ -1291,8 +1300,16 @@ fn fill_quantity(
     time: UtcTimestamp,
 ) -> Result<Decimal, LabError> {
     let rules = plan.spec.rules_at(time)?;
+    // The cap must anticipate the exact price execute_fill will settle:
+    // open uplifted by the price-cost rate and rounded up to the tick.
+    let price_cost_rate = plan_price_cost_rate(plan)?;
+    let multiplier = checked_add(Decimal::ONE, price_cost_rate, "worst-case multiplier")?;
     let worst_price = round_adversarial(
-        execution_bar.candle.open.get(),
+        checked_mul(
+            execution_bar.candle.open.get(),
+            multiplier,
+            "worst-case price",
+        )?,
         tick_for(execution_bar.candle.open.get(), rules)?,
         Side::Buy,
     )?;

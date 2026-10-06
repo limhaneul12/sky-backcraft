@@ -788,3 +788,82 @@ fn regime_gating_changes_the_executed_path() {
         "gating changes the executed path on a trending-then-falling market"
     );
 }
+
+#[test]
+fn buy_reservation_anticipates_the_cost_adjusted_worst_price() {
+    // fee 100bps + price cost 50bps: the reservation must cap the quantity at
+    // the tick-rounded, cost-uplifted execution price, not the raw open.
+    let btc = dataset("KRW-BTC", &FLAT_PRICES);
+    let xrp = dataset("KRW-XRP", &FLAT_PRICES);
+    let mut plan = plan(&["KRW-BTC", "KRW-XRP"], StrategySpec::BuyAndHold);
+    plan.spec.costs.buy_fee_bps = BasisPoints::new(decimal("100")).expect("fee");
+    plan.spec.costs.sell_fee_bps = BasisPoints::new(decimal("100")).expect("fee");
+    plan.spec.costs.half_spread_bps = BasisPoints::new(decimal("50")).expect("cost");
+    plan.spec.costs.assumption_label = "worst-price reservation fixture".into();
+    let spec = portfolio_spec(
+        "1000",
+        &[("KRW-BTC", "0.80"), ("KRW-XRP", "0.30")],
+        "0.80",
+        "0.00",
+        "0",
+        ArbitrationPolicy::Priority,
+    );
+    let ledger = run(&plan, &[btc, xrp], &spec);
+    let buy = ledger
+        .fills
+        .iter()
+        .find(|fill| fill.side == Side::Buy && fill.market.code() == "KRW-BTC")
+        .expect("btc buy");
+    // fee 100bps = 0.01, price cost 50bps = 0.005:
+    // reserved = 800 x 1.015 = 812; worst price = 100 x 1.005 = 100.50;
+    // quantity cap = 812 / (100.50 x 1.01) = 7.99960... -> 7.9996 on step.
+    assert_eq!(buy.qty.get(), decimal("7.9996"));
+    assert_eq!(buy.price.get(), decimal("100.50"));
+    // Settled debit stays inside the reservation: 7.9996 x 100.50 x 1.01.
+    assert_eq!(
+        buy.cash_after.get(),
+        decimal("188.000602"),
+        "cash after the buy equals the pool minus the reservation-bound debit"
+    );
+    for mark in &ledger.marks {
+        assert!(mark.cash.get() >= Decimal::ZERO);
+    }
+}
+
+#[test]
+fn portfolio_rejects_passive_execution_plans_fail_closed() {
+    let btc = dataset("KRW-BTC", &FLAT_PRICES);
+    let mut plan = plan(&["KRW-BTC"], StrategySpec::BuyAndHold);
+    plan.spec.execution = ExecutionPolicy::PassiveBuy {
+        offset_bps: BasisPoints::new(decimal("10")).expect("offset"),
+        penetration_ticks: 1,
+        fill_fraction: crate::contracts::PassiveFraction::Half,
+        ttl_execution_bars: 1,
+        participation_cap: Weight::new(Decimal::ONE).expect("cap"),
+    };
+    let spec = portfolio_spec(
+        "1000",
+        &[("KRW-BTC", "0.45")],
+        "0.70",
+        "0.20",
+        "0",
+        ArbitrationPolicy::Priority,
+    );
+    let result = run_portfolio(
+        &plan,
+        std::slice::from_ref(&btc),
+        &spec,
+        None,
+        &RunId::new("run-passive").expect("run id"),
+        100,
+        &|| false,
+    );
+    assert!(
+        matches!(
+            result,
+            Err(LabError::InvalidConfig(message))
+                if message.contains("passive execution is not supported")
+        ),
+        "passive plans must fail closed, not run as silent takers"
+    );
+}
