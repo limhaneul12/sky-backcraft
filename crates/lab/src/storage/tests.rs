@@ -174,6 +174,7 @@ fn save_v2_policy_plan_fixture(store: &mut Store, policy: &PolicyRevision) -> Pl
     let spec = ExperimentSpec {
         schema_version: "2.0".into(),
         causal_execution: None,
+        capital_mode: None,
         dataset_ids: vec![dataset_id.clone()],
         markets: vec![market.clone()],
         range: dataset_request.range,
@@ -1500,6 +1501,8 @@ fn policy_cascade_delete_removes_frozen_plans_and_reseeding_stays_explicit() {
             time("2024-01-02T00:01:00Z"),
         )
         .expect("cascade delete");
+    // Deletion folds the WAL cheaply (passive checkpoint); physical
+    // compaction moved to the explicit maintenance compact operation.
     assert!(outcome.vacuumed);
     assert!(
         store
@@ -2509,4 +2512,171 @@ fn portfolio_run_publishes_atomically_and_pages_facts() -> Result<(), Box<dyn st
     );
     let _ = Decimal::from_str("0");
     Ok(())
+}
+
+#[test]
+fn wal_checkpoint_and_compact_reclaim_without_corruption() -> Result<(), Box<dyn std::error::Error>>
+{
+    use crate::contracts::CheckpointMode;
+    let root = TempRoot::new("wal-closure");
+    let mut store = Store::open(&root.0)?;
+    // Inflate the database with disposable pages, then drop them to create
+    // freelist pages a VACUUM can reclaim.
+    // Disable autocheckpoint so the bulk write leaves real WAL frames for
+    // the explicit checkpoint to fold.
+    store
+        .connection
+        .execute_batch("PRAGMA wal_autocheckpoint=0;")
+        .map_err(|error| LabError::Internal(format!("sqlite wal fixture: {error}")))?;
+    store
+        .connection
+        .execute_batch(
+            "CREATE TABLE pressure_fixture(id INTEGER PRIMARY KEY, payload TEXT);\
+             WITH RECURSIVE seq(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM seq WHERE i < 20000) \
+             INSERT INTO pressure_fixture(payload) \
+             SELECT printf('%.2000d', 1) FROM seq;",
+        )
+        .map_err(|error| LabError::Internal(format!("sqlite fixture: {error}")))?;
+    let checkpoint = store.checkpoint_wal(CheckpointMode::Truncate)?;
+    assert_eq!(checkpoint.mode, CheckpointMode::Truncate);
+    assert!(!checkpoint.busy, "sole owner must not report busy");
+    assert!(
+        checkpoint.before.wal_bytes > 0,
+        "fixture must leave WAL frames"
+    );
+    assert_eq!(
+        checkpoint.after.wal_bytes, 0,
+        "TRUNCATE folds and shrinks the WAL for a sole owner"
+    );
+    // The empty checkpoint right after a TRUNCATE has no WAL frames left.
+    let idempotent = store.checkpoint_wal(CheckpointMode::Passive)?;
+    assert_eq!(idempotent.after.wal_bytes, 0);
+    // Restore default autocheckpoint for the compaction journey.
+    store
+        .connection
+        .execute_batch("PRAGMA wal_autocheckpoint=1000;")
+        .map_err(|error| LabError::Internal(format!("sqlite wal restore: {error}")))?;
+
+    // Dropped pages become freelist; only an explicit compaction reclaims them.
+    store
+        .connection
+        .execute_batch("DROP TABLE pressure_fixture;")
+        .map_err(|error| LabError::Internal(format!("sqlite fixture drop: {error}")))?;
+    let outcome = store.compact_database()?;
+    assert_eq!(outcome.integrity, "ok");
+    assert!(
+        outcome.after.allocated_bytes <= outcome.before.allocated_bytes,
+        "VACUUM must not grow the main database"
+    );
+    assert!(
+        outcome.reclaimed_bytes > 0,
+        "dropped freelist pages must be reclaimed: before={} after={}",
+        outcome.before.allocated_bytes,
+        outcome.after.allocated_bytes
+    );
+    assert!(outcome.after.wal_bytes == 0, "final TRUNCATE leaves no WAL");
+    // Reopened storage is intact after the compaction journey.
+    drop(store);
+    let reopened = Store::open(&root.0)?;
+    assert_eq!(
+        reopened
+            .connection
+            .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+            .map_err(|error| LabError::Internal(format!("sqlite reopen: {error}")))?,
+        "ok"
+    );
+    Ok(())
+}
+
+#[test]
+fn storage_pressure_classifier_refuses_hard_and_wal_bands_only() {
+    let limit = 512 * 1024 * 1024_u64;
+    // Healthy: no error.
+    assert!(crate::storage::classify_storage_pressure(0, 0, limit).is_ok());
+    // Soft band (85-94 percent): allowed, only logged. Integer boundaries:
+    // percent = effective*100/limit must land exactly on 90.
+    let soft = limit / 100 * 90;
+    assert!(crate::storage::classify_storage_pressure(soft, 0, limit).is_ok());
+    // Just below the hard band stays admissible.
+    assert!(crate::storage::classify_storage_pressure(soft, 0, limit).is_ok());
+    // Hard band (>=95 percent): DB_STORAGE_PRESSURE with numeric evidence.
+    let hard = limit / 100 * 96;
+    assert!(matches!(
+        crate::storage::classify_storage_pressure(hard, 0, limit),
+        Err(LabError::StoragePressure(message))
+            if message.starts_with("DB_STORAGE_PRESSURE") && message.contains("utilization=95%")
+    ));
+    // WAL pressure is independent of the main file: DB_STORAGE_PRESSURE must
+    // not swallow it, and the remedy names the checkpoint operation.
+    let small_main = limit / 10;
+    let big_wal = 256 * 1024 * 1024_u64 + 1;
+    assert!(matches!(
+        crate::storage::classify_storage_pressure(small_main, big_wal, limit),
+        Err(LabError::StoragePressure(message))
+            if message.starts_with("WAL_STORAGE_PRESSURE") && message.contains("checkpoint")
+    ));
+    // Zero limit is corrupt accounting, never an admission decision.
+    assert!(matches!(
+        crate::storage::classify_storage_pressure(1, 0, 0),
+        Err(LabError::DataCorrupt(_))
+    ));
+}
+
+#[test]
+fn hard_delete_batch_contract_keeps_per_resource_echo_and_bound() {
+    let root = TempRoot::new("hard-delete-batch");
+    let mut store = Store::open(&root.0).expect("open store");
+    let builtins = builtin_policy_definitions().expect("builtin policy definitions");
+    store
+        .seed_builtin_policies_once(&builtins, time("2024-01-01T00:00:00Z"))
+        .expect("seed builtins");
+    let definition = PolicyDefinition {
+        schema_version: "1.0".into(),
+        name: "Batch Delete Policy".into(),
+        description: "batch delete fixture".into(),
+        program: PolicyProgram::Builtin {
+            strategy: StrategySpec::BuyAndHold,
+        },
+    };
+    let policy = store
+        .write_policy(
+            &PolicyWrite::Create {
+                request_id: RequestId::new("batch-delete-policy").expect("request id"),
+                definition,
+            },
+            time("2024-01-01T00:01:00Z"),
+        )
+        .expect("create policy");
+    let resource = DeleteResource::Policy {
+        policy_id: policy.snapshot.reference.policy_id.clone(),
+    };
+    let preview = store
+        .delete_preview(&resource, time("2024-01-02T00:00:00Z"))
+        .expect("preview");
+    let batch = vec![hard_delete_request(&preview, true)];
+    assert!(
+        batch.len() <= crate::contracts::MAX_HARD_DELETE_BATCH,
+        "batches stay within the contract bound"
+    );
+    // Each batched request keeps the exact-echo semantics of the single path.
+    let mut outcomes = Vec::with_capacity(batch.len());
+    for request in &batch {
+        outcomes.push(
+            store
+                .execute_hard_delete(request, time("2024-01-02T00:01:00Z"))
+                .expect("batched delete executes"),
+        );
+    }
+    assert_eq!(outcomes.len(), batch.len());
+    assert!(outcomes[0].deleted_db_rows > 0);
+    // The per-delete WAL fold ran; physical compaction stays explicit.
+    assert!(outcomes[0].vacuumed);
+    // The same preview is now stale or the resource is gone: replays fail
+    // closed like single deletes.
+    assert!(
+        store
+            .execute_hard_delete(&batch[0], time("2024-01-02T00:02:00Z"))
+            .is_err(),
+        "stale preview replay must fail"
+    );
 }

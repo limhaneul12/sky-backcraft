@@ -60,6 +60,12 @@ const DATABASE_WAL_HEADROOM_BYTES: u64 = 260 * 1024 * 1024;
 const DATABASE_PAGE_BYTES: i64 = 4_096;
 const WAL_AUTOCHECKPOINT_PAGES: i64 = 1_000;
 const WAL_JOURNAL_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
+/// Effective-utilization percent at which submissions log a pressure warning.
+const DB_SOFT_PRESSURE_PERCENT: u64 = 85;
+/// Effective-utilization percent at which mutating submissions are refused.
+const DB_HARD_PRESSURE_PERCENT: u64 = 95;
+/// WAL size at which submissions are refused until an explicit checkpoint.
+const WAL_PRESSURE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_PAGE_OBSERVATIONS: usize = 200;
 const MAX_SNAPSHOT_LINKS: usize = 120_000;
 
@@ -2468,6 +2474,78 @@ fn file_size(path: &Path) -> Result<u64, LabError> {
     }
 }
 
+/// Classify SQLite storage pressure from measured byte counts.
+///
+/// Refusals carry stable sub-reasons (`DB_STORAGE_PRESSURE` /
+/// `WAL_STORAGE_PRESSURE`); the soft band is allowed and only reported.
+///
+/// # Errors
+/// Returns [`LabError::StoragePressure`] in the hard and WAL bands and
+/// [`LabError::DataCorrupt`] for a zero limit.
+pub fn classify_storage_pressure(
+    allocated_bytes: u64,
+    wal_bytes: u64,
+    limit_bytes: u64,
+) -> Result<(), LabError> {
+    if limit_bytes == 0 {
+        return Err(LabError::DataCorrupt(
+            "sqlite byte limit must be positive".into(),
+        ));
+    }
+    if wal_bytes > WAL_PRESSURE_BYTES {
+        return Err(LabError::StoragePressure(format!(
+            "WAL_STORAGE_PRESSURE: wal_bytes={wal_bytes} limit={WAL_PRESSURE_BYTES}              remedy=run storage_maintenance action=checkpoint mode=TRUNCATE"
+        )));
+    }
+    let effective = allocated_bytes.saturating_add(wal_bytes);
+    let percent = effective.saturating_mul(100) / limit_bytes;
+    if percent >= DB_HARD_PRESSURE_PERCENT {
+        return Err(LabError::StoragePressure(format!(
+            "DB_STORAGE_PRESSURE: effective_bytes={effective} (main={allocated_bytes} wal={wal_bytes})              limit={limit_bytes} utilization={percent}%              remedy=storage_maintenance action=compact or explicit hard-delete of finished resources"
+        )));
+    }
+    if percent >= DB_SOFT_PRESSURE_PERCENT {
+        tracing::warn!(
+            event = "db_storage_pressure_soft",
+            effective_bytes = effective,
+            limit_bytes = limit_bytes,
+            utilization_percent = percent,
+            remedy = "plan storage_maintenance action=compact"
+        );
+    }
+    Ok(())
+}
+
+impl Store {
+    /// Refuse mutating submissions under hard SQLite storage pressure.
+    ///
+    /// Cheap by design: two PRAGMAs and one WAL file stat — never a
+    /// directory scan. Soft pressure passes and is only logged.
+    /// # Errors
+    /// Returns [`LabError::StoragePressure`] with a stable sub-reason.
+    pub fn enforce_storage_pressure(&self) -> Result<(), LabError> {
+        let page_size: i64 = self
+            .connection
+            .pragma_query_value(None, "page_size", |row| row.get(0))
+            .map_err(sql_error)?;
+        let page_count: i64 = self
+            .connection
+            .pragma_query_value(None, "page_count", |row| row.get(0))
+            .map_err(sql_error)?;
+        let allocated = u64::try_from(page_count.saturating_mul(page_size)).unwrap_or(u64::MAX);
+        let wal_path = self.raw.root.join(format!("{DATABASE_FILE}-wal"));
+        let wal_bytes = if wal_path
+            .try_exists()
+            .map_err(io_error("inspect SQLite WAL"))?
+        {
+            file_size(&wal_path)?
+        } else {
+            0
+        };
+        classify_storage_pressure(allocated, wal_bytes, MAX_DATABASE_BYTES)
+    }
+}
+
 fn configure_database_capacity(connection: &Connection) -> Result<(), LabError> {
     connection
         .pragma_update(None, "page_size", DATABASE_PAGE_BYTES)
@@ -2629,7 +2707,7 @@ fn u64_to_i64(value: u64) -> Result<i64, LabError> {
 #[allow(clippy::needless_pass_by_value)]
 fn sql_error(error: rusqlite::Error) -> LabError {
     if error.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull) {
-        LabError::ResourceLimit(format!(
+        LabError::StoragePressure(format!(
             "sqlite_max_database_bytes reached at stage=write: allowed={MAX_DATABASE_BYTES} \
              unit=bytes remedy=hard-delete finished runs, datasets, jobs or exports; freed pages \
              restore write capacity immediately and the post-delete VACUUM shrinks the file"

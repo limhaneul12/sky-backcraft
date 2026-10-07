@@ -148,7 +148,7 @@ pub struct DeletePreview {
 /// cannot compute digests (LLM clients) can return the preview verbatim; the
 /// server recomputes the binding from the echo, so a stale, expired, or altered
 /// preview is refused exactly like an invalid token.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HardDeleteRequest {
     /// Verbatim copy of the preview being confirmed.
@@ -166,6 +166,8 @@ pub struct DeleteOutcome {
     pub deleted_files: u64,
     pub deleted_file_bytes: u64,
     pub retained_shared_raw_objects: u64,
-    /// True when SQLite file compaction ran after the committed deletion.
+    /// Whether a post-delete WAL checkpoint ran. Physical compaction moved to
+    /// the explicit `storage_maintenance action=compact` operation, so this is
+    /// no longer a full VACUUM; the field stays for backward compatibility.
     pub vacuumed: bool,
 }

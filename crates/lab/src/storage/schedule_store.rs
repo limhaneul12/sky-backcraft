@@ -177,6 +177,67 @@ impl Store {
             .collect()
     }
 
+    /// Blocked schedules whose durable recovery backoff has elapsed.
+    ///
+    /// # Errors
+    /// Returns SQLite failures.
+    pub fn recovery_candidates(
+        &self,
+        now: UtcTimestamp,
+        limit: u32,
+    ) -> Result<Vec<CollectionScheduleRecord>, LabError> {
+        validate_active_scan(limit)?;
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id FROM collection_schedules \
+                 WHERE status='blocked' AND next_action_at_ms<=?1 \
+                 ORDER BY next_action_at_ms,id LIMIT ?2",
+            )
+            .map_err(sql_error)?;
+        let ids = statement
+            .query_map(params![timestamp_ms(now), i64::from(limit)], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(sql_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sql_error)?;
+        drop(statement);
+        let mut records = Vec::with_capacity(ids.len());
+        for id in ids {
+            let schedule_id = ScheduleId::new(id)?;
+            if let Some(record) = self.get_collection_schedule(&schedule_id)? {
+                records.push(record);
+            }
+        }
+        Ok(records)
+    }
+
+    /// Push a blocked schedule's recovery attempt further out after a failed
+    /// probe. Durable: only `next_action_at_ms` moves.
+    ///
+    /// # Errors
+    /// Returns SQLite failures.
+    pub fn defer_recovery(
+        &mut self,
+        schedule_id: &ScheduleId,
+        now: UtcTimestamp,
+        attempt: u32,
+    ) -> Result<(), LabError> {
+        let delay = recovery_backoff_seconds(attempt.saturating_add(1));
+        self.connection
+            .execute(
+                "UPDATE collection_schedules SET next_action_at_ms=?1 \
+                 WHERE id=?2 AND status='blocked'",
+                params![
+                    timestamp_ms(now).saturating_add(i64::from(delay) * 1000),
+                    schedule_id.as_str()
+                ],
+            )
+            .map_err(sql_error)?;
+        Ok(())
+    }
+
     /// Return active schedules ready either for a new fire or a persisted retry.
     ///
     /// # Errors
@@ -523,11 +584,16 @@ impl Store {
             CollectionScheduleStatus::Active => {}
         }
         let failure_json = serde_json::to_string(&failure).map_err(json_error)?;
+        let recovery_delay = recovery_backoff_seconds(0);
         let changed = transaction
             .execute(
                 "UPDATE collection_schedules SET status='blocked',next_action_at_ms=?1,\
                  failure_json=?2 WHERE id=?3 AND status='active'",
-                params![timestamp_ms(now), failure_json, schedule_id.as_str()],
+                params![
+                    timestamp_ms(now).saturating_add(i64::from(recovery_delay) * 1000),
+                    failure_json,
+                    schedule_id.as_str()
+                ],
             )
             .map_err(sql_error)?;
         if changed != 1 {
@@ -689,7 +755,14 @@ fn reconcile_state(
                 }
                 None => None,
             };
-            block_fire(transaction, schedule, fire, &reason, dataset_id.as_ref())
+            block_fire(
+                transaction,
+                schedule,
+                fire,
+                &reason,
+                dataset_id.as_ref(),
+                now,
+            )
         }
         AttemptState::Cancelled { reason, .. } => reconcile_lifecycle_end(
             transaction,
@@ -753,7 +826,7 @@ fn reconcile_failed_attempt(
                 .map_err(sql_error)?;
             Ok(())
         }
-        ScheduleFailureAction::Block => block_fire(transaction, schedule, fire, error, None),
+        ScheduleFailureAction::Block => block_fire(transaction, schedule, fire, error, None, now),
     }
 }
 
@@ -830,6 +903,7 @@ fn block_fire(
     fire: &ScheduleFire,
     failure: &FailureRecord,
     dataset_id: Option<&DatasetId>,
+    now: UtcTimestamp,
 ) -> Result<(), LabError> {
     let failure_json = serde_json::to_string(failure).map_err(json_error)?;
     transaction
@@ -844,17 +918,33 @@ fn block_fire(
             ],
         )
         .map_err(sql_error)?;
+    // Durable self-heal schedule: a blocked schedule becomes a recovery
+    // candidate after a bounded exponential backoff derived from the failed
+    // fire's retry count. Nothing in memory carries this state.
+    let recovery_delay = recovery_backoff_seconds(fire.retry_count);
     transaction
         .execute(
-            "UPDATE collection_schedules SET status='blocked',failure_json=?1 \
-             WHERE id=?2",
+            "UPDATE collection_schedules SET status='blocked',failure_json=?1,\
+             next_action_at_ms=?2 \
+             WHERE id=?3",
             params![
                 serde_json::to_string(failure).map_err(json_error)?,
+                timestamp_ms(now).saturating_add(i64::from(recovery_delay) * 1000),
                 schedule.id.as_str(),
             ],
         )
         .map_err(sql_error)?;
     Ok(())
+}
+
+/// Bounded exponential recovery backoff: 60s doubling capped at one hour.
+#[must_use]
+fn recovery_backoff_seconds(retry_count: u32) -> u32 {
+    let steps = retry_count.min(6);
+    60_u32
+        .checked_mul(1_u32 << steps)
+        .unwrap_or(3_600)
+        .min(3_600)
 }
 
 fn update_fire_status(

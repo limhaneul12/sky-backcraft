@@ -5,6 +5,7 @@ use crate::contracts::{
     PortfolioAssetSpec, RegimeLabel, ReportClock, RequestId, RuleProvenance, RuleSnapshotId,
     SCHEMA_VERSION, StrategySpec, TickBand, UtcRange,
 };
+use crate::engine::run_model;
 use std::str::FromStr;
 
 fn time(value: &str) -> UtcTimestamp {
@@ -157,6 +158,7 @@ fn plan(markets: &[&str], strategy: StrategySpec) -> ResolvedPlan {
             strategies: vec![strategy],
             policy_selections: Vec::new(),
             causal_execution: None,
+            capital_mode: Some(crate::contracts::CapitalMode::SharedPortfolio),
             decision_interval: CandleInterval::H1,
             execution_resolution: CandleInterval::H1,
             latency_ms: 0,
@@ -299,6 +301,15 @@ fn shared_pool_never_double_spends_and_reconciles() {
     );
     // With flat prices and full liquidation, equity returns to initial.
     assert_eq!(terminal.equity.get(), Decimal::from(300_000));
+    // Attribution reconciliation (doc §16): the per-asset contributions must
+    // explain the whole portfolio PnL; run_portfolio already fails closed.
+    let explained: Decimal = ledger
+        .attribution
+        .iter()
+        .map(|item| item.realized_pnl.get() + item.unrealized_pnl.get() - item.fees.get())
+        .sum();
+    let pnl = terminal.equity.get() - Decimal::from(300_000);
+    assert!((pnl - explained).abs() <= decimal("0.00000001"));
     // Attribution sums to the shared-pool activity; both assets traded.
     assert_eq!(ledger.attribution.len(), 2);
     let buys: Decimal = ledger
@@ -865,5 +876,51 @@ fn portfolio_rejects_passive_execution_plans_fail_closed() {
                 if message.contains("passive execution is not supported")
         ),
         "passive plans must fail closed, not run as silent takers"
+    );
+}
+
+#[test]
+fn shared_portfolio_plans_refuse_per_model_execution_and_require_the_mode() {
+    // A SHARED_PORTFOLIO plan must not run through per-model backtests...
+    let btc = dataset("KRW-BTC", &FLAT_PRICES);
+    let mut plan = plan(&["KRW-BTC"], StrategySpec::BuyAndHold);
+    plan.spec.capital_mode = Some(crate::contracts::CapitalMode::SharedPortfolio);
+    let admission = plan.admissions[0].clone();
+    let result = run_model(
+        &plan,
+        std::slice::from_ref(&btc),
+        None,
+        &RunId::new("run-shared-refusal").expect("run id"),
+        &admission,
+        1,
+        &|| false,
+    );
+    assert!(
+        matches!(&result, Err(LabError::InvalidConfig(message)) if message.contains("portfolio runner")),
+        "shared plans refuse the per-model runner: {result:?}"
+    );
+    // ...and the portfolio runner refuses plans without the explicit mode.
+    let mut independent = plan.clone();
+    independent.spec.capital_mode = None;
+    let spec = portfolio_spec(
+        "1000",
+        &[("KRW-BTC", "0.45")],
+        "0.70",
+        "0.20",
+        "0",
+        ArbitrationPolicy::Priority,
+    );
+    let result = run_portfolio(
+        &independent,
+        std::slice::from_ref(&btc),
+        &spec,
+        None,
+        &RunId::new("run-mode-missing").expect("run id"),
+        100,
+        &|| false,
+    );
+    assert!(
+        matches!(&result, Err(LabError::InvalidConfig(message)) if message.contains("SHARED_PORTFOLIO")),
+        "portfolio runner requires the explicit mode: {result:?}"
     );
 }

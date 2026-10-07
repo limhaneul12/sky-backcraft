@@ -53,6 +53,12 @@ pub fn run_model(
     cancelled: &dyn Fn() -> bool,
 ) -> Result<ModelLedger, LabError> {
     plan.spec.validate()?;
+    if plan.spec.capital_mode == Some(crate::contracts::CapitalMode::SharedPortfolio) {
+        return Err(LabError::InvalidConfig(
+            "SHARED_PORTFOLIO plans execute through the portfolio runner, not per-model backtests"
+                .into(),
+        ));
+    }
     validate_admission(plan, admission)?;
     let strategy = crate::contracts::strategy_binding(plan, admission)?;
     if admission.status != AdmissionStatus::Eligible {

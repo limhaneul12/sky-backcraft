@@ -567,3 +567,70 @@ fn freshness_classifies_waiting_source_delay_collector_delay_and_true_gap()
     assert_eq!(failed.markets[0].state, FreshnessState::Failed);
     Ok(())
 }
+
+#[test]
+fn blocked_schedules_persist_a_bounded_recovery_backoff_and_reappear_as_candidates()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::contracts::FailureRecord;
+    let root = TempRoot::new("recovery-backoff");
+    let mut store = Store::open(&root.0)?;
+    let now = time("2024-01-01T08:00:00Z");
+    let schedule = create_schedule(request("schedule-recovery"), now)?;
+    store.create_collection_schedule(&schedule)?;
+    admit(&mut store, &schedule.id, now);
+    // A non-retryable producer failure blocks the schedule and must persist a
+    // bounded recovery wait (60s base from one failed attempt).
+    store.block_collection_schedule(
+        &schedule.id,
+        FailureRecord {
+            code: "INVALID_CONFIG".into(),
+            message: "fixture block".into(),
+        },
+        now,
+    )?;
+    let blocked = store
+        .get_collection_schedule(&schedule.id)?
+        .expect("blocked schedule");
+    assert_eq!(blocked.status, CollectionScheduleStatus::Blocked);
+    let next_action_at: i64 = store
+        .connection
+        .query_row(
+            "SELECT next_action_at_ms FROM collection_schedules WHERE id=?1",
+            [schedule.id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(|error| LabError::Internal(format!("sqlite test read: {error}")))?;
+    assert!(
+        next_action_at > timestamp_ms(now),
+        "blocked schedule must wait out its recovery backoff"
+    );
+    // Before the backoff elapses there is no recovery candidate.
+    assert!(
+        store
+            .recovery_candidates(time("2024-01-01T08:00:30Z"), 8)?
+            .is_empty()
+    );
+    // After it elapses the schedule is a candidate; a failed probe defers it
+    // durably with a longer wait.
+    let due = time("2024-01-01T08:02:00Z");
+    assert_eq!(
+        store.recovery_candidates(due, 8)?.len(),
+        1,
+        "due blocked schedule becomes a recovery candidate"
+    );
+    // attempt=2 defers by 60s x 2^3 = 480s, durably.
+    store.defer_recovery(&schedule.id, due, 2)?;
+    assert!(
+        store
+            .recovery_candidates(time("2024-01-01T08:09:00Z"), 8)?
+            .is_empty(),
+        "a deferred candidate waits out the longer backoff"
+    );
+    assert_eq!(
+        store
+            .recovery_candidates(time("2024-01-01T08:10:00Z"), 8)?
+            .len(),
+        1
+    );
+    Ok(())
+}

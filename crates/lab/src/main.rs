@@ -724,6 +724,35 @@ async fn run_offline_maintenance(
                 })
                 .await?
         }
+        StorageMaintenanceAction::Checkpoint { mode } => {
+            database
+                .call("checkpoint_wal_cli", move |store| {
+                    Ok(StorageMaintenanceResult::Checkpoint {
+                        outcome: store.checkpoint_wal(mode)?,
+                    })
+                })
+                .await?
+        }
+        StorageMaintenanceAction::Compact => {
+            database
+                .call("compact_database_cli", move |store| {
+                    Ok(StorageMaintenanceResult::Compact {
+                        outcome: store.compact_database()?,
+                    })
+                })
+                .await?
+        }
+        StorageMaintenanceAction::HardDeleteBatch { requests } => {
+            database
+                .call("hard_delete_batch_cli", move |store| {
+                    let mut outcomes = Vec::with_capacity(requests.len());
+                    for request in requests {
+                        outcomes.push(store.execute_hard_delete(&request, UtcTimestamp::now())?);
+                    }
+                    Ok(StorageMaintenanceResult::HardDeleteBatch { outcomes })
+                })
+                .await?
+        }
         StorageMaintenanceAction::CreateBackup { request_id } => {
             database
                 .call("create_managed_backup_cli", move |store| {

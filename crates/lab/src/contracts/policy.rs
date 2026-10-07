@@ -84,6 +84,12 @@ pub struct RulesProgram {
 pub struct PolicyIndicator {
     pub id: String,
     pub indicator: PolicyIndicatorKind,
+    /// Source candle interval for this indicator. Absent (or equal to the
+    /// decision interval) uses the decision stream. A *different* interval
+    /// declares a multi-timeframe source; the evaluator refuses those with a
+    /// typed error until the cross-interval feed path ships.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_interval: Option<super::CandleInterval>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -705,6 +711,7 @@ mod tests {
             indicators: vec![PolicyIndicator {
                 id: "close".into(),
                 indicator: PolicyIndicatorKind::Close,
+                source_interval: None,
             }],
             states: vec![PolicyState {
                 id: "memory".into(),

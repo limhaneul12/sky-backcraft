@@ -368,6 +368,7 @@ fn suite_fixture(seed: &str) -> (FrozenResearchSuite, Vec<SuiteCase>) {
         strategies: Vec::new(),
         policy_selections: vec![reference],
         causal_execution: Some(CausalExecutionPolicy::DeclaredPolicyWarmup),
+        capital_mode: None,
         decision_interval: CandleInterval::H1,
         execution_resolution: CandleInterval::H1,
         latency_ms: 0,

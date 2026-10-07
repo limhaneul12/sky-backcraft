@@ -83,6 +83,11 @@ pub enum LabError {
     DataCorrupt(String),
     #[error("RESOURCE_LIMIT: {0}")]
     ResourceLimit(String),
+    /// Persistent-storage pressure with a stable sub-reason in the payload
+    /// (`DB_STORAGE_PRESSURE` / `WAL_STORAGE_PRESSURE`); remediable only by
+    /// explicit maintenance, never by automatic destructive cleanup.
+    #[error("STORAGE_PRESSURE: {0}")]
+    StoragePressure(String),
     #[error("RESOURCE_LIMIT: {0}")]
     RequestLimit(Box<LimitReport>),
     #[error("CANCELLED: {0}")]

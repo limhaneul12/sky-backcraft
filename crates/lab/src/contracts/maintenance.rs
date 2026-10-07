@@ -1,8 +1,8 @@
 //! Bounded storage accounting, managed backups and advisory retention.
 
 use super::{
-    BackupId, ContentHash, DeletePreview, DeleteResource, MetricValue, RequestId, ResearchPage,
-    UtcTimestamp,
+    BackupId, ContentHash, DeleteOutcome, DeletePreview, DeleteResource, MetricValue, RequestId,
+    ResearchPage, UtcTimestamp,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,70 @@ pub enum StorageMaintenanceAction {
         offset: u64,
         limit: u32,
     },
+    /// Fold the write-ahead log back into the main database. Never deletes
+    /// rows and never rewrites the database file.
+    Checkpoint {
+        mode: CheckpointMode,
+    },
+    /// Explicit physical compaction: checkpoint, `VACUUM`, final checkpoint
+    /// and an integrity check. Separated from deletion so batch cleanups do
+    /// not amplify WAL and I/O per deleted resource.
+    Compact,
+    /// Execute a bounded batch of previously previewed hard deletions in one
+    /// call. Every request echoes its own exact preview; nothing is deleted
+    /// without it, and the batch aborts before the first failure.
+    HardDeleteBatch {
+        requests: Vec<super::HardDeleteRequest>,
+    },
+}
+
+/// Hard-deletion batches are bounded so one operator call can never run away.
+pub const MAX_HARD_DELETE_BATCH: usize = 8;
+
+/// SQLite WAL checkpoint aggressiveness, mirroring `PRAGMA wal_checkpoint`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CheckpointMode {
+    Passive,
+    Restart,
+    Truncate,
+}
+
+impl CheckpointMode {
+    /// `PRAGMA wal_checkpoint` argument spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Passive => "PASSIVE",
+            Self::Restart => "RESTART",
+            Self::Truncate => "TRUNCATE",
+        }
+    }
+}
+
+/// Result of one explicit WAL checkpoint with usage on both sides.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WalCheckpointOutcome {
+    pub mode: CheckpointMode,
+    /// True when some frames could not be checkpointed (busy readers/writers).
+    pub busy: bool,
+    pub log_frames: u64,
+    pub checkpointed_frames: u64,
+    pub before: SqliteStorageUsage,
+    pub after: SqliteStorageUsage,
+}
+
+/// Result of one explicit physical compaction (`VACUUM` + checkpoints).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CompactOutcome {
+    pub before: SqliteStorageUsage,
+    pub after: SqliteStorageUsage,
+    /// `before.effective_db_bytes - after.effective_db_bytes`.
+    pub reclaimed_bytes: u64,
+    /// `PRAGMA integrity_check` verdict; anything but `ok` fails the call.
+    pub integrity: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -36,7 +100,15 @@ pub struct SqliteStorageUsage {
     pub reusable_bytes: u64,
     pub wal_bytes: u64,
     pub limit_bytes: u64,
+    /// `(allocated + wal) / limit`; kept for backward compatibility and
+    /// identical to [`Self::effective_utilization`].
     pub utilization: MetricValue,
+    /// `allocated / limit` — the main database file alone against its cap.
+    pub main_db_utilization: MetricValue,
+    /// `allocated + wal` — the total SQLite footprint.
+    pub effective_db_bytes: u64,
+    /// `effective_db_bytes / limit` — the enforced admission metric.
+    pub effective_utilization: MetricValue,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -81,6 +153,15 @@ pub struct RetentionCandidate {
 pub enum StorageMaintenanceResult {
     Usage {
         usage: StorageUsage,
+    },
+    Checkpoint {
+        outcome: WalCheckpointOutcome,
+    },
+    Compact {
+        outcome: CompactOutcome,
+    },
+    HardDeleteBatch {
+        outcomes: Vec<DeleteOutcome>,
     },
     Backup {
         receipt: ManagedBackupReceipt,

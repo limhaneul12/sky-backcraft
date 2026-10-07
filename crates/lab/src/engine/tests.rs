@@ -360,6 +360,7 @@ fn frozen_custom_rule_policy_runs_and_records_exact_trace() {
                 indicators: vec![PolicyIndicator {
                     id: "close".into(),
                     indicator: PolicyIndicatorKind::Close,
+                    source_interval: None,
                 }],
                 states: Vec::new(),
                 rules: vec![PolicyRule {
@@ -1136,6 +1137,7 @@ fn buy_and_hold_fixture() -> (
             strategies: vec![StrategySpec::BuyAndHold],
             policy_selections: Vec::new(),
             causal_execution: None,
+            capital_mode: None,
             decision_interval: CandleInterval::H1,
             execution_resolution: CandleInterval::H1,
             latency_ms: 0,

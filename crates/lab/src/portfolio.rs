@@ -284,6 +284,11 @@ pub fn run_portfolio(
             "portfolio v1 requires zero configured latency".into(),
         ));
     }
+    if plan.spec.capital_mode != Some(crate::contracts::CapitalMode::SharedPortfolio) {
+        return Err(LabError::InvalidConfig(
+            "the portfolio runner requires SHARED_PORTFOLIO capital mode on the frozen plan".into(),
+        ));
+    }
     if matches!(
         plan.spec.execution,
         crate::contracts::ExecutionPolicy::PassiveBuy { .. }
@@ -500,6 +505,28 @@ pub fn run_portfolio(
     let attribution = attribution(&slots, terminal_time)?;
     let totals = totals(&slots, &cash, &state, terminal_time)?;
     reconcile(&slots, &cash)?;
+    // Attribution reconciliation: the per-asset contributions must explain the
+    // whole portfolio PnL inside the accounting tolerance (doc §16).
+    {
+        let portfolio_pnl =
+            checked_sub(totals.terminal_equity.get(), cash.initial, "portfolio pnl")?;
+        let explained = attribution
+            .iter()
+            .map(|item| {
+                item.realized_pnl
+                    .get()
+                    .checked_add(item.unrealized_pnl.get())
+                    .and_then(|value| value.checked_sub(item.fees.get()))
+            })
+            .sum::<Option<Decimal>>()
+            .ok_or_else(|| LabError::AccountingInvariant("attribution sum overflow".into()))?;
+        let residual = checked_sub(portfolio_pnl, explained, "attribution residual")?;
+        if residual.abs() > NUMERIC_TOLERANCE {
+            return Err(LabError::AccountingInvariant(format!(
+                "attribution does not reconcile: portfolio_pnl={portfolio_pnl}, explained={explained}, residual={residual}"
+            )));
+        }
+    }
     Ok(PortfolioLedger {
         run_id: run_id.clone(),
         model_ids: slots.iter().map(|slot| slot.model_id.clone()).collect(),

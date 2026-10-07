@@ -218,6 +218,17 @@ pub enum PitPolicy {
     StrictPit,
     LatestVersionProxy,
 }
+
+/// Explicit capital accounting mode. Absent means the legacy
+/// independent-per-model accounts, so existing plans need no migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CapitalMode {
+    /// Every model runs its own cash account (legacy, fully reproducible).
+    IndependentModels,
+    /// One shared cash pool; execution goes through the portfolio runner.
+    SharedPortfolio,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum EvidenceUnavailablePolicy {
@@ -700,6 +711,10 @@ pub struct ExperimentSpec {
     pub policy_selections: Vec<super::PolicyRevisionRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub causal_execution: Option<CausalExecutionPolicy>,
+    /// Explicit capital accounting mode; `None` keeps the legacy
+    /// independent-per-model accounts byte-compatible with old plans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capital_mode: Option<CapitalMode>,
     pub decision_interval: CandleInterval,
     pub execution_resolution: CandleInterval,
     pub latency_ms: u64,
@@ -800,6 +815,9 @@ impl ExperimentSpec {
                 "experiment v3 causal execution requires STRICT_PIT".into(),
             ));
         }
+        // SHARED_PORTFOLIO is version-agnostic: the per-model runner refuses
+        // it and the portfolio runner requires it, so no other validation
+        // change is needed here.
         self.range.aligned(self.decision_interval)?;
         self.range.aligned(self.execution_resolution)?;
         if self.decision_interval.duration().num_seconds()
@@ -1191,6 +1209,7 @@ mod tests {
             strategies: vec![StrategySpec::BuyAndHold],
             policy_selections: Vec::new(),
             causal_execution: None,
+            capital_mode: None,
             decision_interval: super::CandleInterval::H1,
             execution_resolution: super::CandleInterval::H1,
             latency_ms: 0,

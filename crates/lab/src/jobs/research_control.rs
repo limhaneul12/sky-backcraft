@@ -456,6 +456,46 @@ impl JobService {
                     })
                     .await
             }
+            StorageMaintenanceAction::Checkpoint { mode } => {
+                self.refuse_under_active_jobs().await?;
+                let outcome = self
+                    .inner
+                    .database
+                    .call("checkpoint_wal", move |store| store.checkpoint_wal(mode))
+                    .await?;
+                Ok(StorageMaintenanceResult::Checkpoint { outcome })
+            }
+            StorageMaintenanceAction::Compact => {
+                self.refuse_under_active_jobs().await?;
+                let outcome = self
+                    .admitted(
+                        "compact_database",
+                        super::super::storage::Store::compact_database,
+                    )
+                    .await?;
+                Ok(StorageMaintenanceResult::Compact { outcome })
+            }
+            StorageMaintenanceAction::HardDeleteBatch { requests } => {
+                if requests.is_empty() || requests.len() > crate::contracts::MAX_HARD_DELETE_BATCH {
+                    return Err(LabError::InvalidConfig(format!(
+                        "hard-delete batch requires 1..={} previewed requests",
+                        crate::contracts::MAX_HARD_DELETE_BATCH
+                    )));
+                }
+                self.refuse_under_active_jobs().await?;
+                let mut batch = requests;
+                let outcomes = self
+                    .admitted("hard_delete_batch", move |store| {
+                        let mut outcomes = Vec::with_capacity(batch.len());
+                        for request in batch.drain(..) {
+                            outcomes
+                                .push(store.execute_hard_delete(&request, UtcTimestamp::now())?);
+                        }
+                        Ok(outcomes)
+                    })
+                    .await?;
+                Ok(StorageMaintenanceResult::HardDeleteBatch { outcomes })
+            }
             StorageMaintenanceAction::CreateBackup { request_id } => {
                 self.admitted("create_managed_backup", move |store| {
                     Ok(StorageMaintenanceResult::Backup {
@@ -497,6 +537,20 @@ impl JobService {
                     .await
             }
         }
+    }
+
+    /// Checkpoint and compaction rewrite or fold the database file, so they
+    /// refuse while a compute job may hold long write transactions. Queued
+    /// jobs are fine: they have not claimed the single runner yet.
+    async fn refuse_under_active_jobs(&self) -> Result<(), LabError> {
+        let status = self.status().await?;
+        if status.running_attempts > 0 || status.active_job_id.is_some() {
+            return Err(LabError::TemporarilyBlocked(
+                "ACTIVE_JOB: a compute job is running and may hold write transactions;                  retry storage maintenance after it finishes"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 
     fn signal_managed_cancellation(&self, jobs: &[JobId]) -> Result<(), LabError> {

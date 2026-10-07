@@ -284,6 +284,21 @@ impl RulesEvaluator {
                 "rules evaluator requires a RULES policy definition".into(),
             ));
         };
+        for indicator in &program.indicators {
+            if let Some(source) = indicator.source_interval
+                && source != interval
+            {
+                // Fail closed: a cross-interval indicator would silently read
+                // decision-interval bars (wrong resolution or look-ahead)
+                // until the multi-timeframe feed path ships.
+                return Err(LabError::InvalidConfig(format!(
+                    "indicator {} declares source_interval {source:?} which differs from the \
+                     decision interval {interval:?}; multi-timeframe indicator sources are not \
+                     supported by the evaluator yet",
+                    indicator.id
+                )));
+            }
+        }
         let indicators = program
             .indicators
             .iter()

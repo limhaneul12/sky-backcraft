@@ -324,6 +324,9 @@ impl JobService {
         }
         let job = self
             .admitted("submit_job", move |store| {
+                // Mutating submissions refuse under hard storage pressure;
+                // soft pressure is allowed and only logged.
+                store.enforce_storage_pressure()?;
                 store.submit_job(&submission, UtcTimestamp::now())
             })
             .await?;
@@ -1065,6 +1068,7 @@ fn failure_record(error: &LabError) -> FailureRecord {
         LabError::Conflict(_) => "CONFLICT",
         LabError::DataCorrupt(_) => "DATA_CORRUPT",
         LabError::ResourceLimit(_) | LabError::RequestLimit(_) => "RESOURCE_LIMIT",
+        LabError::StoragePressure(_) => "STORAGE_PRESSURE",
         LabError::Cancelled(_) => "CANCELLED",
         LabError::UnverifiedMarketRules(_) => "UNVERIFIED_MARKET_RULES",
         LabError::AccountingInvariant(_) => "ACCOUNTING_INVARIANT_FAILURE",

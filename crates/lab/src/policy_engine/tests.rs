@@ -73,6 +73,7 @@ fn close_indicator() -> PolicyIndicator {
     PolicyIndicator {
         id: "close".into(),
         indicator: PolicyIndicatorKind::Close,
+        source_interval: None,
     }
 }
 
@@ -234,10 +235,12 @@ fn zero_volume_and_cash_are_valid_but_unanchored_bars_are_rejected() {
             PolicyIndicator {
                 id: "volume".into(),
                 indicator: PolicyIndicatorKind::Volume,
+                source_interval: None,
             },
             PolicyIndicator {
                 id: "turnover".into(),
                 indicator: PolicyIndicatorKind::QuoteTurnover,
+                source_interval: None,
             },
         ],
         states: vec![],
@@ -271,4 +274,40 @@ fn zero_volume_and_cash_are_valid_but_unanchored_bars_are_rejected() {
             Err(LabError::DataGap(_))
         ));
     }
+}
+
+#[test]
+fn cross_interval_indicator_sources_fail_closed_until_multi_timeframe_ships() {
+    let policy = definition(RulesProgram {
+        indicators: vec![PolicyIndicator {
+            id: "regime_ema".into(),
+            indicator: PolicyIndicatorKind::Ema { window: 20 },
+            source_interval: Some(CandleInterval::H4),
+        }],
+        states: vec![],
+        rules: vec![],
+        fallback: PolicyTarget::Hold,
+        signal_expiry: PolicySignalExpiry::EndOfRange,
+    });
+    // The evaluator must refuse a different source interval instead of
+    // silently reading decision-interval bars.
+    assert!(matches!(
+        RulesEvaluator::new(&policy, market(), CandleInterval::H1),
+        Err(LabError::InvalidConfig(message))
+            if message.contains("multi-timeframe indicator sources")
+    ));
+    // Same-interval declaration stays allowed (explicit decision stream).
+    let mut same = definition(RulesProgram {
+        indicators: vec![PolicyIndicator {
+            id: "ema".into(),
+            indicator: PolicyIndicatorKind::Ema { window: 20 },
+            source_interval: Some(CandleInterval::H1),
+        }],
+        states: vec![],
+        rules: vec![],
+        fallback: PolicyTarget::Hold,
+        signal_expiry: PolicySignalExpiry::EndOfRange,
+    });
+    assert!(RulesEvaluator::new(&same, market(), CandleInterval::H1).is_ok());
+    let _ = &mut same;
 }

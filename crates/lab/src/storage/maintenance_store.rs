@@ -46,6 +46,7 @@ impl Store {
         let total = json_u64(&accounting, "total_managed_bytes")?;
         let (backup_count, backup_bytes) =
             inspect_backup_namespace(&managed_backup_root(&self.raw.root)?, false)?;
+        let effective = allocated.saturating_add(wal);
         Ok(StorageUsage {
             sqlite: SqliteStorageUsage {
                 allocated_bytes: allocated,
@@ -53,7 +54,10 @@ impl Store {
                 reusable_bytes: reusable,
                 wal_bytes: wal,
                 limit_bytes: limit,
-                utilization: ratio(allocated.saturating_add(wal), limit),
+                utilization: ratio(effective, limit),
+                main_db_utilization: ratio(allocated, limit),
+                effective_db_bytes: effective,
+                effective_utilization: ratio(effective, limit),
             },
             raw_bytes: raw,
             sealed_ledger_bytes: ledgers,
@@ -65,6 +69,73 @@ impl Store {
             total_managed_bytes: total.saturating_add(backup_bytes),
             data_root_utilization: ratio(total, MAX_MANAGED_BACKUP_SOURCE_BYTES),
             managed_backup_utilization: ratio(backup_bytes, MAX_MANAGED_BACKUP_BYTES),
+        })
+    }
+
+    /// Fold the WAL into the main database with one explicit checkpoint.
+    ///
+    /// Rows are never deleted and the database file is never rewritten; busy
+    /// readers only leave frames unconvered and are reported, not forced.
+    /// # Errors
+    /// Returns corrupt-accounting or SQLite failures.
+    pub fn checkpoint_wal(
+        &self,
+        mode: crate::contracts::CheckpointMode,
+    ) -> Result<crate::contracts::WalCheckpointOutcome, LabError> {
+        let before = self.maintenance_usage()?.sqlite;
+        let (busy, log, checkpointed): (i64, i64, i64) = self
+            .connection
+            .query_row(
+                &format!("PRAGMA wal_checkpoint({});", mode.as_str()),
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(sql_error)?;
+        let after = self.maintenance_usage()?.sqlite;
+        let to_u64 = |value: i64| u64::try_from(value.max(0)).unwrap_or(u64::MAX);
+        Ok(crate::contracts::WalCheckpointOutcome {
+            mode,
+            busy: busy != 0,
+            log_frames: to_u64(log),
+            checkpointed_frames: to_u64(checkpointed),
+            before,
+            after,
+        })
+    }
+
+    /// Explicit physical compaction: checkpoint, `VACUUM`, final checkpoint
+    /// and an integrity check. Deletion stays a separate operation so batch
+    /// cleanups never amplify WAL and I/O per deleted resource.
+    /// # Errors
+    /// Returns corrupt-accounting, integrity or SQLite failures.
+    pub fn compact_database(&mut self) -> Result<crate::contracts::CompactOutcome, LabError> {
+        let before = self.maintenance_usage()?.sqlite;
+        self.connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(sql_error)?;
+        self.connection
+            .execute_batch("VACUUM;")
+            .map_err(sql_error)?;
+        self.connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(sql_error)?;
+        let integrity: String = self
+            .connection
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .map_err(sql_error)?;
+        if integrity != "ok" {
+            return Err(LabError::DataCorrupt(format!(
+                "post-compaction integrity check failed: {integrity}"
+            )));
+        }
+        let after = self.maintenance_usage()?.sqlite;
+        Ok(crate::contracts::CompactOutcome {
+            reclaimed_bytes: before
+                .effective_db_bytes
+                .saturating_sub(after.effective_db_bytes),
+            before,
+            after,
+            integrity,
         })
     }
 

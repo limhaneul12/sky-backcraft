@@ -190,7 +190,11 @@ impl Store {
         }
         let deleted_rows = self.delete_scope_rows(&scope, &scope_digest, &preview.resource, now)?;
         let (files, bytes) = remove_scope_files(&self.raw.root, &scope)?;
-        let vacuumed = deleted_rows > 0 && self.compact_after_delete()?;
+        // Deletion never runs a full VACUUM: repeated per-delete rewrites
+        // amplify WAL and I/O on batch cleanups. A passive checkpoint folds
+        // what it can cheaply; physical compaction is the explicit
+        // storage_maintenance action=compact operation.
+        let vacuumed = deleted_rows > 0 && self.checkpoint_after_delete()?;
         Ok(DeleteOutcome {
             resource: preview.resource.clone(),
             deleted_db_rows: deleted_rows,
@@ -223,9 +227,11 @@ impl Store {
         Ok(recovered)
     }
 
-    fn compact_after_delete(&mut self) -> Result<bool, LabError> {
+    /// Cheap post-delete WAL fold. Returns whether a checkpoint ran; this is
+    /// never a physical compaction.
+    fn checkpoint_after_delete(&self) -> Result<bool, LabError> {
         self.connection
-            .execute_batch("VACUUM;")
+            .execute_batch("PRAGMA wal_checkpoint(PASSIVE);")
             .map_err(sql_error)?;
         Ok(true)
     }

@@ -994,6 +994,7 @@ fn fixture() -> RunBundle {
     let spec = ExperimentSpec {
         schema_version: SCHEMA_VERSION.into(),
         causal_execution: None,
+        capital_mode: None,
         dataset_ids: vec![dataset_id.clone()],
         markets: vec![market.clone()],
         range,

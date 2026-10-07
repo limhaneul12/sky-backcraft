@@ -429,6 +429,7 @@ fn suite_request(
             strategies: Vec::new(),
             policy_selections: vec![policy],
             causal_execution: Some(CausalExecutionPolicy::DeclaredPolicyWarmup),
+            capital_mode: None,
             decision_interval: CandleInterval::H1,
             execution_resolution: CandleInterval::H1,
             latency_ms: 0,
@@ -679,6 +680,7 @@ async fn real_runtime_runs_shared_capital_portfolio_and_publishes_ledger()
         strategies: vec![StrategySpec::BuyAndHold],
         policy_selections: Vec::new(),
         causal_execution: None,
+        capital_mode: Some(crate::contracts::CapitalMode::SharedPortfolio),
         decision_interval: CandleInterval::H1,
         execution_resolution: CandleInterval::H1,
         latency_ms: 0,
@@ -826,6 +828,86 @@ async fn real_runtime_runs_shared_capital_portfolio_and_publishes_ledger()
         "single asset with 45 percent cap never rejects a BuyAndHold entry"
     );
 
+    runtime.shutdown().await?;
+    let _stopped = server.stop.send(());
+    server.task.await??;
+    owner.shutdown()?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocked_schedules_self_heal_after_a_successful_source_probe()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::contracts::{
+        CandleInterval, FailureRecord, RequestId as RequestIdType, ScheduleRetryPolicy,
+    };
+    let root = TempRoot::new("schedule-self-heal");
+    let owner = DatabaseOwner::open(root.0.clone())?;
+    let database = owner.handle();
+    let server = start_fixture(false).await?;
+    let client = UpbitClient::synthetic_local(&server.base_url)?;
+    let runtime = JobRuntime::start(database.clone(), client, root.0.clone(), None).await?;
+    let service = runtime.service();
+    let request = crate::contracts::CollectionScheduleRequest {
+        request_id: RequestIdType::new("schedule-self-heal")?,
+        markets: vec![crate::contracts::MarketId::parse_upbit("KRW-BTC")?],
+        interval: CandleInterval::H1,
+        lookback_bars: 2,
+        cadence_seconds: 3_600,
+        freshness_policy: None,
+        retry: ScheduleRetryPolicy {
+            max_retries: 1,
+            backoff_seconds: 60,
+        },
+    };
+    let created = service
+        .collection_schedule(crate::contracts::CollectionScheduleAction::Create {
+            request: Box::new(request),
+        })
+        .await?;
+    let schedule_id =
+        crate::contracts::ScheduleId::new(created["id"].as_str().expect("created schedule id"))?;
+    let blocked_id = schedule_id.clone();
+    // Force the schedule into the blocked state with an elapsed backoff, as a
+    // finished network outage would have left it.
+    let failure = FailureRecord {
+        code: "NETWORK_UNAVAILABLE".into(),
+        message: "fixture outage".into(),
+    };
+    let blocked_at = crate::contracts::UtcTimestamp::parse_rfc3339("2024-01-01T00:00:00Z")?;
+    database
+        .call("block_for_self_heal_fixture", move |store| {
+            store.block_collection_schedule(&blocked_id, failure, blocked_at)?;
+            // Pull the recovery instant into the past: the outage already
+            // lasted longer than the persisted backoff.
+            // Pull the recovery instant into the past: the outage already
+            // lasted longer than the persisted backoff. zero fills this.
+            store.defer_recovery(&blocked_id, blocked_at, 6)?;
+            Ok(())
+        })
+        .await?;
+    // The coordinator sweep probes the loopback source and resumes the
+    // schedule without operator action.
+    let healed = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            let value = service
+                .collection_schedule(crate::contracts::CollectionScheduleAction::Get {
+                    schedule_id: schedule_id.clone(),
+                })
+                .await?;
+            if value["status"].as_str() == Some("active") {
+                return Ok::<_, LabError>(value);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    })
+    .await??;
+    assert_eq!(healed["status"].as_str(), Some("active"));
+    assert_eq!(
+        healed["failure"],
+        serde_json::Value::Null,
+        "recovery clears the recorded failure"
+    );
     runtime.shutdown().await?;
     let _stopped = server.stop.send(());
     server.task.await??;
