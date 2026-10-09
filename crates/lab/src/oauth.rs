@@ -609,13 +609,14 @@ async fn approve(State(state): State<OAuthState>, RawForm(body): RawForm) -> Res
     let Ok(params) = parse_form(text) else {
         return oauth_error(StatusCode::BAD_REQUEST, "invalid_request");
     };
-    let (Some(flow_id), Some(csrf), Some(owner_code)) = (
+    let (Some(flow_id), Some(csrf), Some(raw_owner_code)) = (
         params.get("flow_id"),
         params.get("csrf"),
         params.get("owner_code"),
     ) else {
         return oauth_error(StatusCode::BAD_REQUEST, "invalid_request");
     };
+    let owner_code = raw_owner_code.trim();
     let Ok(code) = random_token(32) else {
         return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
     };
@@ -634,6 +635,24 @@ async fn approve(State(state): State<OAuthState>, RawForm(body): RawForm) -> Res
             Instant::now(),
         ) {
             Ok(redirect) => redirect,
+            Err(GrantError::AccessDenied) => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                    r#"<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>승인 실패</title></head>
+<body style="font-family:-apple-system,sans-serif;max-width:560px;margin:60px auto;padding:0 20px;line-height:1.6">
+<h2 style="color:#d32f2f">승인 코드가 올바르지 않습니다 (403)</h2>
+<p>입력하신 운영자 승인 코드가 현재 실행 중인 Sky Backcraft 앱의 코드와 일치하지 않습니다.</p>
+<ol style="padding-left:20px">
+<li>macOS 상단 메뉴 막대의 <strong>Sky Backcraft 아이콘</strong>을 클릭하세요.</li>
+<li><strong>'OAuth 로그인 코드 복사'</strong>를 클릭하여 최신 코드를 복사하세요.</li>
+<li>연결하려는 MCP 클라이언트(Cursor, Claude Desktop 등)에서 다시 연결을 시도하여 열리는 승인 창에 붙여넣으세요.</li>
+</ol>
+<p style="color:#888;font-size:13px">※ 앱이 재시작되면 보안을 위해 승인 코드가 새로 생성됩니다.</p>
+</body></html>"#,
+                )
+                    .into_response();
+            }
             Err(error) => return grant_error_response(error),
         }
     };
@@ -763,14 +782,15 @@ fn refresh_token(state: &OAuthState, params: &HashMap<String, String>) -> Respon
 fn consent_page(client_name: &str, redirect_uri: &str, flow_id: &str, csrf: &str) -> String {
     format!(
         "<!doctype html><html lang=\"ko\"><head><meta charset=\"utf-8\"><title>Sky Backcraft 승인</title></head>\
-         <body style=\"font-family:-apple-system,sans-serif;max-width:560px;margin:60px auto;padding:0 20px\">\
+         <body style=\"font-family:-apple-system,sans-serif;max-width:560px;margin:60px auto;padding:0 20px;line-height:1.6\">\
          <h2>Sky Backcraft MCP 연결 승인</h2><p><strong>{}</strong> 앱이 Sky Backcraft MCP에 접근하려고 합니다.</p>\
          <p style=\"word-break:break-all;color:#555\">돌아갈 주소: {}</p>\
          <form method=\"post\" action=\"/authorize/approve\">\
          <input type=\"hidden\" name=\"flow_id\" value=\"{}\"><input type=\"hidden\" name=\"csrf\" value=\"{}\">\
-         <label for=\"owner_code\">앱에 표시된 운영자 승인 코드</label>\
-         <input id=\"owner_code\" name=\"owner_code\" type=\"password\" autocomplete=\"one-time-code\" required style=\"display:block;width:100%;padding:10px;margin:8px 0\">\
-         <button type=\"submit\" style=\"padding:10px 18px\">승인</button></form></body></html>",
+         <label for=\"owner_code\" style=\"font-weight:600\">앱에 표시된 운영자 승인 코드</label>\
+         <p style=\"font-size:13px;color:#666;margin:4px 0 8px 0\">macOS 상단 메뉴 막대 아이콘 &gt; <strong>'OAuth 로그인 코드 복사'</strong>를 클릭하여 복사된 64자리 코드를 붙여넣으세요.</p>\
+         <input id=\"owner_code\" name=\"owner_code\" type=\"password\" autocomplete=\"one-time-code\" required style=\"display:block;width:100%;padding:10px;margin:8px 0;box-sizing:border-box\">\
+         <button type=\"submit\" style=\"padding:10px 18px;cursor:pointer\">승인</button></form></body></html>",
         html_escape(client_name),
         html_escape(redirect_uri),
         html_escape(flow_id),
