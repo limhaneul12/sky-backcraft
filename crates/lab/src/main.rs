@@ -106,7 +106,7 @@ fn dispatch(args: &[String]) -> Result<(), LabError> {
             let root = data_root(&args[1..]);
             let owner = DatabaseOwner::open(root.clone())?;
             let upbit = UpbitClient::new()?;
-            let revision = mcp::detect_git_revision();
+            let revision = mcp::build_git_revision();
             let result = runtime()?.block_on(run_local_request(
                 command,
                 owner.handle(),
@@ -228,7 +228,7 @@ fn dispatch(args: &[String]) -> Result<(), LabError> {
             let config = McpServeConfig::parse(&args[1..])?;
             prepare_server_root(&config)?;
             let upbit = UpbitClient::new()?;
-            let git_revision = mcp::detect_git_revision();
+            let git_revision = mcp::build_git_revision();
             let owner = DatabaseOwner::open(config.data_root.clone())?;
             let result =
                 runtime()?.block_on(run_mcp_serve(config, upbit, git_revision, owner.handle()));
@@ -268,7 +268,7 @@ fn dispatch(args: &[String]) -> Result<(), LabError> {
 fn run_policy_command(args: &[String]) -> Result<(), LabError> {
     use spot_lab::contracts::{HistoryQuery, PolicyQuery, PolicyWrite};
     enum Request {
-        Write(PolicyWrite),
+        Write(Box<PolicyWrite>),
         Query(PolicyQuery),
         History(HistoryQuery),
     }
@@ -277,7 +277,7 @@ fn run_policy_command(args: &[String]) -> Result<(), LabError> {
         LabError::InvalidConfig("command requires --request <json-or-toml>".into())
     })?;
     let request = match args[0].as_str() {
-        "policy-write" => Request::Write(read_config(&path)?),
+        "policy-write" => Request::Write(Box::new(read_config(&path)?)),
         "policy-query" => Request::Query(read_config(&path)?),
         "history-query" => Request::History(read_config(&path)?),
         _ => return Err(LabError::Internal("unknown policy command".into())),
@@ -287,21 +287,7 @@ fn run_policy_command(args: &[String]) -> Result<(), LabError> {
         .handle()
         .call_blocking("policy_cli", move |store| {
             let value = match request {
-                Request::Write(PolicyWrite::Sweep {
-                    request_id,
-                    family,
-                    template,
-                    mode,
-                }) => serde_json::to_value(store.sweep_policy(
-                    &request_id,
-                    family,
-                    &template,
-                    &mode,
-                    UtcTimestamp::now(),
-                )?)?,
-                Request::Write(write) => {
-                    serde_json::to_value(store.write_policy(&write, UtcTimestamp::now())?)?
-                }
+                Request::Write(write) => write_policy_cli(store, *write)?,
                 Request::Query(PolicyQuery::List {
                     after_policy_id,
                     limit,
@@ -431,6 +417,47 @@ fn parse_research_command(args: &[String]) -> Result<(ResearchCommand, bool), La
     Ok((request, wait))
 }
 
+fn write_policy_cli(
+    store: &mut spot_lab::storage::Store,
+    write: spot_lab::contracts::PolicyWrite,
+) -> Result<serde_json::Value, LabError> {
+    use spot_lab::contracts::PolicyWrite;
+    let now = UtcTimestamp::now();
+    match write {
+        PolicyWrite::Sweep {
+            request_id,
+            family,
+            template,
+            mode,
+            research,
+        } => Ok(serde_json::to_value(store.sweep_policy(
+            &request_id,
+            family,
+            &template,
+            &mode,
+            research.as_ref(),
+            now,
+        )?)?),
+        PolicyWrite::Preflight {
+            family,
+            template,
+            mode,
+            research,
+            ..
+        } => Ok(serde_json::to_value(
+            spot_lab::contracts::preflight_parameter_sweep(
+                family,
+                &template,
+                &mode,
+                research.as_ref(),
+            )?,
+        )?),
+        write @ (PolicyWrite::Create { .. } | PolicyWrite::Revise { .. }) => {
+            Ok(serde_json::to_value(store.write_policy(&write, now)?)?)
+        }
+    }
+}
+
 fn run_research_command(args: &[String]) -> Result<(), LabError> {
     let (request, wait) = parse_research_command(args)?;
     let root = data_root(&args[1..]);
@@ -447,7 +474,7 @@ fn run_research_command(args: &[String]) -> Result<(), LabError> {
             owner.handle(),
             upbit,
             root,
-            mcp::detect_git_revision(),
+            mcp::build_git_revision(),
         ))
     } else {
         runtime()?.block_on(run_offline_research_command(request, owner.handle()))
@@ -745,11 +772,10 @@ async fn run_offline_maintenance(
         StorageMaintenanceAction::HardDeleteBatch { requests } => {
             database
                 .call("hard_delete_batch_cli", move |store| {
-                    let mut outcomes = Vec::with_capacity(requests.len());
-                    for request in requests {
-                        outcomes.push(store.execute_hard_delete(&request, UtcTimestamp::now())?);
-                    }
-                    Ok(StorageMaintenanceResult::HardDeleteBatch { outcomes })
+                    Ok(StorageMaintenanceResult::HardDeleteBatch {
+                        outcomes: store
+                            .execute_hard_delete_batch(&requests, UtcTimestamp::now())?,
+                    })
                 })
                 .await?
         }
@@ -1335,7 +1361,6 @@ async fn run_mcp_serve(
             Ok(LabMcpService::new(
                 database.clone(),
                 upbit.clone(),
-                git_revision.clone(),
                 job_service.clone(),
                 exposure,
             ))
@@ -1604,6 +1629,82 @@ fn run_schemas(args: &[String]) -> Result<(), LabError> {
     std::fs::create_dir_all(&out)
         .map_err(|error| LabError::InvalidConfig(format!("create {}: {error}", out.display())))?;
     let schemas = [
+        (
+            "sweep-preflight-report",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::SweepPreflightReport
+            ))?,
+        ),
+        (
+            "schedule-recovery-state",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::ScheduleRecoveryState
+            ))?,
+        ),
+        (
+            "portfolio-result-summary",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::PortfolioProjection<
+                    spot_lab::contracts::PortfolioResultSummary,
+                >
+            ))?,
+        ),
+        (
+            "portfolio-equity",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::PortfolioProjection<
+                    spot_lab::contracts::PortfolioProjectionPage<
+                        spot_lab::contracts::PortfolioEquityPoint,
+                    >,
+                >
+            ))?,
+        ),
+        (
+            "portfolio-allocations",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::PortfolioProjection<
+                    spot_lab::contracts::PortfolioProjectionPage<
+                        spot_lab::contracts::PortfolioAllocationPoint,
+                    >,
+                >
+            ))?,
+        ),
+        (
+            "portfolio-rebalances",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::PortfolioProjection<
+                    spot_lab::contracts::PortfolioProjectionPage<
+                        spot_lab::contracts::PortfolioRebalancePoint,
+                    >,
+                >
+            ))?,
+        ),
+        (
+            "portfolio-contributions",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::PortfolioProjection<
+                    spot_lab::contracts::PortfolioContributions,
+                >
+            ))?,
+        ),
+        (
+            "portfolio-regime-timeline",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::PortfolioProjection<
+                    spot_lab::contracts::PortfolioProjectionPage<
+                        spot_lab::contracts::PortfolioRegimeTimelinePoint,
+                    >,
+                >
+            ))?,
+        ),
+        (
+            "portfolio-regime-summary",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::PortfolioProjection<
+                    spot_lab::contracts::PortfolioRegimeResult,
+                >
+            ))?,
+        ),
         (
             "research-suite-action",
             schema_json(&schemars::schema_for!(

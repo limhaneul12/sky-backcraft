@@ -105,6 +105,35 @@ pub enum ResultQueryParams {
         run_id: RunId,
         model_id: crate::contracts::ModelId,
     },
+    PortfolioSummary {
+        run_id: RunId,
+    },
+    PortfolioEquity {
+        run_id: RunId,
+        offset: u64,
+        limit: u32,
+    },
+    PortfolioAllocations {
+        run_id: RunId,
+        offset: u64,
+        limit: u32,
+    },
+    PortfolioRebalances {
+        run_id: RunId,
+        offset: u64,
+        limit: u32,
+    },
+    PortfolioContributions {
+        run_id: RunId,
+    },
+    RegimeTimeline {
+        run_id: RunId,
+        offset: u64,
+        limit: u32,
+    },
+    RegimeSummary {
+        run_id: RunId,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -243,14 +272,26 @@ fn sanitize_attempt(attempt: &mut JobAttempt) {
             // INVALID_CONFIG records echo only the caller's own rejected input
             // with fixed guidance text; masking either would hide exactly the
             // diagnosis a caller needs, so both pass through bounded.
-            error.message = if matches!(error.code.as_str(), "RESOURCE_LIMIT" | "INVALID_CONFIG") {
+            // ACCOUNTING_INVARIANT_FAILURE carries invariant name, event seq,
+            // and diagnostic findings required for auditing.
+            error.message = if matches!(
+                error.code.as_str(),
+                "RESOURCE_LIMIT" | "INVALID_CONFIG" | "ACCOUNTING_INVARIANT_FAILURE"
+            ) {
                 error.message.chars().take(512).collect()
             } else {
                 public_failure_message(&error.code)
             };
         }
         AttemptState::Blocked { reason, .. } => {
-            reason.message = public_failure_message(&reason.code);
+            reason.message = if matches!(
+                reason.code.as_str(),
+                "RESOURCE_LIMIT" | "INVALID_CONFIG" | "ACCOUNTING_INVARIANT_FAILURE"
+            ) {
+                reason.message.chars().take(512).collect()
+            } else {
+                public_failure_message(&reason.code)
+            };
         }
         AttemptState::Cancelled { reason, .. } => *reason = "job cancelled".into(),
         AttemptState::Interrupted { reason, .. } => *reason = "job interrupted".into(),
@@ -414,6 +455,66 @@ fn result_page_value(
     Ok(serde_json::Value::Object(result))
 }
 
+fn portfolio_result_value(
+    store: &crate::storage::Store,
+    query: ResultQueryParams,
+) -> Result<serde_json::Value, LabError> {
+    let value = match query {
+        ResultQueryParams::PortfolioSummary { run_id } => store
+            .portfolio_summary_projection(&run_id)?
+            .map(serde_json::to_value)
+            .transpose(),
+        ResultQueryParams::PortfolioEquity {
+            run_id,
+            offset,
+            limit,
+        } => store
+            .portfolio_equity(&run_id, offset, limit)?
+            .map(serde_json::to_value)
+            .transpose(),
+        ResultQueryParams::PortfolioAllocations {
+            run_id,
+            offset,
+            limit,
+        } => store
+            .portfolio_allocations(&run_id, offset, limit)?
+            .map(serde_json::to_value)
+            .transpose(),
+        ResultQueryParams::PortfolioRebalances {
+            run_id,
+            offset,
+            limit,
+        } => store
+            .portfolio_rebalances(&run_id, offset, limit)?
+            .map(serde_json::to_value)
+            .transpose(),
+        ResultQueryParams::PortfolioContributions { run_id } => store
+            .portfolio_contributions(&run_id)?
+            .map(serde_json::to_value)
+            .transpose(),
+        ResultQueryParams::RegimeTimeline {
+            run_id,
+            offset,
+            limit,
+        } => store
+            .portfolio_regime_timeline(&run_id, offset, limit)?
+            .map(serde_json::to_value)
+            .transpose(),
+        ResultQueryParams::RegimeSummary { run_id } => store
+            .portfolio_regime_summary(&run_id)?
+            .map(serde_json::to_value)
+            .transpose(),
+        ResultQueryParams::Ledger { .. }
+        | ResultQueryParams::Summary { .. }
+        | ResultQueryParams::Costs { .. } => {
+            return Err(LabError::Internal(
+                "ordinary results cannot enter the portfolio projection adapter".into(),
+            ));
+        }
+    }?;
+    value.ok_or_else(|| LabError::InvalidConfig("unknown portfolio run ID".into()))
+}
+
 fn tagged_schema<T: JsonSchema + 'static>() -> std::sync::Arc<JsonObject> {
     let mut schema = rmcp::handler::server::common::schema_for_type::<T>()
         .as_ref()
@@ -456,7 +557,6 @@ pub struct LabMcpService {
     tool_router: ToolRouter<Self>,
     upbit: UpbitClient,
     database: DatabaseHandle,
-    git_revision: Option<String>,
     jobs: JobService,
     exposure: McpExposure,
 }
@@ -468,7 +568,6 @@ impl LabMcpService {
     pub fn new(
         database: DatabaseHandle,
         upbit: UpbitClient,
-        git_revision: Option<String>,
         jobs: JobService,
         exposure: McpExposure,
     ) -> Self {
@@ -476,7 +575,6 @@ impl LabMcpService {
             tool_router: Self::tool_router(),
             upbit,
             database,
-            git_revision,
             jobs,
             exposure,
         }
@@ -507,11 +605,17 @@ impl LabMcpService {
             Ok(value) => value,
             Err(error) => return tool_error(&error),
         };
+        let verification_receipt = crate::verification::verified_build_receipt();
+        let implementation_status = if verification_receipt.is_some() {
+            "VERIFIED"
+        } else {
+            "IMPLEMENTED_UNVERIFIED"
+        };
         let status = serde_json::json!({
             "lab": "upbit-spot-lab",
             "package": env!("CARGO_PKG_NAME"),
             "version": env!("CARGO_PKG_VERSION"),
-            "code_revision": self.git_revision,
+            "code_revision": build_git_revision(),
             "source_digest": env!("SPOT_LAB_SOURCE_SHA256"),
             "lockfile_digest": env!("SPOT_LAB_LOCK_SHA256"),
             "toolchain": env!("SPOT_LAB_TOOLCHAIN"),
@@ -520,7 +624,8 @@ impl LabMcpService {
             "rounding_version": crate::contracts::ROUNDING_VERSION,
             "normalizer_version": crate::contracts::NORMALIZER_VERSION,
             "sqlite_version": rusqlite::version(),
-            "implementation_status": "IMPLEMENTED_UNVERIFIED",
+            "implementation_status": implementation_status,
+            "verification_receipt": verification_receipt,
             "implemented": {
                 "contracts": true,
                 "market_data_upbit": true,
@@ -551,9 +656,13 @@ impl LabMcpService {
                 "contract": "two_step_resource_delete_preview_then_resource_hard_delete",
                 "preview_ttl_seconds": crate::contracts::DELETE_PREVIEW_TTL_SECONDS,
                 "shared_by_all_callers": true,
-                "mode": "HARD_DELETE_ROWS_AND_EXCLUSIVE_FILES",
+                "mode": if self.exposure.public_no_auth() {
+                    "DISABLED_IN_PUBLIC_NO_AUTH"
+                } else {
+                    "HARD_DELETE_ROWS_AND_EXCLUSIVE_FILES"
+                },
                 "public_no_auth_warning": if self.exposure.public_no_auth() {
-                    "any caller reaching this unauthenticated URL can delete with the same contract"
+                    "destructive operations are disabled in public unauthenticated mode"
                 } else {
                     ""
                 },
@@ -617,6 +726,11 @@ impl LabMcpService {
     )]
     async fn collect_data(&self, arguments: JsonObject) -> Result<CallToolResult, McpError> {
         let request: CollectRequest = parse_arguments(arguments)?;
+        if self.exposure.public_no_auth() {
+            return result_or_error::<()>(Err(LabError::Conflict(
+                "data collection submission is disabled when public_no_auth is enabled; authenticated local or bearer access required".into(),
+            )));
+        }
         request
             .validate(crate::contracts::UtcTimestamp::now())
             .map_err(|error| invalid_params(&error))?;
@@ -701,6 +815,11 @@ impl LabMcpService {
     )]
     async fn evidence_register(&self, arguments: JsonObject) -> Result<CallToolResult, McpError> {
         let import: EvidenceImport = parse_arguments(arguments)?;
+        if self.exposure.public_no_auth() {
+            return result_or_error::<()>(Err(LabError::Conflict(
+                "evidence registration is disabled when public_no_auth is enabled; authenticated local or bearer access required".into(),
+            )));
+        }
         let snapshot =
             crate::evidence::build_snapshot(import).map_err(|error| invalid_params(&error))?;
         let response = EvidenceRegistered {
@@ -799,6 +918,11 @@ impl LabMcpService {
     )]
     async fn policy_write(&self, arguments: JsonObject) -> Result<CallToolResult, McpError> {
         let write: PolicyWrite = parse_arguments(arguments)?;
+        if self.exposure.public_no_auth() && !matches!(&write, PolicyWrite::Preflight { .. }) {
+            return result_or_error::<()>(Err(LabError::Conflict(
+                "policy mutation is disabled when public_no_auth is enabled; authenticated local or bearer access required".into(),
+            )));
+        }
         match &write {
             PolicyWrite::Create { definition, .. } | PolicyWrite::Revise { definition, .. } => {
                 definition
@@ -806,7 +930,7 @@ impl LabMcpService {
                     .map_err(|error| invalid_params(&error))?;
             }
             // Sweep definitions are validated during expansion.
-            PolicyWrite::Sweep { .. } => {}
+            PolicyWrite::Sweep { .. } | PolicyWrite::Preflight { .. } => {}
         }
         let now = crate::contracts::UtcTimestamp::now();
         let result = match write {
@@ -815,6 +939,7 @@ impl LabMcpService {
                 family,
                 template,
                 mode,
+                research,
             } => {
                 self.database
                     .call("mcp_policy_sweep", move |store| {
@@ -823,11 +948,25 @@ impl LabMcpService {
                             family,
                             &template,
                             &mode,
+                            research.as_ref(),
                             now,
                         )?)?)
                     })
                     .await
             }
+            PolicyWrite::Preflight {
+                family,
+                template,
+                mode,
+                research,
+                ..
+            } => crate::contracts::preflight_parameter_sweep(
+                family,
+                &template,
+                &mode,
+                research.as_ref(),
+            )
+            .and_then(|report| serde_json::to_value(report).map_err(LabError::from)),
             write => {
                 self.database
                     .call("mcp_policy_write", move |store| {
@@ -978,6 +1117,16 @@ impl LabMcpService {
     )]
     async fn job_control(&self, arguments: JsonObject) -> Result<CallToolResult, McpError> {
         let params: JobControlParams = parse_arguments(arguments)?;
+        if self.exposure.public_no_auth()
+            && matches!(
+                params.action,
+                JobControlAction::Cancel | JobControlAction::Retry
+            )
+        {
+            return result_or_error::<()>(Err(LabError::Conflict(
+                "job mutations are disabled when public_no_auth is enabled; authenticated local or bearer access required".into(),
+            )));
+        }
         let control = match params.action {
             JobControlAction::Get => JobControl::Get {
                 job_id: params.job_id,
@@ -993,7 +1142,7 @@ impl LabMcpService {
     }
 
     #[tool(
-        description = "Read one bounded typed ledger page by run, model, section, range and cursor",
+        description = "Read bounded model-ledger or shared-portfolio equity, allocation, attribution and regime results",
         input_schema = tagged_schema::<ResultQueryParams>(),
         annotations(
             title = "Result Query",
@@ -1038,6 +1187,21 @@ impl LabMcpService {
                         store
                             .load_model_cost_summary(&run_id, &model_id)?
                             .ok_or_else(|| LabError::InvalidConfig("unknown run/model ID".into()))
+                    })
+                    .await;
+                result_or_error(result)
+            }
+            query @ (ResultQueryParams::PortfolioSummary { .. }
+            | ResultQueryParams::PortfolioEquity { .. }
+            | ResultQueryParams::PortfolioAllocations { .. }
+            | ResultQueryParams::PortfolioRebalances { .. }
+            | ResultQueryParams::PortfolioContributions { .. }
+            | ResultQueryParams::RegimeTimeline { .. }
+            | ResultQueryParams::RegimeSummary { .. }) => {
+                let result = self
+                    .database
+                    .call("mcp_portfolio_result", move |store| {
+                        portfolio_result_value(store, query)
                     })
                     .await;
                 result_or_error(result)
@@ -1198,6 +1362,11 @@ impl LabMcpService {
         arguments: JsonObject,
     ) -> Result<CallToolResult, McpError> {
         let request: HardDeleteRequest = parse_arguments(arguments)?;
+        if self.exposure.public_no_auth() {
+            return result_or_error::<()>(Err(LabError::Conflict(
+                "destructive operations are disabled when public_no_auth is enabled; authenticated local or bearer access required".into(),
+            )));
+        }
         let result = self
             .database
             .call("resource_hard_delete", move |store| {
@@ -1214,6 +1383,18 @@ impl LabMcpService {
     )]
     async fn research_suite(&self, arguments: JsonObject) -> Result<CallToolResult, McpError> {
         let action: crate::contracts::ResearchSuiteAction = parse_arguments(arguments)?;
+        if self.exposure.public_no_auth()
+            && matches!(
+                &action,
+                crate::contracts::ResearchSuiteAction::Create { .. }
+                    | crate::contracts::ResearchSuiteAction::Pause { .. }
+                    | crate::contracts::ResearchSuiteAction::Resume { .. }
+            )
+        {
+            return result_or_error::<()>(Err(LabError::Conflict(
+                "research suite mutations are disabled when public_no_auth is enabled; authenticated local or bearer access required".into(),
+            )));
+        }
         match &action {
             crate::contracts::ResearchSuiteAction::Create { request } => {
                 crate::research::expand_geometry(request).map_err(|e| invalid_params(&e))?;
@@ -1235,6 +1416,18 @@ impl LabMcpService {
     )]
     async fn collection_schedule(&self, arguments: JsonObject) -> Result<CallToolResult, McpError> {
         let action: crate::contracts::CollectionScheduleAction = parse_arguments(arguments)?;
+        if self.exposure.public_no_auth()
+            && matches!(
+                &action,
+                crate::contracts::CollectionScheduleAction::Create { .. }
+                    | crate::contracts::CollectionScheduleAction::Pause { .. }
+                    | crate::contracts::CollectionScheduleAction::Resume { .. }
+            )
+        {
+            return result_or_error::<()>(Err(LabError::Conflict(
+                "schedule mutations are disabled when public_no_auth is enabled; authenticated local or bearer access required".into(),
+            )));
+        }
         match &action {
             crate::contracts::CollectionScheduleAction::Create { request } => {
                 request.validate().map_err(|e| invalid_params(&e))?;
@@ -1254,6 +1447,16 @@ impl LabMcpService {
     )]
     async fn storage_maintenance(&self, arguments: JsonObject) -> Result<CallToolResult, McpError> {
         let action: crate::contracts::StorageMaintenanceAction = parse_arguments(arguments)?;
+        if matches!(
+            &action,
+            crate::contracts::StorageMaintenanceAction::HardDeleteBatch { .. }
+                | crate::contracts::StorageMaintenanceAction::Compact
+        ) && self.exposure.public_no_auth()
+        {
+            return result_or_error::<()>(Err(LabError::Conflict(
+                "destructive or physical maintenance operations are disabled when public_no_auth is enabled; authenticated local or bearer access required".into(),
+            )));
+        }
         if let crate::contracts::StorageMaintenanceAction::RetentionCandidates { limit, .. } =
             &action
         {
@@ -1400,19 +1603,16 @@ impl ServerHandler for LabMcpService {
     }
 }
 
-/// Read the short workspace revision once at startup (never per request).
+/// Build-time git identity embedded by `build.rs`; `code_revision` never
+/// collapses to null when the server runs outside a git checkout.
 #[must_use]
-pub fn detect_git_revision() -> Option<String> {
-    let output = std::process::Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+pub fn build_git_revision() -> Option<String> {
+    let value = env!("SPOT_LAB_GIT_REVISION");
+    if value == "unknown" {
+        None
+    } else {
+        Some(value.to_owned())
     }
-    String::from_utf8(output.stdout)
-        .ok()
-        .map(|text| text.trim().to_owned())
 }
 
 /// Flatten a tool result into its text content blocks.
@@ -1427,5 +1627,7 @@ pub fn result_text(result: CallToolResult) -> String {
     text
 }
 
+#[cfg(test)]
+mod closure_tests;
 #[cfg(test)]
 mod tests;

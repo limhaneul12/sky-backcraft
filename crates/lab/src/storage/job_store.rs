@@ -8,7 +8,7 @@ use crate::contracts::{
 use rusqlite::{OptionalExtension, Transaction, params};
 
 const MAX_QUEUED_JOBS: i64 = 8;
-const MAX_JOB_ATTEMPTS: u32 = 32;
+pub(super) const MAX_JOB_ATTEMPTS: u32 = 32;
 const INITIAL_STAGE: &str = "queued";
 
 #[derive(Debug, Clone)]
@@ -229,7 +229,9 @@ impl Store {
     pub fn is_managed_job(&self, job_id: &JobId) -> Result<bool, LabError> {
         self.connection
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM research_suite_cases WHERE job_id=?1 UNION ALL SELECT 1 FROM schedule_fires WHERE job_id=?1)",
+                "SELECT EXISTS(SELECT 1 FROM research_suite_cases WHERE job_id=?1 \
+                 UNION ALL SELECT 1 FROM schedule_fires WHERE job_id=?1 \
+                 UNION ALL SELECT 1 FROM schedule_recovery_chunks WHERE job_id=?1)",
                 [job_id.as_str()],
                 |row| row.get(0),
             )

@@ -57,6 +57,16 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "0011_portfolio_research",
         include_str!("migrations/0011_portfolio_research.sql"),
     ),
+    (
+        12,
+        "0012_schedule_recovery",
+        include_str!("migrations/0012_schedule_recovery.sql"),
+    ),
+    (
+        13,
+        "0013_portfolio_projections",
+        include_str!("migrations/0013_portfolio_projections.sql"),
+    ),
 ];
 
 pub(super) fn apply(connection: &mut Connection) -> Result<(), LabError> {

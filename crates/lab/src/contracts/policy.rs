@@ -85,9 +85,9 @@ pub struct PolicyIndicator {
     pub id: String,
     pub indicator: PolicyIndicatorKind,
     /// Source candle interval for this indicator. Absent (or equal to the
-    /// decision interval) uses the decision stream. A *different* interval
-    /// declares a multi-timeframe source; the evaluator refuses those with a
-    /// typed error until the cross-interval feed path ships.
+    /// decision interval) uses the decision stream; a different interval
+    /// declares a multi-timeframe source fed from completed bars of that
+    /// interval whose close time is at or before each decision time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_interval: Option<super::CandleInterval>,
 }
@@ -295,6 +295,50 @@ impl PolicyDefinition {
         Ok(())
     }
 
+    /// Every declared cross-interval indicator source of this definition.
+    #[must_use]
+    pub fn declared_source_intervals(&self) -> Vec<crate::contracts::CandleInterval> {
+        match &self.program {
+            PolicyProgram::Builtin { .. } => Vec::new(),
+            PolicyProgram::Rules { program } => program
+                .indicators
+                .iter()
+                .filter_map(|indicator| indicator.source_interval)
+                .collect(),
+        }
+    }
+
+    /// Exact causal source requirements for indicators whose stream differs
+    /// from `decision_interval`. Duplicate interval declarations collapse to
+    /// the largest indicator warmup and the result is stably ordered by width.
+    #[must_use]
+    pub(crate) fn source_requirements(
+        &self,
+        decision_interval: crate::contracts::CandleInterval,
+    ) -> Vec<(crate::contracts::CandleInterval, usize)> {
+        let PolicyProgram::Rules { program } = &self.program else {
+            return Vec::new();
+        };
+        program.source_requirements(decision_interval)
+    }
+
+    /// Required completed decision-stream bars before policy evaluation.
+    /// Cross-interval indicator windows are warmed on their own streams and
+    /// therefore do not inflate this count.
+    ///
+    /// # Errors
+    /// Rejects an invalid definition or warmup arithmetic overflow.
+    pub(crate) fn decision_warmup_bars(
+        &self,
+        decision_interval: crate::contracts::CandleInterval,
+    ) -> Result<usize, LabError> {
+        self.validate()?;
+        match &self.program {
+            PolicyProgram::Builtin { strategy } => strategy.warmup_bars(),
+            PolicyProgram::Rules { program } => program.decision_warmup_bars(decision_interval),
+        }
+    }
+
     /// Required completed decision bars before evaluating this policy.
     ///
     /// # Errors
@@ -396,6 +440,47 @@ impl RulesProgram {
             .ok_or_else(|| LabError::ResourceLimit("policy warmup calculation overflow".into()))
     }
 
+    fn decision_warmup_bars(
+        &self,
+        decision_interval: crate::contracts::CandleInterval,
+    ) -> Result<usize, LabError> {
+        let base = self
+            .indicators
+            .iter()
+            .filter(|indicator| {
+                indicator.source_interval.unwrap_or(decision_interval) == decision_interval
+            })
+            .map(|indicator| indicator.indicator.warmup_bars())
+            .max()
+            .unwrap_or(1);
+        base.checked_add(usize::from(self.has_cross()))
+            .ok_or_else(|| LabError::ResourceLimit("policy warmup calculation overflow".into()))
+    }
+
+    fn source_requirements(
+        &self,
+        decision_interval: crate::contracts::CandleInterval,
+    ) -> Vec<(crate::contracts::CandleInterval, usize)> {
+        let mut requirements = Vec::<(crate::contracts::CandleInterval, usize)>::new();
+        for indicator in &self.indicators {
+            let source = indicator.source_interval.unwrap_or(decision_interval);
+            if source == decision_interval {
+                continue;
+            }
+            let warmup = indicator.indicator.warmup_bars();
+            if let Some((_, current)) = requirements
+                .iter_mut()
+                .find(|(interval, _)| *interval == source)
+            {
+                *current = (*current).max(warmup);
+            } else {
+                requirements.push((source, warmup));
+            }
+        }
+        requirements.sort_by_key(|(interval, _)| interval.duration().num_seconds());
+        requirements
+    }
+
     fn has_cross(&self) -> bool {
         self.states.iter().any(|state| state.next.has_cross())
             || self
@@ -436,7 +521,7 @@ impl PolicyIndicatorKind {
         }
     }
 
-    fn warmup_bars(&self) -> usize {
+    pub(crate) fn warmup_bars(&self) -> usize {
         match self {
             Self::Sma { window } | Self::Ema { window } => *window,
             Self::Rsi { window }

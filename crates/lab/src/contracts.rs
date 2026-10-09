@@ -46,6 +46,8 @@ pub mod sweep;
 pub use sweep::*;
 pub mod portfolio;
 pub use portfolio::*;
+pub mod portfolio_query;
+pub use portfolio_query::*;
 pub mod regime;
 pub use regime::*;
 pub mod maintenance;
@@ -304,6 +306,7 @@ impl TryFrom<String> for MarketId {
 pub enum CandleInterval {
     M1,
     M5,
+    M15,
     H1,
     H4,
     D1,
@@ -320,6 +323,7 @@ impl CandleInterval {
         match code.to_ascii_lowercase().as_str() {
             "m1" | "1m" => Ok(Self::M1),
             "m5" | "5m" => Ok(Self::M5),
+            "m15" | "15m" => Ok(Self::M15),
             "h1" | "1h" => Ok(Self::H1),
             "h4" | "4h" => Ok(Self::H4),
             "d1" | "1d" => Ok(Self::D1),
@@ -336,6 +340,7 @@ impl CandleInterval {
         match self {
             Self::M1 => Duration::minutes(1),
             Self::M5 => Duration::minutes(5),
+            Self::M15 => Duration::minutes(15),
             Self::H1 => Duration::hours(1),
             Self::H4 => Duration::hours(4),
             Self::D1 => Duration::hours(24),
@@ -349,6 +354,7 @@ impl CandleInterval {
         match self {
             Self::M1 => "v1/candles/minutes/1",
             Self::M5 => "v1/candles/minutes/5",
+            Self::M15 => "v1/candles/minutes/15",
             Self::H1 => "v1/candles/minutes/60",
             Self::H4 => "v1/candles/minutes/240",
             Self::D1 => "v1/candles/days",

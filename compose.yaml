@@ -5,6 +5,9 @@ services:
     build:
       context: .
       target: runtime
+      args:
+        SKY_BACKCRAFT_BUILD_REVISION: ${SKY_BACKCRAFT_BUILD_REVISION:-}
+        SKY_BACKCRAFT_VERIFICATION_RECEIPT: ${SKY_BACKCRAFT_VERIFICATION_RECEIPT:-}
     image: ${SPOT_LAB_IMAGE:-sky-backcraft:local}
     restart: unless-stopped
     init: true
@@ -30,6 +33,9 @@ services:
     build:
       context: .
       target: ci
+      args:
+        SKY_BACKCRAFT_BUILD_REVISION: ${SKY_BACKCRAFT_BUILD_REVISION:-}
+        SKY_BACKCRAFT_VERIFICATION_RECEIPT: ${SKY_BACKCRAFT_VERIFICATION_RECEIPT:-}
     image: ${SPOT_LAB_CI_IMAGE:-sky-backcraft-ci:local}
     profiles:
       - ci

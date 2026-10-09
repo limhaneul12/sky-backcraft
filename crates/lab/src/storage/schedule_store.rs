@@ -1,5 +1,7 @@
 //! SQLite persistence and reconciliation for periodic collection schedules.
 
+mod recovery;
+
 use super::{Store, enum_text, json_error, sql_error, timestamp_from_ms, timestamp_ms, u64_to_i64};
 use crate::contracts::{
     AttemptId, AttemptState, CollectRequest, CollectionFreshness, CollectionSchedulePage,
@@ -68,7 +70,8 @@ impl Store {
         }
         enforce_active_capacity(&self.connection)?;
         let request_json = serde_json::to_string(&schedule.request).map_err(json_error)?;
-        self.connection
+        let transaction = self.connection.transaction().map_err(sql_error)?;
+        transaction
             .execute(
                 "INSERT INTO collection_schedules(\
                  id,request_id,input_digest,status,created_at_ms,next_action_at_ms,request_json,\
@@ -85,6 +88,17 @@ impl Store {
                 ],
             )
             .map_err(sql_error)?;
+        transaction
+            .execute(
+                "INSERT INTO schedule_recoveries(\
+                 schedule_id,failure_class,state,attempt_count,last_probe_at_ms,\
+                 last_recovery_at_ms,gap_start_ms,gap_end_ms,next_chunk_start_ms,\
+                 backfill_job_id,backfill_attempt_id,next_recovery_at_ms,updated_at_ms\
+                 ) VALUES (?1,NULL,'active',0,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,?2)",
+                params![schedule.id.as_str(), timestamp_ms(schedule.created_at)],
+            )
+            .map_err(sql_error)?;
+        transaction.commit().map_err(sql_error)?;
         load_schedule(&self.connection, &schedule.id)?
             .ok_or_else(|| LabError::Internal("created collection schedule disappeared".into()))
     }
@@ -153,6 +167,22 @@ impl Store {
         })
     }
 
+    /// Check if any schedule fire is currently in flight, queued or waiting retry.
+    ///
+    /// # Errors
+    /// Returns SQLite failure on corrupted query.
+    pub fn has_active_schedule_fires(&self) -> Result<bool, LabError> {
+        let count: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM schedule_fires WHERE status IN ('in_flight', 'queued', 'retry_wait')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
+        Ok(count > 0)
+    }
+
     /// Return a bounded deterministic set whose pinned attempts may have changed.
     ///
     /// # Errors
@@ -177,67 +207,6 @@ impl Store {
             .collect()
     }
 
-    /// Blocked schedules whose durable recovery backoff has elapsed.
-    ///
-    /// # Errors
-    /// Returns SQLite failures.
-    pub fn recovery_candidates(
-        &self,
-        now: UtcTimestamp,
-        limit: u32,
-    ) -> Result<Vec<CollectionScheduleRecord>, LabError> {
-        validate_active_scan(limit)?;
-        let mut statement = self
-            .connection
-            .prepare(
-                "SELECT id FROM collection_schedules \
-                 WHERE status='blocked' AND next_action_at_ms<=?1 \
-                 ORDER BY next_action_at_ms,id LIMIT ?2",
-            )
-            .map_err(sql_error)?;
-        let ids = statement
-            .query_map(params![timestamp_ms(now), i64::from(limit)], |row| {
-                row.get::<_, String>(0)
-            })
-            .map_err(sql_error)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(sql_error)?;
-        drop(statement);
-        let mut records = Vec::with_capacity(ids.len());
-        for id in ids {
-            let schedule_id = ScheduleId::new(id)?;
-            if let Some(record) = self.get_collection_schedule(&schedule_id)? {
-                records.push(record);
-            }
-        }
-        Ok(records)
-    }
-
-    /// Push a blocked schedule's recovery attempt further out after a failed
-    /// probe. Durable: only `next_action_at_ms` moves.
-    ///
-    /// # Errors
-    /// Returns SQLite failures.
-    pub fn defer_recovery(
-        &mut self,
-        schedule_id: &ScheduleId,
-        now: UtcTimestamp,
-        attempt: u32,
-    ) -> Result<(), LabError> {
-        let delay = recovery_backoff_seconds(attempt.saturating_add(1));
-        self.connection
-            .execute(
-                "UPDATE collection_schedules SET next_action_at_ms=?1 \
-                 WHERE id=?2 AND status='blocked'",
-                params![
-                    timestamp_ms(now).saturating_add(i64::from(delay) * 1000),
-                    schedule_id.as_str()
-                ],
-            )
-            .map_err(sql_error)?;
-        Ok(())
-    }
-
     /// Return active schedules ready either for a new fire or a persisted retry.
     ///
     /// # Errors
@@ -253,12 +222,13 @@ impl Store {
             .connection
             .prepare(
                 "SELECT s.id FROM collection_schedules s \
+                 JOIN schedule_recoveries r ON r.schedule_id=s.id \
                  WHERE s.status=?1 AND (\
-                   EXISTS (SELECT 1 FROM schedule_fires f WHERE f.schedule_id=s.id \
+                   (r.state='degraded' AND EXISTS (SELECT 1 FROM schedule_fires f WHERE f.schedule_id=s.id \
                            AND f.status='retry_wait' AND f.retry_at_ms<=?2) OR \
-                   (s.next_action_at_ms<=?2 AND NOT EXISTS (\
+                   (r.state='active' AND s.next_action_at_ms<=?2 AND NOT EXISTS (\
                        SELECT 1 FROM schedule_fires f WHERE f.schedule_id=s.id \
-                       AND f.status IN ('planned','queued','running','retry_wait')))\
+                       AND f.status IN ('planned','queued','running','retry_wait'))))\
                  ) ORDER BY s.next_action_at_ms,s.id LIMIT ?3",
             )
             .map_err(sql_error)?;
@@ -453,6 +423,7 @@ impl Store {
             )
             .map_err(sql_error)?;
         let mut running_jobs = Vec::new();
+        running_jobs.extend(recovery::pause_recovery_tx(&transaction, schedule_id, now)?);
         if let Some(fire) = load_current_fire(&transaction, schedule_id)? {
             match fire.status {
                 ScheduleFireStatus::Queued | ScheduleFireStatus::Running => {
@@ -514,8 +485,9 @@ impl Store {
             return Ok(schedule);
         }
         enforce_active_capacity(&transaction)?;
+        let recovery_owned = recovery::resume_recovery_tx(&transaction, schedule_id, now)?;
         let latest = load_latest_fire(&transaction, schedule_id)?;
-        if let Some(fire) = latest {
+        if !recovery_owned && let Some(fire) = latest {
             match fire.status {
                 ScheduleFireStatus::Queued
                 | ScheduleFireStatus::Running
@@ -583,24 +555,7 @@ impl Store {
             CollectionScheduleStatus::Blocked => return Ok(schedule),
             CollectionScheduleStatus::Active => {}
         }
-        let failure_json = serde_json::to_string(&failure).map_err(json_error)?;
-        let recovery_delay = recovery_backoff_seconds(0);
-        let changed = transaction
-            .execute(
-                "UPDATE collection_schedules SET status='blocked',next_action_at_ms=?1,\
-                 failure_json=?2 WHERE id=?3 AND status='active'",
-                params![
-                    timestamp_ms(now).saturating_add(i64::from(recovery_delay) * 1000),
-                    failure_json,
-                    schedule_id.as_str()
-                ],
-            )
-            .map_err(sql_error)?;
-        if changed != 1 {
-            return Err(LabError::Conflict(
-                "collection schedule changed before producer block".into(),
-            ));
-        }
+        recovery::record_failure_tx(&transaction, schedule_id, &failure, now)?;
         transaction
             .execute(
                 "UPDATE schedule_fires SET status='blocked',retry_at_ms=NULL,failure_json=?1 \
@@ -672,6 +627,14 @@ impl Store {
             observed_at,
             interval: schedule.request.interval,
             markets,
+            failure_class: schedule.failure_class,
+            recovery_state: schedule.recovery_state,
+            recovery_attempt_count: schedule.recovery_attempt_count,
+            last_probe_at: schedule.last_probe_at,
+            last_recovery_at: schedule.last_recovery_at,
+            pending_gap: schedule.pending_gap,
+            backfill_job_id: schedule.backfill_job_id,
+            next_recovery_at: schedule.next_recovery_at,
         })
     }
 }
@@ -824,6 +787,7 @@ fn reconcile_failed_attempt(
                     ],
                 )
                 .map_err(sql_error)?;
+            recovery::record_degraded_tx(transaction, &schedule.id, retry_at, now)?;
             Ok(())
         }
         ScheduleFailureAction::Block => block_fire(transaction, schedule, fire, error, None, now),
@@ -855,6 +819,9 @@ fn reconcile_lifecycle_end(
             ],
         )
         .map_err(sql_error)?;
+    if schedule.status == CollectionScheduleStatus::Active {
+        recovery::record_degraded_tx(transaction, &schedule.id, now, now)?;
+    }
     Ok(())
 }
 
@@ -894,6 +861,7 @@ fn complete_fire(
             ],
         )
         .map_err(sql_error)?;
+    recovery::reset_active_tx(transaction, &schedule.id, now)?;
     Ok(())
 }
 
@@ -918,33 +886,8 @@ fn block_fire(
             ],
         )
         .map_err(sql_error)?;
-    // Durable self-heal schedule: a blocked schedule becomes a recovery
-    // candidate after a bounded exponential backoff derived from the failed
-    // fire's retry count. Nothing in memory carries this state.
-    let recovery_delay = recovery_backoff_seconds(fire.retry_count);
-    transaction
-        .execute(
-            "UPDATE collection_schedules SET status='blocked',failure_json=?1,\
-             next_action_at_ms=?2 \
-             WHERE id=?3",
-            params![
-                serde_json::to_string(failure).map_err(json_error)?,
-                timestamp_ms(now).saturating_add(i64::from(recovery_delay) * 1000),
-                schedule.id.as_str(),
-            ],
-        )
-        .map_err(sql_error)?;
+    recovery::record_failure_tx(transaction, &schedule.id, failure, now)?;
     Ok(())
-}
-
-/// Bounded exponential recovery backoff: 60s doubling capped at one hour.
-#[must_use]
-fn recovery_backoff_seconds(retry_count: u32) -> u32 {
-    let steps = retry_count.min(6);
-    60_u32
-        .checked_mul(1_u32 << steps)
-        .unwrap_or(3_600)
-        .min(3_600)
 }
 
 fn update_fire_status(
@@ -1017,6 +960,7 @@ fn load_schedule(
     let Some((request, digest, status, created, next, dataset, boundary, failure)) = row else {
         return Ok(None);
     };
+    let recovery = recovery::load_recovery(connection, schedule_id)?;
     let mut record = CollectionScheduleRecord {
         id: schedule_id.clone(),
         request: serde_json::from_str(&request).map_err(json_error)?,
@@ -1031,6 +975,14 @@ fn load_schedule(
             .map(|json| serde_json::from_str(&json).map_err(json_error))
             .transpose()?,
         in_flight: load_current_fire(connection, schedule_id)?,
+        failure_class: recovery.failure_class,
+        recovery_state: recovery.state,
+        recovery_attempt_count: recovery.attempt_count,
+        last_probe_at: recovery.last_probe_at,
+        last_recovery_at: recovery.last_recovery_at,
+        pending_gap: recovery.pending_gap,
+        backfill_job_id: recovery.backfill_job_id,
+        next_recovery_at: recovery.next_recovery_at,
     };
     record.last_success_coverage = record.derive_last_success_coverage()?;
     Ok(Some(record))
@@ -1141,40 +1093,23 @@ fn project_market_freshness(
     probe: Option<&crate::contracts::SourceProbeResult>,
     observed_at: UtcTimestamp,
 ) -> Result<MarketFreshness, LabError> {
-    let dataset_id = schedule.last_success_dataset_id.as_ref();
-    let Some(dataset_id) = dataset_id else {
-        let classification = crate::scheduling::classify_market_freshness(
-            expected_end,
-            None,
-            observed_at,
-            u64::from(schedule.request.lookback_bars),
-            interval_seconds,
-            policy,
-            probe,
-            schedule.failure.as_ref(),
-        );
-        return Ok(MarketFreshness {
-            market: market.clone(),
-            expected_end,
-            latest_completed_end: None,
-            age_seconds: None,
-            gap_count: u64::from(schedule.request.lookback_bars),
-            missing: Some(FreshnessMissingReason::NeverCollected),
-            consecutive_missing: u64::from(schedule.request.lookback_bars),
-            state: classification.state,
-            state_reason: classification.reason,
-            source_probe: probe.cloned(),
-        });
-    };
     let interval_text = enum_text(&schedule.request.interval)?;
     let latest: Option<i64> = connection
         .query_row(
-            "SELECT MAX(o.close_time_ms) \
-             FROM dataset_members m JOIN candle_observations o ON o.id=m.observation_id \
-             WHERE m.dataset_id=?1 AND o.market=?2 AND o.interval=?3 AND o.completed=1 \
+            "WITH owned_datasets(dataset_id) AS (\
+               SELECT last_success_dataset_id FROM collection_schedules \
+               WHERE id=?1 AND last_success_dataset_id IS NOT NULL \
+               UNION SELECT dataset_id FROM schedule_fires \
+               WHERE schedule_id=?1 AND status='completed' AND dataset_id IS NOT NULL \
+               UNION SELECT dataset_id FROM schedule_recovery_chunks \
+               WHERE schedule_id=?1 AND status='completed' AND dataset_id IS NOT NULL\
+             ) SELECT MAX(o.close_time_ms) FROM owned_datasets d \
+             JOIN dataset_members m ON m.dataset_id=d.dataset_id \
+             JOIN candle_observations o ON o.id=m.observation_id \
+             WHERE o.market=?2 AND o.interval=?3 AND o.completed=1 \
              AND o.close_time_ms<=?4",
             params![
-                dataset_id.as_str(),
+                schedule.id.as_str(),
                 market.code(),
                 &interval_text,
                 timestamp_ms(expected_end),
@@ -1184,12 +1119,20 @@ fn project_market_freshness(
         .map_err(sql_error)?;
     let rows: i64 = connection
         .query_row(
-            "SELECT COUNT(DISTINCT o.open_time_ms) \
-             FROM dataset_members m JOIN candle_observations o ON o.id=m.observation_id \
-             WHERE m.dataset_id=?1 AND o.market=?2 AND o.interval=?3 AND o.completed=1 \
+            "WITH owned_datasets(dataset_id) AS (\
+               SELECT last_success_dataset_id FROM collection_schedules \
+               WHERE id=?1 AND last_success_dataset_id IS NOT NULL \
+               UNION SELECT dataset_id FROM schedule_fires \
+               WHERE schedule_id=?1 AND status='completed' AND dataset_id IS NOT NULL \
+               UNION SELECT dataset_id FROM schedule_recovery_chunks \
+               WHERE schedule_id=?1 AND status='completed' AND dataset_id IS NOT NULL\
+             ) SELECT COUNT(DISTINCT o.open_time_ms) FROM owned_datasets d \
+             JOIN dataset_members m ON m.dataset_id=d.dataset_id \
+             JOIN candle_observations o ON o.id=m.observation_id \
+             WHERE o.market=?2 AND o.interval=?3 AND o.completed=1 \
              AND o.open_time_ms>=?4 AND o.close_time_ms<=?5",
             params![
-                dataset_id.as_str(),
+                schedule.id.as_str(),
                 market.code(),
                 &interval_text,
                 timestamp_ms(start),
@@ -1239,6 +1182,7 @@ fn project_market_freshness(
         policy,
         probe,
         schedule.failure.as_ref(),
+        Some(schedule.next_action_at),
     );
     Ok(MarketFreshness {
         market: market.clone(),

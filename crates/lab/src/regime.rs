@@ -71,7 +71,8 @@ impl RegimeClassifier {
         Some((now - past) / f64::from(u32::try_from(lookback).unwrap_or(1)))
     }
 
-    /// Observe one completed decision bar; returns `None` during warmup.
+    /// Observe one completed decision bar. Warmup is an explicit UNKNOWN
+    /// observation with absent features; it is never silently omitted.
     ///
     /// # Errors
     /// Rejects nonfinite derived statistics (a corrupted bar can only fail
@@ -92,10 +93,46 @@ impl RegimeClassifier {
         }
         self.push(close, high, low, volume);
         self.decision_bars = self.decision_bars.saturating_add(1);
-        let warmup = self.spec.warmup_bars();
-        if self.closes.len() < warmup {
-            return Ok(None);
+        let causal_input_digest = self.observation_digest(bar, interval)?;
+        if self.closes.len() < self.spec.warmup_bars() {
+            return Ok(Some(RegimeObservation {
+                market: self.market.clone(),
+                decision_time: bar.candle.close_time_utc,
+                features: None,
+                regime: RegimeLabel::Unknown,
+                vol_state: VolState::NormalVol,
+                classifier_revision: self.spec.revision.clone(),
+                causal_input_digest,
+            }));
         }
+        self.classified_observation(bar, interval, close, volume, causal_input_digest)
+            .map(Some)
+    }
+
+    fn observation_digest(
+        &self,
+        bar: &CandleObservation,
+        interval: CandleInterval,
+    ) -> Result<ContentHash, LabError> {
+        ContentHash::of_value(&(
+            "regime-observation-v2",
+            &self.spec,
+            &self.dataset_digest,
+            self.market.code(),
+            interval,
+            bar.candle.close_time_utc,
+            &bar.content_digest,
+        ))
+    }
+
+    fn classified_observation(
+        &self,
+        bar: &CandleObservation,
+        interval: CandleInterval,
+        close: f64,
+        volume: f64,
+        causal_input_digest: ContentHash,
+    ) -> Result<RegimeObservation, LabError> {
         let sma_long = Self::sma(&self.closes, self.spec.sma_long).ok_or_else(|| {
             LabError::Internal("regime warmup verified but long SMA unavailable".into())
         })?;
@@ -164,25 +201,17 @@ impl RegimeClassifier {
             volume_expansion,
             directional_persistence,
         };
-        // The digest binds identity geometry, not bar contents; the dataset
-        // semantic digest already pins the exact causal input bytes.
-        let causal_input_digest = ContentHash::of_value(&(
-            "regime-observation-v1",
-            &self.spec.revision,
-            self.spec.warmup_bars(),
-            &self.dataset_digest,
-            self.market.code(),
-            bar.candle.close_time_utc,
-        ))?;
-        Ok(Some(RegimeObservation {
+        // The digest binds the complete frozen classifier plus this causal
+        // completed bar. Parameter or source-content changes cannot alias.
+        Ok(RegimeObservation {
             market: self.market.clone(),
             decision_time: bar.candle.close_time_utc,
-            features,
+            features: Some(features),
             regime,
             vol_state,
             classifier_revision: self.spec.revision.clone(),
             causal_input_digest,
-        }))
+        })
     }
 
     fn push(&mut self, close: f64, high: f64, low: f64, volume: f64) {

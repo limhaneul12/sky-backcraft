@@ -502,6 +502,19 @@ fn drawdown_stop_blocks_new_buys_after_a_loss() {
 }
 
 #[test]
+fn maximum_drawdown_retains_a_recovered_interior_trough() {
+    let drawdown = maximum_drawdown([
+        decimal("100"),
+        decimal("120"),
+        decimal("90"),
+        decimal("130"),
+        decimal("125"),
+    ])
+    .expect("drawdown is representable");
+    assert_eq!(drawdown, decimal("0.25"));
+}
+
+#[test]
 fn pro_rata_scaling_is_deterministic_and_never_overdraws() {
     // Two equal-cap assets compete for one constrained pool; pro-rata gives
     // each the same share of the available headroom.
@@ -922,5 +935,170 @@ fn shared_portfolio_plans_refuse_per_model_execution_and_require_the_mode() {
     assert!(
         matches!(&result, Err(LabError::InvalidConfig(message)) if message.contains("SHARED_PORTFOLIO")),
         "portfolio runner requires the explicit mode: {result:?}"
+    );
+}
+
+fn setup_completion_costs(plan: &mut ResolvedPlan) {
+    plan.spec.capital_mode = Some(crate::contracts::CapitalMode::SharedPortfolio);
+    plan.spec.initial_cash = quote("300000");
+    plan.spec.costs.buy_fee_bps = BasisPoints::new(decimal("5")).expect("fee");
+    plan.spec.costs.sell_fee_bps = BasisPoints::new(decimal("5")).expect("fee");
+    plan.spec.costs.half_spread_bps = BasisPoints::new(decimal("1")).expect("cost");
+    plan.spec.costs.slippage_bps = BasisPoints::new(decimal("2")).expect("cost");
+    plan.spec.costs.impact_bps = BasisPoints::new(decimal("1")).expect("cost");
+}
+
+fn assert_portfolio_invariants(ledger: &PortfolioLedger) {
+    assert_eq!(ledger.status, PortfolioStatus::Completed);
+    assert!(!ledger.fills.is_empty(), "Expected fills to execute");
+
+    // Portfolio asset + cash sum equality on every mark
+    for mark in &ledger.marks {
+        let sum = mark.cash.get() + mark.position_value.get();
+        assert_eq!(
+            mark.equity.get(),
+            sum,
+            "Equity must equal cash + position_value at {}: equity={}, sum={}",
+            mark.time,
+            mark.equity.get(),
+            sum
+        );
+    }
+
+    // Attribution reconciliation
+    let total_explained: Decimal = ledger
+        .attribution
+        .iter()
+        .map(|a| a.realized_pnl.get() + a.unrealized_pnl.get() - a.fees.get())
+        .sum();
+    let portfolio_pnl = ledger.totals.terminal_equity.get() - Decimal::from(300_000);
+    let diff = (portfolio_pnl - total_explained).abs();
+    assert!(
+        diff <= Decimal::new(1, 2),
+        "Attribution must reconcile: portfolio_pnl={portfolio_pnl}, explained={total_explained}"
+    );
+}
+
+#[test]
+fn shared_capital_btc_xrp_300k_buy_and_hold_completion_test() {
+    let spec = portfolio_spec(
+        "300000",
+        &[("KRW-BTC", "0.50"), ("KRW-XRP", "0.50")],
+        "1.00",
+        "0.00",
+        "0.00",
+        ArbitrationPolicy::ProRata,
+    );
+    let make_datasets = || {
+        let mut btc = dataset("KRW-BTC", &FLAT_PRICES);
+        let mut xrp = dataset("KRW-XRP", &FLAT_PRICES);
+        for obs in &mut btc.observations {
+            obs.candle.volume = AssetQuantity::new(Decimal::from(1_000_000)).expect("vol");
+        }
+        for obs in &mut xrp.observations {
+            obs.candle.volume = AssetQuantity::new(Decimal::from(1_000_000)).expect("vol");
+        }
+        vec![btc, xrp]
+    };
+
+    let mut plan1 = plan(&["KRW-BTC", "KRW-XRP"], StrategySpec::BuyAndHold);
+    setup_completion_costs(&mut plan1);
+    let run_id = RunId::new("run-bh-1").expect("run id");
+
+    let ledger1 = run_portfolio(&plan1, &make_datasets(), &spec, None, &run_id, 1, &|| false)
+        .expect("Buy & Hold execution should succeed");
+    assert_portfolio_invariants(&ledger1);
+
+    // Exposure seconds: both assets held for 8 hours (28,800s); totals matches portfolio exposure time
+    assert_eq!(ledger1.totals.exposure_seconds, 8 * 3600);
+    for a in &ledger1.attribution {
+        assert_eq!(a.exposure_seconds, 8 * 3600);
+    }
+
+    // Cost drag: price_cost must equal qty * unit_difference (KRW quote cost, not unit delta)
+    for fill in &ledger1.fills {
+        let unit_diff = fill
+            .price_difference_per_unit
+            .expect("unit price diff")
+            .get();
+        let expected_cost = (unit_diff * fill.qty.get()).round_dp(2);
+        let actual_cost = fill.price_cost.get();
+        assert!(
+            (actual_cost - expected_cost).abs() <= Decimal::new(1, 2),
+            "fill price_cost ({actual_cost}) must equal qty * unit_diff ({expected_cost})"
+        );
+    }
+    let total_fill_price_cost: Decimal = ledger1.fills.iter().map(|f| f.price_cost.get()).sum();
+    assert_eq!(ledger1.totals.price_cost_drag.get(), total_fill_price_cost);
+
+    // Determinism: running again with identical inputs must produce the exact same result
+    let ledger2 = run_portfolio(&plan1, &make_datasets(), &spec, None, &run_id, 1, &|| false)
+        .expect("Replay should succeed");
+
+    assert_eq!(
+        serde_json::to_string(&ledger1).unwrap(),
+        serde_json::to_string(&ledger2).unwrap(),
+        "Execution must be deterministic"
+    );
+}
+
+#[test]
+fn shared_capital_btc_xrp_300k_s2_completion_test() {
+    let spec = portfolio_spec(
+        "300000",
+        &[("KRW-BTC", "0.50"), ("KRW-XRP", "0.50")],
+        "1.00",
+        "0.00",
+        "0.00",
+        ArbitrationPolicy::ProRata,
+    );
+    let prices_btc = [
+        "100", "101", "102", "103", "104", "105", "104", "103", "102", "101", "100", "99", "98",
+        "97", "96", "95",
+    ];
+    let prices_xrp = [
+        "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23", "24",
+        "25",
+    ];
+    let make_datasets = || {
+        let mut btc = dataset("KRW-BTC", &prices_btc);
+        let mut xrp = dataset("KRW-XRP", &prices_xrp);
+        for obs in &mut btc.observations {
+            obs.candle.volume = AssetQuantity::new(Decimal::from(1_000_000)).expect("vol");
+        }
+        for obs in &mut xrp.observations {
+            obs.candle.volume = AssetQuantity::new(Decimal::from(1_000_000)).expect("vol");
+        }
+        vec![btc, xrp]
+    };
+
+    let strategy_s2 = StrategySpec::S2 {
+        entry_length: 2,
+        exit_length: 2,
+    };
+    let mut plan_s2 = plan(&["KRW-BTC", "KRW-XRP"], strategy_s2);
+    setup_completion_costs(&mut plan_s2);
+    plan_s2.spec.range =
+        UtcRange::new(time("2025-01-01T04:00:00Z"), time("2025-01-01T14:00:00Z")).expect("range");
+    plan_s2.spec.terminal_policy = TerminalPolicy::MarkToMarket;
+
+    let run_id = RunId::new("run-s2-1").expect("run id");
+
+    let ledger1 = run_portfolio(&plan_s2, &make_datasets(), &spec, None, &run_id, 1, &|| {
+        false
+    })
+    .expect("S2 execution should succeed");
+    assert_portfolio_invariants(&ledger1);
+
+    // Determinism: running again produces identical ledger
+    let ledger2 = run_portfolio(&plan_s2, &make_datasets(), &spec, None, &run_id, 1, &|| {
+        false
+    })
+    .expect("S2 replay should succeed");
+
+    assert_eq!(
+        serde_json::to_string(&ledger1).unwrap(),
+        serde_json::to_string(&ledger2).unwrap(),
+        "S2 execution must be deterministic"
     );
 }

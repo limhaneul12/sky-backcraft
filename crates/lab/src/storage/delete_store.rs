@@ -143,6 +143,45 @@ impl Store {
         request: &HardDeleteRequest,
         now: UtcTimestamp,
     ) -> Result<DeleteOutcome, LabError> {
+        let mut outcome = self.execute_hard_delete_rows(request, now)?;
+        if outcome.deleted_db_rows > 0 {
+            outcome.vacuumed = self.checkpoint_after_delete()?;
+        }
+        Ok(outcome)
+    }
+
+    /// Execute previewed resources with one final WAL fold, never a per-item VACUUM.
+    /// # Errors
+    /// Preserves each resource's preview, protection and journal checks.
+    pub fn execute_hard_delete_batch(
+        &mut self,
+        requests: &[HardDeleteRequest],
+        now: UtcTimestamp,
+    ) -> Result<Vec<DeleteOutcome>, LabError> {
+        if requests.is_empty() || requests.len() > crate::contracts::MAX_HARD_DELETE_BATCH {
+            return Err(LabError::InvalidConfig(format!(
+                "hard-delete batch requires 1..={} previewed requests",
+                crate::contracts::MAX_HARD_DELETE_BATCH,
+            )));
+        }
+        let mut outcomes = requests
+            .iter()
+            .map(|request| self.execute_hard_delete_rows(request, now))
+            .collect::<Result<Vec<_>, _>>()?;
+        if outcomes.iter().any(|outcome| outcome.deleted_db_rows > 0) {
+            let checkpointed = self.checkpoint_after_delete()?;
+            for outcome in &mut outcomes {
+                outcome.vacuumed = checkpointed;
+            }
+        }
+        Ok(outcomes)
+    }
+
+    fn execute_hard_delete_rows(
+        &mut self,
+        request: &HardDeleteRequest,
+        now: UtcTimestamp,
+    ) -> Result<DeleteOutcome, LabError> {
         let preview = &request.preview;
         if now >= preview.expires_at {
             return Err(LabError::Conflict(
@@ -194,7 +233,6 @@ impl Store {
         // amplify WAL and I/O on batch cleanups. A passive checkpoint folds
         // what it can cheaply; physical compaction is the explicit
         // storage_maintenance action=compact operation.
-        let vacuumed = deleted_rows > 0 && self.checkpoint_after_delete()?;
         Ok(DeleteOutcome {
             resource: preview.resource.clone(),
             deleted_db_rows: deleted_rows,
@@ -206,7 +244,7 @@ impl Store {
                 .iter()
                 .find(|group| group.kind == DeleteEntryKind::RawObject)
                 .map_or(0, |group| group.count),
-            vacuumed,
+            vacuumed: false,
         })
     }
 
@@ -504,6 +542,10 @@ impl Store {
                 "a collection schedule retains this fire lineage; preview-delete the schedule first",
             ),
             (
+                "SELECT 'schedule:' || c.schedule_id FROM schedule_recovery_chunks c WHERE c.job_id IN (SELECT id FROM del_jobs) OR c.attempt_id IN (SELECT id FROM del_attempts) OR c.dataset_id IN (SELECT id FROM del_datasets) ORDER BY c.schedule_id,c.target_ms,c.chunk_index",
+                "a collection schedule retains this recovery lineage; preview-delete the schedule first",
+            ),
+            (
                 "SELECT 'schedule:' || s.id FROM collection_schedules s WHERE s.last_success_dataset_id IN (SELECT id FROM del_datasets) ORDER BY s.id",
                 "a collection schedule retains this last-success dataset; preview-delete the schedule first",
             ),
@@ -742,6 +784,7 @@ impl Store {
                 id IN (SELECT id FROM del_jobs)
                 OR id IN (SELECT job_id FROM research_suite_cases WHERE suite_id IN (SELECT id FROM del_suites) AND job_id IS NOT NULL)
                 OR id IN (SELECT job_id FROM schedule_fires WHERE schedule_id IN (SELECT id FROM del_schedules) AND job_id IS NOT NULL)
+                OR id IN (SELECT job_id FROM schedule_recovery_chunks WHERE schedule_id IN (SELECT id FROM del_schedules))
              ) ORDER BY id",
         ).map_err(sql_error)?;
         let rows = statement
@@ -775,16 +818,24 @@ impl Store {
             ),
             (
                 DeleteEntryKind::Job,
-                "SELECT COUNT(DISTINCT job_id) FROM schedule_fires WHERE schedule_id IN (SELECT id FROM del_schedules) AND job_id IS NOT NULL",
+                "SELECT COUNT(*) FROM (
+                    SELECT job_id FROM schedule_fires WHERE schedule_id IN (SELECT id FROM del_schedules) AND job_id IS NOT NULL
+                    UNION SELECT job_id FROM schedule_recovery_chunks WHERE schedule_id IN (SELECT id FROM del_schedules)
+                )",
             ),
             (
                 DeleteEntryKind::Attempt,
-                "SELECT COUNT(DISTINCT attempt_id) FROM schedule_fires WHERE schedule_id IN (SELECT id FROM del_schedules) AND attempt_id IS NOT NULL",
+                "SELECT COUNT(*) FROM (
+                    SELECT attempt_id FROM schedule_fires WHERE schedule_id IN (SELECT id FROM del_schedules) AND attempt_id IS NOT NULL
+                    UNION SELECT attempt_id FROM schedule_recovery_chunks WHERE schedule_id IN (SELECT id FROM del_schedules)
+                )",
             ),
             (
                 DeleteEntryKind::Dataset,
                 "SELECT COUNT(*) FROM (
                     SELECT dataset_id AS id FROM schedule_fires WHERE schedule_id IN (SELECT id FROM del_schedules) AND dataset_id IS NOT NULL
+                    UNION
+                    SELECT dataset_id FROM schedule_recovery_chunks WHERE schedule_id IN (SELECT id FROM del_schedules) AND dataset_id IS NOT NULL
                     UNION
                     SELECT last_success_dataset_id FROM collection_schedules WHERE id IN (SELECT id FROM del_schedules) AND last_success_dataset_id IS NOT NULL
                  )",

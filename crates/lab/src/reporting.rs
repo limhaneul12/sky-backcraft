@@ -7,6 +7,8 @@
 pub mod comparison;
 pub mod export;
 pub mod metrics;
+pub(crate) mod portfolio_projection;
+pub(crate) mod regime_projection;
 pub use comparison::build_comparisons;
 pub mod verify;
 

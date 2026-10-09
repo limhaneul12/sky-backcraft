@@ -117,6 +117,30 @@ pub enum CollectionScheduleStatus {
     Blocked,
 }
 
+/// Stable classification of the failure currently governing automatic
+/// schedule recovery. Absence means the schedule has no recovery failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleFailureClass {
+    Recoverable,
+    OperatorRequired,
+}
+
+/// Durable scheduler recovery lifecycle. This is independent from the owner
+/// pause status: pausing stops/cancels work while preserving the exact recovery
+/// checkpoint for a later resume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleRecoveryState {
+    Active,
+    Degraded,
+    RecoveryWait,
+    Probing,
+    Backfilling,
+    VerifyingFreshness,
+    OperatorRequired,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ScheduleFireStatus {
@@ -159,6 +183,14 @@ pub struct CollectionScheduleRecord {
     pub last_success_coverage: Option<UtcRange>,
     pub failure: Option<FailureRecord>,
     pub in_flight: Option<ScheduleFire>,
+    pub failure_class: Option<ScheduleFailureClass>,
+    pub recovery_state: ScheduleRecoveryState,
+    pub recovery_attempt_count: u32,
+    pub last_probe_at: Option<UtcTimestamp>,
+    pub last_recovery_at: Option<UtcTimestamp>,
+    pub pending_gap: Option<UtcRange>,
+    pub backfill_job_id: Option<JobId>,
+    pub next_recovery_at: Option<UtcTimestamp>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -209,6 +241,14 @@ pub struct CollectionFreshness {
     pub observed_at: UtcTimestamp,
     pub interval: CandleInterval,
     pub markets: Vec<MarketFreshness>,
+    pub failure_class: Option<ScheduleFailureClass>,
+    pub recovery_state: ScheduleRecoveryState,
+    pub recovery_attempt_count: u32,
+    pub last_probe_at: Option<UtcTimestamp>,
+    pub last_recovery_at: Option<UtcTimestamp>,
+    pub pending_gap: Option<UtcRange>,
+    pub backfill_job_id: Option<JobId>,
+    pub next_recovery_at: Option<UtcTimestamp>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

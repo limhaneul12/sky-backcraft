@@ -169,8 +169,11 @@ pub struct PortfolioFillRecord {
     pub notional: QuoteAmount,
     pub fee: QuoteAmount,
     pub fee_bps: BasisPoints,
-    /// Slippage/impact cost embedded in the fill price; never debited twice.
+    /// Slippage/impact cost embedded in the fill price; never debited twice (in KRW).
     pub price_cost: SignedAmount,
+    /// Per-unit price difference: rounded executed price minus decision close price (in KRW per base unit).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_difference_per_unit: Option<SignedAmount>,
     pub reserved_cash: QuoteAmount,
     pub decision_time: UtcTimestamp,
     pub execution_time: UtcTimestamp,

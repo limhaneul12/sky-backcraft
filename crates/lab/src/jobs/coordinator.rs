@@ -1,5 +1,7 @@
 //! The JobRuntime-owned producer loop never executes engine or network work.
 
+mod schedule_recovery;
+
 use super::JobService;
 use crate::contracts::{
     CollectionScheduleRecord, CollectionScheduleStatus, JobPayload, JobSubmission, LabError,
@@ -40,29 +42,33 @@ impl JobService {
     }
 
     async fn coordinate_once(&self, now: UtcTimestamp) -> Result<(), LabError> {
-        let schedules = self
+        let (schedules, reconciled_recovery) = self
             .inner
             .database
             .call("schedule_reconciliation", move |store| {
                 for id in store.collection_schedule_reconciliation_candidates(8)? {
                     store.reconcile_collection_schedule(&id, now)?;
                 }
-                store.due_collection_schedules(now, 8)
+                let recovery_ids = store.schedule_recovery_reconciliation_candidates(8)?;
+                let reconciled_recovery = !recovery_ids.is_empty();
+                for id in recovery_ids {
+                    store.reconcile_schedule_recovery(&id, now)?;
+                }
+                Ok((store.due_collection_schedules(now, 8)?, reconciled_recovery))
             })
             .await?;
-        // Scheduler self-heal: blocked schedules whose durable recovery
-        // backoff elapsed get one cheap source probe. Success resumes through
-        // the ordinary durable resume path; a still-dead network defers the
-        // next attempt with bounded exponential backoff.
+        if reconciled_recovery {
+            self.inner.wake.notify_one();
+        }
         let recoverable = self
             .inner
             .database
             .call("schedule_recovery_candidates", move |store| {
-                store.recovery_candidates(now, 4)
+                store.schedule_recovery_candidates(now, 4)
             })
             .await?;
         for record in recoverable {
-            self.recover_blocked_schedule(record, now).await;
+            self.recover_schedule(record, now).await;
         }
         let suites = self
             .inner
@@ -162,89 +168,6 @@ impl JobService {
                 .await?;
                 Ok(false)
             }
-        }
-    }
-
-    /// Probe one blocked schedule's source and recover it when the network
-    /// answers. Failures defer the next attempt durably; non-recoverable
-    /// probe errors leave the schedule blocked for operator action.
-    async fn recover_blocked_schedule(&self, record: CollectionScheduleRecord, now: UtcTimestamp) {
-        let Some(market) = record.request.markets.first().cloned() else {
-            return;
-        };
-        let probe = self
-            .inner
-            .upbit
-            .fetch_completed_candles(
-                &market,
-                record.request.interval,
-                crate::contracts::ProbeCount::try_from(1).unwrap_or_default(),
-                None,
-            )
-            .await;
-        let probe_class = match &probe {
-            Ok(_) => None,
-            Err(
-                error @ (LabError::NetworkUnavailable(_)
-                | LabError::RateLimited(_)
-                | LabError::TemporarilyBlocked(_)),
-            ) => Some(error.to_string().chars().take(200).collect::<String>()),
-            Err(error) => {
-                tracing::warn!(
-                    event = "schedule_recovery_probe_non_recoverable",
-                    schedule_id = %record.id,
-                    error = %error,
-                    outcome = "stays_blocked_for_operator"
-                );
-                return;
-            }
-        };
-        if let Some(reason) = probe_class {
-            let attempt = record
-                .in_flight
-                .as_ref()
-                .map_or(2_u32, |fire| fire.retry_count.saturating_add(1));
-            let id = record.id.clone();
-            let deferred = self
-                .inner
-                .database
-                .call("defer_schedule_recovery", move |store| {
-                    store.defer_recovery(&id, now, attempt)
-                })
-                .await;
-            match deferred {
-                Ok(()) => tracing::info!(
-                    event = "schedule_recovery_deferred",
-                    schedule_id = %record.id,
-                    reason = reason
-                ),
-                Err(error) => tracing::error!(
-                    event = "schedule_recovery_defer_failed",
-                    schedule_id = %record.id,
-                    error = %error
-                ),
-            }
-            return;
-        }
-        let id = record.id.clone();
-        let recovered = self
-            .inner
-            .database
-            .call("recover_collection_schedule", move |store| {
-                store.resume_collection_schedule(&id, now)
-            })
-            .await;
-        match recovered {
-            Ok(_) => tracing::info!(
-                event = "schedule_recovered",
-                schedule_id = %record.id,
-                outcome = "resumed_after_probe"
-            ),
-            Err(error) => tracing::warn!(
-                event = "schedule_recovery_resume_failed",
-                schedule_id = %record.id,
-                error = %error
-            ),
         }
     }
 

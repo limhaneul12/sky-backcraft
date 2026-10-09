@@ -2,8 +2,9 @@
 
 use crate::contracts::{
     CollectRequest, CollectionScheduleRecord, CollectionScheduleRequest, CollectionScheduleStatus,
-    FailureRecord, FreshnessPolicy, FreshnessState, LabError, RequestId, ScheduleId,
-    ScheduleRetryPolicy, SourceProbeResult, UtcRange, UtcTimestamp,
+    FailureRecord, FreshnessPolicy, FreshnessState, LabError, RequestId, ScheduleFailureClass,
+    ScheduleId, ScheduleRecoveryState, ScheduleRetryPolicy, SourceProbeResult, UtcRange,
+    UtcTimestamp,
 };
 use chrono::{DateTime, Duration, Utc};
 
@@ -42,7 +43,7 @@ pub struct FreshnessClassification {
 /// as a true gap once their own publication window has expired.
 #[allow(
     clippy::too_many_arguments,
-    reason = "one typed classification needs the boundary, lag, policy, probe and failure inputs"
+    reason = "one typed classification needs the boundary, lag, policy, probe, failure and next_action inputs"
 )]
 #[must_use]
 pub fn classify_market_freshness(
@@ -54,6 +55,7 @@ pub fn classify_market_freshness(
     policy: &FreshnessPolicy,
     probe: Option<&SourceProbeResult>,
     schedule_failure: Option<&FailureRecord>,
+    next_action_at: Option<UtcTimestamp>,
 ) -> FreshnessClassification {
     if let Some(failure) = schedule_failure {
         return FreshnessClassification {
@@ -67,7 +69,21 @@ pub fn classify_market_freshness(
             reason: "latest completed boundary covers the expected boundary".into(),
         };
     }
-    if probe.is_some_and(|probe| probe.source_has_boundary == Some(true)) {
+    let within_cycle = next_action_at.is_some_and(|next| observed_at < next);
+    let within_cycle_grace = next_action_at.is_some_and(|next| {
+        let grace = u64::from(policy.grace_seconds);
+        observed_at.0 <= next.0 + chrono::Duration::seconds(i64::try_from(grace).unwrap_or(0))
+    });
+    if let Some(probe) = probe
+        && probe.source_has_boundary == Some(true)
+    {
+        if within_cycle_grace {
+            return FreshnessClassification {
+                state: FreshnessState::WaitingForFinalization,
+                reason: "source exposes the expected boundary; awaiting scheduled collection cycle"
+                    .into(),
+            };
+        }
         return FreshnessClassification {
             state: FreshnessState::CollectorDelay,
             reason: "source exposes the expected boundary; the collector has not committed it"
@@ -90,13 +106,22 @@ pub fn classify_market_freshness(
     let historical_missing = consecutive_missing.saturating_sub(1);
     let oldest_historical_age =
         missing_for.saturating_add(historical_missing.saturating_mul(interval_seconds));
-    let consecutive_gap = historical_missing >= u64::from(policy.consecutive_gap_threshold)
+    let consecutive_gap = !within_cycle
+        && historical_missing >= u64::from(policy.consecutive_gap_threshold)
         && oldest_historical_age >= u64::from(policy.source_delay_seconds);
     if consecutive_gap {
         return FreshnessClassification {
             state: FreshnessState::TrueGap,
             reason: format!(
                 "{historical_missing} consecutive historical boundaries are absent past the source delay"
+            ),
+        };
+    }
+    if within_cycle {
+        return FreshnessClassification {
+            state: FreshnessState::WaitingForFinalization,
+            reason: format!(
+                "boundary is within the scheduled collection cycle ({historical_missing} bars pending collection)"
             ),
         };
     }
@@ -114,6 +139,19 @@ pub fn classify_market_freshness(
         reason: format!(
             "{historical_missing} consecutive historical boundaries are absent but below the gap threshold"
         ),
+    }
+}
+
+/// Classify a durable failure record by its stable error code. Codes outside
+/// the recoverable set are operator-required (fail closed, never retried
+/// into an infinite loop).
+#[must_use]
+pub fn classify_schedule_failure(failure: &FailureRecord) -> ScheduleFailureClass {
+    match failure.code.as_str() {
+        "NETWORK_UNAVAILABLE" | "RATE_LIMITED" | "TEMPORARILY_BLOCKED" => {
+            ScheduleFailureClass::Recoverable
+        }
+        _ => ScheduleFailureClass::OperatorRequired,
     }
 }
 
@@ -140,6 +178,14 @@ pub fn create_schedule(
         last_success_coverage: None,
         failure: None,
         in_flight: None,
+        failure_class: None,
+        recovery_state: ScheduleRecoveryState::Active,
+        recovery_attempt_count: 0,
+        last_probe_at: None,
+        last_recovery_at: None,
+        pending_gap: None,
+        backfill_job_id: None,
+        next_recovery_at: None,
     })
 }
 
@@ -153,6 +199,7 @@ pub fn schedule_tick(
     now: UtcTimestamp,
 ) -> Result<ScheduleTick, LabError> {
     if schedule.status != CollectionScheduleStatus::Active
+        || schedule.recovery_state != ScheduleRecoveryState::Active
         || schedule.in_flight.is_some()
         || now < schedule.next_action_at
     {
@@ -194,7 +241,7 @@ pub fn classify_failure_record(
 ) -> Result<ScheduleFailureAction, LabError> {
     let transient = matches!(
         failure.code.as_str(),
-        "NETWORK_UNAVAILABLE" | "RATE_LIMITED"
+        "NETWORK_UNAVAILABLE" | "RATE_LIMITED" | "TEMPORARILY_BLOCKED"
     );
     if !transient || completed_retries >= retry.max_retries {
         return Ok(ScheduleFailureAction::Block);
@@ -248,6 +295,105 @@ pub fn fire_request_id(schedule_id: &ScheduleId, boundary: UtcTimestamp) -> Requ
         schedule_id.as_str(),
         boundary.to_rfc3339()
     ))
+}
+
+/// Freeze the exact outage range. A never-successful schedule recovers the
+/// configured lookback; an established schedule starts at its last committed
+/// boundary so every completed candle after the outage is covered.
+///
+/// # Errors
+/// Returns invalid timestamp/range geometry.
+pub fn recovery_gap(
+    schedule: &CollectionScheduleRecord,
+    target: UtcTimestamp,
+) -> Result<Option<UtcRange>, LabError> {
+    let start = if let Some(last) = schedule.last_success_boundary {
+        last
+    } else {
+        UtcTimestamp(
+            target
+                .0
+                .checked_sub_signed(
+                    schedule
+                        .request
+                        .interval
+                        .duration()
+                        .checked_mul(i32::try_from(schedule.request.lookback_bars).map_err(
+                            |_| LabError::ResourceLimit("schedule lookback exceeds i32".into()),
+                        )?)
+                        .ok_or_else(|| {
+                            LabError::ResourceLimit("schedule recovery range overflow".into())
+                        })?,
+                )
+                .ok_or_else(|| {
+                    LabError::InvalidConfig("schedule recovery timestamp overflow".into())
+                })?,
+        )
+    };
+    if start >= target {
+        return Ok(None);
+    }
+    UtcRange::new(start, target).map(Some)
+}
+
+/// Build one bounded, content-stable recovery chunk. Repeated calls for the
+/// same schedule/target/index/generation produce the same ordinary job
+/// identity. Generation advances only after the immutable 32-attempt job
+/// history is exhausted.
+///
+/// # Errors
+/// Rejects invalid persisted geometry or arithmetic overflow.
+pub fn recovery_chunk_request(
+    schedule: &CollectionScheduleRecord,
+    target: UtcTimestamp,
+    next_start: UtcTimestamp,
+    chunk_index: u32,
+    generation: u32,
+) -> Result<CollectRequest, LabError> {
+    if next_start >= target {
+        return Err(LabError::InvalidConfig(
+            "recovery chunk start must precede target".into(),
+        ));
+    }
+    let width = schedule.request.interval.duration().num_seconds();
+    if width <= 0 {
+        return Err(LabError::InvalidConfig(
+            "schedule interval must be positive".into(),
+        ));
+    }
+    let market_count = i64::try_from(schedule.request.markets.len())
+        .map_err(|_| LabError::ResourceLimit("recovery market count overflow".into()))?;
+    let row_bars = i64::try_from(crate::contracts::MAX_DATASET_ROWS)
+        .map_err(|_| LabError::ResourceLimit("recovery row limit overflow".into()))?
+        / market_count;
+    let duration_bars = i64::try_from(crate::contracts::MAX_COLLECTION_EVALUATION_SECONDS)
+        .map_err(|_| LabError::ResourceLimit("recovery duration limit overflow".into()))?
+        / width;
+    let chunk_bars = row_bars.min(duration_bars).max(1);
+    let candidate_end = next_start
+        .0
+        .checked_add_signed(Duration::seconds(
+            width.checked_mul(chunk_bars).ok_or_else(|| {
+                LabError::ResourceLimit("recovery chunk duration overflow".into())
+            })?,
+        ))
+        .ok_or_else(|| LabError::InvalidConfig("recovery chunk end overflow".into()))?;
+    let end = UtcTimestamp(candidate_end.min(target.0));
+    let request_id = RequestId::from_seed(&format!(
+        "collection-schedule-recovery:{}:{}:{}:{}",
+        schedule.id.as_str(),
+        target.to_rfc3339(),
+        chunk_index,
+        generation
+    ));
+    Ok(CollectRequest {
+        request_id,
+        markets: schedule.request.markets.clone(),
+        range: UtcRange::new(next_start, end)?,
+        data_resolution: schedule.request.interval,
+        warmup_bars: 0,
+        completed_only: true,
+    })
 }
 
 fn lookback_range(

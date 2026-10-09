@@ -483,15 +483,9 @@ impl JobService {
                     )));
                 }
                 self.refuse_under_active_jobs().await?;
-                let mut batch = requests;
                 let outcomes = self
                     .admitted("hard_delete_batch", move |store| {
-                        let mut outcomes = Vec::with_capacity(batch.len());
-                        for request in batch.drain(..) {
-                            outcomes
-                                .push(store.execute_hard_delete(&request, UtcTimestamp::now())?);
-                        }
-                        Ok(outcomes)
+                        store.execute_hard_delete_batch(&requests, UtcTimestamp::now())
                     })
                     .await?;
                 Ok(StorageMaintenanceResult::HardDeleteBatch { outcomes })
@@ -540,13 +534,28 @@ impl JobService {
     }
 
     /// Checkpoint and compaction rewrite or fold the database file, so they
-    /// refuse while a compute job may hold long write transactions. Queued
-    /// jobs are fine: they have not claimed the single runner yet.
+    /// refuse while a compute job or collection task may hold write transactions.
     async fn refuse_under_active_jobs(&self) -> Result<(), LabError> {
         let status = self.status().await?;
-        if status.running_attempts > 0 || status.active_job_id.is_some() {
+        if status.running_attempts > 0
+            || status.queued_attempts > 0
+            || status.active_job_id.is_some()
+        {
             return Err(LabError::TemporarilyBlocked(
-                "ACTIVE_JOB: a compute job is running and may hold write transactions;                  retry storage maintenance after it finishes"
+                "ACTIVE_JOB: a compute or collection job is running or queued and may hold write transactions; retry storage maintenance after it finishes"
+                    .into(),
+            ));
+        }
+        let has_active_schedule_fires = self
+            .inner
+            .database
+            .call("check_active_schedule_fires", |store| {
+                store.has_active_schedule_fires()
+            })
+            .await?;
+        if has_active_schedule_fires {
+            return Err(LabError::TemporarilyBlocked(
+                "ACTIVE_SCHEDULE: a collection schedule fire is in-flight, queued, or waiting retry; retry storage maintenance after it finishes"
                     .into(),
             ));
         }

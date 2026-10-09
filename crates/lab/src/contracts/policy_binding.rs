@@ -38,18 +38,6 @@ impl StrategyBinding {
             Self::Policy { reference, .. } => Some(reference),
         }
     }
-    /// Return the exact warmup declared by this frozen strategy or policy revision.
-    ///
-    /// # Errors
-    /// Rejects a missing, mismatched or invalid frozen policy definition.
-    pub(crate) fn warmup_bars(&self, plan: &ResolvedPlan) -> Result<usize, LabError> {
-        match self {
-            Self::Legacy(spec) => spec.warmup_bars(),
-            Self::Policy { reference, family } => frozen_policy(plan, reference, *family)?
-                .definition
-                .warmup_bars(),
-        }
-    }
     /// Resolve only the immutable body embedded in this plan, never a registry head.
     /// # Errors
     /// Rejects missing, mismatched or altered frozen definitions.

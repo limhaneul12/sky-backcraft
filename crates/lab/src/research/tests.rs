@@ -274,7 +274,25 @@ fn causal_digest_excludes_terminal_decision_but_keeps_terminal_execution_bar() {
     let (mut plan, mut dataset) = causal_fixture();
     plan.spec.range = range("2024-01-01T00:00:00Z", "2024-01-01T08:00:00Z");
     plan.spec.decision_interval = CandleInterval::H4;
-    dataset.observations.extend([
+    let h4_observations = vec![
+        interval_observation(
+            "decision-h4-warmup-1",
+            CandleInterval::H4,
+            "2023-12-31T12:00:00Z",
+            "2023-12-31T16:00:00Z",
+        ),
+        interval_observation(
+            "decision-h4-warmup-2",
+            CandleInterval::H4,
+            "2023-12-31T16:00:00Z",
+            "2023-12-31T20:00:00Z",
+        ),
+        interval_observation(
+            "decision-h4-warmup-3",
+            CandleInterval::H4,
+            "2023-12-31T20:00:00Z",
+            "2024-01-01T00:00:00Z",
+        ),
         interval_observation(
             "decision-h4-first",
             CandleInterval::H4,
@@ -287,17 +305,34 @@ fn causal_digest_excludes_terminal_decision_but_keeps_terminal_execution_bar() {
             "2024-01-01T04:00:00Z",
             "2024-01-01T08:00:00Z",
         ),
-    ]);
-    let baseline = causal_input_digest(&plan, &[dataset.clone()], None).expect("baseline digest");
+    ];
+    let h4_id = crate::contracts::DatasetId::new("causal-h4-dataset").expect("H4 dataset id");
+    let mut h4_dataset = dataset.clone();
+    h4_dataset.manifest.id = h4_id.clone();
+    h4_dataset.manifest.request.request_id =
+        RequestId::new("causal-h4-collection").expect("H4 collection");
+    h4_dataset.manifest.request.data_resolution = CandleInterval::H4;
+    let h4_coverage = range("2023-12-31T12:00:00Z", "2024-01-01T08:00:00Z");
+    h4_dataset.manifest.request.range = h4_coverage;
+    h4_dataset.manifest.coverage = h4_coverage;
+    h4_dataset.manifest.row_count = 5;
+    h4_dataset.manifest.semantic_digest = ContentHash::of_bytes(b"causal-h4-semantic");
+    h4_dataset.manifest.provenance_digest = ContentHash::of_bytes(b"causal-h4-provenance");
+    h4_dataset.observations = h4_observations;
+    plan.spec.dataset_ids.push(h4_id.clone());
+    plan.dataset_digests
+        .push((h4_id, h4_dataset.manifest.semantic_digest.clone()));
+    let baseline = causal_input_digest(&plan, &[dataset.clone(), h4_dataset.clone()], None)
+        .expect("baseline digest");
 
-    dataset
+    h4_dataset
         .observations
         .iter_mut()
         .find(|observation| observation.id.as_str().contains("terminal-unused"))
         .expect("terminal decision")
         .content_digest = ContentHash::of_bytes(b"unused terminal decision changed");
-    let unused_changed =
-        causal_input_digest(&plan, &[dataset.clone()], None).expect("unused decision digest");
+    let unused_changed = causal_input_digest(&plan, &[dataset.clone(), h4_dataset.clone()], None)
+        .expect("unused decision digest");
     assert_eq!(baseline, unused_changed);
 
     dataset
@@ -309,8 +344,8 @@ fn causal_digest_excludes_terminal_decision_but_keeps_terminal_execution_bar() {
         })
         .expect("terminal execution bar")
         .content_digest = ContentHash::of_bytes(b"terminal execution changed");
-    let execution_changed =
-        causal_input_digest(&plan, &[dataset], None).expect("terminal execution digest");
+    let execution_changed = causal_input_digest(&plan, &[dataset, h4_dataset], None)
+        .expect("terminal execution digest");
     assert_ne!(baseline, execution_changed);
 }
 
@@ -325,6 +360,21 @@ fn legacy_causal_digest_remains_the_original_plan_input_digest() {
         causal_input_digest(&plan, &[], None).expect("legacy digest"),
         expected
     );
+}
+
+#[test]
+fn causal_digest_binds_blocked_admission_reason_without_unused_feed_inputs() {
+    let (mut plan, _) = causal_fixture();
+    for admission in &mut plan.admissions {
+        admission.status = AdmissionStatus::BlockedData;
+        admission.reasons = vec!["DATA_GAP: frozen fixture".into()];
+    }
+    let baseline = causal_input_digest(&plan, &[], None)
+        .expect("blocked models consume no observation stream");
+    plan.admissions[0].reasons = vec!["DATA_GAP: different frozen reason".into()];
+    let changed = causal_input_digest(&plan, &[], None)
+        .expect("blocked reason remains part of causal identity");
+    assert_ne!(baseline, changed);
 }
 
 #[test]

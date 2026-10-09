@@ -13,11 +13,12 @@ use crate::contracts::{
     CausalExecutionPolicy, CollectRequest, ContentHash, CostPolicy, DatasetId, DatasetManifest,
     DatasetSnapshot, DatasetStatus, DynamicCostKind, DynamicCostModel, EvidenceId, EvidenceImport,
     EvidenceProvenance, EvidencePurpose, EvidenceRevisionId, EvidenceUnavailablePolicy,
-    EvidenceVersion, ExecutionPolicy, HistoricalFeeSchedule, MarkKind, MarketDataOrigin, MarketId,
-    MarketRuleSnapshot, ModelAdmission, ModelId, ModelStatus, OrderStatus, PitPolicy, PlanId,
-    PriceKrw, QuoteAmount, ReasonCode, ReportClock, RequestId, ResolvedPlan, RuleProvenance,
-    RuleSnapshotId, RunId, SCHEMA_VERSION, Side, StateParameters, StrategyKind, StrategySpec,
-    TerminalPolicy, TickBand, UtcRange, UtcTimestamp, Weight, experiment_config_digest,
+    EvidenceVersion, ExecutionPolicy, HistoricalFeeSchedule, LabError, MarkKind, MarketDataOrigin,
+    MarketId, MarketRuleSnapshot, ModelAdmission, ModelId, ModelStatus, OrderStatus, PitPolicy,
+    PlanId, PriceKrw, QuoteAmount, ReasonCode, ReportClock, RequestId, ResolvedPlan,
+    RuleProvenance, RuleSnapshotId, RunId, SCHEMA_VERSION, Side, StateParameters, StrategyKind,
+    StrategySpec, TerminalPolicy, TickBand, UtcRange, UtcTimestamp, Weight,
+    experiment_config_digest,
 };
 use rust_decimal::Decimal;
 
@@ -1551,5 +1552,379 @@ fn dynamic_volatility_cost_uses_only_the_completed_liquidity_bar() {
     assert!(
         wide_fill.price.get() > decimal("100"),
         "prior-bar volatility raises the buy price"
+    );
+}
+
+fn mtf_m1_observations() -> Vec<CandleObservation> {
+    let origin = time("2025-01-01T00:00:00Z");
+    (0_i64..(51 * 60))
+        .map(|minute| {
+            let open_time = UtcTimestamp(origin.0 + chrono::Duration::minutes(minute));
+            let close = Decimal::from(100 + minute);
+            CandleObservation {
+                id: crate::contracts::ObservationId::from_seed(&format!("mtf-m1-{minute}")),
+                candle: CandleRecord {
+                    market: "KRW-BTC".into(),
+                    interval: CandleInterval::M1,
+                    open_time_utc: open_time,
+                    close_time_utc: UtcTimestamp(open_time.0 + chrono::Duration::minutes(1)),
+                    open: PriceKrw::new(close - Decimal::ONE).expect("open"),
+                    high: PriceKrw::new(close + Decimal::ONE).expect("high"),
+                    low: PriceKrw::new(close - Decimal::ONE).expect("low"),
+                    close: PriceKrw::new(close).expect("close"),
+                    volume: AssetQuantity::new(Decimal::from(10_000)).expect("volume"),
+                    quote_turnover: QuoteAmount::new(close * Decimal::from(10_000))
+                        .expect("turnover"),
+                    completed: true,
+                },
+                content_digest: ContentHash::of_bytes(format!("mtf-m1-{minute}").as_bytes()),
+                raw_object_ids: Vec::new(),
+                constituent_ids: Vec::new(),
+            }
+        })
+        .collect()
+}
+
+fn mtf_dataset(id: &str, observations: Vec<CandleObservation>) -> DatasetSnapshot {
+    let first = observations.first().expect("dataset is not empty");
+    let last = observations.last().expect("dataset is not empty");
+    let interval = first.candle.interval;
+    let coverage =
+        UtcRange::new(first.candle.open_time_utc, last.candle.close_time_utc).expect("coverage");
+    let semantic_digest = ContentHash::of_value(&observations).expect("semantic digest");
+    DatasetSnapshot {
+        manifest: DatasetManifest {
+            schema_version: SCHEMA_VERSION.into(),
+            id: DatasetId::new(id).expect("dataset id"),
+            request: CollectRequest {
+                request_id: RequestId::new(format!("request-{id}")).expect("request id"),
+                markets: vec![MarketId::parse_upbit("KRW-BTC").expect("market")],
+                range: coverage,
+                data_resolution: interval,
+                warmup_bars: 0,
+                completed_only: true,
+            },
+            coverage,
+            status: DatasetStatus::Ready,
+            row_count: observations.len() as u64,
+            normalizer_version: "fixture-v1".into(),
+            gap_policy: "FAIL_CLOSED".into(),
+            semantic_digest,
+            provenance_digest: ContentHash::of_bytes(format!("provenance-{id}").as_bytes()),
+            origin: MarketDataOrigin::SyntheticTestOnly,
+            raw_objects: Vec::new(),
+            quality_issues: Vec::new(),
+            reuse: None,
+        },
+        observations,
+    }
+}
+
+fn mtf_definition(reverse_declarations: bool) -> PolicyDefinition {
+    let mut indicators = vec![
+        PolicyIndicator {
+            id: "h1_ema20".into(),
+            indicator: PolicyIndicatorKind::Ema { window: 20 },
+            source_interval: Some(CandleInterval::H1),
+        },
+        PolicyIndicator {
+            id: "h1_ema50".into(),
+            indicator: PolicyIndicatorKind::Ema { window: 50 },
+            source_interval: Some(CandleInterval::H1),
+        },
+        PolicyIndicator {
+            id: "m15_rsi14".into(),
+            indicator: PolicyIndicatorKind::Rsi { window: 14 },
+            source_interval: Some(CandleInterval::M15),
+        },
+        PolicyIndicator {
+            id: "m5_close".into(),
+            indicator: PolicyIndicatorKind::Close,
+            source_interval: Some(CandleInterval::M5),
+        },
+        PolicyIndicator {
+            id: "m5_ema20".into(),
+            indicator: PolicyIndicatorKind::Ema { window: 20 },
+            source_interval: Some(CandleInterval::M5),
+        },
+    ];
+    if reverse_declarations {
+        indicators.reverse();
+    }
+    PolicyDefinition {
+        schema_version: "1.0".into(),
+        name: "h1_m15_m5_m1".into(),
+        description: "SYNTHETIC_TEST_ONLY".into(),
+        program: PolicyProgram::Rules {
+            program: RulesProgram {
+                indicators,
+                states: Vec::new(),
+                rules: vec![PolicyRule {
+                    id: "mtf_long".into(),
+                    condition: BoolExpr::And {
+                        conditions: vec![
+                            BoolExpr::Compare {
+                                comparison: CompareOp::Gt,
+                                left: NumericExpr::Indicator {
+                                    id: "h1_ema20".into(),
+                                },
+                                right: NumericExpr::Indicator {
+                                    id: "h1_ema50".into(),
+                                },
+                            },
+                            BoolExpr::Compare {
+                                comparison: CompareOp::Gt,
+                                left: NumericExpr::Indicator {
+                                    id: "m15_rsi14".into(),
+                                },
+                                right: NumericExpr::Constant { value: 50.0 },
+                            },
+                            BoolExpr::Compare {
+                                comparison: CompareOp::Gt,
+                                left: NumericExpr::Indicator {
+                                    id: "m5_close".into(),
+                                },
+                                right: NumericExpr::Indicator {
+                                    id: "m5_ema20".into(),
+                                },
+                            },
+                        ],
+                    },
+                    target: PolicyTarget::Weight {
+                        value: NumericExpr::Constant { value: 1.0 },
+                    },
+                }],
+                fallback: PolicyTarget::Weight {
+                    value: NumericExpr::Constant { value: 0.0 },
+                },
+                signal_expiry: PolicySignalExpiry::DecisionBars { bars: 1 },
+            },
+        },
+    }
+}
+
+fn run_mtf_layout(
+    native_sources: bool,
+    reverse_declarations: bool,
+) -> Result<
+    (
+        ResolvedPlan,
+        Vec<DatasetSnapshot>,
+        crate::contracts::ModelLedger,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let m1 = mtf_m1_observations();
+    let mut datasets = vec![mtf_dataset("dataset-mtf-m1", m1.clone())];
+    if native_sources {
+        for (interval, id) in [
+            (CandleInterval::M5, "dataset-mtf-m5"),
+            (CandleInterval::M15, "dataset-mtf-m15"),
+            (CandleInterval::H1, "dataset-mtf-h1"),
+        ] {
+            let mut native = crate::collection::resample(&m1, interval)?;
+            for (index, observation) in native.iter_mut().enumerate() {
+                observation.id = crate::contracts::ObservationId::from_seed(&format!(
+                    "native-{interval:?}-{index}"
+                ));
+                observation.content_digest = ContentHash::of_value(&observation.candle)?;
+                observation.constituent_ids.clear();
+            }
+            datasets.push(mtf_dataset(id, native));
+        }
+    }
+
+    let definition = mtf_definition(reverse_declarations);
+    let reference = PolicyRevisionRef {
+        policy_id: crate::contracts::PolicyId::new("policy-mtf-closure")?,
+        revision_id: crate::contracts::PolicyRevisionId::new(if reverse_declarations {
+            "policy-revision-mtf-reversed"
+        } else {
+            "policy-revision-mtf"
+        })?,
+        definition_digest: ContentHash::of_value(&definition)?,
+    };
+    let frozen = FrozenPolicyRevision {
+        reference: reference.clone(),
+        revision_number: 1,
+        parent_revision_id: None,
+        family: StrategyKind::Other,
+        origin: PolicyOrigin::Builtin,
+        definition,
+    };
+    let (base, _, _, _, _) = buy_and_hold_fixture();
+    let mut spec = base.spec;
+    spec.schema_version = "3.0".into();
+    spec.dataset_ids = datasets
+        .iter()
+        .map(|dataset| dataset.manifest.id.clone())
+        .collect();
+    spec.range = UtcRange::new(time("2025-01-03T02:00:00Z"), time("2025-01-03T03:00:00Z"))?;
+    spec.market_rules.valid_range = spec.range;
+    spec.strategies.clear();
+    spec.policy_selections = vec![reference];
+    spec.causal_execution = Some(CausalExecutionPolicy::DeclaredPolicyWarmup);
+    spec.capital_mode = Some(crate::contracts::CapitalMode::IndependentModels);
+    spec.decision_interval = CandleInterval::M1;
+    spec.execution_resolution = CandleInterval::M1;
+    let plan = crate::planning::resolve_with_policies(&spec, &datasets, None, &[frozen])?;
+    assert_eq!(plan.admissions.len(), 1);
+    assert_eq!(plan.admissions[0].status, AdmissionStatus::Eligible);
+    let run_id = RunId::from_seed(if native_sources {
+        "run-mtf-native"
+    } else {
+        "run-mtf-derived"
+    });
+    let ledger = run_model(
+        &plan,
+        &datasets,
+        None,
+        &run_id,
+        &plan.admissions[0],
+        100,
+        &|| false,
+    )?;
+    Ok((plan, datasets, ledger))
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one planner/runner fixture compares native and derived causal feeds, declaration ordering and rejected constituents"
+)]
+fn h1_m15_m5_policy_runs_on_m1_for_derived_and_native_layouts() {
+    let (derived_plan, derived_datasets, derived) =
+        run_mtf_layout(false, false).expect("derived M1 layout runs");
+    let (native_plan, native_datasets, native) =
+        run_mtf_layout(true, false).expect("native interval layout runs");
+    let (_, _, reordered) =
+        run_mtf_layout(false, true).expect("declaration order does not change output");
+    for ledger in [&derived, &native, &reordered] {
+        assert!(ledger.fills.iter().any(|fill| fill.side == Side::Buy));
+    }
+    for candidate in [&native, &reordered] {
+        assert_eq!(derived.fills.len(), candidate.fills.len());
+        for (expected, actual) in derived.fills.iter().zip(&candidate.fills) {
+            assert_eq!(expected.side, actual.side);
+            assert_eq!(expected.price, actual.price);
+            assert_eq!(expected.qty, actual.qty);
+        }
+    }
+
+    let h1_range = crate::policy_engine::source_causal_range(
+        derived_plan.spec.range,
+        CandleInterval::M1,
+        CandleInterval::H1,
+        50,
+    )
+    .expect("H1 causal range");
+    let market = &derived_plan.admissions[0].market;
+    let complete_h1 = crate::policy_engine::prepare_interval_bars(
+        &derived_datasets,
+        market,
+        CandleInterval::H1,
+        h1_range,
+    )
+    .expect("complete M1 constituents derive H1");
+    let mut gapped = derived_datasets.clone();
+    gapped[0].observations.remove(60);
+    assert!(matches!(
+        crate::policy_engine::prepare_interval_bars(&gapped, market, CandleInterval::H1, h1_range,),
+        Err(LabError::DataGap(_))
+    ));
+    let mut incomplete = derived_datasets.clone();
+    incomplete[0].observations[60].candle.completed = false;
+    assert!(
+        crate::policy_engine::prepare_interval_bars(
+            &incomplete,
+            market,
+            CandleInterval::H1,
+            h1_range,
+        )
+        .is_err()
+    );
+    let execution_range = derived_plan
+        .spec
+        .range
+        .with_warmup(1, CandleInterval::M1)
+        .expect("execution prefix range");
+    let mut missing_execution_prefix = derived_datasets.clone();
+    missing_execution_prefix[0]
+        .observations
+        .retain(|bar| bar.candle.open_time_utc != execution_range.start());
+    assert!(matches!(
+        crate::policy_engine::prepare_interval_bars(
+            &missing_execution_prefix,
+            market,
+            CandleInterval::M1,
+            execution_range,
+        ),
+        Err(LabError::DataGap(_))
+    ));
+    let mut with_future = derived_datasets.clone();
+    let mut future = with_future[0]
+        .observations
+        .last()
+        .expect("last M1 bar")
+        .clone();
+    future.candle.open_time_utc = derived_plan.spec.range.end();
+    future.candle.close_time_utc =
+        UtcTimestamp(derived_plan.spec.range.end().0 + chrono::Duration::minutes(1));
+    future.id = crate::contracts::ObservationId::from_seed("future-m1");
+    future.content_digest = ContentHash::of_bytes(b"future-m1");
+    with_future[0].observations.push(future);
+    assert_eq!(
+        complete_h1
+            .iter()
+            .map(|bar| &bar.content_digest)
+            .collect::<Vec<_>>(),
+        crate::policy_engine::prepare_interval_bars(
+            &with_future,
+            market,
+            CandleInterval::H1,
+            h1_range,
+        )
+        .expect("future rows stay outside the causal source range")
+        .iter()
+        .map(|bar| &bar.content_digest)
+        .collect::<Vec<_>>()
+    );
+
+    let baseline = crate::research::causal_input_digest(&native_plan, &native_datasets, None)
+        .expect("native source witness");
+    let mut changed_used = native_datasets.clone();
+    let used_h1 = changed_used
+        .iter_mut()
+        .find(|dataset| dataset.manifest.request.data_resolution == CandleInterval::H1)
+        .and_then(|dataset| {
+            dataset
+                .observations
+                .iter_mut()
+                .find(|bar| bar.candle.close_time_utc == native_plan.spec.range.start())
+        })
+        .expect("used H1 source bar");
+    used_h1.content_digest = ContentHash::of_bytes(b"changed-used-native-h1");
+    assert_ne!(
+        baseline,
+        crate::research::causal_input_digest(&native_plan, &changed_used, None)
+            .expect("changed source witness")
+    );
+
+    let mut changed_future = native_datasets;
+    let future_h1 = changed_future
+        .iter_mut()
+        .find(|dataset| dataset.manifest.request.data_resolution == CandleInterval::H1)
+        .and_then(|dataset| {
+            dataset
+                .observations
+                .iter_mut()
+                .find(|bar| bar.candle.open_time_utc >= native_plan.spec.range.start())
+        })
+        .expect("future H1 source bar");
+    future_h1.content_digest = ContentHash::of_bytes(b"changed-future-native-h1");
+    assert_eq!(
+        baseline,
+        crate::research::causal_input_digest(&native_plan, &changed_future, None)
+            .expect("future source stays outside witness")
     );
 }

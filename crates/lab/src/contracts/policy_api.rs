@@ -27,6 +27,18 @@ pub enum PolicyWrite {
         family: StrategyKind,
         template: StrategySpec,
         mode: super::ParameterSweepMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        research: Option<super::SweepResearchContext>,
+    },
+    /// Calculate candidate and optional research-suite resource counts without
+    /// creating policy revisions.
+    Preflight {
+        request_id: RequestId,
+        family: StrategyKind,
+        template: StrategySpec,
+        mode: super::ParameterSweepMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        research: Option<super::SweepResearchContext>,
     },
 }
 

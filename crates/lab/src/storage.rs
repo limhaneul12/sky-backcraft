@@ -53,17 +53,17 @@ const META_FILE: &str = "metadata.json";
 const OWNER_LOCK_FILE: &str = ".lab-owner.lock";
 pub const MAX_RAW_OBJECT_BYTES: usize = 1024 * 1024;
 pub const MAX_COLLECTION_BYTES: u64 = 64 * 1024 * 1024;
-pub const MAX_DATA_ROOT_BYTES: u64 = 1024 * 1024 * 1024;
+pub const MAX_DATA_ROOT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const MAX_EXPORT_RESERVATION_BYTES: u64 = 193 * 1024 * 1024;
-const MAX_DATABASE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_DATABASE_BYTES: u64 = 1024 * 1024 * 1024;
 const DATABASE_WAL_HEADROOM_BYTES: u64 = 260 * 1024 * 1024;
 const DATABASE_PAGE_BYTES: i64 = 4_096;
 const WAL_AUTOCHECKPOINT_PAGES: i64 = 1_000;
 const WAL_JOURNAL_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
 /// Effective-utilization percent at which submissions log a pressure warning.
-const DB_SOFT_PRESSURE_PERCENT: u64 = 85;
+const DB_SOFT_PRESSURE_PERCENT: u64 = 95;
 /// Effective-utilization percent at which mutating submissions are refused.
-const DB_HARD_PRESSURE_PERCENT: u64 = 95;
+const DB_HARD_PRESSURE_PERCENT: u64 = 96;
 /// WAL size at which submissions are refused until an explicit checkpoint.
 const WAL_PRESSURE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_PAGE_OBSERVATIONS: usize = 200;

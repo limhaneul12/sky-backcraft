@@ -60,32 +60,67 @@ fn bar(index: usize, close: &str) -> CandleObservation {
 }
 
 #[test]
-fn warmup_produces_no_label_and_replay_is_deterministic() {
+fn warmup_produces_explicit_unknown_and_replay_is_deterministic() {
     let mut rising = classifier();
     let mut labels = Vec::new();
     for index in 0..8 {
         let observation = rising
             .observe(&bar(index, &(100 + index).to_string()), CandleInterval::H1)
-            .expect("bars observe");
+            .expect("bars observe")
+            .expect("every completed bar has a regime observation");
         if index < 7 {
-            assert!(observation.is_none(), "bar {index} is inside warmup");
+            assert_eq!(observation.regime, RegimeLabel::Unknown);
+            assert!(observation.features.is_none(), "warmup features are absent");
         } else {
-            let observation = observation.expect("warmup complete");
             assert_eq!(observation.regime, RegimeLabel::TrendUp);
+            assert!(observation.features.is_some());
             assert_eq!(observation.classifier_revision, "test-rule-v1");
-            labels.push(observation);
         }
+        labels.push(observation);
     }
     // Identical input replay produces identical observations.
     let mut replay = classifier();
-    for index in 0..8 {
-        if let Some(observation) = replay
+    for (index, expected) in labels.iter().enumerate() {
+        let observation = replay
             .observe(&bar(index, &(100 + index).to_string()), CandleInterval::H1)
             .expect("bars observe")
-        {
-            assert_eq!(observation, labels[0]);
-        }
+            .expect("warmup and classified labels remain explicit");
+        assert_eq!(&observation, expected);
     }
+}
+
+#[test]
+fn observation_identity_binds_every_classifier_parameter_and_bar_content() {
+    let source = bar(0, "100");
+    let baseline = classifier()
+        .observe(&source, CandleInterval::H1)
+        .expect("observe")
+        .expect("explicit unknown");
+    let mut changed_spec = spec();
+    changed_spec.atr_lookback = 4;
+    let changed_parameter = RegimeClassifier::new(
+        changed_spec,
+        market(),
+        ContentHash::of_bytes(b"regime-test-dataset"),
+    )
+    .observe(&source, CandleInterval::H1)
+    .expect("observe")
+    .expect("explicit unknown");
+    assert_ne!(
+        baseline.causal_input_digest,
+        changed_parameter.causal_input_digest
+    );
+
+    let mut changed_bar = source;
+    changed_bar.content_digest = ContentHash::of_bytes(b"different-candle-content");
+    let changed_content = classifier()
+        .observe(&changed_bar, CandleInterval::H1)
+        .expect("observe")
+        .expect("explicit unknown");
+    assert_ne!(
+        baseline.causal_input_digest,
+        changed_content.causal_input_digest
+    );
 }
 
 #[test]

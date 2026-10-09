@@ -289,15 +289,18 @@ fn cross_interval_indicator_sources_fail_closed_until_multi_timeframe_ships() {
         fallback: PolicyTarget::Hold,
         signal_expiry: PolicySignalExpiry::EndOfRange,
     });
-    // The evaluator must refuse a different source interval instead of
-    // silently reading decision-interval bars.
-    assert!(matches!(
-        RulesEvaluator::new(&policy, market(), CandleInterval::H1),
-        Err(LabError::InvalidConfig(message))
-            if message.contains("multi-timeframe indicator sources")
-    ));
-    // Same-interval declaration stays allowed (explicit decision stream).
-    let mut same = definition(RulesProgram {
+    // The evaluator accepts cross-interval declarations and runs them from a
+    // separate causal source stream (fed via observe_source).
+    let mut evaluator =
+        RulesEvaluator::new(&policy, market(), CandleInterval::H1).expect("policy compiles");
+    assert_eq!(evaluator.source_indicators().len(), 1);
+    assert_eq!(evaluator.warmup_bars, 1);
+    assert_eq!(
+        policy.source_requirements(CandleInterval::H1),
+        vec![(CandleInterval::H4, 20)]
+    );
+    // Same-interval declaration is an explicit decision-stream indicator.
+    let same = definition(RulesProgram {
         indicators: vec![PolicyIndicator {
             id: "ema".into(),
             indicator: PolicyIndicatorKind::Ema { window: 20 },
@@ -308,6 +311,184 @@ fn cross_interval_indicator_sources_fail_closed_until_multi_timeframe_ships() {
         fallback: PolicyTarget::Hold,
         signal_expiry: PolicySignalExpiry::EndOfRange,
     });
-    assert!(RulesEvaluator::new(&same, market(), CandleInterval::H1).is_ok());
-    let _ = &mut same;
+    let same_evaluator = RulesEvaluator::new(&same, market(), CandleInterval::H1)
+        .expect("same-interval source is the decision stream");
+    assert!(same_evaluator.source_indicators().is_empty());
+
+    // Unknown ids and decision-stream ids are rejected on the source feed.
+    let bar = observation(0, 80);
+    assert!(matches!(
+        evaluator.observe_source("missing", &bar),
+        Err(LabError::InvalidConfig(_))
+    ));
+    assert!(matches!(
+        same_evaluator.clone().observe_source("ema", &bar),
+        Err(LabError::InvalidConfig(_))
+    ));
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one hand-computed multi-timeframe journey proves causal feed, values and gating"
+)]
+fn cross_interval_source_feed_is_causal_deterministic_and_leak_free()
+-> Result<(), Box<dyn std::error::Error>> {
+    // Multi-timeframe policy: an M1 decision stream gates on H1 EMAs fed
+    // from a separate causal source stream.
+    let policy = definition(RulesProgram {
+        indicators: vec![
+            PolicyIndicator {
+                id: "h1_ema_fast".into(),
+                indicator: PolicyIndicatorKind::Ema { window: 2 },
+                source_interval: Some(CandleInterval::H1),
+            },
+            PolicyIndicator {
+                id: "h1_ema_slow".into(),
+                indicator: PolicyIndicatorKind::Ema { window: 4 },
+                source_interval: Some(CandleInterval::H1),
+            },
+        ],
+        states: vec![],
+        rules: vec![PolicyRule {
+            id: "regime_long".into(),
+            condition: BoolExpr::Compare {
+                comparison: CompareOp::Gt,
+                left: NumericExpr::Indicator {
+                    id: "h1_ema_fast".into(),
+                },
+                right: NumericExpr::Indicator {
+                    id: "h1_ema_slow".into(),
+                },
+            },
+            target: PolicyTarget::Weight {
+                value: NumericExpr::Constant { value: 1.0 },
+            },
+        }],
+        fallback: PolicyTarget::Hold,
+        signal_expiry: PolicySignalExpiry::EndOfRange,
+    });
+    let mut evaluator =
+        RulesEvaluator::new(&policy, market(), CandleInterval::M1).expect("policy compiles");
+    assert_eq!(evaluator.source_indicators().len(), 2);
+
+    // H1 source bars: a ramp then a drop. The decision stream is contiguous
+    // M1 bars; decision k closes at minute k+1, so the H1 bar covering hour h
+    // closes exactly at decision k = 60*(h+1)-1.
+    let path = [80_i64, 82, 84, 86, 88, 90, 70, 66];
+    let h1_bars: Vec<CandleObservation> = path
+        .iter()
+        .enumerate()
+        .map(|(index, close)| {
+            let mut bar = observation(index.try_into().expect("index"), *close);
+            bar.candle.interval = CandleInterval::H1;
+            bar
+        })
+        .collect();
+    let decision_count = path.len() * 60;
+    let decisions: Vec<CandleObservation> = (0..decision_count)
+        .map(|minute| {
+            let mut bar = observation(
+                i64::try_from(minute).expect("minute"),
+                i64::try_from(100 + minute % 7).expect("close"),
+            );
+            bar.candle.interval = CandleInterval::M1;
+            bar.candle.open_time_utc = UtcTimestamp(
+                Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0)
+                    .single()
+                    .expect("time")
+                    + Duration::minutes(i64::try_from(minute).expect("minute")),
+            );
+            bar.candle.close_time_utc =
+                UtcTimestamp(bar.candle.open_time_utc.0 + Duration::minutes(1));
+            bar
+        })
+        .collect();
+
+    let mut source_index = 0_usize;
+    let mut targets: Vec<Option<Decimal>> = Vec::new();
+    let mut fast_values: Vec<f64> = Vec::new();
+    for bar in &decisions {
+        while source_index < h1_bars.len()
+            && h1_bars[source_index].candle.close_time_utc <= bar.candle.close_time_utc
+        {
+            evaluator.observe_source("h1_ema_fast", &h1_bars[source_index])?;
+            evaluator.observe_source("h1_ema_slow", &h1_bars[source_index])?;
+            source_index += 1;
+        }
+        if let Some(evaluation) = evaluator.observe(bar, cash(), None)? {
+            targets.push(Some(evaluation.target.get()));
+            fast_values.push(
+                evaluation
+                    .indicator_values
+                    .iter()
+                    .find(|value| value.id == "h1_ema_fast")
+                    .expect("fast value present")
+                    .value,
+            );
+        } else {
+            targets.push(none_target());
+            fast_values.push(f64::NAN);
+        }
+    }
+    // Hand-computed boundaries: EMA2 over the H1 closes seeds at bar 1
+    // (values 81, 83, 85, 87, 89, 76.33, 69.44); EMA4 seeds at bar 3 (83,
+    // 85, 87, 80.2, 74.52). The H1 bar for hour h is fed at decision
+    // k = 60*(h+1)-1, so decisions before k=239 are unready.
+    for (k, target) in targets.iter().enumerate().take(239) {
+        assert_eq!(*target, none_target(), "decision {k} awaits source warmup");
+    }
+    // Fast 85 > slow 83 at the first warm decision.
+    assert_eq!(targets[239], Some(Decimal::ONE));
+    assert!((fast_values[239] - 85.0).abs() < 1e-9);
+    for target in targets.iter().take(419).skip(240) {
+        assert_eq!(*target, Some(Decimal::ONE), "ramp keeps the gate on");
+    }
+    // The drop bar (70) feeds at k=419: fast 76.33 < slow 80.2 -> fallback 0.
+    assert_eq!(targets[419], Some(Decimal::ZERO));
+    assert!((fast_values[419] - 76.333_333_333).abs() < 1e-6);
+    for target in targets.iter().skip(420) {
+        assert_eq!(*target, Some(Decimal::ZERO));
+    }
+    // Strict causal feed: all eight H1 bars were consumed by the last minute.
+    assert_eq!(source_index, h1_bars.len());
+    // After the final drop bar (66): fast 69.44 < slow 74.52.
+    assert!((fast_values[479] - 69.444_444_444).abs() < 1e-6);
+
+    // Misfed bars fail closed: regressions, foreign intervals, incomplete bars.
+    assert!(matches!(
+        evaluator.observe_source("h1_ema_fast", &h1_bars[3]),
+        Err(LabError::DataGap(_))
+    ));
+    let mut foreign = h1_bars[3].clone();
+    foreign.candle.interval = CandleInterval::M5;
+    assert!(matches!(
+        evaluator.observe_source("h1_ema_fast", &foreign),
+        Err(LabError::DataGap(_))
+    ));
+    let mut incomplete = h1_bars[3].clone();
+    incomplete.candle.completed = false;
+    assert!(matches!(
+        evaluator.observe_source("h1_ema_fast", &incomplete),
+        Err(LabError::DataGap(_))
+    ));
+
+    // Determinism: an identical replay produces identical values.
+    let mut replay = RulesEvaluator::new(&policy, market(), CandleInterval::M1)?;
+    let mut replay_source = 0_usize;
+    for bar in &decisions {
+        while replay_source < h1_bars.len()
+            && h1_bars[replay_source].candle.close_time_utc <= bar.candle.close_time_utc
+        {
+            replay.observe_source("h1_ema_fast", &h1_bars[replay_source])?;
+            replay.observe_source("h1_ema_slow", &h1_bars[replay_source])?;
+            replay_source += 1;
+        }
+    }
+    assert_eq!(replay.cross_latest, evaluator.cross_latest);
+    Ok(())
+}
+
+fn none_target() -> Option<Decimal> {
+    None
 }

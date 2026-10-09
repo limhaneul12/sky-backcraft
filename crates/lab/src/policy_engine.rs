@@ -8,8 +8,8 @@ use crate::contracts::policy::{
     PolicyIndicator, PolicyIndicatorKind, PolicyProgram, PolicyTarget, PolicyTrace, RulesProgram,
 };
 use crate::contracts::{
-    CandleInterval, CandleObservation, IndicatorSnapshot, LabError, MarketId, PositionState,
-    ReasonCode, ResolvedPlan, StrategyBinding, UtcTimestamp, Weight,
+    CandleInterval, CandleObservation, DatasetSnapshot, IndicatorSnapshot, LabError, MarketId,
+    PositionState, ReasonCode, ResolvedPlan, StrategyBinding, UtcRange, UtcTimestamp, Weight,
 };
 use crate::evidence::EvidenceEvaluator;
 use crate::strategy::indicators::{Ema, RollingExtreme, RollingVol, Rsi, Sma, finite};
@@ -31,13 +31,11 @@ pub(crate) struct RuleEvaluation {
 pub(crate) struct PolicyEvaluator {
     binding: StrategyBinding,
     inner: CompiledPolicy,
+    decision_interval: CandleInterval,
+    decision_warmup_bars: usize,
 }
 
 #[derive(Debug, Clone)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "one inline evaluator per active model avoids a heap allocation; no collection of this enum"
-)]
 enum CompiledPolicy {
     Builtin(StrategyEvaluator),
     Rules(RulesEvaluator),
@@ -51,6 +49,22 @@ impl PolicyEvaluator {
         interval: CandleInterval,
     ) -> Result<Self, LabError> {
         let program = binding.program(plan)?;
+        let decision_warmup_bars = match &program {
+            PolicyProgram::Builtin { strategy } => strategy.warmup_bars()?,
+            PolicyProgram::Rules { .. } => {
+                let reference = binding.policy_ref().ok_or_else(|| {
+                    LabError::InputHashMismatch("RULES policy lacks a frozen revision".into())
+                })?;
+                plan.policy_revisions
+                    .iter()
+                    .find(|revision| revision.reference == *reference)
+                    .ok_or_else(|| {
+                        LabError::InputHashMismatch("RULES policy revision is not frozen".into())
+                    })?
+                    .definition
+                    .decision_warmup_bars(interval)?
+            }
+        };
         let inner = match program {
             PolicyProgram::Builtin { strategy } => {
                 CompiledPolicy::Builtin(StrategyEvaluator::new(strategy, market, interval)?)
@@ -70,7 +84,12 @@ impl PolicyEvaluator {
                 CompiledPolicy::Rules(RulesEvaluator::new(definition, market, interval)?)
             }
         };
-        Ok(Self { binding, inner })
+        Ok(Self {
+            binding,
+            inner,
+            decision_interval: interval,
+            decision_warmup_bars,
+        })
     }
 
     pub(crate) fn observe(
@@ -95,6 +114,52 @@ impl PolicyEvaluator {
                 .observe(observation, position, evidence)?
                 .map(|evaluation| rule_strategy_evaluation(policy_ref, evaluation, position))
                 .transpose(),
+        }
+    }
+
+    /// Cross-interval indicator sources: `(indicator id, interval, kind
+    /// warmup)` triples whose stream differs from the decision interval.
+    pub(crate) fn source_indicators(&self) -> Vec<(String, CandleInterval, usize)> {
+        match &self.inner {
+            CompiledPolicy::Builtin(_) => Vec::new(),
+            CompiledPolicy::Rules(evaluator) => evaluator.source_indicators(),
+        }
+    }
+
+    pub(crate) fn source_requirements(&self) -> Vec<(CandleInterval, usize)> {
+        let mut requirements = Vec::<(CandleInterval, usize)>::new();
+        for (_, interval, warmup) in self.source_indicators() {
+            if let Some((_, current)) = requirements
+                .iter_mut()
+                .find(|(candidate, _)| *candidate == interval)
+            {
+                *current = (*current).max(warmup);
+            } else {
+                requirements.push((interval, warmup));
+            }
+        }
+        requirements.sort_by_key(|(interval, _)| interval.duration().num_seconds());
+        requirements
+    }
+
+    pub(crate) fn decision_warmup_bars(&self) -> usize {
+        self.decision_warmup_bars
+    }
+
+    /// Feed one completed source bar to one cross-interval indicator.
+    /// # Errors
+    /// Propagates evaluator validation failures; builtin strategies never
+    /// declare source intervals, so feeding them is a contract error.
+    pub(crate) fn observe_source(
+        &mut self,
+        id: &str,
+        observation: &CandleObservation,
+    ) -> Result<(), LabError> {
+        match &mut self.inner {
+            CompiledPolicy::Builtin(_) => Err(LabError::InvalidConfig(
+                "builtin strategies have no cross-interval indicator sources".into(),
+            )),
+            CompiledPolicy::Rules(evaluator) => evaluator.observe_source(id, observation),
         }
     }
 
@@ -125,6 +190,318 @@ impl PolicyEvaluator {
             })?;
         Ok(expiry.min(range_end))
     }
+}
+
+/// Bounded incremental cross-interval feed: per-interval cursors over the
+/// frozen causal source bars. Feeding is O(new bars per decision), never a
+/// full history reaggregation.
+#[derive(Debug)]
+pub(crate) struct CrossIntervalFeed {
+    /// One bounded causal bar list per declared source interval (at most a
+    /// handful of intervals, hence a small association vec, not a map).
+    bars: Vec<(CandleInterval, Vec<CandleObservation>)>,
+    cursors: Vec<(String, usize)>,
+}
+
+impl CrossIntervalFeed {
+    /// Load the causal source bars for every cross-interval indicator of one
+    /// compiled policy. Absent when the policy is single-interval.
+    /// # Errors
+    /// Rejects missing, gapped or incomplete source bars for a declared
+    /// source interval (fail closed; never interpolated).
+    pub(crate) fn new(
+        evaluator: &PolicyEvaluator,
+        datasets: &[DatasetSnapshot],
+        market: &MarketId,
+        range: crate::contracts::UtcRange,
+    ) -> Result<Self, LabError> {
+        let mut bars: Vec<(CandleInterval, Vec<CandleObservation>)> = Vec::new();
+        for (interval, kind_warmup) in evaluator.source_requirements() {
+            let causal_range =
+                source_causal_range(range, evaluator.decision_interval, interval, kind_warmup)?;
+            let loaded = prepare_interval_bars(
+                datasets,
+                market,
+                interval,
+                SourceWindow::declared_warmup(causal_range, range.start()),
+            )?;
+            bars.push((interval, loaded));
+        }
+        let cursors = evaluator
+            .source_indicators()
+            .into_iter()
+            .map(|(id, _, _)| (id, 0_usize))
+            .collect();
+        Ok(Self { bars, cursors })
+    }
+
+    /// Feed every source bar that closed at or before `decision_time` to its
+    /// indicator. `source_bar.close_time <= decision_time` is the strict
+    /// causal alignment invariant.
+    /// # Errors
+    /// Propagates evaluator validation failures.
+    pub(crate) fn feed_until(
+        &mut self,
+        evaluator: &mut PolicyEvaluator,
+        decision_time: crate::contracts::UtcTimestamp,
+    ) -> Result<(), LabError> {
+        for (id, interval, _kind_warmup) in evaluator.source_indicators() {
+            let Some((_, bars)) = self.bars.iter().find(|(declared, _)| *declared == interval)
+            else {
+                continue;
+            };
+            let start = self
+                .cursors
+                .iter()
+                .find(|(indicator, _)| *indicator == id)
+                .map_or(0_usize, |(_, cursor)| *cursor);
+            for bar in bars.iter().skip(start) {
+                if bar.candle.close_time_utc > decision_time {
+                    break;
+                }
+                evaluator.observe_source(&id, bar)?;
+                if let Some((_, cursor)) = self
+                    .cursors
+                    .iter_mut()
+                    .find(|(indicator, _)| *indicator == id)
+                {
+                    *cursor += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn source_causal_range(
+    range: UtcRange,
+    decision_interval: CandleInterval,
+    source_interval: CandleInterval,
+    warmup_bars: usize,
+) -> Result<UtcRange, LabError> {
+    let warmup = i64::try_from(warmup_bars)
+        .map_err(|_| LabError::ResourceLimit("source warmup overflow".into()))?;
+    let last_decision = range
+        .end()
+        .0
+        .checked_sub_signed(decision_interval.duration())
+        .ok_or_else(|| LabError::InvalidConfig("decision range underflow".into()))?;
+    let source_seconds = source_interval.duration().num_seconds();
+    let first_source_close_seconds = range
+        .start()
+        .0
+        .timestamp()
+        .div_euclid(source_seconds)
+        .checked_mul(source_seconds)
+        .ok_or_else(|| LabError::InvalidConfig("source boundary overflow".into()))?;
+    let warmup_seconds = source_seconds
+        .checked_mul(warmup)
+        .ok_or_else(|| LabError::InvalidConfig("source warmup overflow".into()))?;
+    let source_start_seconds = first_source_close_seconds
+        .checked_sub(warmup_seconds)
+        .ok_or_else(|| LabError::InvalidConfig("source warmup underflow".into()))?;
+    let source_end_seconds = last_decision
+        .timestamp()
+        .div_euclid(source_seconds)
+        .checked_mul(source_seconds)
+        .ok_or_else(|| LabError::InvalidConfig("source boundary overflow".into()))?;
+    let source_end = chrono::DateTime::from_timestamp(source_end_seconds, 0)
+        .map(UtcTimestamp)
+        .ok_or_else(|| LabError::InvalidConfig("source boundary is not representable".into()))?;
+    let source_start = chrono::DateTime::from_timestamp(source_start_seconds, 0)
+        .map(UtcTimestamp)
+        .ok_or_else(|| LabError::InvalidConfig("source warmup is not representable".into()))?;
+    UtcRange::new(source_start, source_end).map_err(|error| {
+        LabError::InsufficientWarmup(format!(
+            "source interval {source_interval:?} has no completed bar before the final decision: {error}"
+        ))
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SourceWindow {
+    Complete(UtcRange),
+    DeclaredWarmup {
+        range: UtcRange,
+        evaluation_start: UtcTimestamp,
+    },
+}
+
+impl SourceWindow {
+    pub(crate) fn declared_warmup(range: UtcRange, evaluation_start: UtcTimestamp) -> Self {
+        Self::DeclaredWarmup {
+            range,
+            evaluation_start,
+        }
+    }
+
+    fn range(self) -> UtcRange {
+        match self {
+            Self::Complete(range) | Self::DeclaredWarmup { range, .. } => range,
+        }
+    }
+
+    fn missing_leading_bar(self) -> LabError {
+        match self {
+            Self::DeclaredWarmup {
+                range,
+                evaluation_start,
+            } if range.start() < evaluation_start => LabError::InsufficientWarmup(
+                "source window starts after the declared warmup boundary".into(),
+            ),
+            Self::Complete(_) | Self::DeclaredWarmup { .. } => {
+                LabError::DataGap("source window starts after its required boundary".into())
+            }
+        }
+    }
+}
+
+impl From<UtcRange> for SourceWindow {
+    fn from(range: UtcRange) -> Self {
+        Self::Complete(range)
+    }
+}
+
+/// Resolve one complete immutable interval stream. Exact native observations
+/// take precedence. When absent, the closest divisible finer stream is
+/// resampled through the collection authority using fixed UTC buckets and all
+/// constituents. The selected path is validated against the actual rows, not
+/// only manifest coverage.
+pub(crate) fn prepare_interval_bars(
+    datasets: &[DatasetSnapshot],
+    market: &MarketId,
+    target: CandleInterval,
+    window: impl Into<SourceWindow>,
+) -> Result<Vec<CandleObservation>, LabError> {
+    let window = window.into();
+    let range = window.range();
+    let exact = collect_interval_rows(datasets, market, target, range);
+    let native_declared = datasets.iter().any(|dataset| {
+        dataset.manifest.request.data_resolution == target
+            && dataset.manifest.request.markets.contains(market)
+    });
+    if native_declared {
+        reject_quality_issues(datasets, market, target, range)?;
+        validate_interval_bars(&exact, market, target, window)?;
+        return Ok(exact);
+    }
+
+    let target_seconds = target.duration().num_seconds();
+    let mut finer = datasets
+        .iter()
+        .flat_map(|dataset| dataset.observations.iter())
+        .filter(|row| row.candle.market == market.code())
+        .map(|row| row.candle.interval)
+        .filter(|interval| {
+            let seconds = interval.duration().num_seconds();
+            seconds < target_seconds && target_seconds % seconds == 0
+        })
+        .collect::<Vec<_>>();
+    finer.sort_by_key(|interval| interval.duration().num_seconds());
+    finer.dedup();
+    let source = finer.pop().ok_or_else(|| {
+        LabError::DataGap(format!(
+            "no native {target:?} or divisible finer observations for {market}"
+        ))
+    })?;
+    reject_quality_issues(datasets, market, source, range)?;
+    let source_rows = collect_interval_rows(datasets, market, source, range);
+    validate_interval_bars(&source_rows, market, source, window)?;
+    let derived = crate::collection::resample(&source_rows, target)?;
+    validate_interval_bars(&derived, market, target, window)?;
+    Ok(derived)
+}
+
+fn reject_quality_issues(
+    datasets: &[DatasetSnapshot],
+    market: &MarketId,
+    interval: CandleInterval,
+    range: UtcRange,
+) -> Result<(), LabError> {
+    if datasets.iter().any(|dataset| {
+        dataset.manifest.request.data_resolution == interval
+            && dataset.manifest.request.markets.contains(market)
+            && dataset.manifest.quality_issues.iter().any(|issue| {
+                issue.market == *market
+                    && issue.severity == crate::contracts::QualitySeverity::Error
+                    && issue.start < range.end()
+                    && issue.end > range.start()
+            })
+    }) {
+        return Err(LabError::DataGap(format!(
+            "{interval:?} source for {market} has an overlapping error-severity quality issue"
+        )));
+    }
+    Ok(())
+}
+
+fn collect_interval_rows(
+    datasets: &[DatasetSnapshot],
+    market: &MarketId,
+    interval: CandleInterval,
+    range: UtcRange,
+) -> Vec<CandleObservation> {
+    let mut rows = datasets
+        .iter()
+        .flat_map(|dataset| dataset.observations.iter())
+        .filter(|row| {
+            row.candle.market == market.code()
+                && row.candle.interval == interval
+                && range.contains(row.candle.open_time_utc)
+                && row.candle.close_time_utc <= range.end()
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        left.candle
+            .open_time_utc
+            .cmp(&right.candle.open_time_utc)
+            .then_with(|| left.id.as_str().cmp(right.id.as_str()))
+    });
+    rows
+}
+
+fn validate_interval_bars(
+    rows: &[CandleObservation],
+    market: &MarketId,
+    interval: CandleInterval,
+    window: SourceWindow,
+) -> Result<(), LabError> {
+    let range = window.range();
+    let Some(first) = rows.first() else {
+        return Err(LabError::DataGap(format!(
+            "no {interval:?} observations for {market}"
+        )));
+    };
+    let Some(last) = rows.last() else {
+        return Err(LabError::DataGap(
+            "prepared interval unexpectedly empty".into(),
+        ));
+    };
+    if first.candle.open_time_utc > range.start() {
+        return Err(window.missing_leading_bar());
+    }
+    let seconds = interval.duration().num_seconds();
+    if first.candle.open_time_utc != range.start()
+        || last.candle.close_time_utc != range.end()
+        || rows.iter().any(|row| {
+            row.candle.market != market.code()
+                || row.candle.interval != interval
+                || !row.candle.completed
+                || row.candle.open_time_utc.0.timestamp_subsec_nanos() != 0
+                || row.candle.close_time_utc.0.timestamp_subsec_nanos() != 0
+                || row.candle.open_time_utc.0.timestamp().rem_euclid(seconds) != 0
+                || row.candle.close_time_utc.0 - row.candle.open_time_utc.0 != interval.duration()
+        })
+        || rows
+            .windows(2)
+            .any(|pair| pair[0].candle.close_time_utc != pair[1].candle.open_time_utc)
+    {
+        return Err(LabError::DataGap(format!(
+            "{interval:?} source window for {market} is incomplete, duplicated or misaligned"
+        )));
+    }
+    Ok(())
 }
 
 fn rule_strategy_evaluation(
@@ -220,6 +597,10 @@ pub(crate) struct RulesEvaluator {
     indicators: Vec<IndicatorRuntime>,
     state: BTreeMap<String, f64>,
     crosses: BTreeMap<String, CrossSample>,
+    /// Latest warm value of each cross-interval indicator.
+    cross_latest: BTreeMap<String, f64>,
+    /// Last fed source close per cross-interval indicator (strict ordering).
+    cross_last_close: BTreeMap<String, UtcTimestamp>,
     requires_evidence: bool,
 }
 
@@ -245,6 +626,10 @@ struct EvalContext<'a> {
 struct IndicatorRuntime {
     id: String,
     kind: IndicatorState,
+    /// Effective source stream: the declared interval or the decision one.
+    source_interval: CandleInterval,
+    /// The declared indicator kind's own warmup (window) in source bars.
+    kind_warmup: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -278,31 +663,16 @@ impl RulesEvaluator {
         market: MarketId,
         interval: CandleInterval,
     ) -> Result<Self, LabError> {
-        let warmup_bars = definition.warmup_bars()?;
+        let warmup_bars = definition.decision_warmup_bars(interval)?;
         let PolicyProgram::Rules { program } = &definition.program else {
             return Err(LabError::InvalidConfig(
                 "rules evaluator requires a RULES policy definition".into(),
             ));
         };
-        for indicator in &program.indicators {
-            if let Some(source) = indicator.source_interval
-                && source != interval
-            {
-                // Fail closed: a cross-interval indicator would silently read
-                // decision-interval bars (wrong resolution or look-ahead)
-                // until the multi-timeframe feed path ships.
-                return Err(LabError::InvalidConfig(format!(
-                    "indicator {} declares source_interval {source:?} which differs from the \
-                     decision interval {interval:?}; multi-timeframe indicator sources are not \
-                     supported by the evaluator yet",
-                    indicator.id
-                )));
-            }
-        }
         let indicators = program
             .indicators
             .iter()
-            .map(IndicatorRuntime::new)
+            .map(|spec| IndicatorRuntime::new(spec, interval))
             .collect::<Vec<_>>();
         let state = program
             .states
@@ -319,8 +689,95 @@ impl RulesEvaluator {
             indicators,
             state,
             crosses: BTreeMap::new(),
+            cross_latest: BTreeMap::new(),
+            cross_last_close: BTreeMap::new(),
             requires_evidence: definition.requires_evidence(),
         })
+    }
+
+    /// Cross-interval indicator sources: `(indicator id, interval, kind
+    /// warmup)` triples whose stream differs from the decision interval.
+    pub(crate) fn source_indicators(&self) -> Vec<(String, CandleInterval, usize)> {
+        self.indicators
+            .iter()
+            .filter(|indicator| indicator.source_interval != self.interval)
+            .map(|indicator| {
+                (
+                    indicator.id.clone(),
+                    indicator.source_interval,
+                    indicator.kind_warmup,
+                )
+            })
+            .collect()
+    }
+
+    /// Feed one completed source bar to one cross-interval indicator.
+    ///
+    /// Causal alignment is enforced here: the bar must belong to the
+    /// indicator's declared source interval, be completed, and close strictly
+    /// after the previously fed bar for the same indicator.
+    /// # Errors
+    /// Rejects unknown ids, decision-stream ids, foreign bars, incomplete or
+    /// misaligned bars, regressions and corrupt OHLC relations.
+    pub(crate) fn observe_source(
+        &mut self,
+        id: &str,
+        observation: &CandleObservation,
+    ) -> Result<(), LabError> {
+        let Some(index) = self
+            .indicators
+            .iter()
+            .position(|indicator| indicator.id == id)
+        else {
+            return Err(LabError::InvalidConfig(format!(
+                "unknown policy indicator {id}"
+            )));
+        };
+        let indicator = &self.indicators[index];
+        let source = indicator.source_interval;
+        if source == self.interval {
+            return Err(LabError::InvalidConfig(format!(
+                "indicator {id} reads the decision stream; feed it through observe"
+            )));
+        }
+        let candle = &observation.candle;
+        if candle.market != self.market.code()
+            || candle.interval != source
+            || !candle.completed
+            || candle.open_time_utc.0.timestamp_subsec_nanos() != 0
+            || candle.close_time_utc.0.timestamp_subsec_nanos() != 0
+            || candle
+                .open_time_utc
+                .0
+                .timestamp()
+                .rem_euclid(source.duration().num_seconds())
+                != 0
+            || candle.close_time_utc.0 - candle.open_time_utc.0 != source.duration()
+            || self
+                .cross_last_close
+                .get(id)
+                .is_some_and(|previous| *previous != candle.open_time_utc)
+        {
+            return Err(LabError::DataGap(format!(
+                "policy source {id} requires contiguous completed {source:?} bars closing forward"
+            )));
+        }
+        if candle.high < candle.open
+            || candle.high < candle.close
+            || candle.low > candle.open
+            || candle.low > candle.close
+            || candle.high < candle.low
+        {
+            return Err(LabError::DataCorrupt("invalid policy OHLC relation".into()));
+        }
+        let prices = CandlePrices::from_observation(observation)?;
+        let indicator = &mut self.indicators[index];
+        if let Some(value) = indicator.update(observation, &prices, source)? {
+            self.cross_latest.insert(id.to_string(), value);
+        }
+        self.cross_last_close
+            .insert(id.to_string(), candle.close_time_utc);
+        Ok(())
     }
 
     pub(crate) fn observe(
@@ -334,6 +791,14 @@ impl RulesEvaluator {
         if !self.indicators.is_empty() {
             let prices = CandlePrices::from_observation(observation)?;
             for indicator in &mut self.indicators {
+                if indicator.source_interval != self.interval {
+                    // Cross-interval indicators hold their latest fed value;
+                    // they are updated only through observe_source.
+                    if let Some(value) = self.cross_latest.get(&indicator.id) {
+                        values.insert(indicator.id.clone(), *value);
+                    }
+                    continue;
+                }
                 let value = indicator.update(observation, &prices, self.interval)?;
                 if let Some(value) = value {
                     values.insert(indicator.id.clone(), value);
@@ -497,7 +962,7 @@ impl RulesEvaluator {
 }
 
 impl IndicatorRuntime {
-    fn new(spec: &PolicyIndicator) -> Self {
+    fn new(spec: &PolicyIndicator, decision_interval: CandleInterval) -> Self {
         let kind = match &spec.indicator {
             PolicyIndicatorKind::Open => IndicatorState::Open,
             PolicyIndicatorKind::High => IndicatorState::High,
@@ -524,6 +989,8 @@ impl IndicatorRuntime {
         Self {
             id: spec.id.clone(),
             kind,
+            source_interval: spec.source_interval.unwrap_or(decision_interval),
+            kind_warmup: spec.indicator.warmup_bars(),
         }
     }
 

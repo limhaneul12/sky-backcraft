@@ -6,7 +6,7 @@ use crate::contracts::{
     ResearchSuiteRequest, RuleProvenance, RuleSnapshotId, SuiteSummary, TerminalPolicy, TickBand,
     UtcRange, Weight,
 };
-use crate::database::DatabaseOwner;
+use crate::database::{DatabaseHandle, DatabaseOwner};
 use crate::jobs::JobRuntime;
 use crate::market_data::UpbitClient;
 use axum::extract::State;
@@ -51,6 +51,10 @@ struct RequestGate {
 struct FixtureState {
     candles: Arc<Vec<u8>>,
     gate: Option<Arc<RequestGate>>,
+    request_aware: bool,
+    temporary_failures: Option<Arc<AtomicU64>>,
+    candle_responses: Arc<AtomicU64>,
+    candle_response_ready: Arc<Notify>,
 }
 
 struct FixtureServer {
@@ -58,6 +62,8 @@ struct FixtureServer {
     gate: Option<Arc<RequestGate>>,
     stop: oneshot::Sender<()>,
     task: tokio::task::JoinHandle<Result<(), std::io::Error>>,
+    candle_responses: Arc<AtomicU64>,
+    candle_response_ready: Arc<Notify>,
 }
 
 async fn fixture_response(
@@ -68,7 +74,7 @@ async fn fixture_response(
         return (
             StatusCode::OK,
             [("Remaining-Req", "group=market; min=1800; sec=9")],
-            br#"[{"market":"KRW-BTC"}]"#.to_vec(),
+            br#"[{"market":"KRW-BTC"},{"market":"KRW-ETH"}]"#.to_vec(),
         );
     }
     if let Some(gate) = &state.gate
@@ -77,22 +83,62 @@ async fn fixture_response(
         gate.entered.notify_one();
         gate.release.notified().await;
     }
+    if let Some(remaining) = &state.temporary_failures
+        && remaining
+            .fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |value| {
+                value.checked_sub(1)
+            })
+            .is_ok()
+    {
+        record_candle_response(&state);
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [("Remaining-Req", "group=candle; min=1800; sec=9")],
+            br#"{"error":"temporary fixture outage"}"#.to_vec(),
+        );
+    }
+    record_candle_response(&state);
     (
         StatusCode::OK,
         [("Remaining-Req", "group=candle; min=1800; sec=9")],
-        state.candles.as_ref().clone(),
+        if state.request_aware {
+            request_aware_wire_candles(&uri)
+        } else {
+            state.candles.as_ref().clone()
+        },
     )
 }
 
 async fn start_fixture(block_candles: bool) -> Result<FixtureServer, std::io::Error> {
+    start_fixture_with_mode(block_candles, false, 0).await
+}
+
+async fn start_request_aware_fixture(
+    temporary_failures: u64,
+) -> Result<FixtureServer, std::io::Error> {
+    start_fixture_with_mode(false, true, temporary_failures).await
+}
+
+async fn start_fixture_with_mode(
+    block_candles: bool,
+    request_aware: bool,
+    temporary_failures: u64,
+) -> Result<FixtureServer, std::io::Error> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let gate = block_candles.then(|| Arc::new(RequestGate::default()));
+    let candle_responses = Arc::new(AtomicU64::new(0));
+    let candle_response_ready = Arc::new(Notify::new());
     let app = axum::Router::new()
         .fallback(fixture_response)
         .with_state(FixtureState {
             candles: Arc::new(wire_candles()),
             gate: gate.clone(),
+            request_aware,
+            temporary_failures: (temporary_failures > 0)
+                .then(|| Arc::new(AtomicU64::new(temporary_failures))),
+            candle_responses: Arc::clone(&candle_responses),
+            candle_response_ready: Arc::clone(&candle_response_ready),
         });
     let (stop_tx, stop_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
@@ -107,7 +153,92 @@ async fn start_fixture(block_candles: bool) -> Result<FixtureServer, std::io::Er
         gate,
         stop: stop_tx,
         task,
+        candle_responses,
+        candle_response_ready,
     })
+}
+
+fn record_candle_response(state: &FixtureState) {
+    state.candle_responses.fetch_add(1, AtomicOrdering::Release);
+    state.candle_response_ready.notify_waiters();
+}
+
+async fn wait_for_candle_responses(server: &FixtureServer, expected: u64) {
+    loop {
+        let ready = server.candle_response_ready.notified();
+        if server.candle_responses.load(AtomicOrdering::Acquire) >= expected {
+            return;
+        }
+        ready.await;
+    }
+}
+
+async fn wait_for_schedule_recovery_state(
+    database: &DatabaseHandle,
+    schedule_id: &crate::contracts::ScheduleId,
+    expected: crate::contracts::ScheduleRecoveryState,
+) -> Result<crate::contracts::CollectionScheduleRecord, LabError> {
+    let mut poll = tokio::time::interval(std::time::Duration::from_millis(10));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        poll.tick().await;
+        let id = schedule_id.clone();
+        let record = database
+            .call("wait_schedule_recovery_state", move |store| {
+                store.reconcile_collection_schedule(&id, UtcTimestamp::now())
+            })
+            .await?;
+        if record.recovery_state == expected {
+            return Ok(record);
+        }
+    }
+}
+
+fn request_aware_wire_candles(uri: &Uri) -> Vec<u8> {
+    let parsed = reqwest::Url::parse(&format!("http://fixture{uri}")).expect("fixture request URL");
+    let parameters = parsed
+        .query_pairs()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let market = parameters
+        .get("market")
+        .map_or("KRW-BTC", std::borrow::Cow::as_ref);
+    let count = parameters
+        .get("count")
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(2)
+        .clamp(1, 200);
+    let anchor = parameters
+        .get("to")
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map_or_else(
+            || {
+                let now = chrono::Utc::now();
+                chrono::DateTime::from_timestamp(
+                    now.timestamp() - now.timestamp().rem_euclid(3_600),
+                    0,
+                )
+                .expect("current hourly boundary")
+            },
+            |value| value.with_timezone(&chrono::Utc),
+        );
+    let rows = (0..count)
+        .map(|offset| {
+            let opened = anchor
+                .checked_sub_signed(chrono::Duration::hours(offset + 1))
+                .expect("fixture candle time");
+            serde_json::json!({
+                "market": market,
+                "candle_date_time_utc": opened.naive_utc().format("%Y-%m-%dT%H:%M:%S").to_string(),
+                "opening_price": 100 + offset,
+                "high_price": 102 + offset,
+                "low_price": 99 + offset,
+                "trade_price": 101 + offset,
+                "candle_acc_trade_volume": 10,
+                "candle_acc_trade_price": 1000,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_vec(&rows).expect("request-aware wire candles")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -792,24 +923,33 @@ async fn real_runtime_runs_shared_capital_portfolio_and_publishes_ledger()
     let crate::contracts::JobOutput::Portfolio { run_id } = output else {
         panic!("portfolio job produces a portfolio output");
     };
-    let (summary, facts) = database
+    let inspect_run_id = run_id.clone();
+    let projection_run_id = run_id.clone();
+    let (summary, facts, projections) = database
         .call("inspect_portfolio_runtime", move |store| {
             let summary = store
-                .portfolio_run_summary(&run_id)?
+                .portfolio_run_summary(&inspect_run_id)?
                 .ok_or_else(|| LabError::DataCorrupt("portfolio run disappeared".into()))?;
             let marks = store.portfolio_facts(
-                &run_id,
+                &inspect_run_id,
                 crate::contracts::PortfolioFactKind::Mark,
                 0,
                 500,
             )?;
             let fills = store.portfolio_facts(
-                &run_id,
+                &inspect_run_id,
                 crate::contracts::PortfolioFactKind::Fill,
                 0,
                 500,
             )?;
-            Ok((summary, (marks.len(), fills.len())))
+            let projections = serde_json::to_value((
+                store.portfolio_summary_projection(&projection_run_id)?,
+                store.portfolio_equity(&projection_run_id, 0, 500)?,
+                store.portfolio_allocations(&projection_run_id, 0, 500)?,
+                store.portfolio_rebalances(&projection_run_id, 0, 500)?,
+                store.portfolio_contributions(&projection_run_id)?,
+            ))?;
+            Ok((summary, (marks.len(), fills.len()), projections))
         })
         .await?;
     assert_eq!(summary.status, "completed");
@@ -827,30 +967,57 @@ async fn real_runtime_runs_shared_capital_portfolio_and_publishes_ledger()
         serde_json::json!(0),
         "single asset with 45 percent cap never rejects a BuyAndHold entry"
     );
+    let projected = projections
+        .as_array()
+        .expect("five typed portfolio projections");
+    assert_eq!(projected.len(), 5);
+    assert!(projected.iter().all(|value| value["status"] == "AVAILABLE"));
 
     runtime.shutdown().await?;
     let _stopped = server.stop.send(());
     server.task.await??;
     owner.shutdown()?;
+    let reopened = DatabaseOwner::open(root.0.clone())?;
+    let reopened_database = reopened.handle();
+    let reopened_run_id = run_id;
+    let reopened_projections = reopened_database
+        .call("inspect_reopened_portfolio_projections", move |store| {
+            Ok(serde_json::to_value((
+                store.portfolio_summary_projection(&reopened_run_id)?,
+                store.portfolio_equity(&reopened_run_id, 0, 500)?,
+                store.portfolio_allocations(&reopened_run_id, 0, 500)?,
+                store.portfolio_rebalances(&reopened_run_id, 0, 500)?,
+                store.portfolio_contributions(&reopened_run_id)?,
+            ))?)
+        })
+        .await?;
+    assert_eq!(reopened_projections, projections);
+    reopened.shutdown()?;
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn blocked_schedules_self_heal_after_a_successful_source_probe()
+#[expect(
+    clippy::too_many_lines,
+    reason = "one causal fixture proves the actual 503, durable retry, all-market probe, backfill and freshness state journey"
+)]
+async fn recoverable_schedule_probes_all_markets_backfills_and_verifies_freshness()
 -> Result<(), Box<dyn std::error::Error>> {
-    use crate::contracts::{
-        CandleInterval, FailureRecord, RequestId as RequestIdType, ScheduleRetryPolicy,
-    };
+    use crate::contracts::{CandleInterval, RequestId as RequestIdType, ScheduleRetryPolicy};
     let root = TempRoot::new("schedule-self-heal");
     let owner = DatabaseOwner::open(root.0.clone())?;
     let database = owner.handle();
-    let server = start_fixture(false).await?;
+    // Three bounded HTTP attempts for the initial fire and three for its one
+    // ordinary retry fail with real 503 responses. Recovery probes then see a
+    // healthy request-aware source.
+    let server = start_request_aware_fixture(6).await?;
     let client = UpbitClient::synthetic_local(&server.base_url)?;
-    let runtime = JobRuntime::start(database.clone(), client, root.0.clone(), None).await?;
-    let service = runtime.service();
     let request = crate::contracts::CollectionScheduleRequest {
         request_id: RequestIdType::new("schedule-self-heal")?,
-        markets: vec![crate::contracts::MarketId::parse_upbit("KRW-BTC")?],
+        markets: vec![
+            crate::contracts::MarketId::parse_upbit("KRW-BTC")?,
+            crate::contracts::MarketId::parse_upbit("KRW-ETH")?,
+        ],
         interval: CandleInterval::H1,
         lookback_bars: 2,
         cadence_seconds: 3_600,
@@ -860,49 +1027,95 @@ async fn blocked_schedules_self_heal_after_a_successful_source_probe()
             backoff_seconds: 60,
         },
     };
-    let created = service
-        .collection_schedule(crate::contracts::CollectionScheduleAction::Create {
-            request: Box::new(request),
-        })
-        .await?;
-    let schedule_id =
-        crate::contracts::ScheduleId::new(created["id"].as_str().expect("created schedule id"))?;
-    let blocked_id = schedule_id.clone();
-    // Force the schedule into the blocked state with an elapsed backoff, as a
-    // finished network outage would have left it.
-    let failure = FailureRecord {
-        code: "NETWORK_UNAVAILABLE".into(),
-        message: "fixture outage".into(),
-    };
-    let blocked_at = crate::contracts::UtcTimestamp::parse_rfc3339("2024-01-01T00:00:00Z")?;
+    let created_at = UtcTimestamp::now();
+    let frozen = crate::scheduling::create_schedule(request, created_at)?;
+    let schedule_id = frozen.id.clone();
     database
-        .call("block_for_self_heal_fixture", move |store| {
-            store.block_collection_schedule(&blocked_id, failure, blocked_at)?;
-            // Pull the recovery instant into the past: the outage already
-            // lasted longer than the persisted backoff.
-            // Pull the recovery instant into the past: the outage already
-            // lasted longer than the persisted backoff. zero fills this.
-            store.defer_recovery(&blocked_id, blocked_at, 6)?;
+        .call("create_self_heal_fixture", move |store| {
+            store.create_collection_schedule(&frozen)?;
             Ok(())
         })
         .await?;
-    // The coordinator sweep probes the loopback source and resumes the
-    // schedule without operator action.
-    let healed = tokio::time::timeout(std::time::Duration::from_secs(15), async {
-        loop {
-            let value = service
-                .collection_schedule(crate::contracts::CollectionScheduleAction::Get {
-                    schedule_id: schedule_id.clone(),
-                })
-                .await?;
-            if value["status"].as_str() == Some("active") {
-                return Ok::<_, LabError>(value);
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        }
+    let runtime = JobRuntime::start(database.clone(), client, root.0.clone(), None).await?;
+    let service = runtime.service();
+    service
+        .coordinate_once(UtcTimestamp(
+            created_at
+                .0
+                .checked_add_signed(chrono::Duration::seconds(1))
+                .expect("initial scheduler clock"),
+        ))
+        .await?;
+    let degraded = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        wait_for_candle_responses(&server, 3).await;
+        wait_for_schedule_recovery_state(
+            &database,
+            &schedule_id,
+            crate::contracts::ScheduleRecoveryState::Degraded,
+        )
+        .await
     })
-    .await??;
+    .await
+    .map_err(|_| "initial 503 to durable degraded phase timed out")??;
+    let retry_at = degraded
+        .in_flight
+        .as_ref()
+        .and_then(|fire| fire.retry_at)
+        .expect("ordinary retry wait");
+    service
+        .coordinate_once(UtcTimestamp(
+            retry_at
+                .0
+                .checked_add_signed(chrono::Duration::seconds(1))
+                .expect("retry clock"),
+        ))
+        .await?;
+    let waiting = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        wait_for_candle_responses(&server, 6).await;
+        wait_for_schedule_recovery_state(
+            &database,
+            &schedule_id,
+            crate::contracts::ScheduleRecoveryState::RecoveryWait,
+        )
+        .await
+    })
+    .await
+    .map_err(|_| "ordinary retry to durable recovery wait phase timed out")??;
+    assert_eq!(
+        waiting
+            .failure
+            .as_ref()
+            .map(|failure| failure.code.as_str()),
+        Some("NETWORK_UNAVAILABLE")
+    );
+    let recovery_at = waiting.next_recovery_at.expect("durable recovery wait");
+    service
+        .coordinate_once(UtcTimestamp(
+            recovery_at
+                .0
+                .checked_add_signed(chrono::Duration::seconds(1))
+                .expect("recovery clock"),
+        ))
+        .await?;
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        wait_for_candle_responses(&server, 10).await;
+        wait_for_schedule_recovery_state(
+            &database,
+            &schedule_id,
+            crate::contracts::ScheduleRecoveryState::Active,
+        )
+        .await
+    })
+    .await
+    .map_err(|_| "probe/backfill to freshness-verified active phase timed out")??;
+    let healed = service
+        .collection_schedule(crate::contracts::CollectionScheduleAction::Get {
+            schedule_id: schedule_id.clone(),
+        })
+        .await?;
     assert_eq!(healed["status"].as_str(), Some("active"));
+    assert_eq!(healed["recovery_state"].as_str(), Some("active"));
+    assert!(healed["last_success_boundary"].is_string());
     assert_eq!(
         healed["failure"],
         serde_json::Value::Null,

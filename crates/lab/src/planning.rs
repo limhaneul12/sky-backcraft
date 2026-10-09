@@ -1,11 +1,11 @@
 //! Typed dataset admission and frozen input planning; no strategy interpretation.
 
 use crate::contracts::{
-    AdmissionStatus, ContentHash, DatasetId, DatasetSnapshot, EvidenceSnapshot, ExperimentSpec,
-    FrozenPolicyRevision, LabError, LimitItem, LimitReport, MAX_DATASET_ROWS, MAX_MODEL_EVENTS,
-    MAX_RUN_EVENTS, MarketId, ModelAdmission, ModelId, PlanId, PlanRequest, PolicyRevisionRef,
-    QualitySeverity, RequestSize, ResolvedPlan, RuleProvenance, StrategyKind, StrategySpec,
-    UtcRange, UtcTimestamp, Weight, active_limits, evaluation_days_ceil, experiment_config_digest,
+    AdmissionStatus, CandleInterval, ContentHash, DatasetId, DatasetSnapshot, EvidenceSnapshot,
+    ExperimentSpec, FrozenPolicyRevision, LabError, LimitItem, LimitReport, MAX_DATASET_ROWS,
+    MAX_MODEL_EVENTS, MAX_RUN_EVENTS, MarketId, ModelAdmission, ModelId, PlanId, PlanRequest,
+    PolicyRevisionRef, RequestSize, ResolvedPlan, RuleProvenance, StrategyKind, StrategySpec,
+    UtcTimestamp, Weight, active_limits, evaluation_days_ceil, experiment_config_digest,
 };
 use crate::database::DatabaseHandle;
 use crate::evidence::EvidenceEvaluator;
@@ -144,7 +144,13 @@ pub fn resolve_with_policies(
                     &config_digest,
                 ))?),
             };
-            let mut reasons = data_reasons(spec, selection.warmup, market, datasets)?;
+            let mut reasons = data_reasons(
+                spec,
+                selection.warmup,
+                market,
+                datasets,
+                &selection.source_requirements,
+            )?;
             let evidence_strategy = selection.requires_evidence;
             let mut status = if reasons.is_empty() {
                 AdmissionStatus::Eligible
@@ -196,10 +202,14 @@ pub fn resolve_with_policies(
 /// Bounded, deterministic plan warnings; the shared-capital note stays until a
 /// native portfolio surface replaces the independent-account default.
 fn base_plan_warnings(spec: &ExperimentSpec) -> Vec<String> {
-    let mut warnings = vec![
-        "HISTORICAL_REPLAY / BAR_CLOSE_ASSUMED; all fills are SIMULATED_ONLY".into(),
-        "independent cash account for each asset-strategy; not a shared-capital portfolio".into(),
-    ];
+    let mut warnings =
+        vec!["HISTORICAL_REPLAY / BAR_CLOSE_ASSUMED; all fills are SIMULATED_ONLY".into()];
+    if spec.capital_mode != Some(crate::contracts::CapitalMode::SharedPortfolio) {
+        warnings.push(
+            "independent cash account for each asset-strategy; not a shared-capital portfolio"
+                .into(),
+        );
+    }
     if spec.market_rules_history.is_empty() {
         if spec.market_rules.provenance == RuleProvenance::ExplicitScenario {
             warnings.push(
@@ -325,6 +335,8 @@ struct PlanningSelection<'a> {
     legacy: Option<&'a StrategySpec>,
     warmup: usize,
     requires_evidence: bool,
+    /// Declared cross-interval sources and their exact indicator warmups.
+    source_requirements: Vec<(CandleInterval, usize)>,
 }
 
 fn planning_selections<'a>(
@@ -344,6 +356,7 @@ fn planning_selections<'a>(
                         strategy,
                         StrategySpec::S5 { .. } | StrategySpec::S1CoverageControl { .. }
                     ),
+                    source_requirements: Vec::new(),
                 })
             })
             .collect()
@@ -355,8 +368,13 @@ fn planning_selections<'a>(
                     family: policy.family,
                     reference: Some(&policy.reference),
                     legacy: None,
-                    warmup: policy.definition.warmup_bars()?,
+                    warmup: policy
+                        .definition
+                        .decision_warmup_bars(spec.decision_interval)?,
                     requires_evidence: policy.definition.requires_evidence(),
+                    source_requirements: policy
+                        .definition
+                        .source_requirements(spec.decision_interval),
                 })
             })
             .collect()
@@ -435,52 +453,58 @@ fn data_reasons(
     warmup: usize,
     market: &MarketId,
     datasets: &[DatasetSnapshot],
+    source_requirements: &[(CandleInterval, usize)],
 ) -> Result<Vec<String>, LabError> {
     let mut reasons = Vec::new();
     let warmup = u32::try_from(warmup)
         .map_err(|_| LabError::InvalidConfig("warmup count overflow".into()))?;
     let needed = spec.range.with_warmup(warmup, spec.decision_interval)?;
     let execution_needed = spec.range.with_warmup(1, spec.execution_resolution)?;
-    let mut decision_usable = false;
-    let mut execution_usable = false;
-    for dataset in datasets {
-        if !dataset.manifest.request.markets.contains(market) {
-            continue;
-        }
-        let source = dataset
-            .manifest
-            .request
-            .data_resolution
-            .duration()
-            .num_seconds();
-        let covers = |range: UtcRange| {
-            dataset.manifest.coverage.start() <= range.start()
-                && dataset.manifest.coverage.end() >= range.end()
-                && !dataset.manifest.quality_issues.iter().any(|i| {
-                    i.market == *market
-                        && i.severity == QualitySeverity::Error
-                        && i.start < range.end()
-                        && i.end > range.start()
-                })
-        };
-        if source == spec.decision_interval.duration().num_seconds() && covers(needed) {
-            decision_usable = true;
-        }
-        if source == spec.execution_resolution.duration().num_seconds() && covers(execution_needed)
-        {
-            execution_usable = true;
-        }
-    }
-    if !decision_usable {
+    if crate::policy_engine::prepare_interval_bars(
+        datasets,
+        market,
+        spec.decision_interval,
+        crate::policy_engine::SourceWindow::declared_warmup(needed, spec.range.start()),
+    )
+    .is_err()
+    {
         reasons.push(
             "INSUFFICIENT_WARMUP / DATA_GAP: complete decision grid and lookback required".into(),
         );
     }
-    if !execution_usable {
+    if crate::policy_engine::prepare_interval_bars(
+        datasets,
+        market,
+        spec.execution_resolution,
+        execution_needed,
+    )
+    .is_err()
+    {
         reasons.push(
             "DATA_GAP: complete divisible execution grid including preceding volume bar required"
                 .into(),
         );
+    }
+    // Cross-interval indicator sources need their own causal dataset window.
+    for (source, source_warmup) in source_requirements {
+        let source_needed = crate::policy_engine::source_causal_range(
+            spec.range,
+            spec.decision_interval,
+            *source,
+            *source_warmup,
+        )?;
+        if crate::policy_engine::prepare_interval_bars(
+            datasets,
+            market,
+            *source,
+            crate::policy_engine::SourceWindow::declared_warmup(source_needed, spec.range.start()),
+        )
+        .is_err()
+        {
+            reasons.push(format!(
+                "DATA_GAP: no complete {source:?} source dataset covering the policy warmup window"
+            ));
+        }
     }
     Ok(reasons)
 }
@@ -506,4 +530,103 @@ fn has_coverage(
         );
     }
     Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::contracts::{
+        AssetQuantity, BasisPoints, CandleInterval, CapitalMode, CostPolicy, DatasetId,
+        EvidenceUnavailablePolicy, ExecutionPolicy, MarketId, MarketRuleSnapshot, PriceKrw,
+        QuoteAmount, ReportClock, RuleProvenance, RuleSnapshotId, SCHEMA_VERSION, StrategySpec,
+        TerminalPolicy, TickBand, UtcRange, Weight,
+    };
+    use rust_decimal::Decimal;
+
+    fn sample_spec(capital_mode: Option<CapitalMode>) -> ExperimentSpec {
+        let now = UtcTimestamp::now();
+        let range =
+            UtcRange::new(now, UtcTimestamp(now.0 + chrono::Duration::hours(4))).expect("range");
+        let zero = BasisPoints::new(Decimal::ZERO).expect("zero bps");
+        let market_rules = MarketRuleSnapshot {
+            id: RuleSnapshotId::new("rule-snap").expect("id"),
+            provenance: RuleProvenance::ExplicitScenario,
+            valid_range: range,
+            observed_at: now,
+            source_refs: vec!["synthetic://test".into()],
+            assumption_label: "test rules".into(),
+            min_notional: QuoteAmount::new(Decimal::ONE).expect("min"),
+            quantity_step: AssetQuantity::new(Decimal::new(1, 4)).expect("step"),
+            ticks: vec![TickBand {
+                lower_bound: QuoteAmount::new(Decimal::ZERO).expect("zero"),
+                tick: PriceKrw::new(Decimal::ONE).expect("one"),
+            }],
+            fee_schedule: None,
+            trading_state: None,
+            maintenance_windows: Vec::new(),
+        };
+        ExperimentSpec {
+            schema_version: SCHEMA_VERSION.into(),
+            dataset_ids: vec![DatasetId::new("dataset-KRW-BTC").expect("dataset")],
+            markets: vec![MarketId::parse_upbit("KRW-BTC").expect("market")],
+            range,
+            strategies: vec![StrategySpec::BuyAndHold],
+            policy_selections: Vec::new(),
+            causal_execution: None,
+            capital_mode,
+            decision_interval: CandleInterval::H1,
+            execution_resolution: CandleInterval::H1,
+            latency_ms: 0,
+            initial_cash: QuoteAmount::new(Decimal::from(300_000)).expect("cash"),
+            costs: CostPolicy {
+                buy_fee_bps: zero,
+                sell_fee_bps: zero,
+                maker_fee_bps: zero,
+                half_spread_bps: zero,
+                slippage_bps: zero,
+                impact_bps: zero,
+                assumption_label: "test costs".into(),
+                dynamic: None,
+            },
+            execution: ExecutionPolicy::NextBarOpen {
+                participation_cap: Weight::new(Decimal::ONE).expect("weight"),
+            },
+            market_rules,
+            market_rules_history: Vec::new(),
+            terminal_policy: TerminalPolicy::LiquidateScenario,
+            evidence_snapshot_id: None,
+            pit_policy: crate::contracts::PitPolicy::StrictPit,
+            evidence_unavailable: EvidenceUnavailablePolicy::CashWithMatchedControl,
+            report_clock: ReportClock {
+                timezone: "UTC".into(),
+                min_annualization_days: 1,
+                risk_free_annual: 0.0,
+            },
+            seed: 42,
+        }
+    }
+
+    #[test]
+    fn base_plan_warnings_omits_independent_account_warning_for_shared_portfolio() {
+        let spec = sample_spec(Some(CapitalMode::SharedPortfolio));
+        let warnings = base_plan_warnings(&spec);
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.contains("independent cash account")),
+            "shared portfolio should not contain independent cash account warning: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn base_plan_warnings_includes_independent_account_warning_for_independent_models() {
+        let spec = sample_spec(Some(CapitalMode::IndependentModels));
+        let warnings = base_plan_warnings(&spec);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("independent cash account")),
+            "independent models should contain independent cash account warning: {warnings:?}"
+        );
+    }
 }

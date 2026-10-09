@@ -95,9 +95,8 @@ fn full_tool_catalog_and_malformed_inputs_use_protocol_contract()
         let service = LabMcpService::new(
             database.handle(),
             upbit,
-            None,
             jobs.service(),
-            McpExposure::PublicNoAuth,
+            McpExposure::Local,
         );
         for (exposure, auth, public) in [
             (McpExposure::Local, "none", false),
@@ -346,6 +345,115 @@ fn full_tool_catalog_and_malformed_inputs_use_protocol_contract()
             .await
             .map_err(|error| LabError::Internal(format!("join MCP regression server: {error}")))?
             .map_err(|error| LabError::Internal(format!("MCP regression server: {error}")))?;
+        jobs.shutdown().await?;
+        Ok::<(), LabError>(())
+    });
+    drop(runtime);
+    let closed = database.shutdown();
+    let removed = std::fs::remove_dir_all(root);
+    result?;
+    closed?;
+    removed?;
+    Ok(())
+}
+
+#[test]
+fn public_no_auth_blocks_mutations_and_permits_reads() -> Result<(), Box<dyn std::error::Error>> {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "spot-lab-mcp-noauth-{}-{nonce}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&root)?;
+    let database = crate::database::DatabaseOwner::open(root.clone())?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(async {
+        let upbit = UpbitClient::new()?;
+        let jobs =
+            crate::jobs::JobRuntime::start(database.handle(), upbit.clone(), root.clone(), None)
+                .await?;
+        let service = LabMcpService::new(
+            database.handle(),
+            upbit,
+            jobs.service(),
+            McpExposure::PublicNoAuth,
+        );
+
+        let (server_transport, client_transport) = tokio::io::duplex(16_384);
+        let server_handle = tokio::spawn(async move {
+            let server = service
+                .serve(server_transport)
+                .await
+                .map_err(|error| error.to_string())?;
+            server.waiting().await.map_err(|error| error.to_string())?;
+            Ok::<(), String>(())
+        });
+        let client = ()
+            .serve(client_transport)
+            .await
+            .map_err(|error| LabError::Internal(format!("start MCP noauth client: {error}")))?;
+
+        // Mutations must be blocked
+        let mut policy_params = CallToolRequestParams::default();
+        policy_params.name = "policy_write".into();
+        policy_params.arguments = Some(object(serde_json::json!({
+            "action": "create",
+            "request_id": "req-blocked",
+            "definition": {
+                "schema_version": "1.0",
+                "name": "blocked",
+                "description": "test",
+                "program": { "kind": "BUILTIN", "strategy": { "kind": "BUY_AND_HOLD" } }
+            }
+        })));
+        let policy_output = client
+            .call_tool(policy_params)
+            .await
+            .map_err(|e| LabError::Internal(e.to_string()))?;
+        assert_eq!(policy_output.is_error, Some(true));
+        assert!(result_text(policy_output).contains("policy mutation is disabled"));
+
+        let mut compact_params = CallToolRequestParams::default();
+        compact_params.name = "storage_maintenance".into();
+        compact_params.arguments = Some(object(serde_json::json!({ "action": "compact" })));
+        let compact_output = client
+            .call_tool(compact_params)
+            .await
+            .map_err(|e| LabError::Internal(e.to_string()))?;
+        assert_eq!(compact_output.is_error, Some(true));
+        assert!(result_text(compact_output).contains("disabled when public_no_auth is enabled"));
+
+        // Reads must be permitted
+        let mut status_params = CallToolRequestParams::default();
+        status_params.name = "lab_status".into();
+        status_params.arguments = Some(object(serde_json::json!({})));
+        let status_output = client
+            .call_tool(status_params)
+            .await
+            .map_err(|e| LabError::Internal(e.to_string()))?;
+        assert_ne!(status_output.is_error, Some(true));
+
+        let mut list_params = CallToolRequestParams::default();
+        list_params.name = "policy_query".into();
+        list_params.arguments = Some(object(serde_json::json!({ "action": "list", "limit": 10 })));
+        let list_output = client
+            .call_tool(list_params)
+            .await
+            .map_err(|e| LabError::Internal(e.to_string()))?;
+        assert_ne!(list_output.is_error, Some(true));
+
+        client
+            .cancel()
+            .await
+            .map_err(|e| LabError::Internal(e.to_string()))?;
+        server_handle
+            .await
+            .map_err(|e| LabError::Internal(e.to_string()))?
+            .map_err(LabError::Internal)?;
         jobs.shutdown().await?;
         Ok::<(), LabError>(())
     });

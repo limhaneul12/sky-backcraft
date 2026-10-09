@@ -67,6 +67,13 @@ impl CheckpointMode {
     }
 }
 
+/// SQLite reports that the requested checkpoint could not finish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CheckpointBusyReason {
+    SqliteBusy,
+}
+
 /// Result of one explicit WAL checkpoint with usage on both sides.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -74,6 +81,10 @@ pub struct WalCheckpointOutcome {
     pub mode: CheckpointMode,
     /// True when some frames could not be checkpointed (busy readers/writers).
     pub busy: bool,
+    /// SQLite could not finish the requested checkpoint because the database
+    /// was busy. No reader or writer is forcibly interrupted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub busy_reason: Option<CheckpointBusyReason>,
     pub log_frames: u64,
     pub checkpointed_frames: u64,
     pub before: SqliteStorageUsage,

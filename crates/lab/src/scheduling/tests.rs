@@ -67,7 +67,7 @@ fn duplicate_boundary_is_suppressed_and_full_queue_can_leave_state_unchanged() {
 fn only_classified_transient_failures_retry_with_a_cap() {
     let policy = request().retry;
     let now = time("2024-01-01T00:00:00Z");
-    for code in ["NETWORK_UNAVAILABLE", "RATE_LIMITED"] {
+    for code in ["NETWORK_UNAVAILABLE", "RATE_LIMITED", "TEMPORARILY_BLOCKED"] {
         let failure = FailureRecord {
             code: code.into(),
             message: "transient fixture".into(),
@@ -84,7 +84,7 @@ fn only_classified_transient_failures_retry_with_a_cap() {
             ScheduleFailureAction::Block
         );
     }
-    for code in ["TEMPORARILY_BLOCKED", "DATA_CORRUPT"] {
+    for code in ["INVALID_CONFIG", "DATA_CORRUPT"] {
         let failure = FailureRecord {
             code: code.into(),
             message: "permanent fixture".into(),
@@ -150,6 +150,35 @@ fn an_in_flight_fire_prevents_parallel_admission() {
 }
 
 #[test]
+fn recovery_chunks_cover_the_entire_frozen_gap_beyond_normal_lookback() {
+    let created = time("2023-01-01T00:00:00Z");
+    let mut schedule = create_schedule(request(), created).expect("create schedule");
+    schedule.last_success_boundary = Some(created);
+    let target = time("2025-01-01T00:00:00Z");
+    let gap = recovery_gap(&schedule, target)
+        .expect("recovery gap")
+        .expect("nonempty outage");
+    assert_eq!(gap.start(), created);
+    assert_eq!(gap.end(), target);
+
+    let mut cursor = gap.start();
+    let mut index = 0_u32;
+    while cursor < target {
+        let chunk = recovery_chunk_request(&schedule, target, cursor, index, 0)
+            .expect("bounded recovery chunk");
+        assert_eq!(chunk.range.start(), cursor);
+        assert!(chunk.range.end() <= target);
+        chunk
+            .validate(target)
+            .expect("chunk stays within public bounds");
+        cursor = chunk.range.end();
+        index = index.checked_add(1).expect("bounded fixture chunks");
+    }
+    assert_eq!(cursor, target);
+    assert!(index > 1, "two-year outage must require bounded chunking");
+}
+
+#[test]
 fn freshness_classifier_separates_finalization_publication_and_true_gaps() {
     let expected = time("2024-01-01T02:00:00Z");
     let latest = Some(time("2024-01-01T01:00:00Z"));
@@ -173,6 +202,7 @@ fn freshness_classifier_separates_finalization_publication_and_true_gaps() {
             &policy,
             probe,
             None,
+            None,
         )
         .state
     };
@@ -187,6 +217,7 @@ fn freshness_classifier_separates_finalization_publication_and_true_gaps() {
             &policy,
             None,
             None,
+            None,
         )
         .state,
         FreshnessState::Fresh
@@ -196,7 +227,7 @@ fn freshness_classifier_separates_finalization_publication_and_true_gaps() {
         classify(expected, 1, None),
         FreshnessState::WaitingForFinalization
     );
-    // A source probe that exposes the boundary is a collector problem.
+    // A source probe that exposes the boundary is a collector problem when no cycle is pending.
     assert_eq!(
         classify(time("2024-01-01T02:20:00Z"), 1, Some(&probe(true))),
         FreshnessState::CollectorDelay
@@ -235,9 +266,58 @@ fn freshness_classifier_separates_finalization_publication_and_true_gaps() {
             3_600,
             &policy,
             None,
-            Some(&failure)
+            Some(&failure),
+            None,
         )
         .state,
         FreshnessState::Failed
+    );
+}
+
+#[test]
+fn freshness_classifier_cycle_awareness_prevents_false_collector_delay_and_gap() {
+    let expected = time("2024-01-01T02:00:00Z");
+    let latest = Some(time("2024-01-01T01:00:00Z"));
+    let policy = FreshnessPolicy {
+        grace_seconds: 600,
+        source_delay_seconds: 3_600,
+        consecutive_gap_threshold: 2,
+    };
+    let probe = SourceProbeResult {
+        attempted: true,
+        source_has_boundary: Some(true),
+        note: "classifier fixture".into(),
+    };
+    // When next_action_at is pending in the future, source boundary presence is waiting for finalization, not collector delay.
+    assert_eq!(
+        classify_market_freshness(
+            expected,
+            latest,
+            time("2024-01-01T02:20:00Z"),
+            1,
+            3_600,
+            &policy,
+            Some(&probe),
+            None,
+            Some(time("2024-01-01T04:00:00Z")),
+        )
+        .state,
+        FreshnessState::WaitingForFinalization
+    );
+    // When within the scheduled collection cycle, multiple uncollected bars are waiting for scheduled collection, not a true gap.
+    assert_eq!(
+        classify_market_freshness(
+            expected,
+            latest,
+            time("2024-01-01T03:30:00Z"),
+            3,
+            3_600,
+            &policy,
+            None,
+            None,
+            Some(time("2024-01-01T04:00:00Z")),
+        )
+        .state,
+        FreshnessState::WaitingForFinalization
     );
 }

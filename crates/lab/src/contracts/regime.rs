@@ -125,7 +125,10 @@ pub struct RegimeFeatures {
 pub struct RegimeObservation {
     pub market: MarketId,
     pub decision_time: UtcTimestamp,
-    pub features: RegimeFeatures,
+    /// Classification features are absent only during frozen classifier
+    /// warmup. UNKNOWN never carries fabricated zero features.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub features: Option<RegimeFeatures>,
     pub regime: RegimeLabel,
     pub vol_state: VolState,
     pub classifier_revision: String,
@@ -236,7 +239,8 @@ impl RegimeSummary {
     /// Aggregate one run's observations in decision-time order.
     ///
     /// # Errors
-    /// Rejects label serialization failures.
+    /// Retains the result shape used by callers while aggregating only typed
+    /// labels; no string parsing or fallback participates.
     pub fn from_observations(observations: &[RegimeObservation]) -> Result<Self, LabError> {
         let mut ordered: Vec<&RegimeObservation> = observations.iter().collect();
         ordered.sort_by(|left, right| {
@@ -246,22 +250,25 @@ impl RegimeSummary {
         });
         let mut bars = std::collections::BTreeMap::new();
         let mut transitions = 0_u64;
-        let mut previous: Option<(String, RegimeLabel)> = None;
+        let mut previous = std::collections::BTreeMap::<String, RegimeLabel>::new();
         for observation in ordered {
-            let key = serde_json::to_value(observation.regime)?
-                .as_str()
-                .unwrap_or_default()
-                .to_string();
+            let key = match observation.regime {
+                RegimeLabel::TrendUp => "TREND_UP",
+                RegimeLabel::TrendDown => "TREND_DOWN",
+                RegimeLabel::Chop => "CHOP",
+                RegimeLabel::Unknown => "UNKNOWN",
+            }
+            .to_string();
             bars.entry(key.clone())
                 .and_modify(|count: &mut u64| *count = count.saturating_add(1))
                 .or_insert(1_u64);
-            if let Some((market, label)) = previous
-                && market == observation.market.code()
-                && label != observation.regime
+            let market = observation.market.code();
+            if previous
+                .insert(market, observation.regime)
+                .is_some_and(|label| label != observation.regime)
             {
                 transitions = transitions.saturating_add(1);
             }
-            previous = Some((observation.market.code(), observation.regime));
         }
         Ok(Self { bars, transitions })
     }
@@ -281,7 +288,7 @@ mod summary_tests {
             Ok(RegimeObservation {
                 market: market.clone(),
                 decision_time: UtcTimestamp::parse_rfc3339(time)?,
-                features: RegimeFeatures {
+                features: Some(RegimeFeatures {
                     close_vs_sma_long: 0.0,
                     sma_mid_vs_short: 0.0,
                     sma_short_slope: 0.0,
@@ -289,7 +296,7 @@ mod summary_tests {
                     realized_vol_annualized: 0.0,
                     volume_expansion: 0.0,
                     directional_persistence: 0.0,
-                },
+                }),
                 regime: label,
                 vol_state: VolState::NormalVol,
                 classifier_revision: "test".into(),
@@ -313,6 +320,23 @@ mod summary_tests {
             observations[1].clone(),
         ];
         assert_eq!(RegimeSummary::from_observations(&shuffled)?, summary);
+
+        let eth = MarketId::parse_upbit("KRW-ETH")?;
+        let mut interleaved = observations.clone();
+        for (index, label) in [RegimeLabel::Unknown, RegimeLabel::TrendDown]
+            .into_iter()
+            .enumerate()
+        {
+            let mut entry = observations[index].clone();
+            entry.market = eth.clone();
+            entry.regime = label;
+            interleaved.push(entry);
+        }
+        let interleaved = RegimeSummary::from_observations(&interleaved)?;
+        assert_eq!(
+            interleaved.transitions, 3,
+            "two BTC and one ETH transitions"
+        );
         Ok(())
     }
 }

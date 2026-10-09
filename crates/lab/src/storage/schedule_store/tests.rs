@@ -1,6 +1,7 @@
 use super::*;
 use crate::contracts::{
-    ArtifactId, CandleInterval, CollectionScheduleRequest, FreshnessState, JobSubmission, MarketId,
+    ArtifactId, CandleInterval, CollectionScheduleRequest, DeleteBlockerClass, DeleteResource,
+    FreshnessState, JobSubmission, MarketId, ScheduleFailureClass, ScheduleRecoveryState,
     ScheduleRetryPolicy, SourceProbeResult,
 };
 use crate::scheduling::{ScheduleTick, create_schedule, schedule_tick};
@@ -257,6 +258,14 @@ fn permanent_producer_failure_blocks_schedule_until_explicit_resume() {
         .block_collection_schedule(&schedule.id, failure.clone(), now)
         .expect("block schedule");
     assert_eq!(blocked.status, CollectionScheduleStatus::Blocked);
+    assert_eq!(
+        blocked.failure_class,
+        Some(ScheduleFailureClass::OperatorRequired)
+    );
+    assert_eq!(
+        blocked.recovery_state,
+        ScheduleRecoveryState::OperatorRequired
+    );
     assert_eq!(
         blocked.failure.as_ref().map(|value| value.code.as_str()),
         Some("RESOURCE_LIMIT")
@@ -569,7 +578,7 @@ fn freshness_classifies_waiting_source_delay_collector_delay_and_true_gap()
 }
 
 #[test]
-fn blocked_schedules_persist_a_bounded_recovery_backoff_and_reappear_as_candidates()
+fn recoverable_failures_persist_backoff_while_permanent_failures_require_operator()
 -> Result<(), Box<dyn std::error::Error>> {
     use crate::contracts::FailureRecord;
     let root = TempRoot::new("recovery-backoff");
@@ -577,60 +586,298 @@ fn blocked_schedules_persist_a_bounded_recovery_backoff_and_reappear_as_candidat
     let now = time("2024-01-01T08:00:00Z");
     let schedule = create_schedule(request("schedule-recovery"), now)?;
     store.create_collection_schedule(&schedule)?;
-    admit(&mut store, &schedule.id, now);
-    // A non-retryable producer failure blocks the schedule and must persist a
-    // bounded recovery wait (60s base from one failed attempt).
+    // Recoverable failures stay under automatic ownership and never become a
+    // permanent blocked schedule after the ordinary retry budget is exhausted.
     store.block_collection_schedule(
         &schedule.id,
         FailureRecord {
-            code: "INVALID_CONFIG".into(),
-            message: "fixture block".into(),
+            code: "NETWORK_UNAVAILABLE".into(),
+            message: "fixture outage".into(),
         },
         now,
     )?;
-    let blocked = store
+    let waiting = store
         .get_collection_schedule(&schedule.id)?
-        .expect("blocked schedule");
-    assert_eq!(blocked.status, CollectionScheduleStatus::Blocked);
-    let next_action_at: i64 = store
-        .connection
-        .query_row(
-            "SELECT next_action_at_ms FROM collection_schedules WHERE id=?1",
-            [schedule.id.as_str()],
-            |row| row.get(0),
-        )
-        .map_err(|error| LabError::Internal(format!("sqlite test read: {error}")))?;
-    assert!(
-        next_action_at > timestamp_ms(now),
-        "blocked schedule must wait out its recovery backoff"
+        .expect("recovering schedule");
+    assert_eq!(waiting.status, CollectionScheduleStatus::Active);
+    assert_eq!(waiting.recovery_state, ScheduleRecoveryState::RecoveryWait);
+    assert_eq!(
+        waiting.failure_class,
+        Some(ScheduleFailureClass::Recoverable)
     );
-    // Before the backoff elapses there is no recovery candidate.
     assert!(
         store
-            .recovery_candidates(time("2024-01-01T08:00:30Z"), 8)?
+            .schedule_recovery_candidates(time("2024-01-01T08:00:30Z"), 8)?
             .is_empty()
     );
-    // After it elapses the schedule is a candidate; a failed probe defers it
-    // durably with a longer wait.
     let due = time("2024-01-01T08:02:00Z");
     assert_eq!(
-        store.recovery_candidates(due, 8)?.len(),
+        store.schedule_recovery_candidates(due, 8)?.len(),
         1,
-        "due blocked schedule becomes a recovery candidate"
+        "due recovering schedule becomes a probe candidate"
     );
-    // attempt=2 defers by 60s x 2^3 = 480s, durably.
-    store.defer_recovery(&schedule.id, due, 2)?;
+    let probing = store.claim_schedule_recovery_probe(&schedule.id, due)?;
+    assert_eq!(probing.recovery_state, ScheduleRecoveryState::Probing);
+    assert_eq!(probing.recovery_attempt_count, 1);
+    store.defer_schedule_recovery(
+        &schedule.id,
+        &FailureRecord {
+            code: "RATE_LIMITED".into(),
+            message: "still unavailable".into(),
+        },
+        due,
+    )?;
     assert!(
         store
-            .recovery_candidates(time("2024-01-01T08:09:00Z"), 8)?
+            .schedule_recovery_candidates(time("2024-01-01T08:02:30Z"), 8)?
             .is_empty(),
-        "a deferred candidate waits out the longer backoff"
+        "a deferred candidate waits out the durable backoff"
     );
     assert_eq!(
         store
-            .recovery_candidates(time("2024-01-01T08:10:00Z"), 8)?
+            .schedule_recovery_candidates(time("2024-01-01T08:03:00Z"), 8)?
             .len(),
         1
     );
+
+    let permanent = create_schedule(request("schedule-permanent"), now)?;
+    store.create_collection_schedule(&permanent)?;
+    store.block_collection_schedule(
+        &permanent.id,
+        FailureRecord {
+            code: "INVALID_CONFIG".into(),
+            message: "bad market".into(),
+        },
+        now,
+    )?;
+    let operator = store
+        .get_collection_schedule(&permanent.id)?
+        .expect("operator schedule");
+    assert_eq!(operator.status, CollectionScheduleStatus::Blocked);
+    assert_eq!(
+        operator.recovery_state,
+        ScheduleRecoveryState::OperatorRequired
+    );
+    assert!(
+        store
+            .schedule_recovery_candidates(time("2024-01-02T00:00:00Z"), 8)?
+            .iter()
+            .all(|candidate| candidate.id != permanent.id),
+        "permanent failures never enter automatic recovery"
+    );
+    Ok(())
+}
+
+#[test]
+fn restart_preserves_one_pinned_recovery_chunk_without_duplicate_jobs()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = TempRoot::new("recovery-restart");
+    let now = time("2024-01-02T08:00:00Z");
+    let schedule = create_schedule(request("schedule-recovery-restart"), now)?;
+    let schedule_id = schedule.id.clone();
+    {
+        let mut store = Store::open(&root.0)?;
+        store.create_collection_schedule(&schedule)?;
+        store.block_collection_schedule(
+            &schedule_id,
+            FailureRecord {
+                code: "NETWORK_UNAVAILABLE".into(),
+                message: "fixture outage".into(),
+            },
+            now,
+        )?;
+        let due = time("2024-01-02T08:02:00Z");
+        store.claim_schedule_recovery_probe(&schedule_id, due)?;
+        let started = store.begin_schedule_recovery_backfill(
+            &schedule_id,
+            time("2024-01-02T08:00:00Z"),
+            due,
+        )?;
+        assert_eq!(started.recovery_state, ScheduleRecoveryState::Backfilling);
+        let job_id = started.backfill_job_id.clone().expect("backfill job");
+        let queued_schedule_preview = store.delete_preview(
+            &DeleteResource::Schedule {
+                schedule_id: schedule_id.clone(),
+            },
+            now,
+        )?;
+        assert!(queued_schedule_preview.blockers.iter().any(|blocker| {
+            blocker.class == DeleteBlockerClass::ActiveJob
+                && blocker.reference == format!("job:{}", job_id.as_str())
+        }));
+        let child_preview = store.delete_preview(
+            &DeleteResource::Job {
+                job_id: job_id.clone(),
+            },
+            now,
+        )?;
+        assert!(child_preview.blockers.iter().any(|blocker| {
+            blocker.class == DeleteBlockerClass::ProtectedReference
+                && blocker.reference == format!("schedule:{}", schedule_id.as_str())
+        }));
+        let claimed = store.claim_next(now)?.expect("recovery chunk claimed");
+        let running_schedule_preview = store.delete_preview(
+            &DeleteResource::Schedule {
+                schedule_id: schedule_id.clone(),
+            },
+            now,
+        )?;
+        assert!(
+            running_schedule_preview
+                .blockers
+                .iter()
+                .any(|blocker| blocker.class == DeleteBlockerClass::ActiveJob)
+        );
+        store.finish_attempt(
+            &claimed.id,
+            AttemptState::Interrupted {
+                ended_at: now,
+                reason: "fixture restart".into(),
+            },
+        )?;
+    }
+    let mut reopened = Store::open(&root.0)?;
+    reopened.reconcile_schedule_recovery(&schedule_id, now)?;
+    let durable = reopened
+        .get_collection_schedule(&schedule_id)?
+        .expect("recovery survives restart");
+    let target = durable.pending_gap.expect("frozen gap").end();
+    let repeated = reopened.begin_schedule_recovery_backfill(&schedule_id, target, now)?;
+    assert_eq!(repeated.backfill_job_id, durable.backfill_job_id);
+    let (chunks, jobs, attempts): (i64, i64, i64) = reopened.connection.query_row(
+        "SELECT (SELECT COUNT(*) FROM schedule_recovery_chunks WHERE schedule_id=?1),\
+                (SELECT COUNT(*) FROM jobs WHERE id=?2),\
+                (SELECT COUNT(*) FROM job_attempts WHERE job_id=?2)",
+        params![
+            schedule_id.as_str(),
+            durable.backfill_job_id.as_ref().expect("job").as_str()
+        ],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    assert_eq!((chunks, jobs, attempts), (1, 1, 2));
+    Ok(())
+}
+
+#[test]
+fn pausing_recovery_backfill_cancels_owner_and_resume_repins_same_job()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = TempRoot::new("recovery-pause");
+    let mut store = Store::open(&root.0)?;
+    let now = time("2024-01-02T08:00:00Z");
+    let schedule = create_schedule(request("schedule-recovery-pause"), now)?;
+    store.create_collection_schedule(&schedule)?;
+    store.block_collection_schedule(
+        &schedule.id,
+        FailureRecord {
+            code: "NETWORK_UNAVAILABLE".into(),
+            message: "fixture outage".into(),
+        },
+        now,
+    )?;
+    let due = time("2024-01-02T08:02:00Z");
+    store.claim_schedule_recovery_probe(&schedule.id, due)?;
+    let started =
+        store.begin_schedule_recovery_backfill(&schedule.id, time("2024-01-02T08:00:00Z"), due)?;
+    let job_id = started.backfill_job_id.expect("backfill job");
+    let claimed = store.claim_next(due)?.expect("running backfill");
+    let (paused, signals) = store.pause_collection_schedule(&schedule.id, due)?;
+    assert_eq!(paused.status, CollectionScheduleStatus::Paused);
+    assert_eq!(signals, vec![job_id.clone()]);
+    store.finish_attempt(
+        &claimed.id,
+        AttemptState::Cancelled {
+            ended_at: due,
+            reason: "owner pause".into(),
+        },
+    )?;
+    let paused = store.reconcile_schedule_recovery(&schedule.id, due)?;
+    assert_eq!(paused.recovery_state, ScheduleRecoveryState::RecoveryWait);
+    assert_eq!(paused.backfill_job_id.as_ref(), Some(&job_id));
+    let resumed = store.resume_collection_schedule(&schedule.id, due)?;
+    assert_eq!(resumed.status, CollectionScheduleStatus::Active);
+    assert_eq!(resumed.recovery_state, ScheduleRecoveryState::Backfilling);
+    assert_eq!(resumed.backfill_job_id.as_ref(), Some(&job_id));
+    let job = store.get_job(&job_id)?.expect("backfill job retained");
+    assert_eq!(job.attempts.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn exhausted_recoverable_job_rotates_generation_without_permanent_block()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = TempRoot::new("recovery-attempt-cap");
+    let mut store = Store::open(&root.0)?;
+    let now = time("2024-01-02T08:00:00Z");
+    let schedule = create_schedule(request("schedule-recovery-attempt-cap"), now)?;
+    store.create_collection_schedule(&schedule)?;
+    store.block_collection_schedule(
+        &schedule.id,
+        FailureRecord {
+            code: "NETWORK_UNAVAILABLE".into(),
+            message: "fixture outage".into(),
+        },
+        now,
+    )?;
+    let due = time("2024-01-02T08:02:00Z");
+    store.claim_schedule_recovery_probe(&schedule.id, due)?;
+    let started =
+        store.begin_schedule_recovery_backfill(&schedule.id, time("2024-01-02T08:00:00Z"), due)?;
+    let exhausted_job = started.backfill_job_id.expect("first generation job");
+    let mut clock = due;
+    for attempt_number in 1..=32_u32 {
+        let claimed = store.claim_next(clock)?.expect("queued recovery attempt");
+        assert_eq!(claimed.job_id, exhausted_job);
+        assert_eq!(claimed.number, attempt_number);
+        store.finish_attempt(
+            &claimed.id,
+            AttemptState::Failed {
+                ended_at: clock,
+                error: FailureRecord {
+                    code: "NETWORK_UNAVAILABLE".into(),
+                    message: format!("fixture outage attempt {attempt_number}"),
+                },
+            },
+        )?;
+        let waiting = store.reconcile_schedule_recovery(&schedule.id, clock)?;
+        assert_eq!(waiting.status, CollectionScheduleStatus::Active);
+        assert_eq!(waiting.recovery_state, ScheduleRecoveryState::RecoveryWait);
+        assert_eq!(
+            waiting.failure_class,
+            Some(ScheduleFailureClass::Recoverable)
+        );
+        let retry_at = waiting.next_recovery_at.expect("bounded retry wait");
+        clock = UtcTimestamp(
+            retry_at
+                .0
+                .checked_add_signed(chrono::Duration::seconds(1))
+                .expect("fixture retry time"),
+        );
+        if attempt_number < 32 {
+            let retried = store.retry_schedule_recovery_backfill(&schedule.id, clock)?;
+            assert_eq!(retried.backfill_job_id.as_ref(), Some(&exhausted_job));
+        }
+    }
+
+    let rotated = store.retry_schedule_recovery_backfill(&schedule.id, clock)?;
+    let new_job = rotated.backfill_job_id.expect("rotated generation job");
+    assert_ne!(new_job, exhausted_job);
+    assert_eq!(rotated.status, CollectionScheduleStatus::Active);
+    assert_eq!(rotated.recovery_state, ScheduleRecoveryState::Backfilling);
+    assert_eq!(
+        rotated.failure_class,
+        Some(ScheduleFailureClass::Recoverable)
+    );
+    let (chunks, old_attempts, new_attempts): (i64, i64, i64) = store.connection.query_row(
+        "SELECT (SELECT COUNT(*) FROM schedule_recovery_chunks WHERE schedule_id=?1),\
+                (SELECT COUNT(*) FROM job_attempts WHERE job_id=?2),\
+                (SELECT COUNT(*) FROM job_attempts WHERE job_id=?3)",
+        params![
+            schedule.id.as_str(),
+            exhausted_job.as_str(),
+            new_job.as_str()
+        ],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    assert_eq!((chunks, old_attempts, new_attempts), (2, 32, 1));
     Ok(())
 }

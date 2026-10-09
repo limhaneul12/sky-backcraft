@@ -40,16 +40,67 @@ pub struct ResearchGeometry {
 ///
 /// # Errors
 /// Returns the create-time validation error for structurally invalid requests.
+pub fn plan_suite(
+    request: &ResearchSuiteRequest,
+) -> Result<crate::contracts::SuitePlanReport, LabError> {
+    let candidates = u64::try_from(request.template.policy_selections.len())
+        .map_err(|_| LabError::ResourceLimit("candidate count exceeds u64".into()))?;
+    let shape = plan_suite_shape(request, candidates)?;
+    Ok(crate::contracts::SuitePlanReport {
+        candidates: u32::try_from(shape.candidates)
+            .map_err(|_| LabError::ResourceLimit("candidate count exceeds u32".into()))?,
+        markets: u32::try_from(shape.markets)
+            .map_err(|_| LabError::ResourceLimit("market count exceeds u32".into()))?,
+        folds: u32::try_from(shape.folds)
+            .map_err(|_| LabError::ResourceLimit("fold count exceeds u32".into()))?,
+        cost_scenarios: u32::try_from(shape.cost_scenarios)
+            .map_err(|_| LabError::ResourceLimit("scenario count exceeds u32".into()))?,
+        planned_runs: shape.planned_runs,
+        comparison_cells: shape.comparison_cells,
+        estimated_model_events: shape.estimated_model_events,
+        estimated_run_events: shape.estimated_run_events,
+        estimated_storage_bytes: shape.estimated_storage_bytes,
+        admission: shape.admission,
+        suggestions: shape.suggestions,
+        notes: shape.notes,
+    })
+}
+
+/// Constant-size resource geometry for a hypothetical candidate count. The
+/// caller supplies a structurally valid suite template; no policy references
+/// are allocated for the override count.
+pub(crate) struct SuitePlanShape {
+    pub candidates: u64,
+    pub markets: u64,
+    pub folds: u64,
+    pub cost_scenarios: u64,
+    pub planned_runs: u64,
+    pub comparison_cells: u64,
+    pub estimated_model_events: u64,
+    pub estimated_run_events: u64,
+    pub estimated_storage_bytes: u64,
+    pub admission: crate::contracts::SuitePlanAdmission,
+    pub suggestions: Vec<String>,
+    pub notes: Vec<String>,
+    pub estimates_saturated: bool,
+}
+
+/// Reuse the suite planner formulas with a candidate cardinality override.
+///
+/// # Errors
+/// Returns validation or checked range arithmetic failures. Multiplicative
+/// cardinality overflow is represented by saturated estimates and rejection.
 #[expect(
     clippy::too_many_lines,
     reason = "one read-only admission pass mirrors every create-time limit formula"
 )]
-pub fn plan_suite(
+pub(crate) fn plan_suite_shape(
     request: &ResearchSuiteRequest,
-) -> Result<crate::contracts::SuitePlanReport, LabError> {
+    candidates: u64,
+) -> Result<SuitePlanShape, LabError> {
     use crate::contracts::{SuitePlanAdmission, SuitePlanLimitKind, SuitePlanViolation};
     let invalid = |message: String| {
-        Ok(crate::contracts::SuitePlanReport {
+        Ok(SuitePlanShape {
             candidates: 0,
             markets: 0,
             folds: 0,
@@ -62,6 +113,7 @@ pub fn plan_suite(
             admission: SuitePlanAdmission::Invalid { message },
             suggestions: Vec::new(),
             notes: Vec::new(),
+            estimates_saturated: false,
         })
     };
     if let Err(error) = request.template.validate() {
@@ -100,14 +152,19 @@ pub fn plan_suite(
     {
         return invalid("cost sweep axes must not contain duplicates".into());
     }
-    let scenario_count = checked_product(&[fees.len(), slippages.len()], "suite scenarios")?;
-    let candidates = request.template.policy_selections.len();
-    let markets = request.template.markets.len();
+    let scenario_count = checked_u64_product(&[
+        u64::try_from(fees.len())
+            .map_err(|_| LabError::ResourceLimit("fee scenario count exceeds u64".into()))?,
+        u64::try_from(slippages.len())
+            .map_err(|_| LabError::ResourceLimit("slippage scenario count exceeds u64".into()))?,
+    ]);
+    let markets = u64::try_from(request.template.markets.len())
+        .map_err(|_| LabError::ResourceLimit("market count exceeds u64".into()))?;
     let mut violations = Vec::new();
-    if scenario_count > MAX_SUITE_SCENARIOS {
+    if scenario_count.value > u64::try_from(MAX_SUITE_SCENARIOS).unwrap_or(u64::MAX) {
         violations.push(SuitePlanViolation {
             item: SuitePlanLimitKind::SuiteScenarios,
-            requested: u64::try_from(scenario_count).unwrap_or(u64::MAX),
+            requested: scenario_count.value,
             allowed: u64::try_from(MAX_SUITE_SCENARIOS).unwrap_or(u64::MAX),
         });
     }
@@ -154,43 +211,32 @@ pub fn plan_suite(
     };
     let (runs, cells) = match request.design {
         crate::contracts::ResearchDesign::Batch => (
-            u64::try_from(scenario_count).unwrap_or(u64::MAX),
-            u64::try_from(
-                checked_product(&[scenario_count, candidates, markets], "suite cells")
-                    .unwrap_or(usize::MAX),
-            )
-            .unwrap_or(u64::MAX),
+            CheckedEstimate::exact(scenario_count.value),
+            checked_u64_product(&[scenario_count.value, candidates, markets]),
         ),
         crate::contracts::ResearchDesign::WalkForward { .. } => {
-            let candidate_and_winner = candidates.saturating_add(1);
+            let candidate_and_winner = candidates.checked_add(1);
             (
-                folds
-                    .checked_mul(u64::try_from(scenario_count).unwrap_or(u64::MAX))
-                    .and_then(|value| value.checked_mul(2))
-                    .unwrap_or(u64::MAX),
-                folds
-                    .checked_mul(u64::try_from(scenario_count).unwrap_or(u64::MAX))
-                    .and_then(|value| value.checked_mul(u64::try_from(markets).unwrap_or(u64::MAX)))
-                    .and_then(|value| {
-                        value.checked_mul(u64::try_from(candidate_and_winner).unwrap_or(u64::MAX))
-                    })
-                    .unwrap_or(u64::MAX),
+                checked_u64_product(&[folds, scenario_count.value, 2]),
+                candidate_and_winner.map_or(CheckedEstimate::saturated(), |count| {
+                    checked_u64_product(&[folds, scenario_count.value, markets, count])
+                }),
             )
         }
     };
     let runs_limit = u64::try_from(MAX_SUITE_RUNS).unwrap_or(u64::MAX);
     let cells_limit = u64::try_from(MAX_SUITE_CELLS).unwrap_or(u64::MAX);
-    if runs > runs_limit {
+    if runs.value > runs_limit {
         violations.push(SuitePlanViolation {
             item: SuitePlanLimitKind::SuiteRuns,
-            requested: runs,
+            requested: runs.value,
             allowed: runs_limit,
         });
     }
-    if cells > cells_limit {
+    if cells.value > cells_limit {
         violations.push(SuitePlanViolation {
             item: SuitePlanLimitKind::SuiteCells,
-            requested: cells,
+            requested: cells.value,
             allowed: cells_limit,
         });
     }
@@ -217,14 +263,11 @@ pub fn plan_suite(
     };
     let event_limit = u64::try_from(MAX_RUN_EVENTS).unwrap_or(u64::MAX);
     let event_result = match request.design {
-        crate::contracts::ResearchDesign::Batch => per_model_events(request.template.range)?
-            .checked_mul(
-                u64::try_from(
-                    checked_product(&[candidates, markets, scenario_count], "batch models")
-                        .unwrap_or(usize::MAX),
-                )
-                .unwrap_or(u64::MAX),
-            ),
+        crate::contracts::ResearchDesign::Batch => {
+            let models = checked_u64_product(&[candidates, markets, scenario_count.value]);
+            checked_u64_product(&[per_model_events(request.template.range)?, models.value])
+                .with_saturation(models.saturated)
+        }
         crate::contracts::ResearchDesign::WalkForward {
             selection_bars,
             evaluation_bars,
@@ -233,34 +276,26 @@ pub fn plan_suite(
             // Every fold repeats the same selection/evaluation shape.
             let start = request.template.range.start();
             let interval = request.template.decision_interval.duration();
-            let selection_events = per_model_events(sub_range(start, selection_bars, interval)?)?
-                .checked_mul(
-                    u64::try_from(
-                        checked_product(&[candidates, markets, scenario_count], "selection models")
-                            .unwrap_or(usize::MAX),
-                    )
-                    .unwrap_or(u64::MAX),
-                );
-            let evaluation_events = per_model_events(sub_range(start, evaluation_bars, interval)?)?
-                .checked_mul(
-                    u64::try_from(
-                        checked_product(&[markets, scenario_count], "evaluation models")
-                            .unwrap_or(usize::MAX),
-                    )
-                    .unwrap_or(u64::MAX),
-                );
-            selection_events
-                .and_then(|selection| {
-                    evaluation_events.and_then(|evaluation| selection.checked_add(evaluation))
-                })
-                .and_then(|per_fold| per_fold.checked_mul(folds))
+            let selection_models =
+                checked_u64_product(&[candidates, markets, scenario_count.value]);
+            let evaluation_models = checked_u64_product(&[markets, scenario_count.value]);
+            let selection_events = checked_u64_product(&[
+                per_model_events(sub_range(start, selection_bars, interval)?)?,
+                selection_models.value,
+            ])
+            .with_saturation(selection_models.saturated);
+            let evaluation_events = checked_u64_product(&[
+                per_model_events(sub_range(start, evaluation_bars, interval)?)?,
+                evaluation_models.value,
+            ])
+            .with_saturation(evaluation_models.saturated);
+            checked_u64_sum(selection_events, evaluation_events).and_then_product(folds)
         }
-    }
-    .unwrap_or(u64::MAX);
-    if event_result > event_limit {
+    };
+    if event_result.value > event_limit {
         violations.push(SuitePlanViolation {
             item: SuitePlanLimitKind::RunEvents,
-            requested: event_result,
+            requested: event_result.value,
             allowed: event_limit,
         });
     }
@@ -271,29 +306,85 @@ pub fn plan_suite(
             violations: violations.clone(),
         }
     };
-    let suggestions = reduction_suggestions(request, &violations);
+    let suggestions = reduction_suggestions(request, candidates, &violations);
     let mut notes = vec![
         "planner is read-only; create additionally checks policy revisions exist and stay unchanged"
             .to_string(),
     ];
-    if event_result >= event_limit {
+    let storage_estimate = checked_u64_product(&[event_result.value, PLANNED_BYTES_PER_EVENT])
+        .with_saturation(event_result.saturated);
+    let estimates_saturated = scenario_count.saturated
+        || runs.saturated
+        || cells.saturated
+        || event_result.saturated
+        || storage_estimate.saturated;
+    if estimates_saturated {
+        notes.push(
+            "checked resource arithmetic overflowed; saturated estimates are u64::MAX".into(),
+        );
+    } else if event_result.value >= event_limit {
         notes.push("event estimate saturates the aggregate bound; treat the number as an order of magnitude".into());
     }
-    Ok(crate::contracts::SuitePlanReport {
-        candidates: u32_count(candidates, "candidates")?,
-        markets: u32_count(markets, "markets")?,
-        folds: u32::try_from(folds)
-            .map_err(|_| LabError::ResourceLimit("fold count overflow".into()))?,
-        cost_scenarios: u32_count(scenario_count, "scenarios")?,
-        planned_runs: runs,
-        comparison_cells: cells,
+    Ok(SuitePlanShape {
+        candidates,
+        markets,
+        folds,
+        cost_scenarios: scenario_count.value,
+        planned_runs: runs.value,
+        comparison_cells: cells.value,
         estimated_model_events: per_model_events(request.template.range)?,
-        estimated_run_events: event_result,
-        estimated_storage_bytes: event_result.saturating_mul(PLANNED_BYTES_PER_EVENT),
+        estimated_run_events: event_result.value,
+        estimated_storage_bytes: storage_estimate.value,
         admission,
         suggestions,
         notes,
+        estimates_saturated,
     })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CheckedEstimate {
+    value: u64,
+    saturated: bool,
+}
+
+impl CheckedEstimate {
+    const fn exact(value: u64) -> Self {
+        Self {
+            value,
+            saturated: false,
+        }
+    }
+
+    const fn saturated() -> Self {
+        Self {
+            value: u64::MAX,
+            saturated: true,
+        }
+    }
+
+    const fn with_saturation(mut self, saturated: bool) -> Self {
+        self.saturated |= saturated;
+        self
+    }
+
+    fn and_then_product(self, factor: u64) -> Self {
+        checked_u64_product(&[self.value, factor]).with_saturation(self.saturated)
+    }
+}
+
+fn checked_u64_product(values: &[u64]) -> CheckedEstimate {
+    values
+        .iter()
+        .try_fold(1_u64, |product, value| product.checked_mul(*value))
+        .map_or_else(CheckedEstimate::saturated, CheckedEstimate::exact)
+}
+
+fn checked_u64_sum(left: CheckedEstimate, right: CheckedEstimate) -> CheckedEstimate {
+    left.value
+        .checked_add(right.value)
+        .map_or_else(CheckedEstimate::saturated, CheckedEstimate::exact)
+        .with_saturation(left.saturated || right.saturated)
 }
 
 /// Range covering `bars` decision bars from `start`.
@@ -317,12 +408,13 @@ fn failure_message(error: &LabError) -> String {
 #[must_use]
 fn reduction_suggestions(
     request: &ResearchSuiteRequest,
+    candidate_count: u64,
     violations: &[crate::contracts::SuitePlanViolation],
 ) -> Vec<String> {
     use crate::contracts::SuitePlanLimitKind;
     let mut suggestions = Vec::new();
     let markets = request.template.markets.len().max(1);
-    let candidates = request.template.policy_selections.len().max(1);
+    let candidates = candidate_count.max(1);
     for violation in violations {
         match violation.item {
             SuitePlanLimitKind::SuiteScenarios => {
@@ -367,15 +459,13 @@ fn reduction_suggestions(
                 }
                 let per_candidate = violation
                     .requested
-                    .checked_div(u64::try_from(candidates).unwrap_or(u64::MAX))
+                    .checked_div(candidates)
                     .unwrap_or(u64::MAX);
                 let max_candidates = violation
                     .allowed
                     .checked_div(per_candidate.max(1))
                     .unwrap_or(1);
-                if max_candidates < u64::try_from(candidates).unwrap_or(u64::MAX)
-                    && max_candidates >= 1
-                {
+                if max_candidates < candidates && max_candidates >= 1 {
                     suggestions.push(format!(
                         "split candidates into batches of at most {max_candidates}; compare batches only on identical evaluation windows"
                     ));
@@ -443,6 +533,7 @@ struct CausalInputProjection<'a> {
 struct CausalConfigProjection<'a> {
     spec_without_input_ids: ExperimentSpec,
     policy_revisions: &'a [FrozenPolicyRevision],
+    admissions: &'a [crate::contracts::ModelAdmission],
 }
 
 #[derive(Serialize)]
@@ -641,12 +732,21 @@ pub fn causal_input_digest(
     causal_spec.evidence_snapshot_id = None;
     let evaluator = EvidenceEvaluator::new(evidence, plan.spec.pit_policy)?;
     let zero_weight = Weight::new(Decimal::ZERO)?;
-    let mut observations = BTreeMap::<&ObservationId, &ContentHash>::new();
+    let mut observations = BTreeMap::<ObservationId, ContentHash>::new();
     let mut evidence_points = BTreeMap::new();
     for admission in &plan.admissions {
+        if admission.status != crate::contracts::AdmissionStatus::Eligible {
+            continue;
+        }
         let market_code = admission.market.code();
         let binding = strategy_binding(plan, admission)?;
-        let warmup = u32::try_from(binding.warmup_bars(plan)?)
+        let compiled = crate::policy_engine::PolicyEvaluator::compile(
+            binding.clone(),
+            plan,
+            admission.market.clone(),
+            plan.spec.decision_interval,
+        )?;
+        let warmup = u32::try_from(compiled.decision_warmup_bars())
             .map_err(|_| LabError::ResourceLimit("policy warmup exceeds u32".into()))?;
         let decision_range = plan
             .spec
@@ -664,28 +764,46 @@ pub fn causal_input_digest(
                     .find(|policy| policy.reference == *reference)
             })
             .is_some_and(|policy| policy.definition.requires_evidence());
-        for dataset in datasets {
-            for observation in &dataset.observations {
-                if observation.candle.market != market_code.as_str() {
-                    continue;
-                }
-                let in_decision = observation.candle.interval == plan.spec.decision_interval
-                    && decision_range.contains(observation.candle.open_time_utc)
-                    && observation.candle.close_time_utc < plan.spec.range.end();
-                let in_execution = observation.candle.interval == plan.spec.execution_resolution
-                    && execution_range.contains(observation.candle.open_time_utc);
-                if !in_decision && !in_execution {
-                    continue;
-                }
-                match observations.insert(&observation.id, &observation.content_digest) {
-                    Some(existing) if existing != &observation.content_digest => {
-                        return Err(LabError::InputHashMismatch(
-                            "causal observation ID has conflicting content".into(),
-                        ));
-                    }
-                    _ => {}
-                }
-                if requires_evidence && in_decision {
+        let decision_bars = crate::policy_engine::prepare_interval_bars(
+            datasets,
+            &admission.market,
+            plan.spec.decision_interval,
+            crate::policy_engine::SourceWindow::declared_warmup(
+                decision_range,
+                plan.spec.range.start(),
+            ),
+        )?;
+        let execution_bars = crate::policy_engine::prepare_interval_bars(
+            datasets,
+            &admission.market,
+            plan.spec.execution_resolution,
+            execution_range,
+        )?;
+        insert_causal_observations(&mut observations, &decision_bars, |observation| {
+            observation.candle.close_time_utc < plan.spec.range.end()
+        })?;
+        insert_causal_observations(&mut observations, &execution_bars, |_| true)?;
+        for (source_interval, source_warmup) in compiled.source_requirements() {
+            let source_range = crate::policy_engine::source_causal_range(
+                plan.spec.range,
+                plan.spec.decision_interval,
+                source_interval,
+                source_warmup,
+            )?;
+            let source_bars = crate::policy_engine::prepare_interval_bars(
+                datasets,
+                &admission.market,
+                source_interval,
+                crate::policy_engine::SourceWindow::declared_warmup(
+                    source_range,
+                    plan.spec.range.start(),
+                ),
+            )?;
+            insert_causal_observations(&mut observations, &source_bars, |_| true)?;
+        }
+        if requires_evidence {
+            for observation in &decision_bars {
+                if observation.candle.close_time_utc < plan.spec.range.end() {
                     evidence_points.insert(
                         (market_code.clone(), observation.candle.close_time_utc),
                         admission.market.clone(),
@@ -732,14 +850,36 @@ pub fn causal_input_digest(
         });
     }
     ContentHash::of_value(&CausalInputProjection {
-        version: "causal-input-v1",
+        version: "causal-input-v2-mtf-admission",
         config: CausalConfigProjection {
             spec_without_input_ids: causal_spec,
             policy_revisions: &plan.policy_revisions,
+            admissions: &plan.admissions,
         },
         observations,
         evidence: causal_evidence,
     })
+}
+
+fn insert_causal_observations(
+    output: &mut BTreeMap<ObservationId, ContentHash>,
+    observations: &[crate::contracts::CandleObservation],
+    include: impl Fn(&crate::contracts::CandleObservation) -> bool,
+) -> Result<(), LabError> {
+    for observation in observations
+        .iter()
+        .filter(|observation| include(observation))
+    {
+        match output.insert(observation.id.clone(), observation.content_digest.clone()) {
+            Some(existing) if existing != observation.content_digest => {
+                return Err(LabError::InputHashMismatch(
+                    "causal observation ID has conflicting content".into(),
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Materialize every planned run with stable IDs; evaluation cases remain gated by a winner.

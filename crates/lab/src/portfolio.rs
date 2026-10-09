@@ -19,7 +19,7 @@ use crate::contracts::{
     TerminalPolicy, UtcTimestamp, Weight,
 };
 use crate::engine::execution::{bps_rate, floor_to_step, tick_for};
-use crate::policy_engine::PolicyEvaluator;
+use crate::policy_engine::{CrossIntervalFeed, PolicyEvaluator};
 use crate::regime::{RegimeClassifier, gate_action};
 use crate::strategy::PositionView;
 use rust_decimal::Decimal;
@@ -48,10 +48,11 @@ struct MarketSlot {
     closed_trades: u64,
     max_weight_seen: Decimal,
     exposure_seconds: u64,
-    exposure_open_since: Option<UtcTimestamp>,
     episode_opened_at: Option<UtcTimestamp>,
     decision_marks_since_open: u64,
     gate: Option<(RegimeClassifier, Vec<CandleObservation>)>,
+    /// Bounded causal cross-interval feed; empty for single-interval policies.
+    source_feed: CrossIntervalFeed,
 }
 
 /// Shared cash ledger for the whole portfolio; the single spend authority.
@@ -67,10 +68,11 @@ impl SharedCash {
     }
 
     fn reserve(&mut self, amount: Decimal) -> Result<(), LabError> {
-        if amount > self.free()? {
-            return Err(LabError::AccountingInvariant(
-                "portfolio reservation exceeds free cash".into(),
-            ));
+        let free = self.free()?;
+        if amount > free {
+            return Err(LabError::AccountingInvariant(format!(
+                "portfolio reservation exceeds free cash: required {amount}, free {free}"
+            )));
         }
         self.reserved = checked_add(self.reserved, amount, "portfolio reservation")?;
         Ok(())
@@ -78,9 +80,10 @@ impl SharedCash {
 
     fn release(&mut self, amount: Decimal) -> Result<(), LabError> {
         if amount > self.reserved {
-            return Err(LabError::AccountingInvariant(
-                "portfolio release exceeds reserved cash".into(),
-            ));
+            return Err(LabError::AccountingInvariant(format!(
+                "portfolio release exceeds reserved cash: requested {amount}, reserved {}",
+                self.reserved
+            )));
         }
         self.reserved = checked_sub(self.reserved, amount, "portfolio release")?;
         Ok(())
@@ -88,15 +91,17 @@ impl SharedCash {
 
     fn settle_buy(&mut self, debit: Decimal) -> Result<(), LabError> {
         if debit > self.total {
-            return Err(LabError::AccountingInvariant(
-                "portfolio buy debit exceeds total cash".into(),
-            ));
+            return Err(LabError::AccountingInvariant(format!(
+                "portfolio buy debit exceeds total cash: debit {debit}, total {}",
+                self.total
+            )));
         }
         self.total = checked_sub(self.total, debit, "portfolio buy cash")?;
         if self.total < Decimal::ZERO {
-            return Err(LabError::AccountingInvariant(
-                "portfolio cash went negative; fees may never overdraw the pool".into(),
-            ));
+            return Err(LabError::AccountingInvariant(format!(
+                "portfolio cash went negative ({}); fees may never overdraw the pool",
+                self.total
+            )));
         }
         Ok(())
     }
@@ -118,6 +123,7 @@ struct RunnerState {
     observations: Vec<RegimeObservation>,
     peak_equity: Decimal,
     record_count: usize,
+    portfolio_exposure_seconds: u64,
 }
 
 impl RunnerState {
@@ -321,6 +327,8 @@ pub fn run_portfolio(
                 episode_opened_at: None,
                 held_decision_bars: None,
             };
+            slot.source_feed
+                .feed_until(&mut slot.evaluator, bar.candle.close_time_utc)?;
             slot.evaluator.observe(bar, view, None)?;
         }
         if let Some((gate, gate_bars)) = &mut slot.gate {
@@ -347,10 +355,11 @@ pub fn run_portfolio(
         observations: Vec::new(),
         peak_equity: spec.initial_cash.get(),
         record_count: 0,
+        portfolio_exposure_seconds: 0,
     };
-    for time in &timeline {
+    for (step_index, time) in timeline.iter().enumerate() {
         check_cancelled(cancelled)?;
-        let marked = mark_state(&slots, cash.total, *time);
+        let marked = mark_state(&slots, cash.total, *time)?;
         state.push_mark(&marked, &slots, &cash, *time)?;
         let mut signals = Vec::new();
         #[allow(
@@ -406,14 +415,17 @@ pub fn run_portfolio(
                     .flatten(),
                 held_decision_bars: holding.then_some(slots[slot_index].decision_marks_since_open),
             };
-            let evaluation = slots[slot_index]
-                .evaluator
-                .observe(&bar, view, None)?
-                .ok_or_else(|| {
-                    LabError::InsufficientWarmup(
-                        "strategy warmup did not complete by portfolio start".into(),
-                    )
-                })?;
+            let evaluation = {
+                let slot = &mut slots[slot_index];
+                slot.source_feed
+                    .feed_until(&mut slot.evaluator, bar.candle.close_time_utc)?;
+                slot.evaluator.observe(&bar, view, None)?
+            }
+            .ok_or_else(|| {
+                LabError::InsufficientWarmup(
+                    "strategy warmup did not complete by portfolio start".into(),
+                )
+            })?;
             let mut target = evaluation.constrained_target_weight.get();
             if let (Some(regime_spec), Some((gate, _))) = (regime, &mut slots[slot_index].gate) {
                 // Warmup-incomplete classification applies the frozen UNKNOWN
@@ -447,6 +459,26 @@ pub fn run_portfolio(
             plan,
             participation_cap,
         )?;
+        let next_time = if let Some(next) = timeline.get(step_index + 1) {
+            *next
+        } else {
+            plan.spec.range.end()
+        };
+        let step_seconds = u64::try_from((next_time.0 - time.0).num_seconds()).unwrap_or(0);
+        if step_seconds > 0 {
+            let mut portfolio_has_position = false;
+            for slot in &mut slots {
+                if slot.qty > Decimal::ZERO {
+                    slot.exposure_seconds = slot.exposure_seconds.saturating_add(step_seconds);
+                    portfolio_has_position = true;
+                }
+            }
+            if portfolio_has_position {
+                state.portfolio_exposure_seconds = state
+                    .portfolio_exposure_seconds
+                    .saturating_add(step_seconds);
+            }
+        }
     }
     // Terminal handling: optional liquidation at the terminal execution close.
     if plan.spec.terminal_policy == TerminalPolicy::LiquidateScenario {
@@ -500,7 +532,7 @@ pub fn run_portfolio(
         }
     }
     let terminal_time = plan.spec.range.end();
-    let terminal_mark = mark_state(&slots, cash.total, terminal_time);
+    let terminal_mark = mark_state(&slots, cash.total, terminal_time)?;
     state.push_mark(&terminal_mark, &slots, &cash, terminal_time)?;
     let attribution = attribution(&slots, terminal_time)?;
     let totals = totals(&slots, &cash, &state, terminal_time)?;
@@ -619,7 +651,13 @@ fn market_slots(
         }
         let binding: StrategyBinding = crate::contracts::strategy_binding(plan, admission)?;
         let strategy_kind = binding.kind();
-        let warmup = u32::try_from(binding.warmup_bars(plan)?)
+        let evaluator = PolicyEvaluator::compile(
+            binding,
+            plan,
+            asset.market.clone(),
+            plan.spec.decision_interval,
+        )?;
+        let warmup = u32::try_from(evaluator.decision_warmup_bars())
             .map_err(|_| LabError::ResourceLimit("policy warmup overflow".into()))?;
         let decision_range = plan
             .spec
@@ -629,30 +667,24 @@ fn market_slots(
             .spec
             .range
             .with_warmup(1, plan.spec.execution_resolution)?;
-        let decision_bars = crate::engine::observations_for_range(
+        let decision_bars = crate::policy_engine::prepare_interval_bars(
             datasets,
             &asset.market,
             plan.spec.decision_interval,
-            Some(decision_range),
-        )?
-        .into_iter()
-        .cloned()
-        .collect();
-        let execution_bars = crate::engine::observations_for_range(
+            crate::policy_engine::SourceWindow::declared_warmup(
+                decision_range,
+                plan.spec.range.start(),
+            ),
+        )?;
+        let execution_bars = crate::policy_engine::prepare_interval_bars(
             datasets,
             &asset.market,
             plan.spec.execution_resolution,
-            Some(execution_range),
-        )?
-        .into_iter()
-        .cloned()
-        .collect();
-        let evaluator = PolicyEvaluator::compile(
-            binding,
-            plan,
-            asset.market.clone(),
-            plan.spec.decision_interval,
+            execution_range,
         )?;
+        // Bounded causal cross-interval stream per declared source interval.
+        let source_feed =
+            CrossIntervalFeed::new(&evaluator, datasets, &asset.market, plan.spec.range)?;
         // The classifier keeps its own causal stream: its warmup is usually
         // longer than the strategy's, and the strategy stream must stay at
         // the declared policy warmup for reproducibility.
@@ -700,9 +732,9 @@ fn market_slots(
             closed_trades: 0,
             max_weight_seen: Decimal::ZERO,
             exposure_seconds: 0,
-            exposure_open_since: None,
             episode_opened_at: None,
             decision_marks_since_open: 0,
+            source_feed,
             gate,
         });
     }
@@ -754,63 +786,70 @@ fn shared_timeline(
 }
 
 /// Mark every market at the latest decision close at or before `time`.
-fn mark_state(slots: &[MarketSlot], cash_total: Decimal, time: UtcTimestamp) -> PortfolioMark {
+fn mark_state(
+    slots: &[MarketSlot],
+    cash_total: Decimal,
+    time: UtcTimestamp,
+) -> Result<PortfolioMark, LabError> {
     let mut position_value = Decimal::ZERO;
     let mut weights = BTreeMap::new();
     for slot in slots {
-        let close = close_at(slot, time);
-        let value = checked_mul(slot.qty, close, "marked position").unwrap_or(Decimal::ZERO);
-        position_value =
-            checked_add(position_value, value, "position sum").unwrap_or(Decimal::ZERO);
+        let close = close_at(slot, time)?;
+        let value = checked_mul(slot.qty, close, "marked position")?;
+        position_value = checked_add(position_value, value, "position sum")?;
     }
-    let equity =
-        checked_add(cash_total, position_value, "portfolio equity").unwrap_or(Decimal::ZERO);
+    let equity = checked_add(cash_total, position_value, "portfolio equity")?;
     for slot in slots {
-        let close = close_at(slot, time);
-        let value = checked_mul(slot.qty, close, "marked position").unwrap_or(Decimal::ZERO);
+        let close = close_at(slot, time)?;
+        let value = checked_mul(slot.qty, close, "marked position")?;
         let weight = if equity.is_zero() {
             Decimal::ZERO
         } else {
-            checked_div(value, equity, "asset weight").unwrap_or(Decimal::ZERO)
+            checked_div(value, equity, "asset weight")?
         };
         weights.insert(slot.market.code(), weight);
     }
     let gross_weight = if equity.is_zero() {
         Decimal::ZERO
     } else {
-        checked_div(position_value, equity, "gross weight").unwrap_or(Decimal::ZERO)
+        checked_div(position_value, equity, "gross weight")?
     };
-    PortfolioMark {
+    Ok(PortfolioMark {
         cash: cash_total,
         position_value,
         gross_weight,
         equity,
         weights,
-    }
+    })
 }
 
 /// Latest decision close at or before `time`; the terminal instant prefers the
 /// execution bar that closes exactly at the range end.
-fn close_at(slot: &MarketSlot, time: UtcTimestamp) -> Decimal {
-    if let Some(bar) = slot
+fn close_at(slot: &MarketSlot, time: UtcTimestamp) -> Result<Decimal, LabError> {
+    if let Ok(index) = slot
         .execution_bars
-        .iter()
-        .find(|bar| bar.candle.close_time_utc == time)
+        .binary_search_by_key(&time, |bar| bar.candle.close_time_utc)
     {
-        return bar.candle.close.get();
+        return Ok(slot.execution_bars[index].candle.close.get());
     }
     slot.decision_bars
-        .iter()
-        .rev()
-        .find(|bar| bar.candle.close_time_utc <= time)
-        .map_or(Decimal::ZERO, |bar| bar.candle.close.get())
+        .partition_point(|bar| bar.candle.close_time_utc <= time)
+        .checked_sub(1)
+        .and_then(|index| slot.decision_bars.get(index))
+        .map(|bar| bar.candle.close.get())
+        .ok_or_else(|| {
+            LabError::DataGap(format!(
+                "portfolio market {} has no causal close at or before {time}",
+                slot.market
+            ))
+        })
 }
 
 /// Unrealized profit of every position at `time` (mark value minus basis).
 fn unrealized_at(slots: &[MarketSlot], time: UtcTimestamp) -> Result<Decimal, LabError> {
     let mut total = Decimal::ZERO;
     for slot in slots {
-        let close = close_at(slot, time);
+        let close = close_at(slot, time)?;
         let value = checked_mul(slot.qty, close, "marked value")?;
         total = checked_add(
             total,
@@ -840,7 +879,7 @@ fn arbitrate_and_fill(
     if signals.is_empty() {
         return Ok(());
     }
-    let marked = mark_state(slots, cash.total, time);
+    let marked = mark_state(slots, cash.total, time)?;
     let equity = marked.equity;
     let mut ordered: Vec<&Signal> = signals.iter().collect();
     match state.spec.arbitration {
@@ -878,37 +917,11 @@ fn arbitrate_and_fill(
     let mut sells = Vec::new();
     let mut buys = Vec::new();
     for signal in &ordered {
-        let weight = current_weight(slots, signal.slot_index, equity)?;
+        let weight = current_weight(slots, signal.slot_index, equity, time)?;
         if signal.target < weight {
             sells.push(*signal);
         } else if signal.target > weight {
             buys.push(*signal);
-        }
-    }
-    if state.spec.arbitration == ArbitrationPolicy::ProRata && buys.len() > 1 {
-        allocate_pro_rata(
-            slots,
-            cash,
-            state,
-            &buys,
-            time,
-            plan,
-            equity,
-            participation_cap,
-        )?;
-    } else {
-        for (rank, signal) in buys.iter().enumerate() {
-            allocate_buy(
-                slots,
-                cash,
-                state,
-                signal,
-                u32::try_from(rank).map_err(|_| LabError::ResourceLimit("rank overflow".into()))?,
-                time,
-                plan,
-                equity,
-                participation_cap,
-            )?;
         }
     }
     for (rank, signal) in sells.iter().enumerate() {
@@ -969,6 +982,32 @@ fn arbitrate_and_fill(
             time,
         )?;
     }
+    if state.spec.arbitration == ArbitrationPolicy::ProRata && buys.len() > 1 {
+        allocate_pro_rata(
+            slots,
+            cash,
+            state,
+            &buys,
+            time,
+            plan,
+            equity,
+            participation_cap,
+        )?;
+    } else {
+        for (rank, signal) in buys.iter().enumerate() {
+            allocate_buy(
+                slots,
+                cash,
+                state,
+                signal,
+                u32::try_from(rank).map_err(|_| LabError::ResourceLimit("rank overflow".into()))?,
+                time,
+                plan,
+                equity,
+                participation_cap,
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -980,20 +1019,22 @@ fn current_weight(
     slots: &[MarketSlot],
     slot_index: usize,
     equity: Decimal,
+    time: UtcTimestamp,
 ) -> Result<Decimal, LabError> {
     if equity.is_zero() {
         return Ok(Decimal::ZERO);
     }
     let slot = &slots[slot_index];
-    let close = slot
-        .decision_bars
-        .last()
-        .map_or(Decimal::ZERO, |bar| bar.candle.close.get());
+    let close = close_at(slot, time)?;
     let value = checked_mul(slot.qty, close, "current value")?;
     checked_div(value, equity, "current weight")
 }
 
 #[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "pro rata arbitration coordinates cash scaling, allocation bounds and execution"
+)]
 fn allocate_pro_rata(
     slots: &mut [MarketSlot],
     cash: &mut SharedCash,
@@ -1006,39 +1047,117 @@ fn allocate_pro_rata(
 ) -> Result<(), LabError> {
     // Pro-rata scales every competing buy by one common factor so the shared
     // pool is never double-spent and no buy is silently preferred.
-    let desired: Vec<Decimal> = buys
-        .iter()
-        .map(|signal| desired_notional(slots, signal, equity, time))
-        .collect::<Result<Vec<_>, LabError>>()?;
-    let total_desired = desired.iter().try_fold(Decimal::ZERO, |sum, value| {
-        checked_add(sum, *value, "pro-rata sum")
-    })?;
-    let available = buy_headroom(slots, cash, state, equity)?;
-    let factor = if total_desired.is_zero() {
+    let mut targets = Vec::with_capacity(buys.len());
+    let mut multipliers = Vec::with_capacity(buys.len());
+    let mut cash_demands = Vec::with_capacity(buys.len());
+    let mut total_desired = Decimal::ZERO;
+    let mut total_cash_demand = Decimal::ZERO;
+
+    for signal in buys {
+        let slot = &slots[signal.slot_index];
+        let desired = desired_notional(slots, signal, equity, time)?;
+        let close = close_at(slot, time)?;
+        let position_value = checked_mul(slot.qty, close, "position value")?;
+        let asset_headroom = checked_sub(
+            checked_mul(state.spec.asset_cap(&slot.market), equity, "asset budget")?,
+            position_value,
+            "asset headroom",
+        )?
+        .max(Decimal::ZERO);
+        let target = desired.min(asset_headroom);
+
+        let fees = plan.spec.fee_policy_at(time)?;
+        let fee_rate = bps_rate(fees.buy)?;
+        let price_cost_rate = plan_price_cost_rate(plan)?;
+        let multiplier = checked_add(
+            Decimal::ONE,
+            checked_add(fee_rate, price_cost_rate, "reservation costs")?,
+            "reservation multiplier",
+        )?;
+        let cash_demand = checked_mul(target, multiplier, "buy cash demand")?;
+
+        total_desired = checked_add(total_desired, target, "pro-rata target sum")?;
+        total_cash_demand =
+            checked_add(total_cash_demand, cash_demand, "pro-rata cash demand sum")?;
+
+        targets.push(target);
+        multipliers.push(multiplier);
+        cash_demands.push(cash_demand);
+    }
+
+    let gross = state.spec.risk.max_gross_exposure.get();
+    let gross_headroom = checked_sub(
+        checked_mul(gross, equity, "gross budget")?,
+        gross_value(slots, time)?,
+        "gross headroom",
+    )?
+    .max(Decimal::ZERO);
+    let reserve = state.spec.risk.min_cash_weight.get();
+    let cash_headroom = checked_sub(
+        cash.free()?,
+        checked_mul(reserve, equity, "reserve budget")?,
+        "cash headroom",
+    )?
+    .max(Decimal::ZERO);
+
+    let gross_factor = if total_desired > gross_headroom && !total_desired.is_zero() {
+        checked_div(gross_headroom, total_desired, "gross pro-rata factor")?
+    } else {
+        Decimal::ONE
+    };
+    let cash_factor = if total_cash_demand > cash_headroom && !total_cash_demand.is_zero() {
+        checked_div(cash_headroom, total_cash_demand, "cash pro-rata factor")?
+    } else {
+        Decimal::ONE
+    };
+
+    let factor = if total_desired.is_zero() || total_cash_demand.is_zero() {
         Decimal::ZERO
     } else {
-        checked_div(available, total_desired, "pro-rata factor")?.min(Decimal::ONE)
+        Decimal::ONE.min(gross_factor).min(cash_factor)
     };
-    for (rank, (signal, notional)) in buys.iter().zip(&desired).enumerate() {
-        let scaled = checked_mul(*notional, factor, "pro-rata scaling")?;
-        if scaled.is_zero() {
-            let binding = binding_reason(slots, cash, state, signal, equity)?;
+
+    let min_notional = plan.spec.rules_at(time)?.min_notional.get();
+
+    for (rank, ((signal, target_notional), multiplier)) in
+        buys.iter().zip(&targets).zip(&multipliers).enumerate()
+    {
+        let desired = desired_notional(slots, signal, equity, time)?;
+        let scaled = checked_mul(*target_notional, factor, "pro-rata scaling")?;
+        let max_safe = checked_div(cash.free()?, *multiplier, "safe notional")?;
+        let allocation = scaled.min(max_safe);
+
+        if allocation < min_notional || allocation.is_zero() {
+            let binding = if allocation.is_zero() {
+                binding_reason(slots, cash, state, signal, equity, time)?
+            } else {
+                PortfolioRejectionReason::MinNotional
+            };
+            state.push_intent(
+                time,
+                &slots[signal.slot_index].market,
+                Side::Buy,
+                signal.target,
+                desired,
+                u32::try_from(rank).map_err(|_| LabError::ResourceLimit("rank overflow".into()))?,
+            )?;
             state.push_rejection(
                 time,
                 &slots[signal.slot_index].market,
                 Side::Buy,
                 signal.target,
-                *notional,
+                desired,
                 binding,
             )?;
             continue;
         }
+
         state.push_intent(
             time,
             &slots[signal.slot_index].market,
             Side::Buy,
             signal.target,
-            scaled,
+            desired,
             u32::try_from(rank).map_err(|_| LabError::ResourceLimit("rank overflow".into()))?,
         )?;
         execute_buy(
@@ -1046,7 +1165,7 @@ fn allocate_pro_rata(
             cash,
             state,
             signal,
-            scaled,
+            allocation,
             time,
             plan,
             participation_cap,
@@ -1059,13 +1178,10 @@ fn desired_notional(
     slots: &[MarketSlot],
     signal: &Signal,
     equity: Decimal,
-    _time: UtcTimestamp,
+    time: UtcTimestamp,
 ) -> Result<Decimal, LabError> {
     let slot = &slots[signal.slot_index];
-    let close = slot
-        .decision_bars
-        .last()
-        .map_or(Decimal::ZERO, |bar| bar.candle.close.get());
+    let close = close_at(slot, time)?;
     let position_value = checked_mul(slot.qty, close, "position value")?;
     let target_value = checked_mul(signal.target, equity, "target value")?;
     Ok(checked_sub(target_value, position_value, "buy gap")?.max(Decimal::ZERO))
@@ -1077,11 +1193,12 @@ fn buy_headroom(
     cash: &SharedCash,
     state: &RunnerState,
     equity: Decimal,
+    time: UtcTimestamp,
 ) -> Result<Decimal, LabError> {
     let gross = state.spec.risk.max_gross_exposure.get();
     let gross_headroom = checked_sub(
         checked_mul(gross, equity, "gross budget")?,
-        gross_value(slots)?,
+        gross_value(slots, time)?,
         "gross headroom",
     )?
     .max(Decimal::ZERO);
@@ -1102,12 +1219,10 @@ fn binding_reason(
     state: &RunnerState,
     signal: &Signal,
     equity: Decimal,
+    time: UtcTimestamp,
 ) -> Result<PortfolioRejectionReason, LabError> {
     let slot = &slots[signal.slot_index];
-    let close = slot
-        .decision_bars
-        .last()
-        .map_or(Decimal::ZERO, |bar| bar.candle.close.get());
+    let close = close_at(slot, time)?;
     let position_value = checked_mul(slot.qty, close, "position value")?;
     let asset_headroom = checked_sub(
         checked_mul(state.spec.asset_cap(&slot.market), equity, "asset budget")?,
@@ -1122,7 +1237,7 @@ fn binding_reason(
     } else {
         checked_div(checked_sub(peak, equity, "drawdown")?, peak, "drawdown")?
     };
-    let gross_headroom = buy_headroom(slots, cash, state, equity)?;
+    let gross_headroom = buy_headroom(slots, cash, state, equity, time)?;
     if stop > Decimal::ZERO && drawdown >= stop {
         Ok(PortfolioRejectionReason::PortfolioStop)
     } else if asset_headroom.is_zero() {
@@ -1171,10 +1286,7 @@ fn allocate_buy(
         return Ok(());
     }
     let slot = &slots[signal.slot_index];
-    let close = slot
-        .decision_bars
-        .last()
-        .map_or(Decimal::ZERO, |bar| bar.candle.close.get());
+    let close = close_at(slot, time)?;
     let position_value = checked_mul(slot.qty, close, "position value")?;
     let asset_headroom = checked_sub(
         checked_mul(state.spec.asset_cap(&slot.market), equity, "asset budget")?,
@@ -1185,7 +1297,7 @@ fn allocate_buy(
     let gross = state.spec.risk.max_gross_exposure.get();
     let gross_headroom = checked_sub(
         checked_mul(gross, equity, "gross budget")?,
-        gross_value(slots)?,
+        gross_value(slots, time)?,
         "gross headroom",
     )?
     .max(Decimal::ZERO);
@@ -1196,13 +1308,22 @@ fn allocate_buy(
         "cash headroom",
     )?
     .max(Decimal::ZERO);
+    let fees = plan.spec.fee_policy_at(time)?;
+    let fee_rate = bps_rate(fees.buy)?;
+    let price_cost_rate = plan_price_cost_rate(plan)?;
+    let multiplier = checked_add(
+        Decimal::ONE,
+        checked_add(fee_rate, price_cost_rate, "reservation costs")?,
+        "reservation multiplier",
+    )?;
+    let cash_notional_headroom = checked_div(cash_headroom, multiplier, "cash notional headroom")?;
     // The binding cap clips the allocation; a clipped amount at or above the
     // minimum notional still trades (a partial fill), anything smaller is a
     // typed rejection that names the binding cap.
     let allocation = requested
         .min(asset_headroom)
         .min(gross_headroom)
-        .min(cash_headroom);
+        .min(cash_notional_headroom);
     let min_notional = plan.spec.rules_at(time)?.min_notional.get();
     if allocation >= min_notional && !allocation.is_zero() {
         execute_buy(
@@ -1252,15 +1373,14 @@ fn execute_buy(
     // The reservation covers the worst-case debit: notional uplifted by the
     // price-cost rate and the fee, so the pool can never be double-spent.
     let price_cost_rate = plan_price_cost_rate(plan)?;
-    let reserved = checked_mul(
-        notional,
-        checked_add(
-            Decimal::ONE,
-            checked_add(fee_rate, price_cost_rate, "reservation costs")?,
-            "reservation multiplier",
-        )?,
-        "buy reservation",
+    let multiplier = checked_add(
+        Decimal::ONE,
+        checked_add(fee_rate, price_cost_rate, "reservation costs")?,
+        "reservation multiplier",
     )?;
+    let raw_reserved = checked_mul(notional, multiplier, "buy reservation")?;
+    let free = cash.free()?;
+    let reserved = raw_reserved.min(free);
     cash.reserve(reserved)?;
     let requested_qty = checked_div(notional, bar.candle.close.get(), "buy quantity")?;
     let slot_index = signal.slot_index;
@@ -1421,6 +1541,7 @@ fn execute_fill(
     )?;
     let qty = floor_to_step(requested_qty.min(volume_cap), rules.quantity_step.get())?;
     let notional = checked_mul(qty, rounded, "fill notional")?;
+    let price_cost_quote = checked_mul(price_cost, qty, "fill price cost quote")?;
     if qty.is_zero() || notional < rules.min_notional.get() {
         if let Some(reserved) = reserved {
             cash.release(reserved)?;
@@ -1448,10 +1569,12 @@ fn execute_fill(
                 cash.release(reserved)?;
             }
             let debit = checked_add(notional, fee, "buy debit")?;
-            if debit > cash.free()? {
-                return Err(LabError::AccountingInvariant(
-                    "portfolio buy debit exceeds free cash".into(),
-                ));
+            let available_cash = cash.free()?;
+            if debit > available_cash {
+                return Err(LabError::AccountingInvariant(format!(
+                    "portfolio buy debit exceeds free cash: market={}, debit={debit}, free={available_cash}",
+                    slot.market
+                )));
             }
             cash.settle_buy(debit)?;
             slot.qty = checked_add(slot.qty, qty, "buy quantity")?;
@@ -1460,9 +1583,10 @@ fn execute_fill(
         }
         Side::Sell => {
             if qty > slot.qty {
-                return Err(LabError::AccountingInvariant(
-                    "portfolio sell exceeds inventory".into(),
-                ));
+                return Err(LabError::AccountingInvariant(format!(
+                    "portfolio sell exceeds inventory: market={}, sell_qty={qty}, slot_qty={}",
+                    slot.market, slot.qty
+                )));
             }
             let removed_basis = if qty == slot.qty {
                 slot.price_basis
@@ -1487,16 +1611,6 @@ fn execute_fill(
         }
     }
     slot.fees = checked_add(slot.fees, fee, "slot fees")?;
-    // Exposure tracking: time-weighted presence of a nonzero position.
-    if slot.qty > Decimal::ZERO && slot.exposure_open_since.is_none() {
-        slot.exposure_open_since = Some(execution_time);
-    } else if slot.qty.is_zero()
-        && let Some(opened) = slot.exposure_open_since.take()
-    {
-        slot.exposure_seconds = slot.exposure_seconds.saturating_add(
-            u64::try_from((execution_time.0 - opened.0).num_seconds()).unwrap_or(0),
-        );
-    }
     let seq = state.next_seq()?;
     state.fills.push(PortfolioFillRecord {
         event_seq: seq,
@@ -1507,7 +1621,8 @@ fn execute_fill(
         notional: QuoteAmount::new(notional)?,
         fee: QuoteAmount::new(fee)?,
         fee_bps,
-        price_cost: crate::contracts::SignedAmount::new(price_cost)?,
+        price_cost: crate::contracts::SignedAmount::new(price_cost_quote)?,
+        price_difference_per_unit: Some(crate::contracts::SignedAmount::new(price_cost)?),
         reserved_cash: QuoteAmount::new(Decimal::ZERO)?,
         decision_time,
         execution_time,
@@ -1535,13 +1650,10 @@ fn plan_price_cost_rate(plan: &ResolvedPlan) -> Result<Decimal, LabError> {
     )
 }
 
-fn gross_value(slots: &[MarketSlot]) -> Result<Decimal, LabError> {
+fn gross_value(slots: &[MarketSlot], time: UtcTimestamp) -> Result<Decimal, LabError> {
     let mut total = Decimal::ZERO;
     for slot in slots {
-        let close = slot
-            .decision_bars
-            .last()
-            .map_or(Decimal::ZERO, |bar| bar.candle.close.get());
+        let close = close_at(slot, time)?;
         total = checked_add(
             total,
             checked_mul(slot.qty, close, "position value")?,
@@ -1558,7 +1670,7 @@ fn attribution(
     slots
         .iter()
         .map(|slot| {
-            let close = close_at(slot, terminal_time);
+            let close = close_at(slot, terminal_time)?;
             let unrealized = checked_sub(
                 checked_mul(slot.qty, close, "terminal value")?,
                 slot.price_basis,
@@ -1586,20 +1698,14 @@ fn totals(
     state: &RunnerState,
     terminal_time: UtcTimestamp,
 ) -> Result<PortfolioTotals, LabError> {
-    let marked = mark_state(slots, cash.total, terminal_time);
-    let mut peak = state.peak_equity;
-    for mark in &state.marks {
-        peak = peak.max(mark.equity.get());
-    }
-    let max_drawdown = if peak.is_zero() {
-        Decimal::ZERO
-    } else {
-        checked_div(
-            checked_sub(peak, marked.equity, "max drawdown")?,
-            peak,
-            "max drawdown",
-        )?
-    };
+    let marked = mark_state(slots, cash.total, terminal_time)?;
+    let max_drawdown = maximum_drawdown(
+        state
+            .marks
+            .iter()
+            .map(|mark| mark.equity.get())
+            .chain(std::iter::once(marked.equity)),
+    )?;
     let gross = slots
         .iter()
         .map(|slot| slot.buy_notional + slot.sell_notional)
@@ -1640,32 +1746,54 @@ fn totals(
                 .map(|fill| fill.price_cost.get())
                 .sum::<Decimal>(),
         )?,
-        exposure_seconds: slots.iter().map(|slot| slot.exposure_seconds).sum(),
+        exposure_seconds: state.portfolio_exposure_seconds,
         rejected_signals: u64::try_from(state.rejections.len())
             .map_err(|_| LabError::ResourceLimit("rejection count overflow".into()))?,
         rejection_reasons,
     })
 }
 
+fn maximum_drawdown(equities: impl IntoIterator<Item = Decimal>) -> Result<Decimal, LabError> {
+    let mut peak = Decimal::ZERO;
+    let mut maximum = Decimal::ZERO;
+    for equity in equities {
+        if equity >= peak {
+            peak = equity;
+            continue;
+        }
+        if peak.is_zero() {
+            continue;
+        }
+        let drawdown = checked_div(
+            checked_sub(peak, equity, "max drawdown")?,
+            peak,
+            "max drawdown",
+        )?;
+        maximum = maximum.max(drawdown);
+    }
+    Ok(maximum)
+}
+
 /// Final reconciliation: cash bounds, position bounds and the aggregate
 /// identity between the terminal equity and the accumulated facts.
 fn reconcile(slots: &[MarketSlot], cash: &SharedCash) -> Result<(), LabError> {
     if cash.total < Decimal::ZERO || cash.reserved < Decimal::ZERO || cash.reserved > cash.total {
-        return Err(LabError::AccountingInvariant(
-            "portfolio cash invariants violated at reconciliation".into(),
-        ));
+        return Err(LabError::AccountingInvariant(format!(
+            "portfolio cash invariants violated at reconciliation: total={}, reserved={}",
+            cash.total, cash.reserved
+        )));
     }
     for slot in slots {
         if slot.qty < Decimal::ZERO || slot.price_basis < Decimal::ZERO {
             return Err(LabError::AccountingInvariant(format!(
-                "portfolio position invariants violated for {}",
-                slot.market
+                "portfolio position invariants violated for {}: qty={}, basis={}",
+                slot.market, slot.qty, slot.price_basis
             )));
         }
         if slot.qty.is_zero() != slot.price_basis.is_zero() {
             return Err(LabError::AccountingInvariant(format!(
-                "portfolio quantity and basis disagree for {}",
-                slot.market
+                "portfolio quantity and basis disagree for {}: qty={}, basis={}",
+                slot.market, slot.qty, slot.price_basis
             )));
         }
     }

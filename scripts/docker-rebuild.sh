@@ -25,7 +25,22 @@ if [ -n "${PUBLIC_DOMAIN:-}" ]; then
   validate_domain "$PUBLIC_DOMAIN"
 fi
 
-docker compose build app
+revision=$(git rev-parse HEAD)
+if ! printf '%s\n' "$revision" | grep -Eq '^[0-9a-f]{40}$'; then
+  printf 'unable to resolve a full lowercase Git revision for this build\n' >&2
+  exit 2
+fi
+git_state=$(git status --porcelain --untracked-files=normal)
+if [ -n "$git_state" ]; then
+  revision="${revision}-dirty"
+fi
+SKY_BACKCRAFT_BUILD_REVISION=$revision
+export SKY_BACKCRAFT_BUILD_REVISION
+
+docker compose build \
+  --build-arg "SKY_BACKCRAFT_BUILD_REVISION=$SKY_BACKCRAFT_BUILD_REVISION" \
+  --build-arg "SKY_BACKCRAFT_VERIFICATION_RECEIPT=${SKY_BACKCRAFT_VERIFICATION_RECEIPT:-}" \
+  app
 
 if [ -n "${PUBLIC_DOMAIN:-}" ]; then
   docker compose up --detach app --remove-orphans

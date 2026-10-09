@@ -14,7 +14,7 @@ use crate::contracts::{
     UtcTimestamp, Weight,
 };
 use crate::evidence::EvidenceEvaluator;
-use crate::policy_engine::PolicyEvaluator;
+use crate::policy_engine::{CrossIntervalFeed, PolicyEvaluator};
 use crate::strategy::{PositionView, StrategyEvaluation};
 use accounting::{
     Account, aggregate_identity_within_tolerance, checked_add, checked_div, checked_mul,
@@ -71,11 +71,18 @@ pub fn run_model(
         } => participation_cap,
     };
     validate_frozen_inputs(plan, datasets, evidence)?;
-    let (decision_bars, execution_bars) = match plan.spec.causal_execution {
+    let mut evaluator = PolicyEvaluator::compile(
+        strategy.clone(),
+        plan,
+        admission.market.clone(),
+        plan.spec.decision_interval,
+    )?;
+    let (decision_rows, execution_rows) = match plan.spec.causal_execution {
         Some(CausalExecutionPolicy::DeclaredPolicyWarmup) => {
-            let decision_warmup = u32::try_from(strategy.warmup_bars(plan)?).map_err(|_| {
-                LabError::ResourceLimit("policy warmup exceeds range arithmetic".into())
-            })?;
+            let decision_warmup =
+                u32::try_from(evaluator.decision_warmup_bars()).map_err(|_| {
+                    LabError::ResourceLimit("policy warmup exceeds range arithmetic".into())
+                })?;
             let decision_range = plan
                 .spec
                 .range
@@ -85,17 +92,20 @@ pub fn run_model(
                 .range
                 .with_warmup(1, plan.spec.execution_resolution)?;
             (
-                observations_for_range(
+                crate::policy_engine::prepare_interval_bars(
                     datasets,
                     &admission.market,
                     plan.spec.decision_interval,
-                    Some(decision_range),
+                    crate::policy_engine::SourceWindow::declared_warmup(
+                        decision_range,
+                        plan.spec.range.start(),
+                    ),
                 )?,
-                observations_for_range(
+                crate::policy_engine::prepare_interval_bars(
                     datasets,
                     &admission.market,
                     plan.spec.execution_resolution,
-                    Some(execution_range),
+                    execution_range,
                 )?,
             )
         }
@@ -105,27 +115,29 @@ pub fn run_model(
                 &admission.market,
                 plan.spec.decision_interval,
                 None,
-            )?,
+            )?
+            .into_iter()
+            .cloned()
+            .collect(),
             observations_for_range(
                 datasets,
                 &admission.market,
                 plan.spec.execution_resolution,
                 None,
-            )?,
+            )?
+            .into_iter()
+            .cloned()
+            .collect(),
         ),
     };
+    let decision_bars = decision_rows.iter().collect::<Vec<_>>();
+    let execution_bars = execution_rows.iter().collect::<Vec<_>>();
     let initial_bar = execution_bars
         .iter()
         .copied()
         .find(|bar| bar.candle.open_time_utc == plan.spec.range.start())
         .ok_or_else(|| LabError::DataGap("missing execution bar at evaluation start".into()))?;
     let evidence_evaluator = Some(EvidenceEvaluator::new(evidence, plan.spec.pit_policy)?);
-    let mut evaluator = PolicyEvaluator::compile(
-        strategy.clone(),
-        plan,
-        admission.market.clone(),
-        plan.spec.decision_interval,
-    )?;
     let mut state = EngineState::new(
         run_id.clone(),
         admission,
@@ -150,6 +162,10 @@ pub fn run_model(
             "execution needs one prior completed liquidity bar".into(),
         ));
     }
+    // Cross-interval source bars: one bounded causal stream per declared
+    // source interval, fed incrementally (never a full reaggregation).
+    let mut source_feed =
+        CrossIntervalFeed::new(&evaluator, datasets, &admission.market, plan.spec.range)?;
     let mut decision_index = 0usize;
     while decision_bars
         .get(decision_index)
@@ -161,6 +177,10 @@ pub fn run_model(
             episode_opened_at: None,
             held_decision_bars: None,
         };
+        source_feed.feed_until(
+            &mut evaluator,
+            decision_bars[decision_index].candle.close_time_utc,
+        )?;
         evaluator.observe(
             decision_bars[decision_index],
             cash,
@@ -231,6 +251,7 @@ pub fn run_model(
 
         if let Some(decision_bar) = decision_bars.get(decision_index).copied() {
             if decision_bar.candle.close_time_utc == now {
+                source_feed.feed_until(&mut evaluator, decision_bar.candle.close_time_utc)?;
                 let marked = state.account.mark(decision_bar.candle.close)?;
                 let position = state.position_view(marked.actual_weight, now)?;
                 let evaluation = evaluator

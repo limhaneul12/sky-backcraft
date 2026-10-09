@@ -96,6 +96,7 @@ impl Store {
         Ok(crate::contracts::WalCheckpointOutcome {
             mode,
             busy: busy != 0,
+            busy_reason: (busy != 0).then_some(crate::contracts::CheckpointBusyReason::SqliteBusy),
             log_frames: to_u64(log),
             checkpointed_frames: to_u64(checkpointed),
             before,
