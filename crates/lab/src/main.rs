@@ -1424,25 +1424,58 @@ async fn run_mcp_serve(
                 let allowed_hosts = allowed_hosts.clone();
                 let allowed_origins = allowed_origins.clone();
                 async move {
-                    let host_ok = request
+                    let host = request
                         .headers()
                         .get(axum::http::header::HOST)
-                        .and_then(|value| value.to_str().ok())
-                        .is_some_and(|host| allowed_hosts.iter().any(|allowed| allowed == host));
-                    let origin_ok = request
+                        .and_then(|value| value.to_str().ok());
+                    let origin = request
                         .headers()
                         .get(axum::http::header::ORIGIN)
-                        .is_none_or(|value| {
-                            value.to_str().is_ok_and(|origin| {
-                                allowed_origins.iter().any(|allowed| allowed == origin)
-                            })
-                        });
+                        .and_then(|value| value.to_str().ok());
+
+                    let host_matches = |candidate: &str, allowed: &str| {
+                        candidate == allowed
+                            || candidate.strip_suffix(":443").is_some_and(|h| h == allowed)
+                            || candidate.strip_suffix(":80").is_some_and(|h| h == allowed)
+                            || allowed.strip_suffix(":443").is_some_and(|h| h == candidate)
+                            || allowed.strip_suffix(":80").is_some_and(|h| h == candidate)
+                    };
+
+                    let host_ok = host.is_some_and(|h| {
+                        allowed_hosts.iter().any(|allowed| host_matches(h, allowed))
+                    });
+
+                    let origin_matches = |candidate: &str, allowed: &str| {
+                        candidate == allowed
+                            || candidate.strip_suffix(":443").is_some_and(|o| o == allowed)
+                            || candidate.strip_suffix(":80").is_some_and(|o| o == allowed)
+                            || allowed.strip_suffix(":443").is_some_and(|o| o == candidate)
+                            || allowed.strip_suffix(":80").is_some_and(|o| o == candidate)
+                    };
+
+                    let path = request.uri().path();
+                    let is_oauth_form = path == "/authorize/approve" || path == "/authorize";
+
+                    let origin_ok = origin.is_none_or(|orig| {
+                        orig == "null"
+                            || is_oauth_form
+                            || allowed_origins.iter().any(|allowed| origin_matches(orig, allowed))
+                    });
+
                     if host_ok && origin_ok {
                         next.run(request).await
                     } else {
+                        tracing::warn!(
+                            event = "host_or_origin_rejected",
+                            host = ?host,
+                            origin = ?origin,
+                            path = %path,
+                            target = "spot_lab::security"
+                        );
                         axum::http::Response::builder()
                             .status(axum::http::StatusCode::FORBIDDEN)
-                            .body(axum::body::Body::empty())
+                            .header(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+                            .body(axum::body::Body::from("접근 거부: 허용되지 않은 Host 또는 Origin입니다."))
                             .unwrap_or_else(|_| axum::response::Response::default())
                     }
                 }

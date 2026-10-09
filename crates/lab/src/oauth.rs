@@ -159,7 +159,7 @@ impl OAuthState {
             )
             .route("/register", post(register))
             .route("/authorize", get(authorize))
-            .route("/authorize/approve", post(approve))
+            .route("/authorize/approve", post(approve).get(approve_get))
             .route("/token", post(token))
             .with_state(self.clone())
     }
@@ -637,16 +637,16 @@ async fn approve(State(state): State<OAuthState>, RawForm(body): RawForm) -> Res
             Ok(redirect) => redirect,
             Err(GrantError::AccessDenied) => {
                 return (
-                    StatusCode::FORBIDDEN,
+                    StatusCode::OK,
                     [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
                     r#"<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>승인 실패</title></head>
 <body style="font-family:-apple-system,sans-serif;max-width:560px;margin:60px auto;padding:0 20px;line-height:1.6">
-<h2 style="color:#d32f2f">승인 코드가 올바르지 않습니다 (403)</h2>
+<h2 style="color:#d32f2f">승인 코드가 올바르지 않습니다</h2>
 <p>입력하신 운영자 승인 코드가 현재 실행 중인 Sky Backcraft 앱의 코드와 일치하지 않습니다.</p>
 <ol style="padding-left:20px">
 <li>macOS 상단 메뉴 막대의 <strong>Sky Backcraft 아이콘</strong>을 클릭하세요.</li>
 <li><strong>'OAuth 로그인 코드 복사'</strong>를 클릭하여 최신 코드를 복사하세요.</li>
-<li>연결하려는 MCP 클라이언트(Cursor, Claude Desktop 등)에서 다시 연결을 시도하여 열리는 승인 창에 붙여넣으세요.</li>
+<li>연결하려는 프로그램(ChatGPT, Cursor, Claude Desktop 등)에서 다시 연결을 시도하여 열리는 새 승인 창에 붙여넣으세요.</li>
 </ol>
 <p style="color:#888;font-size:13px">※ 앱이 재시작되면 보안을 위해 승인 코드가 새로 생성됩니다.</p>
 </body></html>"#,
@@ -665,6 +665,24 @@ async fn approve(State(state): State<OAuthState>, RawForm(body): RawForm) -> Res
         ],
     );
     Redirect::to(&location).into_response()
+}
+
+async fn approve_get() -> Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        r#"<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>Sky Backcraft 승인 안내</title></head>
+<body style="font-family:-apple-system,sans-serif;max-width:560px;margin:60px auto;padding:0 20px;line-height:1.6">
+<h2>새로고침되었거나 만료된 승인 페이지입니다</h2>
+<p>이 주소는 일회용 승인 처리 페이지이므로 직접 접속하거나 새로고침할 수 없습니다.</p>
+<ol style="padding-left:20px">
+<li>현재 브라우저 탭을 닫아주세요.</li>
+<li>연결하려는 프로그램(ChatGPT, Cursor, Claude Desktop 등)에서 다시 <strong>Connect</strong>를 눌러 새로운 승인 창을 띄워주세요.</li>
+<li>macOS 상단 메뉴 막대의 Sky Backcraft 아이콘 &gt; <strong>'OAuth 로그인 코드 복사'</strong>를 클릭하여 복사된 64자리 코드를 새 창에 붙여넣어 주세요.</li>
+</ol>
+</body></html>"#,
+    )
+        .into_response()
 }
 
 async fn token(State(state): State<OAuthState>, RawForm(body): RawForm) -> Response {
