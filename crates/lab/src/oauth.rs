@@ -855,7 +855,7 @@ fn consent_response(body: String) -> Response {
         .header("referrer-policy", "no-referrer")
         .header(
             "content-security-policy",
-            "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+            "default-src 'none'; style-src 'unsafe-inline'; form-action 'self' https: http:; frame-ancestors 'none'; base-uri 'none'",
         )
         .body(axum::body::Body::from(body))
         .unwrap_or_else(|_| Response::new(axum::body::Body::empty()))
