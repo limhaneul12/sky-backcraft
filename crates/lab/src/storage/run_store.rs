@@ -1,5 +1,6 @@
 use super::ledger_seal::{
-    RunLedgerSource, records_of_kind, run_ledger_source, sequenced_from_lines,
+    ModelFactVectors, RunLedgerSource, RunLedgerState, read_run_ledger_state, records_of_kind,
+    run_ledger_source, sequenced_from_lines, visit_run_ledger_source,
 };
 use super::{
     Store, StoredPlan, canonical_decimal, enum_text, io_error, json_error, reject_symlink_chain,
@@ -227,27 +228,27 @@ impl Store {
         let terminal_sections = [
             (
                 "signals",
-                &stored.signals,
+                serde_json::to_value(&stored.signals).map_err(json_error)?,
                 serde_json::to_value(&ledger.signals).map_err(json_error)?,
             ),
             (
                 "order_events",
-                &stored.order_events,
+                serde_json::to_value(&stored.order_events).map_err(json_error)?,
                 serde_json::to_value(&ledger.order_events).map_err(json_error)?,
             ),
             (
                 "fills",
-                &stored.fills,
+                serde_json::to_value(&stored.fills).map_err(json_error)?,
                 serde_json::to_value(&ledger.fills).map_err(json_error)?,
             ),
             (
                 "account_marks",
-                &stored.marks,
+                serde_json::to_value(&stored.marks).map_err(json_error)?,
                 serde_json::to_value(&ledger.account_marks).map_err(json_error)?,
             ),
         ];
         for (section, stored_section, terminal_section) in terminal_sections {
-            if stored_section != &terminal_section {
+            if stored_section != terminal_section {
                 return Err(LabError::InputHashMismatch(format!(
                     "model terminal {section} do not match committed sequenced facts"
                 )));
@@ -392,8 +393,21 @@ impl Store {
         let Some(row) = query_terminal_model_row(self, run_id, model_id)? else {
             return Ok(None);
         };
-        let source = run_ledger_source(self, run_id)?;
-        load_model_from_row(self, run_id, model_id, row, &source).map(Some)
+        if read_run_ledger_state(self, run_id)? == RunLedgerState::Compacted {
+            let mut facts = StreamedModelFacts::default();
+            if !self.visit_run_ledger_lines(run_id, |line| {
+                if line.model_id == *model_id {
+                    facts.observe(line);
+                }
+            })? {
+                return Err(LabError::DataCorrupt(
+                    "compacted run has no ledger chunks".into(),
+                ));
+            }
+            load_streamed_model_from_row(self, run_id, model_id, row, facts).map(Some)
+        } else {
+            load_model_from_row(self, run_id, model_id, row, &RunLedgerSource::Detail).map(Some)
+        }
     }
 
     /// Load durable run header/status details.
@@ -844,11 +858,136 @@ fn insert_marks(
 }
 
 struct StoredSequenced {
-    signals: serde_json::Value,
-    order_events: serde_json::Value,
-    fills: serde_json::Value,
-    marks: serde_json::Value,
+    signals: Vec<SignalRecord>,
+    order_events: Vec<OrderRecord>,
+    fills: Vec<FillRecord>,
+    marks: Vec<AccountMark>,
     last_seq: u64,
+}
+
+#[derive(Default)]
+struct StreamedModelFacts {
+    signals: Vec<(u64, SignalRecord)>,
+    signal_error: Option<LabError>,
+    order_events: Vec<(u64, OrderRecord)>,
+    order_event_error: Option<LabError>,
+    fills: Vec<(u64, FillRecord)>,
+    fill_error: Option<LabError>,
+    marks: Vec<(u64, AccountMark)>,
+    mark_error: Option<LabError>,
+    orders: Vec<(u64, OrderRecord)>,
+    order_error: Option<LabError>,
+}
+
+impl StreamedModelFacts {
+    fn observe(&mut self, line: crate::storage::ledger_seal::LedgerLine) {
+        let crate::storage::ledger_seal::LedgerLine {
+            section,
+            event_seq,
+            liquidity_source_bar_id,
+            liquidity_source_close_time_ms,
+            record,
+            ..
+        } = line;
+        match section {
+            LedgerSection::Signals if self.signal_error.is_none() => {
+                match serde_json::from_value(record)
+                    .map(|signal| (event_seq, signal))
+                    .map_err(json_error)
+                {
+                    Ok(signal) => self.signals.push(signal),
+                    Err(error) => self.signal_error = Some(error),
+                }
+            }
+            LedgerSection::OrderEvents if self.order_event_error.is_none() => {
+                match serde_json::from_value(record)
+                    .map(|order| (event_seq, order))
+                    .map_err(json_error)
+                {
+                    Ok(order) => self.order_events.push(order),
+                    Err(error) => self.order_event_error = Some(error),
+                }
+            }
+            LedgerSection::Fills if self.fill_error.is_none() => {
+                let result = serde_json::from_value::<FillRecord>(record)
+                    .map_err(json_error)
+                    .and_then(|fill| {
+                        if liquidity_source_bar_id.as_deref()
+                            != Some(fill.liquidity_source_bar_id.as_str())
+                        {
+                            return Err(LabError::DataCorrupt(
+                                "sealed fill liquidity source mismatch".into(),
+                            ));
+                        }
+                        if liquidity_source_close_time_ms
+                            != Some(fill.liquidity_source_close_time.0.timestamp_millis())
+                        {
+                            return Err(LabError::DataCorrupt(
+                                "sealed fill liquidity close time mismatch".into(),
+                            ));
+                        }
+                        Ok((event_seq, fill))
+                    });
+                match result {
+                    Ok(fill) => self.fills.push(fill),
+                    Err(error) => self.fill_error = Some(error),
+                }
+            }
+            LedgerSection::Equity if self.mark_error.is_none() => {
+                match serde_json::from_value(record)
+                    .map(|mark| (event_seq, mark))
+                    .map_err(json_error)
+                {
+                    Ok(mark) => self.marks.push(mark),
+                    Err(error) => self.mark_error = Some(error),
+                }
+            }
+            LedgerSection::Orders if self.order_error.is_none() => {
+                match serde_json::from_value(record)
+                    .map(|order| (event_seq, order))
+                    .map_err(json_error)
+                {
+                    Ok(order) => self.orders.push(order),
+                    Err(error) => self.order_error = Some(error),
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn finish_sequenced(&mut self) -> Result<ModelFactVectors, LabError> {
+        let signals =
+            finish_streamed_records(std::mem::take(&mut self.signals), self.signal_error.take())?;
+        let order_events = finish_streamed_records(
+            std::mem::take(&mut self.order_events),
+            self.order_event_error.take(),
+        )?;
+        let fills =
+            finish_streamed_records(std::mem::take(&mut self.fills), self.fill_error.take())?;
+        let account_marks =
+            finish_streamed_records(std::mem::take(&mut self.marks), self.mark_error.take())?;
+        Ok(ModelFactVectors {
+            signals,
+            order_events,
+            fills,
+            account_marks,
+        })
+    }
+
+    fn finish_orders(&mut self) -> Result<Vec<OrderRecord>, LabError> {
+        finish_streamed_records(std::mem::take(&mut self.orders), self.order_error.take())
+    }
+}
+
+fn finish_streamed_records<T>(
+    mut records: Vec<(u64, T)>,
+    error: Option<LabError>,
+) -> Result<Vec<T>, LabError> {
+    if let Some(error) = error {
+        return Err(error);
+    }
+    records.sort_by_key(|(event_seq, _)| *event_seq);
+    Ok(records.into_iter().map(|(_, record)| record).collect())
 }
 
 impl Store {
@@ -876,10 +1015,10 @@ impl Store {
                 .map_err(sql_error)?
                 .ok_or_else(|| LabError::InvalidConfig("unknown run model".into()))?;
             return Ok(StoredSequenced {
-                signals: serde_json::to_value(signals).map_err(json_error)?,
-                order_events: serde_json::to_value(order_events).map_err(json_error)?,
-                fills: serde_json::to_value(fills).map_err(json_error)?,
-                marks: serde_json::to_value(marks).map_err(json_error)?,
+                signals,
+                order_events,
+                fills,
+                marks,
                 last_seq: nonnegative_u64(last, "model last event sequence")?,
             });
         }
@@ -913,10 +1052,10 @@ impl Store {
             .map_err(sql_error)?
             .ok_or_else(|| LabError::InvalidConfig("unknown run model".into()))?;
         Ok(StoredSequenced {
-            signals: serde_json::to_value(signals).map_err(json_error)?,
-            order_events: serde_json::to_value(order_events).map_err(json_error)?,
-            fills: serde_json::to_value(fills).map_err(json_error)?,
-            marks: serde_json::to_value(marks).map_err(json_error)?,
+            signals,
+            order_events,
+            fills,
+            marks,
             last_seq: nonnegative_u64(last, "model last event sequence")?,
         })
     }
@@ -1134,6 +1273,16 @@ fn load_model_from_row(
         run_id,
         model_id,
     )?;
+    build_model_from_parts(model_id, row, sequenced, orders, episodes)
+}
+
+fn build_model_from_parts(
+    model_id: &ModelId,
+    row: StoredModelRow,
+    sequenced: StoredSequenced,
+    orders: Vec<OrderRecord>,
+    episodes: Vec<EpisodeRecord>,
+) -> Result<ModelLedger, LabError> {
     let ledger = ModelLedger {
         model_id: model_id.clone(),
         market: crate::contracts::MarketId::parse_upbit(&row.market)?,
@@ -1141,12 +1290,12 @@ fn load_model_from_row(
         status: serde_json::from_value(serde_json::Value::String(row.status))
             .map_err(json_error)?,
         status_reason: row.status_reason,
-        signals: serde_json::from_value(sequenced.signals).map_err(json_error)?,
+        signals: sequenced.signals,
         orders,
-        order_events: serde_json::from_value(sequenced.order_events).map_err(json_error)?,
-        fills: serde_json::from_value(sequenced.fills).map_err(json_error)?,
+        order_events: sequenced.order_events,
+        fills: sequenced.fills,
         episodes,
-        account_marks: serde_json::from_value(sequenced.marks).map_err(json_error)?,
+        account_marks: sequenced.marks,
         last_event_seq: nonnegative_u64(row.last_committed_event_seq, "model last event sequence")?,
     };
     if row.final_digest.as_deref()
@@ -1157,6 +1306,46 @@ fn load_model_from_row(
         )));
     }
     Ok(ledger)
+}
+
+fn load_streamed_model_from_row(
+    store: &Store,
+    run_id: &RunId,
+    model_id: &ModelId,
+    row: StoredModelRow,
+    mut facts: StreamedModelFacts,
+) -> Result<ModelLedger, LabError> {
+    let ModelFactVectors {
+        signals,
+        order_events,
+        fills,
+        account_marks,
+    } = facts.finish_sequenced()?;
+    let last: i64 = store
+        .connection
+        .query_row(
+            "SELECT last_committed_event_seq FROM run_models WHERE run_id=?1 AND model_id=?2",
+            params![run_id.as_str(), model_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_error)?
+        .ok_or_else(|| LabError::InvalidConfig("unknown run model".into()))?;
+    let sequenced = StoredSequenced {
+        signals,
+        order_events,
+        fills,
+        marks: account_marks,
+        last_seq: nonnegative_u64(last, "model last event sequence")?,
+    };
+    let orders = facts.finish_orders()?;
+    let episodes: Vec<EpisodeRecord> = load_json_records(
+        &store.connection,
+        "SELECT record_json FROM episodes WHERE run_id=?1 AND model_id=?2 ORDER BY opened_at_ms,episode_id",
+        run_id,
+        model_id,
+    )?;
+    build_model_from_parts(model_id, row, sequenced, orders, episodes)
 }
 
 impl Store {
@@ -1189,15 +1378,51 @@ impl Store {
             })?),
             None => None,
         };
-        let ledger_source = run_ledger_source(self, run_id)?;
         let mut models = Vec::with_capacity(plan.resolved.admissions.len());
-        for admission in &plan.resolved.admissions {
-            let model_id = admission.model_id.clone();
-            let row = query_terminal_model_row(self, run_id, &model_id)?.ok_or_else(|| {
-                LabError::Conflict(format!("run model is not terminal: {model_id}"))
-            })?;
-            let model = load_model_from_row(self, run_id, &model_id, row, &ledger_source)?;
-            models.push(model);
+        let ledger_state = read_run_ledger_state(self, run_id)?;
+        if ledger_state == RunLedgerState::Compacted {
+            let mut streamed_facts: BTreeMap<_, _> = plan
+                .resolved
+                .admissions
+                .iter()
+                .map(|admission| (admission.model_id.clone(), StreamedModelFacts::default()))
+                .collect();
+            if !self.visit_run_ledger_lines(run_id, |line| {
+                if let Some(facts) = streamed_facts.get_mut(&line.model_id) {
+                    facts.observe(line);
+                }
+            })? {
+                return Err(LabError::DataCorrupt(
+                    "compacted run has no ledger chunks".into(),
+                ));
+            }
+            for admission in &plan.resolved.admissions {
+                let model_id = admission.model_id.clone();
+                let row = query_terminal_model_row(self, run_id, &model_id)?.ok_or_else(|| {
+                    LabError::Conflict(format!("run model is not terminal: {model_id}"))
+                })?;
+                let facts = streamed_facts.remove(&model_id).ok_or_else(|| {
+                    LabError::Internal("streamed facts missing for plan admission".into())
+                })?;
+                models.push(load_streamed_model_from_row(
+                    self, run_id, &model_id, row, facts,
+                )?);
+            }
+        } else {
+            let ledger_source = RunLedgerSource::Detail;
+            for admission in &plan.resolved.admissions {
+                let model_id = admission.model_id.clone();
+                let row = query_terminal_model_row(self, run_id, &model_id)?.ok_or_else(|| {
+                    LabError::Conflict(format!("run model is not terminal: {model_id}"))
+                })?;
+                models.push(load_model_from_row(
+                    self,
+                    run_id,
+                    &model_id,
+                    row,
+                    &ledger_source,
+                )?);
+            }
         }
         Ok(RunBundle {
             manifest: header.manifest,
@@ -1242,6 +1467,17 @@ enum QueryTable {
 }
 
 impl QueryTable {
+    fn section(self) -> LedgerSection {
+        match self {
+            Self::Signals => LedgerSection::Signals,
+            Self::Orders => LedgerSection::Orders,
+            Self::OrderEvents => LedgerSection::OrderEvents,
+            Self::Fills => LedgerSection::Fills,
+            Self::Episodes => LedgerSection::Episodes,
+            Self::Marks => LedgerSection::Equity,
+        }
+    }
+
     fn source(self) -> &'static str {
         match self {
             Self::Signals => {
@@ -1311,9 +1547,9 @@ fn query_json_page<T: serde::de::DeserializeOwned>(
     table: QueryTable,
 ) -> Result<Page<T>, LabError> {
     if !matches!(table, QueryTable::Episodes)
-        && let RunLedgerSource::Sealed(lines) = run_ledger_source(store, &query.run_id)?
+        && let Some(page) = streamed_sealed_json_page(store, query, model, offset, table)?
     {
-        return sealed_json_page(&lines, query, model, offset, table);
+        return Ok(page);
     }
     let source = table.source();
     let time = table.time_column();
@@ -1408,6 +1644,74 @@ fn query_json_page<T: serde::de::DeserializeOwned>(
     })
 }
 
+fn streamed_sealed_json_page<T: serde::de::DeserializeOwned>(
+    store: &Store,
+    query: &ResultQuery,
+    model: &ModelId,
+    offset: u64,
+    table: QueryTable,
+) -> Result<Option<Page<T>>, LabError> {
+    let section = table.section();
+    let page_end = offset.saturating_add(u64::from(query.limit));
+    let mut matching_count = 0_u64;
+    let mut previous_sequence = None;
+    let mut noncanonical = false;
+    let mut selected = Vec::with_capacity(query.limit as usize);
+    let sealed = visit_run_ledger_source(store, &query.run_id, |line| {
+        if line.section != section
+            || line.model_id != *model
+            || !query
+                .range
+                .is_none_or(|range| crate::storage::ledger_seal::line_in_range(&line, Some(&range)))
+        {
+            return;
+        }
+        if previous_sequence.is_some_and(|previous| line.event_seq < previous) {
+            noncanonical = true;
+        }
+        previous_sequence = Some(line.event_seq);
+        if !noncanonical && matching_count >= offset && matching_count < page_end {
+            selected.push(line);
+        }
+        matching_count = matching_count.saturating_add(1);
+    })?;
+    if !sealed {
+        return Ok(None);
+    }
+
+    if noncanonical {
+        drop(selected);
+        let lines = store
+            .load_run_ledger_lines(&query.run_id)?
+            .ok_or_else(|| LabError::DataCorrupt("compacted run has no ledger chunks".into()))?;
+        return sealed_json_page(&lines, query, model, offset, table).map(Some);
+    }
+
+    // Match the old conversion point: verify the whole source before reporting an
+    // unrepresentable cursor offset.
+    let _ = usize::try_from(offset)
+        .map_err(|_| LabError::ResourceLimit("result offset overflow".into()))?;
+    let records = selected
+        .into_iter()
+        .map(|line| serde_json::from_value(line.record).map_err(json_error))
+        .collect::<Result<Vec<T>, LabError>>()?;
+    let returned_count = u64::try_from(records.len())
+        .map_err(|_| LabError::ResourceLimit("result count overflow".into()))?;
+    let next_offset = offset
+        .checked_add(returned_count)
+        .ok_or_else(|| LabError::ResourceLimit("result cursor overflow".into()))?;
+    Ok(Some(Page {
+        records,
+        returned_count,
+        total_count: matching_count,
+        next_cursor: (next_offset < matching_count).then(|| QueryCursor {
+            model_id: model.clone(),
+            offset: next_offset,
+        }),
+        truncated_reason: (next_offset < matching_count).then(|| "LIMIT".into()),
+    }))
+}
+
 fn sealed_json_page<T: serde::de::DeserializeOwned>(
     lines: &[crate::storage::ledger_seal::LedgerLine],
     query: &ResultQuery,
@@ -1439,6 +1743,7 @@ fn sealed_json_page<T: serde::de::DeserializeOwned>(
         .map_err(|_| LabError::ResourceLimit("result count overflow".into()))?;
     let start = usize::try_from(offset)
         .map_err(|_| LabError::ResourceLimit("result offset overflow".into()))?;
+    let start = start.min(matching.len());
     let end = start
         .saturating_add(query.limit as usize)
         .min(matching.len());
@@ -1461,4 +1766,263 @@ fn sealed_json_page<T: serde::de::DeserializeOwned>(
         }),
         truncated_reason: (next_offset < total_count).then(|| "LIMIT".into()),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::ledger_seal::tests::{
+        ScaledRunConfig, TamperedChunkGuard, TempRoot, encode_result_page,
+        seed_scaled_multi_model_run,
+    };
+    use super::*;
+    use crate::contracts::UtcRange;
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "regression test verifies all six ledger sections across models, offsets, ranges, and hidden-line corruption"
+    )]
+    fn compacted_pages_match_detail_across_models_ranges_and_reject_hidden_corruption() {
+        let root = TempRoot::new("run-store-pages");
+        let mut store = Store::open(&root.0).expect("open store");
+        let seeded = seed_scaled_multi_model_run(
+            &mut store,
+            &ScaledRunConfig {
+                run_id: "run-compacted-pages",
+                completed_models: 2,
+                signals_per_model: 240,
+                roundtrips_per_model: 120,
+                marks_per_model: 260,
+                include_blocked_model: true,
+            },
+        );
+        let range = UtcRange::new(
+            UtcTimestamp::parse_rfc3339("2024-01-01T00:30:00Z").expect("range start"),
+            UtcTimestamp::parse_rfc3339("2024-01-01T02:15:00Z").expect("range end"),
+        )
+        .expect("valid range");
+
+        let mut queries = Vec::new();
+        for model in &seeded.completed_models {
+            for section in [
+                LedgerSection::Signals,
+                LedgerSection::Orders,
+                LedgerSection::OrderEvents,
+                LedgerSection::Fills,
+                LedgerSection::Episodes,
+                LedgerSection::Equity,
+            ] {
+                for offset in [0_u64, 100, 200] {
+                    queries.push(ResultQuery {
+                        run_id: seeded.run_id.clone(),
+                        model_id: Some(model.clone()),
+                        section,
+                        range: None,
+                        limit: 100,
+                        cursor: (offset > 0).then(|| QueryCursor {
+                            model_id: model.clone(),
+                            offset,
+                        }),
+                    });
+                }
+                queries.push(ResultQuery {
+                    run_id: seeded.run_id.clone(),
+                    model_id: Some(model.clone()),
+                    section,
+                    range: Some(range),
+                    limit: 50,
+                    cursor: None,
+                });
+            }
+        }
+
+        let detail_pages: Vec<Vec<u8>> = queries
+            .iter()
+            .map(|q| encode_result_page(&store.query_result(q).expect("detail page query")))
+            .collect();
+
+        store
+            .seal_and_compact_run_ledger(&seeded.run_id)
+            .expect("seal and compact run");
+
+        for (q, expected) in queries.iter().zip(detail_pages.iter()) {
+            let actual = encode_result_page(&store.query_result(q).expect("compacted page query"));
+            assert_eq!(&actual, expected, "mismatch on compacted query {q:?}");
+        }
+
+        let canonical_page_index = queries
+            .iter()
+            .position(|query| {
+                query.model_id.as_ref() == Some(&seeded.completed_models[0])
+                    && query.section == LedgerSection::Signals
+                    && query.range.is_none()
+                    && query.cursor.is_none()
+            })
+            .expect("first model signal page");
+        let canonical_page_query = &queries[canonical_page_index];
+        let expected_canonical_page = &detail_pages[canonical_page_index];
+
+        // An opaque out-of-page record passes envelope parsing until its own page is selected.
+        let opaque_out_of_page_guard =
+            TamperedChunkGuard::rewrite_lines(&store, &seeded.run_id, 0, |lines| {
+                let tail_sig = lines
+                    .iter_mut()
+                    .find(|line| line.contains("sig-00-0239"))
+                    .expect("out-of-page signal line");
+                let mut envelope: serde_json::Value =
+                    serde_json::from_str(tail_sig).expect("signal envelope JSON");
+                envelope["r"] = serde_json::json!("opaque record");
+                *tail_sig = serde_json::to_string(&envelope).expect("encode opaque envelope");
+            });
+        let opaque_page = store
+            .query_result(canonical_page_query)
+            .expect("page excludes opaque out-of-page record");
+        assert_eq!(&encode_result_page(&opaque_page), expected_canonical_page);
+        assert!(matches!(
+            store.query_result(&ResultQuery {
+                run_id: seeded.run_id.clone(),
+                model_id: Some(seeded.completed_models[0].clone()),
+                section: LedgerSection::Signals,
+                range: None,
+                limit: 1,
+                cursor: Some(QueryCursor {
+                    model_id: seeded.completed_models[0].clone(),
+                    offset: 239,
+                }),
+            }),
+            Err(LabError::Internal(_))
+        ));
+        opaque_out_of_page_guard.restore(&store, &seeded.run_id);
+
+        // Reordered selected lines remain sorted by event sequence in the public page.
+        let reordered_guard =
+            TamperedChunkGuard::rewrite_lines(&store, &seeded.run_id, 0, |lines| {
+                let selected_positions = lines
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, line)| {
+                        line.contains("\"kind\":\"SIGNAL\"")
+                            && line.contains("\"model\":\"model-00\"")
+                    })
+                    .take(2)
+                    .map(|(index, _)| index)
+                    .collect::<Vec<_>>();
+                assert_eq!(selected_positions.len(), 2, "two selected signals in chunk");
+                let first_sequence =
+                    serde_json::from_str::<serde_json::Value>(&lines[selected_positions[0]])
+                        .expect("first signal envelope")
+                        .get("seq")
+                        .and_then(serde_json::Value::as_u64)
+                        .expect("first signal sequence");
+                let second_sequence =
+                    serde_json::from_str::<serde_json::Value>(&lines[selected_positions[1]])
+                        .expect("second signal envelope")
+                        .get("seq")
+                        .and_then(serde_json::Value::as_u64)
+                        .expect("second signal sequence");
+                assert!(
+                    first_sequence < second_sequence,
+                    "fixture starts in canonical order"
+                );
+                lines.swap(selected_positions[0], selected_positions[1]);
+            });
+        assert_eq!(
+            &encode_result_page(
+                &store
+                    .query_result(canonical_page_query)
+                    .expect("reordered compacted page")
+            ),
+            expected_canonical_page
+        );
+        reordered_guard.restore(&store, &seeded.run_id);
+
+        // A negative hidden-line sequence invalidates the envelope while retaining its record.
+        let other_model_guard =
+            TamperedChunkGuard::rewrite_lines(&store, &seeded.run_id, 0, |lines| {
+                let other_line = lines
+                    .iter_mut()
+                    .find(|line| line.contains("\"model\":\"model-01\""))
+                    .expect("model-01 line");
+                let mut envelope: serde_json::Value =
+                    serde_json::from_str(other_line).expect("hidden line envelope JSON");
+                envelope["seq"] = serde_json::json!(-1);
+                *other_line = serde_json::to_string(&envelope).expect("encode bad envelope");
+            });
+        assert!(matches!(
+            store.query_result(&ResultQuery {
+                run_id: seeded.run_id.clone(),
+                model_id: Some(seeded.completed_models[0].clone()),
+                section: LedgerSection::Signals,
+                range: None,
+                limit: 5,
+                cursor: None,
+            }),
+            Err(LabError::DataCorrupt(_))
+        ));
+        other_model_guard.restore(&store, &seeded.run_id);
+    }
+
+    #[test]
+    fn sealed_cursor_past_end_is_empty_like_detail() {
+        let root = TempRoot::new("run-store-cursor-past-end");
+        let mut store = Store::open(&root.0).expect("open store");
+        let seeded = seed_scaled_multi_model_run(
+            &mut store,
+            &ScaledRunConfig {
+                run_id: "run-cursor-past-end",
+                completed_models: 1,
+                signals_per_model: 2,
+                roundtrips_per_model: 1,
+                marks_per_model: 2,
+                include_blocked_model: false,
+            },
+        );
+        let model_id = seeded.completed_models[0].clone();
+        let run_id = seeded.run_id.clone();
+        let detail_head = store
+            .query_result(&ResultQuery {
+                run_id: run_id.clone(),
+                model_id: Some(model_id.clone()),
+                section: LedgerSection::Signals,
+                range: None,
+                limit: 1,
+                cursor: None,
+            })
+            .expect("detail first page");
+        let ResultPage::Signals(head_page) = &detail_head else {
+            panic!("expected signals page");
+        };
+        let offset = head_page
+            .total_count
+            .checked_add(1)
+            .expect("representable past-end offset");
+        let query = ResultQuery {
+            run_id,
+            model_id: Some(model_id.clone()),
+            section: LedgerSection::Signals,
+            range: None,
+            limit: 1,
+            cursor: Some(QueryCursor { model_id, offset }),
+        };
+        let detail_past_end = store
+            .query_result(&query)
+            .expect("detail past-end cursor returns empty page");
+        let ResultPage::Signals(page) = &detail_past_end else {
+            panic!("expected signals page");
+        };
+        assert!(page.records.is_empty());
+        assert_eq!(page.returned_count, 0);
+        assert_eq!(page.total_count, head_page.total_count);
+        assert!(page.next_cursor.is_none());
+        assert!(page.truncated_reason.is_none());
+        let expected_page = encode_result_page(&detail_past_end);
+
+        store
+            .seal_and_compact_run_ledger(&seeded.run_id)
+            .expect("seal and compact run");
+        let compacted_past_end = store
+            .query_result(&query)
+            .expect("sealed past-end cursor matches detail");
+        assert_eq!(encode_result_page(&compacted_past_end), expected_page);
+    }
 }

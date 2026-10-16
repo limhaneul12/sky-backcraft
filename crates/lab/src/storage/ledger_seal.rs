@@ -681,6 +681,26 @@ impl Store {
         &self,
         run_id: &RunId,
     ) -> Result<Option<Vec<LedgerLine>>, LabError> {
+        let mut lines = Vec::new();
+        if self.visit_run_ledger_lines(run_id, |line| lines.push(line))? {
+            Ok(Some(lines))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Visit verified lines from a sealed run without retaining the whole ledger.
+    ///
+    /// Returns `false` when the run has no chunk rows. Each chunk is fully
+    /// verified before its lines are parsed and passed to the visitor.
+    ///
+    /// # Errors
+    /// Reports corrupt or tampered chunk files.
+    pub(crate) fn visit_run_ledger_lines(
+        &self,
+        run_id: &RunId,
+        mut visitor: impl FnMut(LedgerLine),
+    ) -> Result<bool, LabError> {
         let rows: Vec<(String, String, i64, i64)> = self.connection.prepare(
             "SELECT relative_path,sha256,event_count,uncompressed_bytes FROM run_ledger_chunks WHERE run_id=?1 ORDER BY chunk_index",
         ).map_err(sql_error)?
@@ -691,9 +711,8 @@ impl Store {
         .collect::<Result<Vec<_>, _>>()
         .map_err(sql_error)?;
         if rows.is_empty() {
-            return Ok(None);
+            return Ok(false);
         }
-        let mut lines = Vec::new();
         for (relative_path, sha256, event_count, uncompressed_bytes) in rows {
             let payload = read_verified_chunk(
                 self,
@@ -709,10 +728,10 @@ impl Store {
                 if line.is_empty() {
                     continue;
                 }
-                lines.push(LedgerLine::from_line(&line)?);
+                visitor(LedgerLine::from_line(&line)?);
             }
         }
-        Ok(Some(lines))
+        Ok(true)
     }
 }
 
@@ -739,14 +758,14 @@ pub(crate) enum RunLedgerSource {
     Sealed(Vec<LedgerLine>),
 }
 
-/// Resolve whether a run's detail rows are still in SQLite or sealed away.
+/// Read the persisted detail-ledger lifecycle state for one run.
 ///
 /// # Errors
 /// Reports corrupt stored state or chunk-file verification failures.
-pub(crate) fn run_ledger_source(
+pub(crate) fn read_run_ledger_state(
     store: &Store,
     run_id: &RunId,
-) -> Result<RunLedgerSource, LabError> {
+) -> Result<RunLedgerState, LabError> {
     let state: String = store
         .connection
         .query_row(
@@ -757,7 +776,36 @@ pub(crate) fn run_ledger_source(
         .optional()
         .map_err(sql_error)?
         .ok_or_else(|| LabError::InvalidConfig("unknown run".into()))?;
-    match RunLedgerState::from_text(&state)? {
+    RunLedgerState::from_text(&state)
+}
+
+/// Visit a compacted run's verified lines, returning `false` for DETAIL/SEALED.
+///
+/// # Errors
+/// Reports corrupt stored state, missing compacted chunks, or chunk verification failures.
+pub(crate) fn visit_run_ledger_source(
+    store: &Store,
+    run_id: &RunId,
+    visitor: impl FnMut(LedgerLine),
+) -> Result<bool, LabError> {
+    match read_run_ledger_state(store, run_id)? {
+        RunLedgerState::Compacted => store
+            .visit_run_ledger_lines(run_id, visitor)?
+            .then_some(true)
+            .ok_or_else(|| LabError::DataCorrupt("compacted run has no ledger chunks".into())),
+        _ => Ok(false),
+    }
+}
+
+/// Resolve a run source with a materialized sealed ledger for compatibility readers.
+///
+/// # Errors
+/// Reports corrupt stored state, missing compacted chunks, or chunk verification failures.
+pub(crate) fn run_ledger_source(
+    store: &Store,
+    run_id: &RunId,
+) -> Result<RunLedgerSource, LabError> {
+    match read_run_ledger_state(store, run_id)? {
         RunLedgerState::Compacted => store
             .load_run_ledger_lines(run_id)?
             .map(RunLedgerSource::Sealed)
@@ -845,3 +893,6 @@ pub(crate) fn line_in_range(line: &LedgerLine, range: Option<&crate::contracts::
         }
     }
 }
+
+#[cfg(test)]
+pub(super) mod tests;

@@ -1,7 +1,7 @@
 //! Bounded read projections for MCP status and result inspection.
 
-use super::ledger_seal::{RunLedgerSource, run_ledger_source};
-use super::{Store, enum_text, sql_error};
+use super::ledger_seal::{RunLedgerState, read_run_ledger_state, visit_run_ledger_source};
+use super::{Store, enum_text, json_error, sql_error};
 use crate::contracts::{
     AccountMark, ContentHash, FillRecord, JobStatus, LabError, LedgerSection, MAX_MODEL_EVENTS,
     MAX_MODELS, MarkKind, MarketId, ModelId, ModelStatus, PlanId, PolicyId, PolicyRevisionId,
@@ -10,6 +10,7 @@ use crate::contracts::{
 use rusqlite::{OptionalExtension, params};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::collections::BTreeMap;
 
 const MAX_VALIDATION_REPORTS: usize = 4;
 const MAX_VALIDATION_FINDINGS: usize = 16;
@@ -132,10 +133,31 @@ impl Store {
         let plan = self
             .load_plan(&header.plan_id)?
             .ok_or_else(|| LabError::DataCorrupt("run summary plan is missing".into()))?;
-        let ledger_source = run_ledger_source(self, run_id)?;
-        let mut models = query_models(self, run_id, plan.resolved.spec.initial_cash)?;
+        let ledger_state = read_run_ledger_state(self, run_id)?;
+        let models_result = query_models(self, run_id, plan.resolved.spec.initial_cash);
+        let mut cost_facts = BTreeMap::new();
+        if ledger_state == RunLedgerState::Compacted {
+            if let Ok(models) = &models_result {
+                for model in models
+                    .iter()
+                    .filter(|model| model.status == Some(ModelStatus::Completed))
+                {
+                    cost_facts.insert(model.model_id.clone(), ModelCostFacts::default());
+                }
+            }
+            if !self.visit_run_ledger_lines(run_id, |line| {
+                if let Some(facts) = cost_facts.get_mut(&line.model_id) {
+                    facts.observe(line.section, line.event_seq, line.record);
+                }
+            })? {
+                return Err(LabError::DataCorrupt(
+                    "compacted run has no ledger chunks".into(),
+                ));
+            }
+        }
+        let mut models = models_result?;
         for model in &mut models {
-            self.complete_model_summary(run_id, model, &ledger_source)?;
+            self.complete_model_summary(run_id, model, cost_facts.get_mut(&model.model_id))?;
         }
         if models.len() > MAX_MODELS || models.len() != plan.resolved.admissions.len() {
             return Err(LabError::DataCorrupt(
@@ -188,56 +210,123 @@ impl Store {
         };
         if header.status.is_none() {
             return self
-                .model_cost_summary_from_source(run_id, model_id, header, &RunLedgerSource::Detail)
+                .model_cost_summary_from_detail(run_id, model_id, header)
                 .map(Some);
         }
-        let source = run_ledger_source(self, run_id)?;
-        self.model_cost_summary_from_source(run_id, model_id, header, &source)
-            .map(Some)
+        let mut facts = ModelCostFacts::default();
+        if visit_run_ledger_source(self, run_id, |line| {
+            if line.model_id == *model_id {
+                facts.observe(line.section, line.event_seq, line.record);
+            }
+        })? {
+            Self::model_cost_summary_from_facts(run_id, model_id, header, &mut facts).map(Some)
+        } else {
+            self.model_cost_summary_from_detail(run_id, model_id, header)
+                .map(Some)
+        }
     }
 
-    fn model_cost_summary_from_source(
+    fn model_cost_summary_from_detail(
         &self,
         run_id: &RunId,
         model_id: &ModelId,
         header: ModelCostHeader,
-        source: &RunLedgerSource,
     ) -> Result<ModelCostSummary, LabError> {
-        let status = header.status.map(|value| parse_enum(&value)).transpose()?;
-        let policy_ref = policy_reference(
-            header.policy_id,
-            header.policy_revision_id,
-            header.policy_definition_digest,
-        )?;
-        let expected_fill_count = nonnegative_u64(header.fill_count, "model fill count")?;
-        let (fills, terminal) = if let RunLedgerSource::Sealed(lines) = source {
-            let fills: Vec<FillRecord> = lines
-                .iter()
-                .filter(|line| line.section == LedgerSection::Fills && line.model_id == *model_id)
-                .map(|line| serde_json::from_value(line.record.clone()).map_err(Into::into))
-                .collect::<Result<Vec<_>, LabError>>()?;
-            let terminal = lines
-                .iter()
-                .filter(|line| line.section == LedgerSection::Equity && line.model_id == *model_id)
-                .max_by_key(|line| line.event_seq)
-                .map(|line| serde_json::from_value::<AccountMark>(line.record.clone()))
-                .transpose()?;
-            (fills, terminal)
-        } else {
-            let fills = load_cost_fills(self, run_id, model_id)?;
-            let terminal = self
-                .connection
-                .query_row(
-                    "SELECT record_json FROM account_marks WHERE run_id=?1 AND model_id=?2 ORDER BY event_seq DESC LIMIT 1",
-                    params![run_id.as_str(), model_id.as_str()],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()
-                .map_err(sql_error)?
-                .map(|json| serde_json::from_str::<AccountMark>(&json))
-                .transpose()?;
-            (fills, terminal)
-        };
+        let (status, policy_ref, expected_fill_count) = model_cost_header_parts(header)?;
+        self.model_cost_summary_from_detail_parts(
+            run_id,
+            model_id,
+            status,
+            policy_ref,
+            expected_fill_count,
+        )
+    }
+
+    fn model_cost_summary_from_detail_parts(
+        &self,
+        run_id: &RunId,
+        model_id: &ModelId,
+        status: Option<ModelStatus>,
+        policy_ref: Option<PolicyRevisionRef>,
+        expected_fill_count: u64,
+    ) -> Result<ModelCostSummary, LabError> {
+        let fills = load_cost_fills(self, run_id, model_id)?;
+        let terminal = self
+            .connection
+            .query_row(
+                "SELECT record_json FROM account_marks WHERE run_id=?1 AND model_id=?2 ORDER BY event_seq DESC LIMIT 1",
+                params![run_id.as_str(), model_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(sql_error)?
+            .map(|json| serde_json::from_str::<AccountMark>(&json))
+            .transpose()?;
+        Self::finish_model_cost_summary(
+            run_id,
+            model_id,
+            status,
+            policy_ref,
+            expected_fill_count,
+            fills,
+            terminal,
+        )
+    }
+
+    fn model_cost_summary_from_facts(
+        run_id: &RunId,
+        model_id: &ModelId,
+        header: ModelCostHeader,
+        facts: &mut ModelCostFacts,
+    ) -> Result<ModelCostSummary, LabError> {
+        let (status, policy_ref, expected_fill_count) = model_cost_header_parts(header)?;
+        Self::model_cost_summary_from_facts_parts(
+            run_id,
+            model_id,
+            status,
+            policy_ref,
+            expected_fill_count,
+            facts,
+        )
+    }
+
+    fn model_cost_summary_from_facts_parts(
+        run_id: &RunId,
+        model_id: &ModelId,
+        status: Option<ModelStatus>,
+        policy_ref: Option<PolicyRevisionRef>,
+        expected_fill_count: u64,
+        facts: &mut ModelCostFacts,
+    ) -> Result<ModelCostSummary, LabError> {
+        if let Some(error) = facts.fill_error.take() {
+            return Err(error);
+        }
+        let fills = std::mem::take(&mut facts.fills);
+        let terminal = facts
+            .terminal
+            .take()
+            .map(|(_, record)| serde_json::from_value::<AccountMark>(record).map_err(json_error))
+            .transpose()?;
+        Self::finish_model_cost_summary(
+            run_id,
+            model_id,
+            status,
+            policy_ref,
+            expected_fill_count,
+            fills,
+            terminal,
+        )
+    }
+
+    fn finish_model_cost_summary(
+        run_id: &RunId,
+        model_id: &ModelId,
+        status: Option<ModelStatus>,
+        policy_ref: Option<PolicyRevisionRef>,
+        expected_fill_count: u64,
+        fills: Vec<FillRecord>,
+        terminal: Option<AccountMark>,
+    ) -> Result<ModelCostSummary, LabError> {
         let costs = fold_model_costs(fills)?;
         let actual_fill_count = u64::try_from(costs.fill_count)
             .map_err(|_| LabError::ResourceLimit("fill count exceeds u64".into()))?;
@@ -275,7 +364,7 @@ impl Store {
         &self,
         run_id: &RunId,
         model: &mut ModelResultSummary,
-        source: &RunLedgerSource,
+        facts: Option<&mut ModelCostFacts>,
     ) -> Result<(), LabError> {
         if model.status != Some(ModelStatus::Completed) {
             model.financial_null_reason = Some(
@@ -286,9 +375,33 @@ impl Store {
             );
             return Ok(());
         }
-        let header = query_model_cost_header(self, run_id, &model.model_id)?
-            .ok_or_else(|| LabError::DataCorrupt("summary model costs missing".into()))?;
-        let costs = self.model_cost_summary_from_source(run_id, &model.model_id, header, source)?;
+        let costs = if let Some(facts) = facts {
+            Self::model_cost_summary_from_facts_parts(
+                run_id,
+                &model.model_id,
+                model.status,
+                model.policy_ref.clone(),
+                model.fill_count,
+                facts,
+            )?
+        } else {
+            self.model_cost_summary_from_detail_parts(
+                run_id,
+                &model.model_id,
+                model.status,
+                model.policy_ref.clone(),
+                model.fill_count,
+            )?
+        };
+        self.complete_model_summary_from_costs(run_id, model, &costs)
+    }
+
+    fn complete_model_summary_from_costs(
+        &self,
+        run_id: &RunId,
+        model: &mut ModelResultSummary,
+        costs: &ModelCostSummary,
+    ) -> Result<(), LabError> {
         let terminal = costs.terminal_equity.ok_or_else(|| {
             LabError::DataCorrupt("completed summary has no terminal equity".into())
         })?;
@@ -441,12 +554,55 @@ struct ModelCostHeader {
     policy_definition_digest: Option<String>,
 }
 
+#[derive(Default)]
+struct ModelCostFacts {
+    fills: Vec<FillRecord>,
+    fill_error: Option<LabError>,
+    terminal: Option<(u64, serde_json::Value)>,
+}
+
+impl ModelCostFacts {
+    fn observe(&mut self, section: LedgerSection, event_seq: u64, record: serde_json::Value) {
+        match section {
+            LedgerSection::Fills if self.fill_error.is_none() => {
+                match serde_json::from_value(record).map_err(json_error) {
+                    Ok(fill) => self.fills.push(fill),
+                    Err(error) => self.fill_error = Some(error),
+                }
+            }
+            LedgerSection::Equity
+                if self
+                    .terminal
+                    .as_ref()
+                    .is_none_or(|(sequence, _)| event_seq >= *sequence) =>
+            {
+                // Iterator::max_by_key keeps the last equal maximum.
+                self.terminal = Some((event_seq, record));
+            }
+            _ => {}
+        }
+    }
+}
+
 struct ModelCosts {
     fill_count: usize,
     buy_notional: rust_decimal::Decimal,
     sell_notional: rust_decimal::Decimal,
     total_fees: rust_decimal::Decimal,
     price_cost_attribution: rust_decimal::Decimal,
+}
+
+fn model_cost_header_parts(
+    header: ModelCostHeader,
+) -> Result<(Option<ModelStatus>, Option<PolicyRevisionRef>, u64), LabError> {
+    let status = header.status.map(|value| parse_enum(&value)).transpose()?;
+    let policy_ref = policy_reference(
+        header.policy_id,
+        header.policy_revision_id,
+        header.policy_definition_digest,
+    )?;
+    let expected_fill_count = nonnegative_u64(header.fill_count, "model fill count")?;
+    Ok((status, policy_ref, expected_fill_count))
 }
 
 fn query_model_cost_header(
@@ -634,4 +790,175 @@ fn checked_add(
 ) -> Result<rust_decimal::Decimal, LabError> {
     left.checked_add(right)
         .ok_or_else(|| LabError::AccountingInvariant(format!("{label} overflow")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::ledger_seal::tests::{
+        ScaledRunConfig, TamperedChunkGuard, TempRoot, seed_scaled_multi_model_run,
+    };
+    use super::*;
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "regression test verifies run summary, per-model cost summary, blocked model financial nulls, and hidden-line corruption"
+    )]
+    fn compacted_summary_and_costs_preserve_mixed_models_and_reject_hidden_corruption() {
+        let root = TempRoot::new("query-read-summary");
+        let mut store = Store::open(&root.0).expect("open store");
+        let seeded = seed_scaled_multi_model_run(
+            &mut store,
+            &ScaledRunConfig {
+                run_id: "run-compacted-summary",
+                completed_models: 3,
+                signals_per_model: 40,
+                roundtrips_per_model: 30,
+                marks_per_model: 120,
+                include_blocked_model: true,
+            },
+        );
+        let blocked_id = seeded.blocked_model.as_ref().expect("blocked model id");
+
+        let detail_summary = store
+            .load_run_summary(&seeded.run_id)
+            .expect("detail summary")
+            .expect("summary exists");
+        let detail_summary_bytes =
+            serde_json::to_vec(&detail_summary).expect("encode detail summary");
+
+        let mut all_models = seeded.completed_models.clone();
+        all_models.push(blocked_id.clone());
+        let detail_costs: Vec<(ModelId, Vec<u8>)> = all_models
+            .iter()
+            .map(|m| {
+                let cost = store
+                    .load_model_cost_summary(&seeded.run_id, m)
+                    .expect("detail model cost")
+                    .expect("model cost exists");
+                (m.clone(), serde_json::to_vec(&cost).expect("encode cost"))
+            })
+            .collect();
+
+        store
+            .seal_and_compact_run_ledger(&seeded.run_id)
+            .expect("seal and compact run");
+
+        let compacted_summary = store
+            .load_run_summary(&seeded.run_id)
+            .expect("compacted summary")
+            .expect("compacted summary exists");
+        assert_eq!(
+            serde_json::to_vec(&compacted_summary).expect("encode compacted summary"),
+            detail_summary_bytes
+        );
+
+        let blocked_entry = compacted_summary
+            .models
+            .iter()
+            .find(|m| m.model_id == *blocked_id)
+            .expect("blocked model in summary");
+        assert_eq!(blocked_entry.status, Some(ModelStatus::BlockedData));
+        assert_eq!(
+            blocked_entry.financial_null_reason.as_deref(),
+            Some("DATA_QUALITY_BLOCKED")
+        );
+        assert!(blocked_entry.terminal_equity.is_none());
+        assert!(blocked_entry.total_return_ratio.is_none());
+        assert!(blocked_entry.total_fees.is_none());
+        assert!(blocked_entry.embedded_price_cost_quote.is_none());
+        assert!(blocked_entry.closed_positions.is_none());
+        assert!(blocked_entry.open_positions.is_none());
+
+        for (model_id, expected_bytes) in &detail_costs {
+            let cost = store
+                .load_model_cost_summary(&seeded.run_id, model_id)
+                .expect("compacted model cost")
+                .expect("compacted cost exists");
+            assert_eq!(
+                &serde_json::to_vec(&cost).expect("encode compacted cost"),
+                expected_bytes,
+                "cost summary mismatch for {model_id}"
+            );
+        }
+
+        let selected_model = &seeded.completed_models[0];
+        let expected_selected_cost = detail_costs
+            .iter()
+            .find(|(model_id, _)| model_id == selected_model)
+            .map(|(_, bytes)| bytes)
+            .expect("selected model detail cost");
+        let compatible_scope_guard =
+            TamperedChunkGuard::rewrite_lines(&store, &seeded.run_id, 0, |lines| {
+                let nonterminal_mark_index = lines
+                    .iter()
+                    .position(|line| {
+                        let envelope: serde_json::Value =
+                            serde_json::from_str(line).expect("ledger envelope JSON");
+                        envelope.get("kind").and_then(serde_json::Value::as_str)
+                            == Some("ACCOUNT_MARK")
+                            && envelope.get("model").and_then(serde_json::Value::as_str)
+                                == Some(selected_model.as_str())
+                    })
+                    .expect("selected model account mark");
+                let mut mark_envelope: serde_json::Value =
+                    serde_json::from_str(&lines[nonterminal_mark_index])
+                        .expect("account mark envelope JSON");
+                assert_ne!(
+                    mark_envelope["r"]["kind"].as_str(),
+                    Some("TERMINAL"),
+                    "selected fixture mark is nonterminal"
+                );
+                mark_envelope["r"] = serde_json::json!("opaque nonterminal mark");
+                lines[nonterminal_mark_index] =
+                    serde_json::to_string(&mark_envelope).expect("encode opaque account mark");
+
+                let fill_index = lines
+                    .iter()
+                    .position(|line| {
+                        let envelope: serde_json::Value =
+                            serde_json::from_str(line).expect("ledger envelope JSON");
+                        envelope.get("kind").and_then(serde_json::Value::as_str) == Some("FILL")
+                            && envelope.get("model").and_then(serde_json::Value::as_str)
+                                == Some(selected_model.as_str())
+                    })
+                    .expect("selected model fill");
+                let mut fill_envelope: serde_json::Value =
+                    serde_json::from_str(&lines[fill_index]).expect("fill envelope JSON");
+                fill_envelope["lsb"] = serde_json::json!("mismatched-source-bar");
+                fill_envelope["lst"] = serde_json::json!(0);
+                lines[fill_index] =
+                    serde_json::to_string(&fill_envelope).expect("encode mismatched fill columns");
+            });
+        let compatible_cost = store
+            .load_model_cost_summary(&seeded.run_id, selected_model)
+            .expect("cost summary preserves old sealed-read validation scope")
+            .expect("selected model cost exists");
+        assert_eq!(
+            &serde_json::to_vec(&compatible_cost).expect("encode compatible cost"),
+            expected_selected_cost
+        );
+        compatible_scope_guard.restore(&store, &seeded.run_id);
+
+        // Corrupt a non-cost line (SIGNAL) in the sealed chunk and verify both summary and cost fail closed.
+        let guard = TamperedChunkGuard::rewrite_lines(&store, &seeded.run_id, 0, |lines| {
+            let sig_line = lines
+                .iter_mut()
+                .find(|line| line.contains("\"kind\":\"SIGNAL\""))
+                .expect("signal line");
+            let mut envelope: serde_json::Value =
+                serde_json::from_str(sig_line).expect("signal envelope JSON");
+            envelope["seq"] = serde_json::json!(-1);
+            *sig_line = serde_json::to_string(&envelope).expect("encode invalid sequence");
+        });
+        assert!(matches!(
+            store.load_run_summary(&seeded.run_id),
+            Err(LabError::DataCorrupt(_))
+        ));
+        assert!(matches!(
+            store.load_model_cost_summary(&seeded.run_id, &seeded.completed_models[0]),
+            Err(LabError::DataCorrupt(_))
+        ));
+        guard.restore(&store, &seeded.run_id);
+    }
 }

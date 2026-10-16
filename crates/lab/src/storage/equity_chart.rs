@@ -1,6 +1,6 @@
 //! Bounded, server-owned equity chart projection over the verified run ledger.
 
-use super::ledger_seal::{RunLedgerSource, records_of_kind, run_ledger_source};
+use super::ledger_seal::{records_of_kind, visit_run_ledger_source};
 use super::{Store, json_error, sql_error};
 use crate::contracts::{AccountMark, LabError, LedgerSection, ModelId, RunId};
 use rusqlite::{OptionalExtension, params};
@@ -32,6 +32,10 @@ impl Store {
     /// # Errors
     /// Rejects invalid capacity, unknown run/model identities, corrupt ledger
     /// rows or sealed chunks, and projections that exceed the transport budget.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one projection read preserves generic, typed, domain and count error order across both storage paths"
+    )]
     pub fn equity_chart_projection(
         &self,
         run_id: &RunId,
@@ -57,33 +61,98 @@ impl Store {
         let expected_count = u64::try_from(expected_count)
             .map_err(|_| LabError::DataCorrupt("negative account mark count".into()))?;
 
-        let source = run_ledger_source(self, run_id)?;
-        let marks = match source {
-            RunLedgerSource::Detail => load_detail_marks(self, run_id, model_id)?,
-            RunLedgerSource::Sealed(lines) => {
-                let mut line_sequences = lines
-                    .iter()
-                    .filter(|line| {
-                        line.section == LedgerSection::Equity && line.model_id == *model_id
-                    })
-                    .map(|line| line.event_seq)
-                    .collect::<Vec<_>>();
-                line_sequences.sort_unstable();
-                let marks =
-                    records_of_kind::<AccountMark>(&lines, model_id, LedgerSection::Equity)?;
-                validate_marks(run_id, model_id, &marks, Some(&line_sequences))?;
-                marks
+        let mut line_count = 0_u64;
+        let mut previous_sequence = None;
+        let mut noncanonical = false;
+        let mut deserialize_error = None;
+        let mut validation_error = None;
+        let mut previous_mark_sequence = None;
+        let mut sampler = usize::try_from(expected_count)
+            .ok()
+            .map(|count| StreamingExtremaSampler::new(count, max_points as usize));
+        let sealed = visit_run_ledger_source(self, run_id, |line| {
+            if line.section != LedgerSection::Equity || line.model_id != *model_id {
+                return;
             }
+            if previous_sequence.is_some_and(|previous| line.event_seq < previous) {
+                noncanonical = true;
+            }
+            previous_sequence = Some(line.event_seq);
+            if noncanonical {
+                return;
+            }
+            line_count = line_count.saturating_add(1);
+            if deserialize_error.is_some() {
+                return;
+            }
+            let envelope_sequence = line.event_seq;
+            let mark = match serde_json::from_value::<AccountMark>(line.record) {
+                Ok(mark) => mark,
+                Err(error) => {
+                    deserialize_error = Some(json_error(error));
+                    return;
+                }
+            };
+            if validation_error.is_none() {
+                validation_error = validate_next_mark(
+                    run_id,
+                    model_id,
+                    &mark,
+                    Some(envelope_sequence),
+                    previous_mark_sequence,
+                )
+                .err();
+                if validation_error.is_none() {
+                    previous_mark_sequence = Some(mark.context.event_seq);
+                }
+            }
+            if validation_error.is_none()
+                && line_count <= expected_count
+                && let Some(sampler) = sampler.as_mut()
+            {
+                sampler.push(mark);
+            }
+        })?;
+        let (total_count, records) = if sealed {
+            if noncanonical {
+                let marks = load_compacted_marks_fallback(self, run_id, model_id)?;
+                let total_count = u64::try_from(marks.len()).map_err(|_| {
+                    LabError::ResourceLimit("account mark count exceeds u64".into())
+                })?;
+                if total_count != expected_count {
+                    return Err(LabError::DataCorrupt(
+                        "account mark ledger count differs from model projection".into(),
+                    ));
+                }
+                (total_count, sample_extrema(marks, max_points as usize))
+            } else {
+                if let Some(error) = deserialize_error {
+                    return Err(error);
+                }
+                if let Some(error) = validation_error {
+                    return Err(error);
+                }
+                if line_count != expected_count {
+                    return Err(LabError::DataCorrupt(
+                        "account mark ledger count differs from model projection".into(),
+                    ));
+                }
+                let sampler = sampler.ok_or_else(|| {
+                    LabError::ResourceLimit("account mark count exceeds usize".into())
+                })?;
+                (line_count, sampler.finish())
+            }
+        } else {
+            let marks = load_detail_marks(self, run_id, model_id)?;
+            let total_count = u64::try_from(marks.len())
+                .map_err(|_| LabError::ResourceLimit("account mark count exceeds u64".into()))?;
+            if total_count != expected_count {
+                return Err(LabError::DataCorrupt(
+                    "account mark ledger count differs from model projection".into(),
+                ));
+            }
+            (total_count, sample_extrema(marks, max_points as usize))
         };
-        let total_count = u64::try_from(marks.len())
-            .map_err(|_| LabError::ResourceLimit("account mark count exceeds u64".into()))?;
-        if total_count != expected_count {
-            return Err(LabError::DataCorrupt(
-                "account mark ledger count differs from model projection".into(),
-            ));
-        }
-
-        let records = sample_extrema(marks, max_points as usize);
         let sample_count = u64::try_from(records.len())
             .map_err(|_| LabError::ResourceLimit("equity sample count exceeds u64".into()))?;
         let projection = EquityChartProjection {
@@ -153,6 +222,25 @@ fn load_detail_marks(
     Ok(marks)
 }
 
+fn load_compacted_marks_fallback(
+    store: &Store,
+    run_id: &RunId,
+    model_id: &ModelId,
+) -> Result<Vec<AccountMark>, LabError> {
+    let lines = store
+        .load_run_ledger_lines(run_id)?
+        .ok_or_else(|| LabError::DataCorrupt("compacted run has no ledger chunks".into()))?;
+    let mut line_sequences = lines
+        .iter()
+        .filter(|line| line.section == LedgerSection::Equity && line.model_id == *model_id)
+        .map(|line| line.event_seq)
+        .collect::<Vec<_>>();
+    line_sequences.sort_unstable();
+    let marks = records_of_kind::<AccountMark>(&lines, model_id, LedgerSection::Equity)?;
+    validate_marks(run_id, model_id, &marks, Some(&line_sequences))?;
+    Ok(marks)
+}
+
 fn validate_marks(
     run_id: &RunId,
     model_id: &ModelId,
@@ -166,24 +254,149 @@ fn validate_marks(
     }
     let mut previous = None;
     for (index, mark) in marks.iter().enumerate() {
-        if mark.context.run_id != *run_id || mark.context.model_id != *model_id {
-            return Err(LabError::DataCorrupt(
-                "account mark record has mismatched run/model identity".into(),
-            ));
-        }
-        if envelope_sequences.is_some_and(|sequences| sequences[index] != mark.context.event_seq) {
-            return Err(LabError::DataCorrupt(
-                "sealed account mark record differs from envelope sequence".into(),
-            ));
-        }
-        if previous.is_some_and(|sequence| sequence >= mark.context.event_seq) {
-            return Err(LabError::DataCorrupt(
-                "account mark sequences are not strictly increasing".into(),
-            ));
-        }
-        previous = Some(mark.context.event_seq);
+        previous = Some(validate_next_mark(
+            run_id,
+            model_id,
+            mark,
+            envelope_sequences.map(|sequences| sequences[index]),
+            previous,
+        )?);
     }
     Ok(())
+}
+
+fn validate_next_mark(
+    run_id: &RunId,
+    model_id: &ModelId,
+    mark: &AccountMark,
+    envelope_sequence: Option<u64>,
+    previous: Option<u64>,
+) -> Result<u64, LabError> {
+    if mark.context.run_id != *run_id || mark.context.model_id != *model_id {
+        return Err(LabError::DataCorrupt(
+            "account mark record has mismatched run/model identity".into(),
+        ));
+    }
+    if envelope_sequence.is_some_and(|sequence| sequence != mark.context.event_seq) {
+        return Err(LabError::DataCorrupt(
+            "sealed account mark record differs from envelope sequence".into(),
+        ));
+    }
+    if previous.is_some_and(|sequence| sequence >= mark.context.event_seq) {
+        return Err(LabError::DataCorrupt(
+            "account mark sequences are not strictly increasing".into(),
+        ));
+    }
+    Ok(mark.context.event_seq)
+}
+
+struct StreamingExtremaSampler {
+    total_len: usize,
+    max_points: usize,
+    seen: usize,
+    selected: Vec<(usize, AccountMark)>,
+    bucket_count: usize,
+    interior_len: usize,
+    bucket_index: usize,
+    bucket_end: usize,
+    peak: Option<(usize, AccountMark)>,
+    drawdown: Option<(usize, AccountMark)>,
+}
+
+impl StreamingExtremaSampler {
+    fn new(total_len: usize, max_points: usize) -> Self {
+        let interior_budget = max_points - 2;
+        let last_index = total_len.saturating_sub(1);
+        let interior_len = last_index.saturating_sub(1);
+        let bucket_count = if total_len <= max_points {
+            0
+        } else {
+            interior_budget.div_ceil(2)
+        };
+        let bucket_end = interior_len
+            .checked_div(bucket_count)
+            .map_or(0, |end| 1 + end);
+        Self {
+            total_len,
+            max_points,
+            seen: 0,
+            selected: Vec::with_capacity(max_points),
+            bucket_count,
+            interior_len,
+            bucket_index: 0,
+            bucket_end,
+            peak: None,
+            drawdown: None,
+        }
+    }
+
+    fn push(&mut self, mark: AccountMark) {
+        let index = self.seen;
+        self.seen += 1;
+        if self.total_len <= self.max_points {
+            self.selected.push((index, mark));
+            return;
+        }
+        if index == 0 {
+            self.selected.push((index, mark));
+            return;
+        }
+        if index + 1 == self.total_len {
+            self.flush_bucket();
+            self.selected.push((index, mark));
+            return;
+        }
+        while index >= self.bucket_end {
+            self.flush_bucket();
+            self.bucket_index += 1;
+            self.bucket_end = 1 + self.interior_len * (self.bucket_index + 1) / self.bucket_count;
+        }
+        if self
+            .peak
+            .as_ref()
+            .is_none_or(|(_, peak)| mark.equity >= peak.equity)
+        {
+            self.peak = Some((index, mark.clone()));
+        }
+        if self
+            .drawdown
+            .as_ref()
+            .is_none_or(|(_, drawdown)| mark.drawdown >= drawdown.drawdown)
+        {
+            self.drawdown = Some((index, mark));
+        }
+    }
+
+    fn flush_bucket(&mut self) {
+        let (Some((peak_index, peak)), Some((drawdown_index, drawdown))) =
+            (self.peak.take(), self.drawdown.take())
+        else {
+            return;
+        };
+        let interior_budget = self.max_points - 2;
+        let remaining = interior_budget - (self.selected.len() - 1);
+        if remaining == 1 {
+            self.selected.push((drawdown_index, drawdown));
+        } else if peak_index <= drawdown_index {
+            self.selected.push((peak_index, peak));
+            if drawdown_index != peak_index {
+                self.selected.push((drawdown_index, drawdown));
+            }
+        } else {
+            self.selected.push((drawdown_index, drawdown));
+            self.selected.push((peak_index, peak));
+        }
+    }
+
+    fn finish(mut self) -> Vec<AccountMark> {
+        if self.total_len > self.max_points {
+            self.flush_bucket();
+        }
+        self.selected.sort_by_key(|(index, _)| *index);
+        self.selected.dedup_by_key(|(index, _)| *index);
+        self.selected.truncate(self.max_points);
+        self.selected.into_iter().map(|(_, mark)| mark).collect()
+    }
 }
 
 fn sample_extrema(marks: Vec<AccountMark>, max_points: usize) -> Vec<AccountMark> {
@@ -479,5 +692,153 @@ mod tests {
             store.equity_chart_projection(&run_id, &model_id, 4),
             Err(LabError::DataCorrupt(_))
         ));
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "regression test verifies compacted/detail projections, count mismatch, extrema and unselected-mark corruption"
+    )]
+    fn compacted_projection_matches_detail_and_rejects_hidden_corruption() {
+        use super::super::ledger_seal::tests::{
+            ScaledRunConfig, TamperedChunkGuard, TempRoot as SharedTempRoot,
+            seed_scaled_multi_model_run,
+        };
+
+        let root = SharedTempRoot::new("equity-chart-compacted");
+        let mut store = Store::open(&root.0).expect("open store");
+        let seeded = seed_scaled_multi_model_run(
+            &mut store,
+            &ScaledRunConfig {
+                run_id: "run-compacted-chart",
+                completed_models: 2,
+                signals_per_model: 10,
+                roundtrips_per_model: 5,
+                marks_per_model: 30,
+                include_blocked_model: false,
+            },
+        );
+        let capacities = [4_u32, 6, 10, 32];
+        let mut detail_projections = Vec::new();
+        for model in &seeded.completed_models {
+            for &cap in &capacities {
+                let proj = store
+                    .equity_chart_projection(&seeded.run_id, model, cap)
+                    .expect("detail chart projection");
+                detail_projections.push((
+                    model.clone(),
+                    cap,
+                    serde_json::to_vec(&proj).expect("encode detail chart"),
+                ));
+            }
+        }
+
+        store
+            .seal_and_compact_run_ledger(&seeded.run_id)
+            .expect("seal and compact run");
+
+        for (model, cap, expected_bytes) in &detail_projections {
+            let proj = store
+                .equity_chart_projection(&seeded.run_id, model, *cap)
+                .expect("compacted chart projection");
+            assert_eq!(
+                &serde_json::to_vec(&proj).expect("encode compacted chart"),
+                expected_bytes,
+                "chart mismatch for {model} at max_points={cap}"
+            );
+        }
+
+        let selected_model = &seeded.completed_models[0];
+        let original_mark_count: i64 = store
+            .connection
+            .query_row(
+                "SELECT account_mark_count FROM run_models WHERE run_id=?1 AND model_id=?2",
+                params![seeded.run_id.as_str(), selected_model.as_str()],
+                |row| row.get(0),
+            )
+            .expect("read selected model mark count");
+        assert_eq!(original_mark_count, 30);
+        store
+            .connection
+            .execute(
+                "UPDATE run_models SET account_mark_count=10 WHERE run_id=?1 AND model_id=?2",
+                params![seeded.run_id.as_str(), selected_model.as_str()],
+            )
+            .expect("lower projected mark count");
+        assert!(matches!(
+            store.equity_chart_projection(&seeded.run_id, selected_model, 4),
+            Err(LabError::DataCorrupt(_))
+        ));
+        store
+            .connection
+            .execute(
+                "UPDATE run_models SET account_mark_count=?1 WHERE run_id=?2 AND model_id=?3",
+                params![
+                    original_mark_count,
+                    seeded.run_id.as_str(),
+                    selected_model.as_str()
+                ],
+            )
+            .expect("restore projected mark count");
+
+        // Verify the 00:05 mark is unselected at max_points=6 and that corrupting
+        // its inner record still fails closed.
+        let unselected_mark_time =
+            crate::contracts::UtcTimestamp::parse_rfc3339("2024-01-01T00:05:00Z")
+                .expect("unselected mark timestamp");
+        let unselected_mark_time_ms = unselected_mark_time.0.timestamp_millis();
+        let unselected_mark_time_marker = format!("\"t\":{unselected_mark_time_ms}");
+        let p6 = store
+            .equity_chart_projection(&seeded.run_id, &seeded.completed_models[0], 6)
+            .expect("compacted chart 6");
+        assert!(
+            !p6.records
+                .iter()
+                .any(|mark| mark.context.accounting_event_time == unselected_mark_time),
+            "the 00:05 interior mark must not be selected at max_points=6"
+        );
+
+        let unselected_guard =
+            TamperedChunkGuard::rewrite_lines(&store, &seeded.run_id, 0, |lines| {
+                let line = lines
+                    .iter_mut()
+                    .find(|entry| {
+                        entry.contains("\"kind\":\"ACCOUNT_MARK\"")
+                            && entry.contains("\"model\":\"model-00\"")
+                            && entry.contains(unselected_mark_time_marker.as_str())
+                    })
+                    .expect("unselected 00:05 model-00 mark line");
+                let mut envelope: serde_json::Value =
+                    serde_json::from_str(line).expect("unselected mark envelope JSON");
+                envelope["r"]["context"]["model_id"] = serde_json::json!("model-01");
+                *line = serde_json::to_string(&envelope).expect("encode mismatched mark");
+            });
+        assert!(matches!(
+            store.equity_chart_projection(&seeded.run_id, &seeded.completed_models[0], 6),
+            Err(LabError::DataCorrupt(_))
+        ));
+        unselected_guard.restore(&store, &seeded.run_id);
+
+        // A negative hidden-line sequence invalidates the envelope while retaining its record.
+        let hidden_model_guard =
+            TamperedChunkGuard::rewrite_lines(&store, &seeded.run_id, 0, |lines| {
+                let line = lines
+                    .iter_mut()
+                    .find(|entry| {
+                        entry.contains("\"kind\":\"ACCOUNT_MARK\"")
+                            && entry.contains("\"model\":\"model-01\"")
+                            && entry.contains(unselected_mark_time_marker.as_str())
+                    })
+                    .expect("model-01 mark line at 00:05");
+                let mut envelope: serde_json::Value =
+                    serde_json::from_str(line).expect("hidden mark envelope JSON");
+                envelope["seq"] = serde_json::json!(-1);
+                *line = serde_json::to_string(&envelope).expect("encode bad hidden envelope");
+            });
+        assert!(matches!(
+            store.equity_chart_projection(&seeded.run_id, &seeded.completed_models[0], 6),
+            Err(LabError::DataCorrupt(_))
+        ));
+        hidden_model_guard.restore(&store, &seeded.run_id);
     }
 }
