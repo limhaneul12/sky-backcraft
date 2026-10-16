@@ -149,7 +149,8 @@ final class PolicyDetailMCPReader {
                     guard total == items.count, root["next_cursor"] is NSNull || root["next_cursor"] == nil else {
                         throw PolicyDetailReadError.resourceLimit("정책 목록이 단일 \(self.pageLimit)개 페이지를 초과합니다")
                     }
-                    let headers = try items.map(Self.header)
+                    let timestampParser = ReadTimestampParser()
+                    let headers = try items.map { try Self.header($0, timestampParser: timestampParser) }
                     guard Set(headers.map(\.policyId)).count == headers.count else {
                         throw PolicyDetailReadError.identityMismatch("중복 policy_id")
                     }
@@ -187,7 +188,8 @@ final class PolicyDetailMCPReader {
                           root["next_cursor"] is NSNull || root["next_cursor"] == nil else {
                         throw PolicyDetailReadError.identityMismatch("정책 \(policyId)의 리비전 개수")
                     }
-                    let history = try items.map(Self.historyItem)
+                    let timestampParser = ReadTimestampParser()
+                    let history = try items.map { try Self.historyItem($0, timestampParser: timestampParser) }
                     let revisionIds = history.map { $0.reference.revisionId }
                     let requestIds = history.map(\.requestId)
                     guard Set(history.map { $0.reference.policyId }) == [policyId],
@@ -231,7 +233,8 @@ final class PolicyDetailMCPReader {
         let definition = try Self.definition(snapshot["definition"])
         let revisionNumber = try Self.integer(snapshot["revision_number"], field: "revision_number")
         let parentRevisionId = snapshot["parent_revision_id"] as? String
-        let createdAt = try Self.utcTimestamp(revision["created_at"], field: "created_at")
+        let timestampParser = ReadTimestampParser()
+        let createdAt = try Self.utcTimestamp(revision["created_at"], field: "created_at", parser: timestampParser)
         let requestId = try Self.string(revision["request_id"], field: "request_id")
         guard definition.name == expected.name,
               revisionNumber == expected.revisionNumber,
@@ -273,11 +276,13 @@ final class PolicyDetailMCPReader {
         return items
     }
 
-    private static func header(_ value: [String: Any]) throws -> PolicyRemoteHeader {
+    private static func header(
+        _ value: [String: Any], timestampParser: ReadTimestampParser
+    ) throws -> PolicyRemoteHeader {
         let policyId = try string(value["policy_id"], field: "policy_id")
         let head = try reference(value["head"])
         guard head.policyId == policyId else { throw PolicyDetailReadError.identityMismatch("header/head policy_id") }
-        let createdAt = try utcTimestamp(value["created_at"], field: "created_at")
+        let createdAt = try utcTimestamp(value["created_at"], field: "created_at", parser: timestampParser)
         return PolicyRemoteHeader(
             policyId: policyId,
             family: try string(value["family"], field: "family"),
@@ -289,13 +294,15 @@ final class PolicyDetailMCPReader {
         )
     }
 
-    private static func historyItem(_ value: [String: Any]) throws -> PolicyRevisionHistoryItem {
+    private static func historyItem(
+        _ value: [String: Any], timestampParser: ReadTimestampParser
+    ) throws -> PolicyRevisionHistoryItem {
         PolicyRevisionHistoryItem(
             reference: try reference(value["reference"]),
             revisionNumber: try integer(value["revision_number"], field: "revision_number"),
             parentRevisionId: value["parent_revision_id"] as? String,
             name: try string(value["name"], field: "name"),
-            createdAt: try utcTimestamp(value["created_at"], field: "created_at"),
+            createdAt: try utcTimestamp(value["created_at"], field: "created_at", parser: timestampParser),
             requestId: try string(value["request_id"], field: "request_id")
         )
     }
@@ -380,13 +387,11 @@ final class PolicyDetailMCPReader {
         return value
     }
 
-    private static func utcTimestamp(_ value: Any?, field: String) throws -> String {
+    private static func utcTimestamp(
+        _ value: Any?, field: String, parser: ReadTimestampParser
+    ) throws -> String {
         let raw = try string(value, field: field)
-        let regular = ISO8601DateFormatter()
-        if regular.date(from: raw) != nil { return raw }
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        guard fractional.date(from: raw) != nil else {
+        guard parser.ordinaryThenFractional(raw) != nil else {
             throw PolicyDetailReadError.invalidResponse(field)
         }
         return raw

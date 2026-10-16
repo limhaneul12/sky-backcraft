@@ -461,6 +461,21 @@ final class DatabaseReader {
         return db
     }
 
+    private func beginReadTransaction(_ db: OpaquePointer, operation: String) throws {
+        var errorPointer: UnsafeMutablePointer<CChar>?
+        let result = sqlite3_exec(db, "BEGIN DEFERRED TRANSACTION;", nil, nil, &errorPointer)
+        guard result == SQLITE_OK else {
+            let detail = errorPointer.map { String(cString: $0) } ?? String(cString: sqlite3_errmsg(db))
+            if let errorPointer { sqlite3_free(errorPointer) }
+            throw LedgerReadError.queryFailed(operation: operation, detail: detail)
+        }
+        if let errorPointer { sqlite3_free(errorPointer) }
+    }
+
+    private func endReadTransaction(_ db: OpaquePointer) {
+        sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+    }
+
     private func prepare(_ db: OpaquePointer, sql: String, operation: String) throws -> OpaquePointer {
         var statement: OpaquePointer?
         let result = sqlite3_prepare_v2(db, sql, -1, &statement, nil)
@@ -517,16 +532,10 @@ final class DatabaseReader {
         return parsed
     }
 
-    private func utcDate(_ value: String, operation: String, field: String) throws -> Date {
-        let wholeSeconds = ISO8601DateFormatter()
-        if let parsed = wholeSeconds.date(from: value) {
-            return parsed
-        }
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let parsed = fractional.date(from: value) {
-            return parsed
-        }
+    private func utcDate(
+        _ value: String, operation: String, field: String, parser: ReadTimestampParser
+    ) throws -> Date {
+        if let parsed = parser.ordinaryThenFractional(value) { return parsed }
         throw LedgerReadError.invalidTimestamp(operation: operation, field: field, value: value)
     }
 
@@ -893,6 +902,8 @@ final class DatabaseReader {
         let operation = "account marks"
         let db = try openDB()
         defer { sqlite3_close(db) }
+        try beginReadTransaction(db, operation: operation)
+        defer { endReadTransaction(db) }
 
         let contextSQL = """
         SELECT r.ledger_state
@@ -912,6 +923,26 @@ final class DatabaseReader {
         }
         let ledgerState = try requiredText(contextStatement, column: 0, operation: operation, field: "ledger_state")
 
+        let countSQL = """
+        SELECT COUNT(*)
+        FROM account_marks AS am
+        JOIN candle_observations AS c ON c.id = am.source_bar_id
+        WHERE am.run_id = ? AND am.model_id = ?;
+        """
+        let countStatement = try prepare(db, sql: countSQL, operation: operation)
+        defer { sqlite3_finalize(countStatement) }
+        bind(runId, at: 1, to: countStatement)
+        bind(modelId, at: 2, to: countStatement)
+        let countStep = sqlite3_step(countStatement)
+        guard countStep == SQLITE_ROW else {
+            throw LedgerReadError.queryFailed(operation: operation, detail: String(cString: sqlite3_errmsg(db)))
+        }
+        let countValue = sqlite3_column_int64(countStatement, 0)
+        try ensureDone(sqlite3_step(countStatement), db: db, operation: operation)
+        guard let rowCount = Int(exactly: countValue), rowCount >= 0 else {
+            throw LedgerReadError.inconsistentData(operation: operation, detail: "account mark count is outside Int range")
+        }
+
         let sql = """
         SELECT am.model_id, am.event_seq, am.equity_decimal, am.cash_total_decimal,
                am.source_bar_id, am.record_json, c.close_time_ms
@@ -926,8 +957,22 @@ final class DatabaseReader {
         bind(modelId, at: 2, to: statement)
 
         var marks: [RealAccountMark] = []
+        let sampleCount = min(rowCount, maxPoints)
+        marks.reserveCapacity(sampleCount)
+        let downsampling = rowCount > maxPoints
+        let sampleDenominator = maxPoints - 1
+        let sampleDistance = downsampling ? rowCount - 1 : 0
+        let sampleStep = downsampling ? sampleDistance / sampleDenominator : 1
+        let sampleRemainder = downsampling ? sampleDistance % sampleDenominator : 0
+        var remainderCarry = 0
+        var nextSampleIndex = 0
+        var rowIndex = 0
+        let timestampParser = ReadTimestampParser()
         var step = sqlite3_step(statement)
         while step == SQLITE_ROW {
+            guard rowIndex < rowCount else {
+                throw LedgerReadError.inconsistentData(operation: operation, detail: "account mark scan exceeded its snapshot count")
+            }
             let selectedModelId = try requiredText(statement, column: 0, operation: operation, field: "model_id")
             guard selectedModelId == modelId else {
                 throw LedgerReadError.inconsistentData(operation: operation, detail: "query returned a different model_id")
@@ -952,39 +997,58 @@ final class DatabaseReader {
                 )
             }
             let closeTimeMilliseconds = sqlite3_column_int64(statement, 6)
-            marks.append(RealAccountMark(
-                modelId: selectedModelId,
-                seq: Int(eventSequence),
-                equityDecimal: try decimal(equityText, operation: operation, field: "equity_decimal"),
-                cashDecimal: try decimal(cashText, operation: operation, field: "cash_total_decimal"),
-                sourceBarId: sourceBarId,
-                timestamp: try utcDate(
-                    record.context.accountingEventTime,
-                    operation: operation,
-                    field: "context.accounting_event_time"
-                ),
-                sourceBarCloseTime: Date(
-                    timeIntervalSince1970: TimeInterval(closeTimeMilliseconds) / 1000.0
-                ),
-                kind: record.kind,
-                drawdownDecimal: try record.drawdown.map {
-                    try decimal($0, operation: operation, field: "record_json.drawdown")
+            let equity = try decimal(equityText, operation: operation, field: "equity_decimal")
+            let cash = try decimal(cashText, operation: operation, field: "cash_total_decimal")
+            let timestamp = try utcDate(
+                record.context.accountingEventTime,
+                operation: operation,
+                field: "context.accounting_event_time",
+                parser: timestampParser
+            )
+            let drawdown = try record.drawdown.map {
+                try decimal($0, operation: operation, field: "record_json.drawdown")
+            }
+            if !downsampling || rowIndex == nextSampleIndex {
+                marks.append(RealAccountMark(
+                    modelId: selectedModelId,
+                    seq: Int(eventSequence),
+                    equityDecimal: equity,
+                    cashDecimal: cash,
+                    sourceBarId: sourceBarId,
+                    timestamp: timestamp,
+                    sourceBarCloseTime: Date(
+                        timeIntervalSince1970: TimeInterval(closeTimeMilliseconds) / 1000.0
+                    ),
+                    kind: record.kind,
+                    drawdownDecimal: drawdown
+                ))
+                if downsampling, marks.count < sampleCount {
+                    nextSampleIndex += sampleStep
+                    if sampleRemainder > 0 {
+                        let carryThreshold = sampleDenominator - sampleRemainder
+                        if remainderCarry >= carryThreshold {
+                            nextSampleIndex += 1
+                            remainderCarry -= carryThreshold
+                        } else {
+                            remainderCarry += sampleRemainder
+                        }
+                    }
                 }
-            ))
+            }
+            rowIndex += 1
             step = sqlite3_step(statement)
         }
         try ensureDone(step, db: db, operation: operation)
+        guard rowIndex == rowCount else {
+            throw LedgerReadError.inconsistentData(operation: operation, detail: "account mark scan differs from its snapshot count")
+        }
+        guard marks.count == sampleCount else {
+            throw LedgerReadError.inconsistentData(operation: operation, detail: "account mark sample differs from its target count")
+        }
         if marks.isEmpty, ledgerState == "COMPACTED" {
             throw LedgerReadError.accountMarksUnavailable(runId: runId, modelId: modelId, ledgerState: ledgerState)
         }
-        return downsample(marks, maxPoints: maxPoints)
-    }
-
-    private func downsample(_ marks: [RealAccountMark], maxPoints: Int) -> [RealAccountMark] {
-        guard marks.count > maxPoints else { return marks }
-        let lastIndex = marks.count - 1
-        let denominator = maxPoints - 1
-        return (0..<maxPoints).map { index in marks[(index * lastIndex) / denominator] }
+        return marks
     }
 
     func fetchAllPolicies() throws -> [RealPolicy] {

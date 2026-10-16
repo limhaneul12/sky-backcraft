@@ -344,12 +344,13 @@ final class LedgerDetailMCPReader {
         guard returned == rawRecords.count, returned <= 100, total >= returned else {
             throw LedgerDetailError.countMismatch("page returned_count/total_count")
         }
+        let timestampParser = ReadTimestampParser()
         let records = try rawRecords.map { record -> LedgerDetailRecord in
             switch section {
-            case .fills: return .fill(try decodeFill(record, runId: runId, modelId: modelId))
-            case .orders, .orderEvents: return .order(try decodeOrder(record, runId: runId, modelId: modelId))
-            case .episodes: return .episode(try decodeEpisode(record, runId: runId, modelId: modelId))
-            case .signals: return .signal(try decodeSignal(record, runId: runId, modelId: modelId))
+            case .fills: return .fill(try decodeFill(record, runId: runId, modelId: modelId, timestampParser: timestampParser))
+            case .orders, .orderEvents: return .order(try decodeOrder(record, runId: runId, modelId: modelId, timestampParser: timestampParser))
+            case .episodes: return .episode(try decodeEpisode(record, runId: runId, modelId: modelId, timestampParser: timestampParser))
+            case .signals: return .signal(try decodeSignal(record, runId: runId, modelId: modelId, timestampParser: timestampParser))
             }
         }
         if section != .episodes {
@@ -387,7 +388,9 @@ final class LedgerDetailMCPReader {
                                 truncatedReason: try optionalString(page, "truncated_reason"))
     }
 
-    private static func decodeFill(_ value: [String: Any], runId: String, modelId: String) throws -> LedgerFillDetail {
+    private static func decodeFill(
+        _ value: [String: Any], runId: String, modelId: String, timestampParser: ReadTimestampParser
+    ) throws -> LedgerFillDetail {
         let unit = try string(value, "embedded_price_cost_quote_unit")
         guard unit == "KRW" else { throw LedgerDetailError.unsupportedUnit(unit) }
         guard try string(value, "price_cost_attribution_unit") == "KRW_PER_BASE_UNIT" else {
@@ -402,7 +405,7 @@ final class LedgerDetailMCPReader {
             throw LedgerDetailError.unsupportedUnit(feeCurrency ?? "fee_currency")
         }
         let liquidityCloseRaw = try string(value, "liquidity_source_close_time")
-        return LedgerFillDetail(identity: try identity(value, runId: runId, modelId: modelId),
+        return LedgerFillDetail(identity: try identity(value, runId: runId, modelId: modelId, timestampParser: timestampParser),
             fillId: try string(value, "fill_id"), orderId: try string(value, "order_id"),
             episodeId: try string(value, "episode_id"), side: side,
             price: try decimal(value, "price"), quantity: try decimal(value, "qty"),
@@ -417,10 +420,10 @@ final class LedgerDetailMCPReader {
             arrivalMidNullReason: try string(value, "arrival_mid_null_reason"),
             executionOrigin: try string(value, "execution_origin"),
             fillObserved: try bool(value, "fill_observed"),
-            timing: try fillTiming(value),
+            timing: try fillTiming(value, timestampParser: timestampParser),
             sourceBarId: try string(value, "source_bar_id"),
             liquiditySourceBarId: try string(value, "liquidity_source_bar_id"),
-            liquiditySourceCloseTime: try timestamp(liquidityCloseRaw),
+            liquiditySourceCloseTime: try timestamp(liquidityCloseRaw, parser: timestampParser),
             liquiditySourceCloseTimeRaw: liquidityCloseRaw,
             liquidityRoleAssumption: try string(value, "liquidity_role_assumption"),
             modelVersion: try string(value, "model_version"),
@@ -428,19 +431,20 @@ final class LedgerDetailMCPReader {
             artificialTerminalExit: try bool(value, "artificial_terminal_exit"), rawJSON: try prettyJSON(value))
     }
 
-    private static func fillTiming(_ value: [String: Any]) throws -> LedgerFillTimingDetail {
+    private static func fillTiming(_ value: [String: Any], timestampParser: ReadTimestampParser) throws -> LedgerFillTimingDetail {
         guard let timing = value["timing"] as? [String: Any] else {
             throw LedgerDetailError.invalidResponse("timing")
         }
         switch try string(timing, "kind") {
         case "EXACT":
             let raw = try string(timing, "at")
-            return .exact(at: try timestamp(raw), raw: raw)
+            return .exact(at: try timestamp(raw, parser: timestampParser), raw: raw)
         case "INTERVAL":
             let start = try string(timing, "start"), end = try string(timing, "end")
             let accounting = try string(timing, "accounting_at")
-            let startDate = try timestamp(start), endDate = try timestamp(end)
-            let accountingDate = try timestamp(accounting)
+            let startDate = try timestamp(start, parser: timestampParser)
+            let endDate = try timestamp(end, parser: timestampParser)
+            let accountingDate = try timestamp(accounting, parser: timestampParser)
             guard startDate <= accountingDate, accountingDate <= endDate else {
                 throw LedgerDetailError.invalidResponse("timing interval ordering")
             }
@@ -451,19 +455,23 @@ final class LedgerDetailMCPReader {
         }
     }
 
-    private static func decodeOrder(_ value: [String: Any], runId: String, modelId: String) throws -> LedgerOrderDetail {
+    private static func decodeOrder(
+        _ value: [String: Any], runId: String, modelId: String, timestampParser: ReadTimestampParser
+    ) throws -> LedgerOrderDetail {
         let createdRaw = try string(value, "created_at")
-        return LedgerOrderDetail(identity: try identity(value, runId: runId, modelId: modelId),
+        return LedgerOrderDetail(identity: try identity(value, runId: runId, modelId: modelId, timestampParser: timestampParser),
             orderId: try string(value, "order_id"), parentSignalId: try string(value, "parent_signal_id"),
             episodeId: try optionalString(value, "episode_id"), side: try string(value, "side"),
             orderType: try string(value, "order_type"), requestedPrice: try optionalDecimal(value, "requested_price"),
             requestedQuantity: try decimal(value, "requested_qty"), reservedCash: try decimal(value, "reserved_cash"),
             cumulativeFilledQuantity: try decimal(value, "cumulative_filled_qty"),
             status: try string(value, "status"), reason: try string(value, "reason"),
-            createdAt: try timestamp(createdRaw), createdAtRaw: createdRaw, rawJSON: try prettyJSON(value))
+            createdAt: try timestamp(createdRaw, parser: timestampParser), createdAtRaw: createdRaw, rawJSON: try prettyJSON(value))
     }
 
-    private static func decodeEpisode(_ value: [String: Any], runId: String, modelId: String) throws -> LedgerEpisodeDetail {
+    private static func decodeEpisode(
+        _ value: [String: Any], runId: String, modelId: String, timestampParser: ReadTimestampParser
+    ) throws -> LedgerEpisodeDetail {
         guard try string(value, "run_id") == runId, try string(value, "model_id") == modelId else {
             throw LedgerDetailError.identityMismatch("episode run_id/model_id")
         }
@@ -474,8 +482,8 @@ final class LedgerDetailMCPReader {
         }
         return LedgerEpisodeDetail(runId: runId, modelId: modelId, market: try string(value, "market"),
             episodeId: try string(value, "episode_id"), status: try string(value, "status"),
-            openedAt: try timestamp(opened), openedAtRaw: opened,
-            closedAt: try closed.map(timestamp), closedAtRaw: closed,
+            openedAt: try timestamp(opened, parser: timestampParser), openedAtRaw: opened,
+            closedAt: try closed.map { try timestamp($0, parser: timestampParser) }, closedAtRaw: closed,
             fillCount: fills.count, orderCount: orders.count, buyVWAP: try decimal(value, "buy_vwap"),
             sellVWAP: try optionalDecimal(value, "sell_vwap"), maxQuantity: try decimal(value, "max_qty"),
             holdingSeconds: try uint64(value, "holding_seconds"),
@@ -485,21 +493,25 @@ final class LedgerDetailMCPReader {
             exitReason: try optionalString(value, "exit_reason"), rawJSON: try prettyJSON(value))
     }
 
-    private static func decodeSignal(_ value: [String: Any], runId: String, modelId: String) throws -> LedgerSignalDetail {
+    private static func decodeSignal(
+        _ value: [String: Any], runId: String, modelId: String, timestampParser: ReadTimestampParser
+    ) throws -> LedgerSignalDetail {
         let signalTime = try string(value, "signal_time")
         guard let reasons = value["reasons"] as? [String] else {
             throw LedgerDetailError.invalidResponse("signal reasons")
         }
-        return LedgerSignalDetail(identity: try identity(value, runId: runId, modelId: modelId),
+        return LedgerSignalDetail(identity: try identity(value, runId: runId, modelId: modelId, timestampParser: timestampParser),
             signalId: try string(value, "signal_id"), strategy: try string(value, "strategy"),
             intendedSide: try optionalString(value, "intended_side"),
             rawTargetWeight: try decimal(value, "raw_target_weight"),
             constrainedTargetWeight: try decimal(value, "constrained_target_weight"),
             outcome: try string(value, "outcome"), reasons: reasons,
-            signalTime: try timestamp(signalTime), signalTimeRaw: signalTime, rawJSON: try prettyJSON(value))
+            signalTime: try timestamp(signalTime, parser: timestampParser), signalTimeRaw: signalTime, rawJSON: try prettyJSON(value))
     }
 
-    private static func identity(_ value: [String: Any], runId: String, modelId: String) throws -> LedgerEventIdentity {
+    private static func identity(
+        _ value: [String: Any], runId: String, modelId: String, timestampParser: ReadTimestampParser
+    ) throws -> LedgerEventIdentity {
         guard let context = value["context"] as? [String: Any] else {
             throw LedgerDetailError.invalidResponse("context")
         }
@@ -510,7 +522,7 @@ final class LedgerDetailMCPReader {
         let raw = try string(context, "accounting_event_time")
         return LedgerEventIdentity(runId: runId, modelId: modelId, market: try string(context, "market"),
                                    sequence: try uint64(context, "event_seq"),
-                                   accountingTime: try timestamp(raw), accountingTimeRaw: raw)
+                                   accountingTime: try timestamp(raw, parser: timestampParser), accountingTimeRaw: raw)
     }
 
     private static func dictionary(_ data: Data, label: String) throws -> [String: Any] {
@@ -568,9 +580,8 @@ final class LedgerDetailMCPReader {
         guard number <= UInt64(Int.max) else { throw LedgerDetailError.invalidResponse(key) }
         return Int(number)
     }
-    private static func timestamp(_ raw: String) throws -> Date {
-        let precise = ISO8601DateFormatter(); precise.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        guard let date = precise.date(from: raw) ?? ISO8601DateFormatter().date(from: raw) else {
+    private static func timestamp(_ raw: String, parser: ReadTimestampParser) throws -> Date {
+        guard let date = parser.fractionalThenOrdinary(raw) else {
             throw LedgerDetailError.invalidResponse("timestamp")
         }
         return date
