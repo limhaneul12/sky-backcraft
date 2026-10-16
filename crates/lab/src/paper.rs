@@ -52,10 +52,181 @@ pub struct PaperSourceCursor {
     pub completed_bars: u64,
 }
 
+struct PlannedPaperSourceBar<'a> {
+    bar: &'a CandleObservation,
+    digest: ContentHash,
+}
+
 struct PlannedPaperSourceFeed<'a> {
     interval: CandleInterval,
+    bars: Vec<PlannedPaperSourceBar<'a>>,
+}
+
+struct PreparedPaperSourceRow<'a> {
+    bar: &'a CandleObservation,
+    original_index: usize,
+    digest: Option<ContentHash>,
+}
+
+struct PreparedPaperSourceStream<'a> {
     indicator_ids: Vec<String>,
-    bars: Vec<&'a CandleObservation>,
+    rows_by_close: Vec<PreparedPaperSourceRow<'a>>,
+    validated_prefix_len: usize,
+    ordered_prefix: Vec<usize>,
+}
+
+/// Per-operation view over one immutable source map; never persisted in a checkpoint.
+pub(crate) struct PreparedPaperSourceFrame<'a> {
+    market_code: String,
+    requirements: Vec<(CandleInterval, usize)>,
+    streams: BTreeMap<CandleInterval, PreparedPaperSourceStream<'a>>,
+}
+
+impl<'a> PreparedPaperSourceFrame<'a> {
+    pub(crate) fn new(
+        evaluator: &PolicyEvaluator,
+        market: &MarketId,
+        source_bars: &'a BTreeMap<CandleInterval, Vec<CandleObservation>>,
+    ) -> Self {
+        let indicators = evaluator.source_indicators();
+        let requirements = evaluator.source_requirements();
+        let mut streams = BTreeMap::new();
+        for (interval, _) in &requirements {
+            let indicator_ids = indicators
+                .iter()
+                .filter(|(_, source_interval, _)| source_interval == interval)
+                .map(|(indicator_id, _, _)| indicator_id.clone())
+                .collect();
+            let mut rows_by_close = source_bars
+                .get(interval)
+                .into_iter()
+                .flatten()
+                .enumerate()
+                .filter(|(_, bar)| bar.candle.completed)
+                .map(|(original_index, bar)| PreparedPaperSourceRow {
+                    bar,
+                    original_index,
+                    digest: None,
+                })
+                .collect::<Vec<_>>();
+            rows_by_close.sort_by(|left, right| {
+                left.bar
+                    .candle
+                    .close_time_utc
+                    .cmp(&right.bar.candle.close_time_utc)
+                    .then_with(|| left.original_index.cmp(&right.original_index))
+            });
+            streams.insert(
+                *interval,
+                PreparedPaperSourceStream {
+                    indicator_ids,
+                    rows_by_close,
+                    validated_prefix_len: 0,
+                    ordered_prefix: Vec::new(),
+                },
+            );
+        }
+        Self {
+            market_code: market.code(),
+            requirements,
+            streams,
+        }
+    }
+}
+
+impl<'a> PreparedPaperSourceStream<'a> {
+    fn prefix_until(
+        &mut self,
+        market_code: &str,
+        interval: CandleInterval,
+        decision_close: UtcTimestamp,
+    ) -> Result<usize, LabError> {
+        let eligible_end = self
+            .rows_by_close
+            .partition_point(|row| row.bar.candle.close_time_utc <= decision_close);
+        if eligible_end > self.validated_prefix_len {
+            let mut newly_eligible = (self.validated_prefix_len..eligible_end).collect::<Vec<_>>();
+            newly_eligible.sort_by_key(|row_index| self.rows_by_close[*row_index].original_index);
+            for row_index in newly_eligible {
+                let bar = self.rows_by_close[row_index].bar;
+                if bar.candle.interval != interval || bar.candle.market != market_code {
+                    return Err(LabError::DataCorrupt(format!(
+                        "paper source row identity mismatch for {interval:?}"
+                    )));
+                }
+                let expected_close = bar
+                    .candle
+                    .open_time_utc
+                    .0
+                    .checked_add_signed(interval.duration())
+                    .map(UtcTimestamp)
+                    .ok_or_else(|| {
+                        LabError::DataCorrupt("paper source boundary overflow".into())
+                    })?;
+                if bar.candle.close_time_utc != expected_close
+                    || crate::scheduling::latest_completed_boundary(
+                        bar.candle.close_time_utc,
+                        interval,
+                    )? != bar.candle.close_time_utc
+                {
+                    return Err(LabError::DataCorrupt(format!(
+                        "paper source row is off the {interval:?} boundary grid"
+                    )));
+                }
+                let digest = observation_digest(&bar.candle)?;
+                if bar.content_digest != digest {
+                    return Err(LabError::InputHashMismatch(
+                        "paper source candle content digest mismatch".into(),
+                    ));
+                }
+                self.rows_by_close[row_index].digest = Some(digest);
+            }
+
+            for row_index in self.validated_prefix_len..eligible_end {
+                if let Some(previous_index) = self.ordered_prefix.last().copied() {
+                    let previous = &self.rows_by_close[previous_index];
+                    let current = &self.rows_by_close[row_index];
+                    if previous.bar.candle.close_time_utc == current.bar.candle.close_time_utc {
+                        let previous_digest = previous.digest.as_ref().ok_or_else(|| {
+                            LabError::Internal("validated paper source digest missing".into())
+                        })?;
+                        let current_digest = current.digest.as_ref().ok_or_else(|| {
+                            LabError::Internal("validated paper source digest missing".into())
+                        })?;
+                        if previous_digest != current_digest {
+                            return Err(LabError::DataCorrupt(format!(
+                                "conflicting paper source rows at {}",
+                                current.bar.candle.close_time_utc
+                            )));
+                        }
+                        continue;
+                    }
+                }
+                self.ordered_prefix.push(row_index);
+            }
+            self.validated_prefix_len = eligible_end;
+        }
+
+        let ordered_end = self.ordered_prefix.partition_point(|row_index| {
+            self.rows_by_close[*row_index].bar.candle.close_time_utc <= decision_close
+        });
+        Ok(ordered_end)
+    }
+
+    fn planned_row(&self, row_index: usize) -> Result<PlannedPaperSourceBar<'a>, LabError> {
+        let row = self
+            .rows_by_close
+            .get(row_index)
+            .ok_or_else(|| LabError::Internal("prepared paper source row missing".into()))?;
+        let digest = row
+            .digest
+            .clone()
+            .ok_or_else(|| LabError::Internal("validated paper source digest missing".into()))?;
+        Ok(PlannedPaperSourceBar {
+            bar: row.bar,
+            digest,
+        })
+    }
 }
 
 enum PausedSourceFeed {
@@ -486,7 +657,9 @@ impl PaperMarketCheckpoint {
             // indicators still need their own completed source history. Seed
             // those streams without observing a decision candle or emitting
             // any pre-start economic effects.
-            let _ = self.feed_sources_until(source_bars, started_at)?;
+            let mut source_frame =
+                PreparedPaperSourceFrame::new(&self.evaluator, &self.market, source_bars);
+            let _ = self.feed_sources_until_prepared(&mut source_frame, started_at)?;
             return Ok(());
         }
         let eligible = decision_bars
@@ -526,8 +699,10 @@ impl PaperMarketCheckpoint {
             episode_opened_at: None,
             held_decision_bars: None,
         };
+        let mut source_frame =
+            PreparedPaperSourceFrame::new(&self.evaluator, &self.market, source_bars);
         for bar in warmup_slice {
-            if !self.feed_sources_until(source_bars, bar.candle.close_time_utc)? {
+            if !self.feed_sources_until_prepared(&mut source_frame, bar.candle.close_time_utc)? {
                 return Ok(());
             }
             self.evaluator
@@ -552,8 +727,14 @@ impl PaperMarketCheckpoint {
         now_utc: UtcTimestamp,
     ) -> Result<PaperStepOutcome, LabError> {
         let mut staged = self.clone();
-        let outcome =
-            staged.catch_up_paused_bars_in_place(decision_bars, source_bars, evidence, now_utc)?;
+        let mut source_frame =
+            PreparedPaperSourceFrame::new(&staged.evaluator, &staged.market, source_bars);
+        let outcome = staged.catch_up_paused_bars_in_place(
+            decision_bars,
+            &mut source_frame,
+            evidence,
+            now_utc,
+        )?;
         if outcome.recovery_required.is_none() && staged.recovery_reason.is_none() {
             *self = staged;
         } else if let Some(reason) = staged.recovery_reason {
@@ -566,13 +747,13 @@ impl PaperMarketCheckpoint {
     fn catch_up_paused_bars_in_place(
         &mut self,
         decision_bars: &[CandleObservation],
-        source_bars: &BTreeMap<CandleInterval, Vec<CandleObservation>>,
+        source_frame: &mut PreparedPaperSourceFrame<'_>,
         evidence: Option<&EvidenceSnapshot>,
         now_utc: UtcTimestamp,
     ) -> Result<PaperStepOutcome, LabError> {
         let evidence_evaluator = EvidenceEvaluator::new(evidence, self.plan.spec.pit_policy)?;
         if let Some(outcome) =
-            self.observe_previous_paused_bar(source_bars, &evidence_evaluator, now_utc)?
+            self.observe_previous_paused_bar(source_frame, &evidence_evaluator, now_utc)?
         {
             return Ok(outcome);
         }
@@ -623,7 +804,7 @@ impl PaperMarketCheckpoint {
                     ),
                 ));
             }
-            let source_ready = match self.feed_sources_for_paused_bar(source_bars, bar, now_utc)? {
+            let source_ready = match self.feed_sources_for_paused_bar(source_frame, bar, now_utc)? {
                 PausedSourceFeed::Ready(ready) => ready,
                 PausedSourceFeed::Recovery(outcome) => return Ok(outcome),
             };
@@ -672,7 +853,7 @@ impl PaperMarketCheckpoint {
 
     fn observe_previous_paused_bar(
         &mut self,
-        source_bars: &BTreeMap<CandleInterval, Vec<CandleObservation>>,
+        source_frame: &mut PreparedPaperSourceFrame<'_>,
         evidence_evaluator: &EvidenceEvaluator,
         now_utc: UtcTimestamp,
     ) -> Result<Option<PaperStepOutcome>, LabError> {
@@ -683,7 +864,7 @@ impl PaperMarketCheckpoint {
             return Ok(None);
         };
         let source_ready =
-            match self.feed_sources_for_paused_bar(source_bars, &previous, now_utc)? {
+            match self.feed_sources_for_paused_bar(source_frame, &previous, now_utc)? {
                 PausedSourceFeed::Ready(ready) => ready,
                 PausedSourceFeed::Recovery(outcome) => return Ok(Some(outcome)),
             };
@@ -707,11 +888,23 @@ impl PaperMarketCheckpoint {
     /// # Errors
     /// Rejects incomplete, future, or out-of-order observations and transitions to
     /// `RecoveryRequired` on conflicting bar digests or non-contiguous gaps.
-    #[allow(clippy::too_many_lines)]
     pub fn step_bar(
         &mut self,
         bar: &CandleObservation,
         source_bars: &BTreeMap<CandleInterval, Vec<CandleObservation>>,
+        evidence: Option<&EvidenceSnapshot>,
+        now_utc: UtcTimestamp,
+    ) -> Result<PaperStepOutcome, LabError> {
+        let mut source_frame =
+            PreparedPaperSourceFrame::new(&self.evaluator, &self.market, source_bars);
+        self.step_bar_with_prepared_sources(bar, &mut source_frame, evidence, now_utc)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn step_bar_with_prepared_sources(
+        &mut self,
+        bar: &CandleObservation,
+        source_frame: &mut PreparedPaperSourceFrame<'_>,
         evidence: Option<&EvidenceSnapshot>,
         now_utc: UtcTimestamp,
     ) -> Result<PaperStepOutcome, LabError> {
@@ -841,7 +1034,7 @@ impl PaperMarketCheckpoint {
 
             if !self.prior_bar_evaluated {
                 let source_ready =
-                    self.feed_sources_until(source_bars, prev.candle.close_time_utc)?;
+                    self.feed_sources_until_prepared(source_frame, prev.candle.close_time_utc)?;
                 if source_ready {
                     let marked = self.engine_state.account.mark(prev.candle.close)?;
                     let position = self.engine_state.position_view(marked.actual_weight, now)?;
@@ -966,7 +1159,7 @@ impl PaperMarketCheckpoint {
                 episode_opened_at: None,
                 held_decision_bars: None,
             };
-            if self.feed_sources_until(source_bars, bar.candle.close_time_utc)? {
+            if self.feed_sources_until_prepared(source_frame, bar.candle.close_time_utc)? {
                 self.evaluator
                     .observe(bar, cash, Some(&evidence_evaluator))?;
                 let seen = u32::try_from(self.evaluator.completed_bars_seen()).unwrap_or(u32::MAX);
@@ -1096,11 +1289,11 @@ impl PaperMarketCheckpoint {
 
     fn feed_sources_for_paused_bar(
         &mut self,
-        source_bars: &BTreeMap<CandleInterval, Vec<CandleObservation>>,
+        source_frame: &mut PreparedPaperSourceFrame<'_>,
         bar: &CandleObservation,
         now_utc: UtcTimestamp,
     ) -> Result<PausedSourceFeed, LabError> {
-        match self.feed_sources_until(source_bars, bar.candle.close_time_utc) {
+        match self.feed_sources_until_prepared(source_frame, bar.candle.close_time_utc) {
             Ok(ready) => Ok(PausedSourceFeed::Ready(ready)),
             Err(LabError::DataGap(reason)) => {
                 let digest = observation_digest(&bar.candle)?;
@@ -1116,36 +1309,47 @@ impl PaperMarketCheckpoint {
         }
     }
 
+    #[cfg(test)]
     fn feed_sources_until(
         &mut self,
         source_bars: &BTreeMap<CandleInterval, Vec<CandleObservation>>,
         decision_close: UtcTimestamp,
     ) -> Result<bool, LabError> {
-        let indicators = self.evaluator.source_indicators();
-        let requirements = self.evaluator.source_requirements();
-        if requirements.is_empty() {
+        let mut source_frame =
+            PreparedPaperSourceFrame::new(&self.evaluator, &self.market, source_bars);
+        self.feed_sources_until_prepared(&mut source_frame, decision_close)
+    }
+
+    fn feed_sources_until_prepared(
+        &mut self,
+        source_frame: &mut PreparedPaperSourceFrame<'_>,
+        decision_close: UtcTimestamp,
+    ) -> Result<bool, LabError> {
+        if source_frame.requirements.is_empty() {
             return Ok(true);
         }
 
-        let mut plans = Vec::with_capacity(requirements.len());
+        let mut plans = Vec::with_capacity(source_frame.requirements.len());
         let mut cold_deferred = false;
-        for (interval, required_bars) in &requirements {
-            let indicator_ids = indicators
-                .iter()
-                .filter(|(_, source_interval, _)| source_interval == interval)
-                .map(|(indicator_id, _, _)| indicator_id.clone())
-                .collect::<Vec<_>>();
-            if indicator_ids.is_empty() {
+        for (interval, required_bars) in &source_frame.requirements {
+            let market_code = source_frame.market_code.as_str();
+            let stream = source_frame.streams.get_mut(interval).ok_or_else(|| {
+                LabError::DataCorrupt(format!(
+                    "prepared paper source stream missing for {interval:?}"
+                ))
+            })?;
+            if stream.indicator_ids.is_empty() {
                 return Err(LabError::DataCorrupt(format!(
                     "source requirement {interval:?} has no declared indicators"
                 )));
             }
-            let bars = self.completed_source_bars_until(source_bars, *interval, decision_close)?;
+            let ordered_end = stream.prefix_until(market_code, *interval, decision_close)?;
+            let ordered_prefix = &stream.ordered_prefix[..ordered_end];
             if let Some(plan) = self.plan_source_interval(
                 *interval,
                 *required_bars,
-                indicator_ids,
-                bars,
+                stream,
+                ordered_prefix,
                 decision_close,
             )? {
                 plans.push(plan);
@@ -1158,11 +1362,21 @@ impl PaperMarketCheckpoint {
         }
 
         for plan in plans {
-            for bar in plan.bars {
-                for indicator_id in &plan.indicator_ids {
-                    self.evaluator.observe_source(indicator_id, bar)?;
+            let indicator_ids = &source_frame
+                .streams
+                .get(&plan.interval)
+                .ok_or_else(|| {
+                    LabError::DataCorrupt(format!(
+                        "prepared paper source stream missing for {:?}",
+                        plan.interval
+                    ))
+                })?
+                .indicator_ids;
+            for planned_bar in plan.bars {
+                for indicator_id in indicator_ids {
+                    self.evaluator
+                        .observe_source(indicator_id, planned_bar.bar)?;
                 }
-                let digest = observation_digest(&bar.candle)?;
                 let cursor =
                     self.source_cursors
                         .entry(plan.interval)
@@ -1172,15 +1386,15 @@ impl PaperMarketCheckpoint {
                             last_bar_digest: None,
                             completed_bars: 0,
                         });
-                cursor.last_bar_close_utc = Some(bar.candle.close_time_utc);
-                cursor.last_bar_digest = Some(digest);
+                cursor.last_bar_close_utc = Some(planned_bar.bar.candle.close_time_utc);
+                cursor.last_bar_digest = Some(planned_bar.digest);
                 cursor.completed_bars = cursor.completed_bars.saturating_add(1);
             }
         }
 
-        for (interval, required_bars) in requirements {
-            let expected = crate::scheduling::latest_completed_boundary(decision_close, interval)?;
-            let Some(cursor) = self.source_cursors.get(&interval) else {
+        for (interval, required_bars) in &source_frame.requirements {
+            let expected = crate::scheduling::latest_completed_boundary(decision_close, *interval)?;
+            let Some(cursor) = self.source_cursors.get(interval) else {
                 return Ok(false);
             };
             if cursor.last_bar_close_utc != Some(expected) {
@@ -1188,7 +1402,7 @@ impl PaperMarketCheckpoint {
                     "paper source cursor for {interval:?} does not reach completed boundary {expected}"
                 )));
             }
-            let required_bars = u64::try_from(required_bars)
+            let required_bars = u64::try_from(*required_bars)
                 .map_err(|_| LabError::ResourceLimit("source warmup count overflow".into()))?;
             if cursor.completed_bars < required_bars {
                 return Ok(false);
@@ -1197,72 +1411,16 @@ impl PaperMarketCheckpoint {
         Ok(true)
     }
 
-    fn completed_source_bars_until<'a>(
-        &self,
-        source_bars: &'a BTreeMap<CandleInterval, Vec<CandleObservation>>,
-        interval: CandleInterval,
-        decision_close: UtcTimestamp,
-    ) -> Result<Vec<&'a CandleObservation>, LabError> {
-        let mut candidates = source_bars
-            .get(&interval)
-            .into_iter()
-            .flatten()
-            .filter(|bar| bar.candle.completed && bar.candle.close_time_utc <= decision_close)
-            .collect::<Vec<_>>();
-        for bar in &candidates {
-            if bar.candle.interval != interval || bar.candle.market != self.market.code() {
-                return Err(LabError::DataCorrupt(format!(
-                    "paper source row identity mismatch for {interval:?}"
-                )));
-            }
-            let expected_close = bar
-                .candle
-                .open_time_utc
-                .0
-                .checked_add_signed(interval.duration())
-                .map(UtcTimestamp)
-                .ok_or_else(|| LabError::DataCorrupt("paper source boundary overflow".into()))?;
-            if bar.candle.close_time_utc != expected_close
-                || crate::scheduling::latest_completed_boundary(
-                    bar.candle.close_time_utc,
-                    interval,
-                )? != bar.candle.close_time_utc
-            {
-                return Err(LabError::DataCorrupt(format!(
-                    "paper source row is off the {interval:?} boundary grid"
-                )));
-            }
-            if bar.content_digest != observation_digest(&bar.candle)? {
-                return Err(LabError::InputHashMismatch(
-                    "paper source candle content digest mismatch".into(),
-                ));
-            }
-        }
-        candidates.sort_by_key(|bar| bar.candle.close_time_utc);
-        let mut ordered: Vec<&CandleObservation> = Vec::with_capacity(candidates.len());
-        for bar in candidates {
-            if let Some(previous) = ordered.last()
-                && previous.candle.close_time_utc == bar.candle.close_time_utc
-            {
-                if previous.content_digest != bar.content_digest {
-                    return Err(LabError::DataCorrupt(format!(
-                        "conflicting paper source rows at {}",
-                        bar.candle.close_time_utc
-                    )));
-                }
-                continue;
-            }
-            ordered.push(bar);
-        }
-        Ok(ordered)
-    }
-
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one source interval plan keeps cursor, warmup and successor checks in their original error order"
+    )]
     fn plan_source_interval<'a>(
         &self,
         interval: CandleInterval,
         required_bars: usize,
-        indicator_ids: Vec<String>,
-        bars: Vec<&'a CandleObservation>,
+        stream: &PreparedPaperSourceStream<'a>,
+        ordered_prefix: &[usize],
         decision_close: UtcTimestamp,
     ) -> Result<Option<PlannedPaperSourceFeed<'a>>, LabError> {
         let expected = crate::scheduling::latest_completed_boundary(decision_close, interval)?;
@@ -1279,7 +1437,8 @@ impl PaperMarketCheckpoint {
             )));
         }
         let last_fed = self.evaluator.cross_last_close();
-        if indicator_ids
+        if stream
+            .indicator_ids
             .iter()
             .any(|indicator_id| last_fed.get(indicator_id).copied() != last_close)
         {
@@ -1289,31 +1448,31 @@ impl PaperMarketCheckpoint {
         }
 
         let Some(last_close) = last_close else {
-            if bars
-                .last()
-                .is_none_or(|bar| bar.candle.close_time_utc != expected)
-            {
+            let Some(last_index) = ordered_prefix.last().copied() else {
+                return Ok(None);
+            };
+            if stream.rows_by_close[last_index].bar.candle.close_time_utc != expected {
                 return Ok(None);
             }
-            let mut contiguous_start = bars.len() - 1;
+            let mut contiguous_start = ordered_prefix.len() - 1;
             while contiguous_start > 0 {
-                let previous = bars[contiguous_start - 1];
-                let current = bars[contiguous_start];
+                let previous = &stream.rows_by_close[ordered_prefix[contiguous_start - 1]].bar;
+                let current = &stream.rows_by_close[ordered_prefix[contiguous_start]].bar;
                 if previous.candle.close_time_utc == current.candle.open_time_utc {
                     contiguous_start -= 1;
                 } else {
                     break;
                 }
             }
-            let suffix = &bars[contiguous_start..];
+            let suffix = &ordered_prefix[contiguous_start..];
             if suffix.len() < required_bars {
                 return Ok(None);
             }
-            return Ok(Some(PlannedPaperSourceFeed {
-                interval,
-                indicator_ids,
-                bars: suffix[suffix.len() - required_bars..].to_vec(),
-            }));
+            let bars = suffix[suffix.len() - required_bars..]
+                .iter()
+                .map(|row_index| stream.planned_row(*row_index))
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(Some(PlannedPaperSourceFeed { interval, bars }));
         };
 
         if last_close > expected {
@@ -1322,11 +1481,19 @@ impl PaperMarketCheckpoint {
             )));
         }
         if let Some(cursor) = cursor {
-            for bar in bars
-                .iter()
-                .filter(|bar| bar.candle.close_time_utc == last_close)
+            let cursor_position = ordered_prefix.partition_point(|row_index| {
+                stream.rows_by_close[*row_index].bar.candle.close_time_utc < last_close
+            });
+            if let Some(row_index) = ordered_prefix.get(cursor_position)
+                && stream.rows_by_close[*row_index].bar.candle.close_time_utc == last_close
             {
-                if Some(&bar.content_digest) != cursor.last_bar_digest.as_ref() {
+                let digest = stream.rows_by_close[*row_index]
+                    .digest
+                    .as_ref()
+                    .ok_or_else(|| {
+                        LabError::Internal("validated paper source digest missing".into())
+                    })?;
+                if Some(digest) != cursor.last_bar_digest.as_ref() {
                     return Err(LabError::InputHashMismatch(format!(
                         "paper source row conflicts with persisted {interval:?} cursor"
                     )));
@@ -1335,11 +1502,13 @@ impl PaperMarketCheckpoint {
         }
 
         let mut expected_open = last_close;
-        let mut successors = Vec::new();
-        for bar in bars
-            .into_iter()
-            .filter(|bar| bar.candle.close_time_utc > last_close)
-        {
+        let successor_start = ordered_prefix.partition_point(|row_index| {
+            stream.rows_by_close[*row_index].bar.candle.close_time_utc <= last_close
+        });
+        let mut successors = Vec::with_capacity(ordered_prefix.len() - successor_start);
+        for row_index in &ordered_prefix[successor_start..] {
+            let source_row = &stream.rows_by_close[*row_index];
+            let bar = source_row.bar;
             if bar.candle.close_time_utc > expected {
                 return Err(LabError::DataCorrupt(format!(
                     "paper source row for {interval:?} exceeds completed boundary {expected}"
@@ -1351,7 +1520,7 @@ impl PaperMarketCheckpoint {
                 )));
             }
             expected_open = bar.candle.close_time_utc;
-            successors.push(bar);
+            successors.push(stream.planned_row(*row_index)?);
         }
         if expected_open != expected {
             return Err(LabError::DataGap(format!(
@@ -1360,7 +1529,6 @@ impl PaperMarketCheckpoint {
         }
         Ok(Some(PlannedPaperSourceFeed {
             interval,
-            indicator_ids,
             bars: successors,
         }))
     }
@@ -2134,6 +2302,62 @@ mod tests {
         )
     }
 
+    fn rules_revision_with_indicators(
+        policy_id: &str,
+        revision_id: &str,
+        name: &str,
+        indicators: Vec<PolicyIndicator>,
+    ) -> FrozenPolicyRevision {
+        let definition = PolicyDefinition {
+            schema_version: "1.0".into(),
+            name: name.into(),
+            description: "SYNTHETIC_TEST_ONLY paper source-feed fixture".into(),
+            program: PolicyProgram::Rules {
+                program: RulesProgram {
+                    indicators,
+                    states: Vec::new(),
+                    rules: Vec::new(),
+                    fallback: PolicyTarget::Hold,
+                    signal_expiry: PolicySignalExpiry::EndOfRange,
+                },
+            },
+        };
+        FrozenPolicyRevision {
+            reference: PolicyRevisionRef {
+                policy_id: PolicyId::new(policy_id).expect("policy id"),
+                revision_id: PolicyRevisionId::new(revision_id).expect("revision id"),
+                definition_digest: ContentHash::of_value(&definition).expect("definition digest"),
+            },
+            revision_number: 1,
+            parent_revision_id: None,
+            family: StrategyKind::S1,
+            origin: PolicyOrigin::User,
+            definition,
+        }
+    }
+
+    fn paper_checkpoint_for_rules_revision(
+        session_id: &PaperSessionId,
+        started_at: UtcTimestamp,
+        revision: &FrozenPolicyRevision,
+    ) -> Result<PaperMarketCheckpoint, LabError> {
+        PaperMarketCheckpoint::new(
+            session_id,
+            MarketId::parse_upbit("KRW-BTC")?,
+            revision,
+            CandleInterval::M1,
+            CandleInterval::M1,
+            0,
+            ExecutionPolicy::NextBarOpen {
+                participation_cap: Weight::new(Decimal::ONE)?,
+            },
+            QuoteAmount::new(dec("1000000"))?,
+            zero_cost_policy(),
+            simple_rules(),
+            started_at,
+        )
+    }
+
     fn mtf_start_write(
         request_id: &str,
         policy_ref: PolicyRevisionRef,
@@ -2759,6 +2983,141 @@ mod tests {
         assert_eq!(checkpoint.signal_count, signals_before_gap);
         assert_eq!(checkpoint.fill_count, 0);
         assert!(checkpoint.engine_state.orders.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn paper_mtf_source_rows_validate_lazily_and_preserve_duplicate_semantics()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let session_id = PaperSessionId::new("paper-mtf-source-validation")?;
+        let started_at = ts("2025-01-02T10:00:30Z");
+        let base = mtf_checkpoint(&session_id, started_at)?;
+        let source_boundary = ts("2025-01-02T10:00:00Z");
+        let valid_history = h1_history(
+            "mtf-source-validation",
+            ts("2025-01-02T07:00:00Z"),
+            &["80", "82", "84"],
+        );
+
+        let mut future_row = candle_obs(
+            "mtf-future-source-with-bad-digest",
+            "KRW-BTC",
+            CandleInterval::H1,
+            "2025-01-02T10:00:00Z",
+            "84",
+            "86",
+        );
+        future_row.content_digest = ContentHash::of_bytes(b"intentionally incorrect future digest");
+        let mut with_future_rows = valid_history.clone();
+        with_future_rows.push(future_row);
+
+        let mut lazy = base.clone();
+        let mut without_future = base.clone();
+        let future_sources = BTreeMap::from([(CandleInterval::H1, with_future_rows)]);
+        let historical_sources = BTreeMap::from([(CandleInterval::H1, valid_history.clone())]);
+        assert!(lazy.feed_sources_until(&future_sources, source_boundary)?);
+        assert!(without_future.feed_sources_until(&historical_sources, source_boundary)?);
+        assert_eq!(
+            lazy.checkpoint_digest()?,
+            without_future.checkpoint_digest()?
+        );
+        assert_eq!(
+            lazy.source_cursors[&CandleInterval::H1].last_bar_close_utc,
+            Some(source_boundary)
+        );
+
+        let before_future_becomes_eligible = lazy.checkpoint_digest()?;
+        assert!(matches!(
+            lazy.feed_sources_until(&future_sources, ts("2025-01-02T11:00:00Z")),
+            Err(LabError::InputHashMismatch(_))
+        ));
+        assert_eq!(lazy.checkpoint_digest()?, before_future_becomes_eligible);
+
+        let mut identical_rows = valid_history.clone();
+        identical_rows.push(
+            identical_rows
+                .last()
+                .expect("history has a final source row")
+                .clone(),
+        );
+        let mut identical_checkpoint = base.clone();
+        let identical_sources = BTreeMap::from([(CandleInterval::H1, identical_rows)]);
+        assert!(identical_checkpoint.feed_sources_until(&identical_sources, source_boundary)?);
+        assert_eq!(
+            identical_checkpoint.source_cursors[&CandleInterval::H1].completed_bars,
+            3
+        );
+
+        let mut conflicting_rows = valid_history;
+        let mut conflicting_duplicate = conflicting_rows
+            .last()
+            .expect("history has a final source row")
+            .clone();
+        conflicting_duplicate.candle.close = PriceKrw::new(dec("85"))?;
+        conflicting_duplicate.candle.high = PriceKrw::new(dec("85"))?;
+        conflicting_duplicate.content_digest = observation_digest(&conflicting_duplicate.candle)?;
+        conflicting_duplicate.id = crate::contracts::ObservationId::from_seed(
+            conflicting_duplicate.content_digest.as_str(),
+        );
+        conflicting_rows.push(conflicting_duplicate);
+        let mut conflicting_checkpoint = base;
+        let before_conflicting_duplicate = conflicting_checkpoint.checkpoint_digest()?;
+        let conflicting_sources = BTreeMap::from([(CandleInterval::H1, conflicting_rows)]);
+        assert!(matches!(
+            conflicting_checkpoint.feed_sources_until(&conflicting_sources, source_boundary),
+            Err(LabError::DataCorrupt(_))
+        ));
+        assert_eq!(
+            conflicting_checkpoint.checkpoint_digest()?,
+            before_conflicting_duplicate
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn paper_mtf_multi_interval_cold_source_defers_after_ready_plan_without_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let revision = rules_revision_with_indicators(
+            "policy-paper-multi-source-cold",
+            "policy-paper-multi-source-cold-r1",
+            "paper_mtf_multi_source_cold",
+            vec![
+                PolicyIndicator {
+                    id: "m5_close".into(),
+                    indicator: PolicyIndicatorKind::Close,
+                    source_interval: Some(CandleInterval::M5),
+                },
+                PolicyIndicator {
+                    id: "h1_close".into(),
+                    indicator: PolicyIndicatorKind::Close,
+                    source_interval: Some(CandleInterval::H1),
+                },
+            ],
+        );
+        let session_id = PaperSessionId::new("paper-mtf-two-source-cold")?;
+        let started_at = ts("2025-01-02T10:00:30Z");
+        let mut checkpoint =
+            paper_checkpoint_for_rules_revision(&session_id, started_at, &revision)?;
+        let decision_close = ts("2025-01-02T11:00:00Z");
+        let ready_m5 = candle_obs(
+            "paper-mtf-ready-m5",
+            "KRW-BTC",
+            CandleInterval::M5,
+            "2025-01-02T10:55:00Z",
+            "100",
+            "100",
+        );
+        let sources = BTreeMap::from([(CandleInterval::M5, vec![ready_m5])]);
+        let before = checkpoint.checkpoint_digest()?;
+
+        assert!(!checkpoint.feed_sources_until(&sources, decision_close)?);
+        assert_eq!(checkpoint.checkpoint_digest()?, before);
+        assert!(checkpoint.evaluator.cross_last_close().is_empty());
+        for interval in [CandleInterval::M5, CandleInterval::H1] {
+            let cursor = &checkpoint.source_cursors[&interval];
+            assert_eq!(cursor.last_bar_close_utc, None);
+            assert_eq!(cursor.completed_bars, 0);
+        }
         Ok(())
     }
 

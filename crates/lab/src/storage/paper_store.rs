@@ -16,8 +16,8 @@ use crate::contracts::{
 use crate::paper::{
     MAX_ACTIVE_PAPER_SESSIONS, MAX_PAPER_MARKETS_PER_SESSION, MAX_PAPER_RECOVERY_BARS,
     PAPER_CHECKPOINT_SCHEMA_VERSION, PaperMarketCheckpoint, PaperStepOutcome,
-    default_start_options, materialize_candle_event, policy_option_from_revision,
-    request_payload_digest, semantic_digest,
+    PreparedPaperSourceFrame, default_start_options, materialize_candle_event,
+    policy_option_from_revision, request_payload_digest, semantic_digest,
 };
 use rusqlite::{OptionalExtension, Transaction, params};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1296,15 +1296,27 @@ impl Store {
         let mut recovery_cause: Option<PaperRecoveryCause> = None;
         {
             let checkpoint = &mut checkpoints[cp_index];
-            for bar in decision_bars {
-                let outcome = checkpoint.step_bar(bar, source_bars, None, now)?;
-                if outcome.did_advance {
-                    pending_events.extend(outcome.events);
-                }
-                if let Some(reason) = outcome.recovery_required {
-                    recovery_reason = Some(reason);
-                    recovery_cause = outcome.recovery_cause;
-                    break;
+            if !decision_bars.is_empty() {
+                let mut source_frame = PreparedPaperSourceFrame::new(
+                    &checkpoint.evaluator,
+                    &checkpoint.market,
+                    source_bars,
+                );
+                for bar in decision_bars {
+                    let outcome = checkpoint.step_bar_with_prepared_sources(
+                        bar,
+                        &mut source_frame,
+                        None,
+                        now,
+                    )?;
+                    if outcome.did_advance {
+                        pending_events.extend(outcome.events);
+                    }
+                    if let Some(reason) = outcome.recovery_required {
+                        recovery_reason = Some(reason);
+                        recovery_cause = outcome.recovery_cause;
+                        break;
+                    }
                 }
             }
         }
@@ -1467,8 +1479,14 @@ impl Store {
                 source_bars.insert(source_interval, bars);
             }
 
+            let mut source_frame = PreparedPaperSourceFrame::new(
+                &checkpoint.evaluator,
+                &checkpoint.market,
+                &source_bars,
+            );
             for bar in &decision_bars {
-                let outcome = checkpoint.step_bar(bar, &source_bars, None, now)?;
+                let outcome =
+                    checkpoint.step_bar_with_prepared_sources(bar, &mut source_frame, None, now)?;
                 if outcome.did_advance {
                     pending_events.extend(outcome.events);
                 }
