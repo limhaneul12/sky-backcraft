@@ -20,6 +20,34 @@ struct AppConfiguration: Codable, Equatable {
     var domain: String
     var port: Int
     var authenticationMode: AuthenticationMode
+    var tradingMcpEnabled: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case domain
+        case port
+        case authenticationMode
+        case tradingMcpEnabled
+    }
+
+    init(
+        domain: String,
+        port: Int,
+        authenticationMode: AuthenticationMode,
+        tradingMcpEnabled: Bool = false
+    ) {
+        self.domain = domain
+        self.port = port
+        self.authenticationMode = authenticationMode
+        self.tradingMcpEnabled = tradingMcpEnabled
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        domain = try container.decode(String.self, forKey: .domain)
+        port = try container.decode(Int.self, forKey: .port)
+        authenticationMode = try container.decode(AuthenticationMode.self, forKey: .authenticationMode)
+        tradingMcpEnabled = try container.decodeIfPresent(Bool.self, forKey: .tradingMcpEnabled) ?? false
+    }
 
     static let `default` = AppConfiguration(
         domain: defaultDomain,
@@ -29,6 +57,9 @@ struct AppConfiguration: Codable, Equatable {
 
     func validated() throws -> AppConfiguration {
         let normalizedDomain = domain.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !tradingMcpEnabled || authenticationMode == .oauth else {
+            throw AppError.configuration("MCP 계좌 조회·전략 제어를 사용하려면 OAuth 인증을 선택하세요.")
+        }
         guard (1...65535).contains(port) else {
             throw AppError.configuration("포트는 1부터 65535 사이여야 합니다.")
         }
@@ -40,7 +71,12 @@ struct AppConfiguration: Codable, Equatable {
                 throw AppError.configuration("도메인에는 호스트 이름만 입력하세요.")
             }
         }
-        return AppConfiguration(domain: normalizedDomain, port: port, authenticationMode: authenticationMode)
+        return AppConfiguration(
+            domain: normalizedDomain,
+            port: port,
+            authenticationMode: authenticationMode,
+            tradingMcpEnabled: tradingMcpEnabled
+        )
     }
 }
 
@@ -79,11 +115,8 @@ final class ConfigurationStore {
         try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
     }
 
-    func dataDirectory(for mode: AuthenticationMode) -> URL {
-        supportDirectory.appendingPathComponent(
-            mode == .none ? "public-research" : "oauth-research",
-            isDirectory: true
-        )
+    func dataDirectory(for mode: AuthenticationMode = .none) -> URL {
+        supportDirectory.appendingPathComponent("research", isDirectory: true)
     }
 
     func load() throws -> AppConfiguration {
