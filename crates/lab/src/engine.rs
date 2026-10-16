@@ -78,7 +78,9 @@ pub fn run_model(
         admission.market.clone(),
         plan.spec.decision_interval,
     )?;
-    let (decision_rows, execution_rows) = match plan.spec.causal_execution {
+    // Prepared streams own resampled rows; whole-vector replay borrows frozen inputs.
+    let prepared_rows;
+    let (decision_bars, execution_bars) = match plan.spec.causal_execution {
         Some(CausalExecutionPolicy::DeclaredPolicyWarmup) => {
             let decision_warmup =
                 u32::try_from(evaluator.decision_warmup_bars()).map_err(|_| {
@@ -92,7 +94,7 @@ pub fn run_model(
                 .spec
                 .range
                 .with_warmup(1, plan.spec.execution_resolution)?;
-            (
+            prepared_rows = (
                 crate::policy_engine::prepare_interval_bars(
                     datasets,
                     &admission.market,
@@ -108,6 +110,10 @@ pub fn run_model(
                     plan.spec.execution_resolution,
                     execution_range,
                 )?,
+            );
+            (
+                prepared_rows.0.iter().collect::<Vec<_>>(),
+                prepared_rows.1.iter().collect::<Vec<_>>(),
             )
         }
         None => (
@@ -116,23 +122,15 @@ pub fn run_model(
                 &admission.market,
                 plan.spec.decision_interval,
                 None,
-            )?
-            .into_iter()
-            .cloned()
-            .collect(),
+            )?,
             observations_for_range(
                 datasets,
                 &admission.market,
                 plan.spec.execution_resolution,
                 None,
-            )?
-            .into_iter()
-            .cloned()
-            .collect(),
+            )?,
         ),
     };
-    let decision_bars = decision_rows.iter().collect::<Vec<_>>();
-    let execution_bars = execution_rows.iter().collect::<Vec<_>>();
     let initial_bar = execution_bars
         .iter()
         .copied()

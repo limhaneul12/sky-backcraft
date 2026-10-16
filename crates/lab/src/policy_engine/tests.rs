@@ -489,6 +489,81 @@ fn cross_interval_source_feed_is_causal_deterministic_and_leak_free()
     Ok(())
 }
 
+#[test]
+fn prepare_interval_bars_uses_largest_divisible_finer_stream()
+-> Result<(), Box<dyn std::error::Error>> {
+    let start = UtcTimestamp(
+        Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0)
+            .single()
+            .expect("start time"),
+    );
+    let end = UtcTimestamp(start.0 + Duration::hours(1));
+    let range = crate::contracts::UtcRange::new(start, end)?;
+    let market = market();
+    let rows = |interval: CandleInterval, count: usize, id_start: i64, close_start: i64| {
+        (0..count)
+            .map(|index| {
+                let index = i64::try_from(index).expect("source index");
+                let mut row = observation(id_start + index, close_start + index);
+                let open = UtcTimestamp(
+                    start.0 + Duration::minutes(index * interval.duration().num_minutes()),
+                );
+                row.candle.interval = interval;
+                row.candle.open_time_utc = open;
+                row.candle.close_time_utc = UtcTimestamp(open.0 + interval.duration());
+                row
+            })
+            .collect::<Vec<_>>()
+    };
+    let snapshot = |id: &str, interval: CandleInterval, observations: Vec<CandleObservation>| {
+        crate::contracts::DatasetSnapshot {
+            manifest: crate::contracts::DatasetManifest {
+                schema_version: "1.0".into(),
+                id: crate::contracts::DatasetId::new(id).expect("dataset id"),
+                request: crate::contracts::CollectRequest {
+                    request_id: crate::contracts::RequestId::new(format!("request-{id}"))
+                        .expect("request id"),
+                    markets: vec![market.clone()],
+                    range,
+                    data_resolution: interval,
+                    warmup_bars: 0,
+                    completed_only: true,
+                },
+                coverage: range,
+                status: crate::contracts::DatasetStatus::Ready,
+                row_count: observations.len() as u64,
+                normalizer_version: "fixture-v1".into(),
+                gap_policy: "FAIL_CLOSED".into(),
+                semantic_digest: ContentHash::of_bytes(format!("semantic-{id}").as_bytes()),
+                provenance_digest: ContentHash::of_bytes(format!("provenance-{id}").as_bytes()),
+                origin: crate::contracts::MarketDataOrigin::SyntheticTestOnly,
+                raw_objects: Vec::new(),
+                quality_issues: Vec::new(),
+                reuse: None,
+            },
+            observations,
+        }
+    };
+    let datasets = vec![
+        snapshot(
+            "dataset-m5",
+            CandleInterval::M5,
+            rows(CandleInterval::M5, 12, 100, 100),
+        ),
+        snapshot(
+            "dataset-m15",
+            CandleInterval::M15,
+            rows(CandleInterval::M15, 4, 200, 200),
+        ),
+    ];
+
+    let prepared = prepare_interval_bars(&datasets, &market, CandleInterval::H1, range)?;
+    assert_eq!(prepared.len(), 1);
+    assert_eq!(prepared[0].candle.close.get(), Decimal::from(203));
+    assert_eq!(prepared[0].constituent_ids.len(), 4);
+    Ok(())
+}
+
 fn none_target() -> Option<Decimal> {
     None
 }

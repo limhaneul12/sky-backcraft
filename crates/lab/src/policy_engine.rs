@@ -251,7 +251,8 @@ pub(crate) struct CrossIntervalFeed {
     /// One bounded causal bar list per declared source interval (at most a
     /// handful of intervals, hence a small association vec, not a map).
     bars: Vec<(CandleInterval, Vec<CandleObservation>)>,
-    cursors: Vec<(String, usize)>,
+    /// Cached indicator order and independent next-bar cursor per source.
+    sources: Vec<(String, CandleInterval, usize)>,
 }
 
 impl CrossIntervalFeed {
@@ -278,12 +279,12 @@ impl CrossIntervalFeed {
             )?;
             bars.push((interval, loaded));
         }
-        let cursors = evaluator
+        let sources = evaluator
             .source_indicators()
             .into_iter()
-            .map(|(id, _, _)| (id, 0_usize))
+            .map(|(id, interval, _)| (id, interval, 0_usize))
             .collect();
-        Ok(Self { bars, cursors })
+        Ok(Self { bars, sources })
     }
 
     /// Feed every source bar that closed at or before `decision_time` to its
@@ -296,28 +297,20 @@ impl CrossIntervalFeed {
         evaluator: &mut PolicyEvaluator,
         decision_time: crate::contracts::UtcTimestamp,
     ) -> Result<(), LabError> {
-        for (id, interval, _kind_warmup) in evaluator.source_indicators() {
-            let Some((_, bars)) = self.bars.iter().find(|(declared, _)| *declared == interval)
+        for (id, interval, cursor) in &mut self.sources {
+            let Some((_, bars)) = self
+                .bars
+                .iter()
+                .find(|(declared, _)| *declared == *interval)
             else {
                 continue;
             };
-            let start = self
-                .cursors
-                .iter()
-                .find(|(indicator, _)| *indicator == id)
-                .map_or(0_usize, |(_, cursor)| *cursor);
-            for bar in bars.iter().skip(start) {
+            for bar in bars.iter().skip(*cursor) {
                 if bar.candle.close_time_utc > decision_time {
                     break;
                 }
-                evaluator.observe_source(&id, bar)?;
-                if let Some((_, cursor)) = self
-                    .cursors
-                    .iter_mut()
-                    .find(|(indicator, _)| *indicator == id)
-                {
-                    *cursor += 1;
-                }
+                evaluator.observe_source(id, bar)?;
+                *cursor += 1;
             }
         }
         Ok(())
@@ -426,19 +419,19 @@ pub(crate) fn prepare_interval_bars(
 ) -> Result<Vec<CandleObservation>, LabError> {
     let window = window.into();
     let range = window.range();
-    let exact = collect_interval_rows(datasets, market, target, range);
     let native_declared = datasets.iter().any(|dataset| {
         dataset.manifest.request.data_resolution == target
             && dataset.manifest.request.markets.contains(market)
     });
     if native_declared {
+        let exact = collect_interval_rows(datasets, market, target, range);
         reject_quality_issues(datasets, market, target, range)?;
         validate_interval_bars(&exact, market, target, window)?;
         return Ok(exact);
     }
 
     let target_seconds = target.duration().num_seconds();
-    let mut finer = datasets
+    let source = datasets
         .iter()
         .flat_map(|dataset| dataset.observations.iter())
         .filter(|row| row.candle.market == market.code())
@@ -447,14 +440,12 @@ pub(crate) fn prepare_interval_bars(
             let seconds = interval.duration().num_seconds();
             seconds < target_seconds && target_seconds % seconds == 0
         })
-        .collect::<Vec<_>>();
-    finer.sort_by_key(|interval| interval.duration().num_seconds());
-    finer.dedup();
-    let source = finer.pop().ok_or_else(|| {
-        LabError::DataGap(format!(
-            "no native {target:?} or divisible finer observations for {market}"
-        ))
-    })?;
+        .max_by_key(|interval| interval.duration().num_seconds())
+        .ok_or_else(|| {
+            LabError::DataGap(format!(
+                "no native {target:?} or divisible finer observations for {market}"
+            ))
+        })?;
     reject_quality_issues(datasets, market, source, range)?;
     let source_rows = collect_interval_rows(datasets, market, source, range);
     validate_interval_bars(&source_rows, market, source, window)?;
