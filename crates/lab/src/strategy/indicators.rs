@@ -1,7 +1,8 @@
 use crate::contracts::LabError;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Sma {
     length: usize,
     values: VecDeque<f64>,
@@ -39,7 +40,7 @@ impl Sma {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Ema {
     length: usize,
     seed_sum: f64,
@@ -77,7 +78,7 @@ impl Ema {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct RollingVol {
     length: usize,
     returns: VecDeque<f64>,
@@ -135,7 +136,7 @@ impl RollingVol {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Rsi {
     length: usize,
     previous_close: Option<f64>,
@@ -207,7 +208,7 @@ fn length_f64(length: usize) -> Result<f64, LabError> {
     })
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct RollingExtreme {
     length: usize,
     index: u64,

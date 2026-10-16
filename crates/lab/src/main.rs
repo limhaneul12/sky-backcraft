@@ -222,14 +222,24 @@ fn dispatch(args: &[String]) -> Result<(), LabError> {
                     "--auth-token",
                     "--public-url",
                 ],
-                &["--public-no-auth", "--allow-network-bind", "--oauth"],
+                &[
+                    "--public-no-auth",
+                    "--allow-network-bind",
+                    "--oauth",
+                    "--trading-mcp",
+                    "--allow-live-orders",
+                    "--live-order-control",
+                ],
                 &["--allow-host"],
             )?;
             let config = McpServeConfig::parse(&args[1..])?;
             prepare_server_root(&config)?;
             let upbit = UpbitClient::new()?;
             let git_revision = mcp::build_git_revision();
-            let owner = DatabaseOwner::open(config.data_root.clone())?;
+            let owner = DatabaseOwner::open_with_live_order_control(
+                config.data_root.clone(),
+                config.live_order_control,
+            )?;
             let result =
                 runtime()?.block_on(run_mcp_serve(config, upbit, git_revision, owner.handle()));
             finish_database(result, Some(owner))
@@ -1005,6 +1015,10 @@ struct McpServeConfig {
     data_root: PathBuf,
     allow_hosts: Vec<String>,
     auth: ServerAuth,
+    desktop_access_token: Option<String>,
+    trading_mcp: bool,
+    live_order_control: bool,
+    live_policy: spot_lab::upbit::execution::LiveExecutionPolicy,
 }
 
 impl McpServeConfig {
@@ -1052,7 +1066,40 @@ impl McpServeConfig {
                 Ok(window[1].clone())
             })
             .collect::<Result<Vec<_>, LabError>>()?;
+        let trading_mcp = flag_flag(args, "--trading-mcp");
+        let allow_live_orders = flag_flag(args, "--allow-live-orders");
+        let live_order_control = flag_flag(args, "--live-order-control");
+        if allow_live_orders && live_order_control {
+            return Err(LabError::InvalidConfig(
+                "--live-order-control and --allow-live-orders are mutually exclusive".into(),
+            ));
+        }
+        if trading_mcp && !flag_flag(args, "--oauth") {
+            return Err(LabError::InvalidConfig("--trading-mcp requires OAuth; anonymous and legacy bearer transports cannot gain trading access".into()));
+        }
+        if allow_live_orders && !trading_mcp {
+            return Err(LabError::InvalidConfig(
+                "--allow-live-orders requires explicit --trading-mcp operator configuration".into(),
+            ));
+        }
+        let live_policy = if allow_live_orders || live_order_control {
+            spot_lab::upbit::execution::LiveExecutionPolicy::OperatorEnabled
+        } else {
+            spot_lab::upbit::execution::LiveExecutionPolicy::Disabled
+        };
         let auth = server_auth_config(args)?;
+        let desktop_access_token = desktop_access_token_from_env()?;
+        if live_order_control
+            && (!trading_mcp && desktop_access_token.is_none()
+                || matches!(auth, ServerAuth::PublicNoAuth | ServerAuth::Bearer(_)))
+        {
+            return Err(LabError::InvalidConfig("--live-order-control requires scoped OAuth trading configuration or a trusted local desktop capability".into()));
+        }
+        if !bind_address.is_loopback() && matches!(auth, ServerAuth::None) {
+            return Err(LabError::InvalidConfig(
+                "non-loopback bind requires --public-no-auth, --auth-token, or --oauth".into(),
+            ));
+        }
         if !allow_hosts.is_empty()
             && !matches!(auth, ServerAuth::PublicNoAuth | ServerAuth::OAuth(_))
         {
@@ -1071,8 +1118,32 @@ impl McpServeConfig {
             data_root: data_root(args),
             allow_hosts,
             auth,
+            desktop_access_token,
+            trading_mcp,
+            live_order_control,
+            live_policy,
         })
     }
+}
+
+fn desktop_access_token_from_env() -> Result<Option<String>, LabError> {
+    let Some(token) = std::env::var_os("SERVICE_DESKTOP_ACCESS_TOKEN") else {
+        return Ok(None);
+    };
+    let token = token.into_string().map_err(|_| {
+        LabError::InvalidConfig("SERVICE_DESKTOP_ACCESS_TOKEN must be valid UTF-8".into())
+    })?;
+    validate_desktop_access_token(&token)?;
+    Ok(Some(token))
+}
+
+fn validate_desktop_access_token(token: &str) -> Result<(), LabError> {
+    if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(LabError::InvalidConfig(
+            "SERVICE_DESKTOP_ACCESS_TOKEN must contain exactly 64 hexadecimal characters".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn server_auth_config(args: &[String]) -> Result<ServerAuth, LabError> {
@@ -1112,8 +1183,12 @@ fn server_auth_config(args: &[String]) -> Result<ServerAuth, LabError> {
             "--oauth requires SPOT_LAB_OAUTH_OWNER_CODE in the environment".into(),
         )
     })?;
-    let oauth = spot_lab::oauth::OAuthState::new(&public_url, owner_code)
-        .map_err(LabError::InvalidConfig)?;
+    let mut oauth = if flag_flag(args, "--trading-mcp") {
+        spot_lab::oauth::OAuthState::new_with_full_trading_on_consent(&public_url, owner_code)
+    } else {
+        spot_lab::oauth::OAuthState::new(&public_url, owner_code)
+    }
+    .map_err(LabError::InvalidConfig)?;
     if !args
         .windows(2)
         .any(|window| window[0] == "--allow-host" && window[1] == oauth.public_host())
@@ -1122,7 +1197,38 @@ fn server_auth_config(args: &[String]) -> Result<ServerAuth, LabError> {
             "--oauth requires --allow-host matching the --public-url host".into(),
         ));
     }
+    if let Some(registry) = read_oauth_client_registry(&data_root(args))? {
+        oauth = oauth
+            .with_pre_registered_clients(registry)
+            .map_err(LabError::InvalidConfig)?;
+    }
     Ok(ServerAuth::OAuth(oauth))
+}
+
+/// Load only operator-owned public client IDs and callback allowlists.
+/// Missing config leaves DCR clients ephemeral; invalid or unreadable config fails startup.
+fn read_oauth_client_registry(
+    data_root: &std::path::Path,
+) -> Result<Option<spot_lab::oauth::OAuthClientRegistryConfig>, LabError> {
+    let path = data_root.join("oauth-clients.json");
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(LabError::InvalidConfig(format!(
+                "inspect OAuth client registry: {error}"
+            )));
+        }
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err(LabError::InvalidConfig(
+                "oauth-clients.json must be a regular file".into(),
+            ));
+        }
+        Ok(_) => {}
+    }
+    let path = path.to_str().ok_or_else(|| {
+        LabError::InvalidConfig("oauth-clients.json path must be valid UTF-8".into())
+    })?;
+    read_config(path).map(Some)
 }
 
 fn read_config<T: serde::de::DeserializeOwned>(path: &str) -> Result<T, LabError> {
@@ -1184,6 +1290,9 @@ fn print_help() {
         "  probe [--market KRW-BTC] [--interval h1] [--count 2] [--data-root data] [--no-save]"
     );
     println!("  mcp-serve [--bind 127.0.0.1] [--port 8130] [--data-root data]");
+    println!(
+        "            [--trading-mcp] [--live-order-control | --allow-live-orders] # separate OAuth scopes and explicit default-OFF live effect gate"
+    );
     println!("            [--allow-network-bind] # explicit container/network namespace binding");
     println!(
         "            [--allow-host <host>]  # repeatable: extra Host headers to accept (e.g. a tunnel domain)"
@@ -1319,6 +1428,10 @@ async fn run_mcp_serve(
         data_root,
         allow_hosts,
         auth: server_auth,
+        desktop_access_token,
+        trading_mcp,
+        live_order_control,
+        live_policy,
     } = server;
     let exposure = server_auth.exposure();
     let public_no_auth = exposure.public_no_auth();
@@ -1339,6 +1452,7 @@ async fn run_mcp_serve(
         .allowed_origins
         .extend(allow_hosts.iter().map(|host| format!("https://{host}")));
     config.allowed_hosts.extend(allow_hosts.iter().cloned());
+    let desktop_config = config.clone();
     let allowed_origins: std::sync::Arc<[String]> = config.allowed_origins.clone().into();
     let listener = tokio::net::TcpListener::bind((bind_address, port))
         .await
@@ -1348,65 +1462,289 @@ async fn run_mcp_serve(
         spot_lab::transport::TransportLimits::default(),
     );
     let state = listener.state();
-    let jobs = spot_lab::jobs::JobRuntime::start(
+    let public_upbit_exchange = spot_lab::upbit::UpbitExchangeService::credential_free_mock();
+    let send_gate =
+        live_order_control.then(spot_lab::upbit::execution::LiveOrderSendGate::new_disabled);
+    let desktop_upbit_exchange = if desktop_access_token.is_some() || trading_mcp {
+        let exchange = if let Some(gate) = send_gate.clone() {
+            if trading_mcp {
+                spot_lab::upbit::UpbitExchangeService::init_from_env_with_policy_and_send_gate(
+                    Some(&data_root), live_policy, gate,
+                )
+            } else {
+                spot_lab::upbit::UpbitExchangeService::init_from_env_or_mock_with_policy_and_send_gate(
+                    Some(&data_root), live_policy, gate,
+                )
+            }
+        } else if trading_mcp {
+            spot_lab::upbit::UpbitExchangeService::init_from_env_with_policy(Some(&data_root), live_policy)
+        } else {
+            spot_lab::upbit::UpbitExchangeService::init_from_env_or_mock(Some(&data_root))
+        }
+        .map_err(|error| {
+            LabError::InvalidConfig(format!("initialize private Upbit service: {error}"))
+        })?;
+        let mut control = spot_lab::upbit::control::TradingControlService::production_with_policy(
+            database.clone(),
+            exchange.risk_guard().clone(),
+            exchange.exchange_read_mode(),
+            exchange.live_execution_policy(),
+        );
+        if let Some(gate) = exchange.live_order_send_gate() {
+            control = control.with_live_order_send_gate(gate);
+        }
+        control.synchronize_from_storage().await?;
+        Some(exchange)
+    } else {
+        None
+    };
+    if trading_mcp && live_order_control {
+        let ServerAuth::OAuth(oauth) = &server_auth else {
+            return Err(LabError::InvalidConfig(
+                "managed trading consent requires OAuth authentication".into(),
+            ));
+        };
+        let exchange = desktop_upbit_exchange.as_ref().ok_or_else(|| {
+            LabError::InvalidConfig(
+                "managed OAuth trading requires the credential-backed exchange service".into(),
+            )
+        })?;
+        let gate = exchange.live_order_send_gate().ok_or_else(|| {
+            LabError::InvalidConfig(
+                "managed OAuth trading requires the shared live-order send gate".into(),
+            )
+        })?;
+        let live_order_control = spot_lab::upbit::live_order_control::LiveOrderControlService::new(
+            database.clone(),
+            exchange.live_execution_policy(),
+            Some(gate),
+            exchange.exchange_read_mode(),
+        );
+        oauth
+            .bind_managed_live_order_control(live_order_control)
+            .map_err(LabError::InvalidConfig)?;
+    }
+    let automation_private_venue = desktop_upbit_exchange.as_ref().map_or_else(
+        spot_lab::upbit::client::UpbitPrivateClient::new_mock,
+        |exchange| exchange.client().clone(),
+    );
+    let automation_risk_guard = desktop_upbit_exchange.as_ref().map_or_else(
+        || public_upbit_exchange.risk_guard().clone(),
+        |exchange| exchange.risk_guard().clone(),
+    );
+    let jobs = spot_lab::jobs::JobRuntime::start_with_venue_and_risk_guard(
         database.clone(),
         upbit.clone(),
-        data_root,
+        automation_private_venue,
+        automation_risk_guard,
+        data_root.clone(),
         git_revision.clone(),
     )
     .await?;
     let job_service = jobs.service();
-    let service = StreamableHttpService::new(
-        move || {
-            Ok(LabMcpService::new(
-                database.clone(),
-                upbit.clone(),
-                job_service.clone(),
-                exposure,
-            ))
-        },
-        LocalSessionManager::default().into(),
-        config,
-    );
-    let server_auth = std::sync::Arc::new(server_auth);
-    let auth_guard = server_auth.clone();
-    let protected_mcp = axum::Router::new()
-        .nest_service("/mcp", service)
-        .route_layer(axum::middleware::from_fn(
-            move |request: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
-                let auth = auth_guard.clone();
-                async move {
-                    let authorized = match auth.as_ref() {
-                        ServerAuth::None | ServerAuth::PublicNoAuth => true,
-                        ServerAuth::Bearer(expected) => {
-                            spot_lab::oauth::accepts_legacy_bearer(request.headers(), expected)
+    let (mcp_router, oauth_routes) = match &server_auth {
+        ServerAuth::OAuth(oauth) => {
+            let oauth_resource_metadata_url = trading_mcp.then(|| oauth.resource_metadata_url());
+            let oauth_db = database.clone();
+            let oauth_upbit = upbit.clone();
+            let oauth_jobs = job_service.clone();
+            let oauth_exchange = if trading_mcp {
+                desktop_upbit_exchange
+                    .as_ref()
+                    .ok_or_else(|| {
+                        LabError::InvalidConfig(
+                            "trading MCP requires the credential-backed exchange service".into(),
+                        )
+                    })?
+                    .clone()
+            } else {
+                public_upbit_exchange.clone()
+            };
+            let oauth_service = StreamableHttpService::new(
+                move || {
+                    let service = LabMcpService::new_with_exchange(
+                        oauth_db.clone(),
+                        oauth_upbit.clone(),
+                        oauth_jobs.clone(),
+                        mcp::McpExposure::OAuth,
+                        oauth_exchange.clone(),
+                    );
+                    Ok(match &oauth_resource_metadata_url {
+                        Some(url) => service.with_remote_trading_oauth(url.clone()),
+                        None => service,
+                    })
+                },
+                LocalSessionManager::default().into(),
+                config.clone(),
+            );
+            let public_db = database.clone();
+            let public_upbit = upbit.clone();
+            let public_jobs = job_service.clone();
+            let public_exchange = public_upbit_exchange.clone();
+            let public_service = StreamableHttpService::new(
+                move || {
+                    Ok(LabMcpService::new_with_exchange(
+                        public_db.clone(),
+                        public_upbit.clone(),
+                        public_jobs.clone(),
+                        mcp::McpExposure::PublicNoAuth,
+                        public_exchange.clone(),
+                    ))
+                },
+                LocalSessionManager::default().into(),
+                config,
+            );
+            let oauth_state = oauth.clone();
+            let protected_oauth = axum::Router::new()
+                .nest_service("/mcp", oauth_service)
+                .route_layer(axum::middleware::from_fn(
+                    move |mut request: axum::http::Request<axum::body::Body>,
+                          next: axum::middleware::Next| {
+                        let state = oauth_state.clone();
+                        async move {
+                            if let Some(permissions) =
+                                state.permissions_for_headers(request.headers())
+                            {
+                                request.extensions_mut().insert(permissions);
+                                next.run(request).await
+                            } else {
+                                axum::http::Response::builder()
+                                    .status(axum::http::StatusCode::UNAUTHORIZED)
+                                    .header(
+                                        axum::http::header::WWW_AUTHENTICATE,
+                                        format!(
+                                            "Bearer resource_metadata=\"{}\", scope=\"mcp\"",
+                                            state.resource_metadata_url()
+                                        ),
+                                    )
+                                    .body(axum::body::Body::empty())
+                                    .unwrap_or_else(|_| axum::response::Response::default())
+                            }
                         }
-                        ServerAuth::OAuth(state) => state.accepts_bearer(request.headers()),
-                    };
-                    if authorized {
-                        next.run(request).await
-                    } else {
-                        let mut response = axum::http::Response::builder()
-                            .status(axum::http::StatusCode::UNAUTHORIZED);
-                        if let ServerAuth::OAuth(state) = auth.as_ref() {
-                            response = response.header(
-                                axum::http::header::WWW_AUTHENTICATE,
-                                format!(
-                                    "Bearer resource_metadata=\"{}\", scope=\"mcp\"",
-                                    state.resource_metadata_url()
-                                ),
-                            );
+                    },
+                ));
+            let public_mcp = axum::Router::new().nest_service("/public/mcp", public_service);
+            (protected_oauth.merge(public_mcp), oauth.router())
+        }
+        ServerAuth::Bearer(expected) => {
+            let bearer_secret = expected.clone();
+            let bearer_db = database.clone();
+            let bearer_upbit = upbit.clone();
+            let bearer_jobs = job_service.clone();
+            let bearer_exchange = public_upbit_exchange.clone();
+            let service = StreamableHttpService::new(
+                move || {
+                    Ok(LabMcpService::new_with_exchange(
+                        bearer_db.clone(),
+                        bearer_upbit.clone(),
+                        bearer_jobs.clone(),
+                        exposure,
+                        bearer_exchange.clone(),
+                    ))
+                },
+                LocalSessionManager::default().into(),
+                config,
+            );
+            let protected = axum::Router::new()
+                .nest_service("/mcp", service)
+                .route_layer(axum::middleware::from_fn(
+                    move |request: axum::http::Request<axum::body::Body>,
+                          next: axum::middleware::Next| {
+                        let secret = bearer_secret.clone();
+                        async move {
+                            if spot_lab::oauth::accepts_legacy_bearer(request.headers(), &secret) {
+                                next.run(request).await
+                            } else {
+                                axum::http::Response::builder()
+                                    .status(axum::http::StatusCode::UNAUTHORIZED)
+                                    .body(axum::body::Body::empty())
+                                    .unwrap_or_else(|_| axum::response::Response::default())
+                            }
                         }
-                        response
-                            .body(axum::body::Body::empty())
-                            .unwrap_or_else(|_| axum::response::Response::default())
-                    }
-                }
+                    },
+                ));
+            (protected, axum::Router::new())
+        }
+        ServerAuth::None | ServerAuth::PublicNoAuth => {
+            let mcp_db = database.clone();
+            let mcp_upbit = upbit.clone();
+            let mcp_jobs = job_service.clone();
+            let mcp_exchange = public_upbit_exchange.clone();
+            let service = StreamableHttpService::new(
+                move || {
+                    Ok(LabMcpService::new_with_exchange(
+                        mcp_db.clone(),
+                        mcp_upbit.clone(),
+                        mcp_jobs.clone(),
+                        exposure,
+                        mcp_exchange.clone(),
+                    ))
+                },
+                LocalSessionManager::default().into(),
+                config.clone(),
+            );
+            let public_db = database.clone();
+            let public_upbit = upbit.clone();
+            let public_jobs = job_service.clone();
+            let public_exchange = public_upbit_exchange.clone();
+            let public_service = StreamableHttpService::new(
+                move || {
+                    Ok(LabMcpService::new_with_exchange(
+                        public_db.clone(),
+                        public_upbit.clone(),
+                        public_jobs.clone(),
+                        mcp::McpExposure::PublicNoAuth,
+                        public_exchange.clone(),
+                    ))
+                },
+                LocalSessionManager::default().into(),
+                config,
+            );
+            let router = axum::Router::new()
+                .nest_service("/mcp", service)
+                .nest_service("/public/mcp", public_service);
+            (router, axum::Router::new())
+        }
+    };
+    let desktop_router = if let (Some(expected_token), Some(desktop_exchange)) =
+        (desktop_access_token, desktop_upbit_exchange)
+    {
+        let desktop_db = database.clone();
+        let desktop_upbit = upbit.clone();
+        let desktop_jobs = job_service.clone();
+        let desktop_service = StreamableHttpService::new(
+            move || {
+                Ok(LabMcpService::new_with_exchange(
+                    desktop_db.clone(),
+                    desktop_upbit.clone(),
+                    desktop_jobs.clone(),
+                    mcp::McpExposure::Desktop,
+                    desktop_exchange.clone(),
+                ))
             },
-        ));
-    let oauth_routes = match server_auth.as_ref() {
-        ServerAuth::OAuth(oauth) => oauth.router(),
-        _ => axum::Router::new(),
+            LocalSessionManager::default().into(),
+            desktop_config,
+        );
+        axum::Router::new()
+            .nest_service("/desktop/mcp", desktop_service)
+            .route_layer(axum::middleware::from_fn(
+                move |request: axum::http::Request<axum::body::Body>,
+                      next: axum::middleware::Next| {
+                    let expected_token = expected_token.clone();
+                    async move {
+                        if desktop_request_allowed(request.headers(), port, &expected_token) {
+                            next.run(request).await
+                        } else {
+                            axum::http::Response::builder()
+                                .status(axum::http::StatusCode::UNAUTHORIZED)
+                                .body(axum::body::Body::empty())
+                                .unwrap_or_else(|_| axum::response::Response::default())
+                        }
+                    }
+                },
+            ))
+    } else {
+        axum::Router::new()
     };
     let allowed_hosts: std::sync::Arc<[String]> = [
         format!("127.0.0.1:{port}"),
@@ -1417,70 +1755,80 @@ async fn run_mcp_serve(
     .chain(allow_hosts)
     .collect::<Vec<_>>()
     .into();
-    let app = oauth_routes
-        .merge(protected_mcp)
-        .layer(axum::middleware::from_fn(
-            move |request: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
-                let allowed_hosts = allowed_hosts.clone();
-                let allowed_origins = allowed_origins.clone();
-                async move {
-                    let host = request
-                        .headers()
-                        .get(axum::http::header::HOST)
-                        .and_then(|value| value.to_str().ok());
-                    let origin = request
-                        .headers()
-                        .get(axum::http::header::ORIGIN)
-                        .and_then(|value| value.to_str().ok());
+    let app =
+        oauth_routes
+            .merge(mcp_router)
+            .merge(desktop_router)
+            .layer(axum::middleware::from_fn(
+                move |request: axum::http::Request<axum::body::Body>,
+                      next: axum::middleware::Next| {
+                    let allowed_hosts = allowed_hosts.clone();
+                    let allowed_origins = allowed_origins.clone();
+                    async move {
+                        let host = request
+                            .headers()
+                            .get(axum::http::header::HOST)
+                            .and_then(|value| value.to_str().ok());
+                        let origin = request
+                            .headers()
+                            .get(axum::http::header::ORIGIN)
+                            .and_then(|value| value.to_str().ok());
 
-                    let host_matches = |candidate: &str, allowed: &str| {
-                        candidate == allowed
-                            || candidate.strip_suffix(":443").is_some_and(|h| h == allowed)
-                            || candidate.strip_suffix(":80").is_some_and(|h| h == allowed)
-                            || allowed.strip_suffix(":443").is_some_and(|h| h == candidate)
-                            || allowed.strip_suffix(":80").is_some_and(|h| h == candidate)
-                    };
+                        let host_matches = |candidate: &str, allowed: &str| {
+                            candidate == allowed
+                                || candidate.strip_suffix(":443").is_some_and(|h| h == allowed)
+                                || candidate.strip_suffix(":80").is_some_and(|h| h == allowed)
+                                || allowed.strip_suffix(":443").is_some_and(|h| h == candidate)
+                                || allowed.strip_suffix(":80").is_some_and(|h| h == candidate)
+                        };
 
-                    let host_ok = host.is_some_and(|h| {
-                        allowed_hosts.iter().any(|allowed| host_matches(h, allowed))
-                    });
+                        let host_ok = host.is_some_and(|h| {
+                            allowed_hosts.iter().any(|allowed| host_matches(h, allowed))
+                        });
 
-                    let origin_matches = |candidate: &str, allowed: &str| {
-                        candidate == allowed
-                            || candidate.strip_suffix(":443").is_some_and(|o| o == allowed)
-                            || candidate.strip_suffix(":80").is_some_and(|o| o == allowed)
-                            || allowed.strip_suffix(":443").is_some_and(|o| o == candidate)
-                            || allowed.strip_suffix(":80").is_some_and(|o| o == candidate)
-                    };
+                        let origin_matches = |candidate: &str, allowed: &str| {
+                            candidate == allowed
+                                || candidate.strip_suffix(":443").is_some_and(|o| o == allowed)
+                                || candidate.strip_suffix(":80").is_some_and(|o| o == allowed)
+                                || allowed.strip_suffix(":443").is_some_and(|o| o == candidate)
+                                || allowed.strip_suffix(":80").is_some_and(|o| o == candidate)
+                        };
 
-                    let path = request.uri().path();
-                    let is_oauth_form = path == "/authorize/approve" || path == "/authorize";
+                        let path = request.uri().path();
+                        let is_oauth_form = path == "/authorize/approve" || path == "/authorize";
 
-                    let origin_ok = origin.is_none_or(|orig| {
-                        orig == "null"
-                            || is_oauth_form
-                            || allowed_origins.iter().any(|allowed| origin_matches(orig, allowed))
-                    });
+                        let origin_ok = origin.is_none_or(|orig| {
+                            orig == "null"
+                                || is_oauth_form
+                                || allowed_origins
+                                    .iter()
+                                    .any(|allowed| origin_matches(orig, allowed))
+                        });
 
-                    if host_ok && origin_ok {
-                        next.run(request).await
-                    } else {
-                        tracing::warn!(
-                            event = "host_or_origin_rejected",
-                            host = ?host,
-                            origin = ?origin,
-                            path = %path,
-                            target = "spot_lab::security"
-                        );
-                        axum::http::Response::builder()
-                            .status(axum::http::StatusCode::FORBIDDEN)
-                            .header(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
-                            .body(axum::body::Body::from("접근 거부: 허용되지 않은 Host 또는 Origin입니다."))
-                            .unwrap_or_else(|_| axum::response::Response::default())
+                        if host_ok && origin_ok {
+                            next.run(request).await
+                        } else {
+                            tracing::warn!(
+                                event = "host_or_origin_rejected",
+                                host = ?host,
+                                origin = ?origin,
+                                path = %path,
+                                target = "spot_lab::security"
+                            );
+                            axum::http::Response::builder()
+                                .status(axum::http::StatusCode::FORBIDDEN)
+                                .header(
+                                    axum::http::header::CONTENT_TYPE,
+                                    "text/plain; charset=utf-8",
+                                )
+                                .body(axum::body::Body::from(
+                                    "접근 거부: 허용되지 않은 Host 또는 Origin입니다.",
+                                ))
+                                .unwrap_or_else(|_| axum::response::Response::default())
+                        }
                     }
-                }
-            },
-        ));
+                },
+            ));
     let app = spot_lab::transport::apply_limits(app, state.clone());
     record_lifecycle_phase(LifecyclePhase::Startup, &state);
     tracing::info!(event = "mcp_listening", bind = %bind_address, port, public_no_auth, auth = exposure.auth_name(), transport = "STATELESS_JSON");
@@ -1535,6 +1883,25 @@ async fn run_mcp_serve(
     }
     record_lifecycle_phase(LifecyclePhase::Join, &state);
     Ok(())
+}
+
+fn desktop_request_allowed(
+    headers: &axum::http::HeaderMap,
+    port: u16,
+    expected_token: &str,
+) -> bool {
+    if headers.contains_key(axum::http::header::ORIGIN) {
+        return false;
+    }
+    let host_ok = headers
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|host| {
+            host == format!("127.0.0.1:{port}")
+                || host == format!("localhost:{port}")
+                || host == format!("[::1]:{port}")
+        });
+    host_ok && spot_lab::oauth::accepts_legacy_bearer(headers, expected_token)
 }
 
 /// Real MCP client round trip (initialize -> tools/list -> tools/call) using
@@ -1662,6 +2029,18 @@ fn run_schemas(args: &[String]) -> Result<(), LabError> {
     std::fs::create_dir_all(&out)
         .map_err(|error| LabError::InvalidConfig(format!("create {}: {error}", out.display())))?;
     let schemas = [
+        (
+            "live-order-control-request",
+            schema_json(&schemars::schema_for!(
+                spot_lab::upbit::live_order_control::LiveOrderControlRequest
+            ))?,
+        ),
+        (
+            "live-order-control-response",
+            schema_json(&schemars::schema_for!(
+                spot_lab::upbit::live_order_control::LiveOrderControlResponse
+            ))?,
+        ),
         (
             "sweep-preflight-report",
             schema_json(&schemars::schema_for!(
@@ -1839,6 +2218,84 @@ fn run_schemas(args: &[String]) -> Result<(), LabError> {
             schema_json(&schemars::schema_for!(spot_lab::contracts::PolicyRevision))?,
         ),
         (
+            "automation-session-write",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::AutomationSessionWrite
+            ))?,
+        ),
+        (
+            "automation-session-query",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::AutomationSessionQuery
+            ))?,
+        ),
+        (
+            "automation-session-view",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::AutomationSessionView
+            ))?,
+        ),
+        (
+            "automation-session-command-response",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::AutomationSessionCommandResponse
+            ))?,
+        ),
+        (
+            "automation-session-request-readback",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::AutomationSessionRequestReadback
+            ))?,
+        ),
+        (
+            "automation-event-page",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::AutomationEventPage
+            ))?,
+        ),
+        (
+            "automation-ledger-page",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::AutomationLedgerPage
+            ))?,
+        ),
+        (
+            "automation-decision-page",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::AutomationDecisionPage
+            ))?,
+        ),
+        (
+            "automation-decision-detail",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::AutomationDecisionDetail
+            ))?,
+        ),
+        (
+            "automation-performance-report",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::AutomationPerformanceReport
+            ))?,
+        ),
+        (
+            "automation-review-snapshot",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::AutomationReviewSnapshot
+            ))?,
+        ),
+        (
+            "automation-review-export-manifest",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::AutomationReviewExportManifest
+            ))?,
+        ),
+        (
+            "automation-review-export-chunk",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::AutomationReviewExportChunk
+            ))?,
+        ),
+        (
             "history-query",
             schema_json(&schemars::schema_for!(spot_lab::contracts::HistoryQuery))?,
         ),
@@ -1859,6 +2316,96 @@ fn run_schemas(args: &[String]) -> Result<(), LabError> {
         (
             "delete-outcome",
             schema_json(&schemars::schema_for!(spot_lab::contracts::DeleteOutcome))?,
+        ),
+        (
+            "policy-delete-preview-echo",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::PolicyDeletePreviewEcho
+            ))?,
+        ),
+        (
+            "policy-delete-item-request",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::PolicyDeleteItemRequest
+            ))?,
+        ),
+        (
+            "policy-delete-write-request",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::PolicyDeleteWriteRequest
+            ))?,
+        ),
+        (
+            "policy-delete-query-request",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::PolicyDeleteQueryRequest
+            ))?,
+        ),
+        (
+            "policy-delete-item-status",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::PolicyDeleteItemStatus
+            ))?,
+        ),
+        (
+            "policy-delete-request-state",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::PolicyDeleteRequestState
+            ))?,
+        ),
+        (
+            "policy-delete-reason-code",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::PolicyDeleteReasonCode
+            ))?,
+        ),
+        (
+            "policy-delete-remediation-code",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::PolicyDeleteRemediationCode
+            ))?,
+        ),
+        (
+            "policy-delete-effect",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::PolicyDeleteEffect
+            ))?,
+        ),
+        (
+            "policy-delete-write-error-code",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::PolicyDeleteWriteErrorCode
+            ))?,
+        ),
+        (
+            "policy-delete-write-error-detail",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::PolicyDeleteWriteErrorDetail
+            ))?,
+        ),
+        (
+            "policy-delete-write-error",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::PolicyDeleteWriteError
+            ))?,
+        ),
+        (
+            "policy-delete-item-readback",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::PolicyDeleteItemReadback
+            ))?,
+        ),
+        (
+            "policy-delete-counts",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::PolicyDeleteCounts
+            ))?,
+        ),
+        (
+            "policy-delete-readback",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::PolicyDeleteReadback
+            ))?,
         ),
         (
             "candle-record",
@@ -1955,6 +2502,18 @@ fn run_schemas(args: &[String]) -> Result<(), LabError> {
             "mcp-verify-run",
             schema_json(&schemars::schema_for!(mcp::VerifyRunParams))?,
         ),
+        (
+            "mcp-trading-control-request",
+            schema_json(&schemars::schema_for!(
+                spot_lab::upbit::control::TradingControlRequest
+            ))?,
+        ),
+        (
+            "mcp-trading-control-status",
+            schema_json(&schemars::schema_for!(
+                spot_lab::upbit::control::TradingControlStatus
+            ))?,
+        ),
     ];
     for (name, text) in &schemas {
         std::fs::write(out.join(format!("{name}.json")), format!("{text}\n"))
@@ -1995,6 +2554,48 @@ mod tests {
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn desktop_access_requires_exact_token_loopback_host_and_absent_origin()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let token = "a".repeat(64);
+        assert!(validate_desktop_access_token(&token).is_ok());
+        assert!(validate_desktop_access_token("short").is_err());
+        assert!(validate_desktop_access_token(&"z".repeat(64)).is_err());
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::HOST,
+            axum::http::HeaderValue::from_static("127.0.0.1:8130"),
+        );
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_str(&format!("Bearer {token}"))?,
+        );
+        assert!(desktop_request_allowed(&headers, 8130, &token));
+
+        headers.insert(
+            axum::http::header::ORIGIN,
+            axum::http::HeaderValue::from_static("http://127.0.0.1:8130"),
+        );
+        assert!(!desktop_request_allowed(&headers, 8130, &token));
+        headers.remove(axum::http::header::ORIGIN);
+        headers.insert(
+            axum::http::header::HOST,
+            axum::http::HeaderValue::from_static("example.invalid:8130"),
+        );
+        assert!(!desktop_request_allowed(&headers, 8130, &token));
+        headers.insert(
+            axum::http::header::HOST,
+            axum::http::HeaderValue::from_static("localhost:8130"),
+        );
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer wrong"),
+        );
+        assert!(!desktop_request_allowed(&headers, 8130, &token));
+        Ok(())
     }
 
     #[test]
@@ -2062,6 +2663,208 @@ mod tests {
             server_auth_config(&strings(&["--auth-token", "long-enough-secret"])),
             Ok(ServerAuth::Bearer(_))
         ));
+        assert!(
+            McpServeConfig::parse(&strings(&["--bind", "0.0.0.0", "--allow-network-bind",]))
+                .is_err()
+        );
+        assert!(
+            McpServeConfig::parse(&strings(&[
+                "--bind",
+                "0.0.0.0",
+                "--allow-network-bind",
+                "--public-no-auth",
+                "--data-root",
+                "isolated-public-test-root",
+            ]))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn oauth_client_registry_file_is_optional_and_fails_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempRoot::new("oauth-client-registry")?;
+        assert!(read_oauth_client_registry(&temporary.0)?.is_none());
+
+        let registry_path = temporary.0.join("oauth-clients.json");
+        std::fs::write(
+            &registry_path,
+            serde_json::json!({
+                "issuer": "https://fixture.invalid",
+                "clients": [{
+                    "client_id": "8F0StuL0EU12ERL2cVoTZW0ZrvGYB0MJ",
+                    "redirect_uris": ["https://chatgpt.com/connector_platform_oauth_redirect"],
+                    "client_name": "ChatGPT"
+                }]
+            })
+            .to_string(),
+        )?;
+        let registry = read_oauth_client_registry(&temporary.0)?
+            .ok_or("present oauth-clients.json was ignored")?;
+        assert_eq!(registry.issuer, "https://fixture.invalid");
+        assert_eq!(registry.clients.len(), 1);
+
+        std::fs::write(&registry_path, b"{")?;
+        assert!(read_oauth_client_registry(&temporary.0).is_err());
+        std::fs::remove_file(&registry_path)?;
+        std::fs::create_dir(&registry_path)?;
+        assert!(read_oauth_client_registry(&temporary.0).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn trading_operator_flags_fail_closed_before_storage_open()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempRoot::new("trading-operator-config")?;
+        for flags in [
+            vec!["--trading-mcp"],
+            vec!["--allow-live-orders"],
+            vec!["--live-order-control"],
+            vec!["--live-order-control", "--allow-live-orders"],
+            vec!["--live-order-control", "--public-no-auth"],
+            vec!["--trading-mcp", "--auth-token", "long-enough-secret"],
+            vec!["--trading-mcp", "--public-no-auth"],
+        ] {
+            let root = temporary.0.join("unopened");
+            let mut args = strings(&["mcp-serve", "--data-root"]);
+            args.push(root.to_string_lossy().into_owned());
+            args.extend(strings(&flags));
+            assert!(dispatch(&args).is_err());
+            assert!(!root.exists(), "invalid financial exposure opened storage");
+        }
+        let default_config =
+            McpServeConfig::parse(&strings(&["--auth-token", "long-enough-secret"]))?;
+        assert!(!default_config.trading_mcp);
+        assert!(!default_config.live_order_control);
+        assert!(!default_config.live_policy.is_enabled());
+        Ok(())
+    }
+
+    #[test]
+    fn trading_operator_config_child() -> Result<(), Box<dyn std::error::Error>> {
+        if std::env::var_os("SKY_TEST_TRADING_OPERATOR_CONFIG").is_none() {
+            return Ok(());
+        }
+        let temporary = TempRoot::new("trading-operator-client-registry")?;
+        let registry_path = temporary.0.join("oauth-clients.json");
+        std::fs::write(
+            &registry_path,
+            serde_json::json!({
+                "issuer": "https://fixture.invalid",
+                "clients": [{
+                    "client_id": "8F0StuL0EU12ERL2cVoTZW0ZrvGYB0MJ",
+                    "redirect_uris": ["https://chatgpt.com/connector_platform_oauth_redirect"],
+                    "client_name": "ChatGPT"
+                }]
+            })
+            .to_string(),
+        )?;
+        let mut args = strings(&[
+            "--oauth",
+            "--public-url",
+            "https://fixture.invalid",
+            "--allow-host",
+            "fixture.invalid",
+            "--trading-mcp",
+        ]);
+        args.extend(strings(&["--data-root"]));
+        args.push(temporary.0.to_string_lossy().into_owned());
+        let read_control_only = McpServeConfig::parse(&args)?;
+        assert!(read_control_only.trading_mcp);
+        assert!(!read_control_only.live_policy.is_enabled());
+        assert!(!read_control_only.live_order_control);
+        assert!(matches!(read_control_only.auth, ServerAuth::OAuth(_)));
+        args.push("--live-order-control".into());
+        let managed = McpServeConfig::parse(&args)?;
+        assert!(managed.live_order_control);
+        assert!(
+            managed.live_policy.is_enabled(),
+            "managed ceiling requires an independent OFF gate"
+        );
+        args.push("--allow-live-orders".into());
+        assert!(
+            McpServeConfig::parse(&args).is_err(),
+            "legacy ON cannot bypass managed OFF"
+        );
+        args.retain(|arg| arg != "--live-order-control");
+        let explicit_effects = McpServeConfig::parse(&args)?;
+        assert!(explicit_effects.trading_mcp);
+        assert!(explicit_effects.live_policy.is_enabled());
+        std::fs::write(&registry_path, b"{")?;
+        assert!(McpServeConfig::parse(&args).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn operator_config_requires_separate_explicit_live_opt_in()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "tests::trading_operator_config_child",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("SKY_TEST_TRADING_OPERATOR_CONFIG", "1")
+            .env("SPOT_LAB_OAUTH_OWNER_CODE", "synthetic-owner-code-123456")
+            .output()?;
+        assert!(
+            output.status.success(),
+            "synthetic operator config failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        Ok(())
+    }
+
+    #[test]
+    fn managed_desktop_config_child() -> Result<(), Box<dyn std::error::Error>> {
+        if std::env::var_os("SKY_TEST_MANAGED_DESKTOP_CONFIG").is_none() {
+            return Ok(());
+        }
+        let config = McpServeConfig::parse(&strings(&["--live-order-control"]))?;
+        assert!(config.live_order_control);
+        assert!(!config.trading_mcp);
+        assert!(config.desktop_access_token.is_some());
+        assert!(
+            McpServeConfig::parse(&strings(&[
+                "--live-order-control",
+                "--auth-token",
+                "long-enough-secret"
+            ]))
+            .is_err()
+        );
+        assert!(
+            McpServeConfig::parse(&strings(&[
+                "--live-order-control",
+                "--public-no-auth",
+                "--data-root",
+                "unused"
+            ]))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn managed_mode_requires_trusted_transport() -> Result<(), Box<dyn std::error::Error>> {
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "tests::managed_desktop_config_child",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("SKY_TEST_MANAGED_DESKTOP_CONFIG", "1")
+            .env("SERVICE_DESKTOP_ACCESS_TOKEN", "a".repeat(64))
+            .output()?;
+        assert!(
+            output.status.success(),
+            "managed config failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        Ok(())
     }
 
     #[test]

@@ -6,23 +6,34 @@
 #![allow(clippy::unused_async_trait_impl)]
 
 use crate::contracts::{
-    ArtifactId, AttemptState, CandleInterval, CandleObservation, CollectRequest, ContentHash,
-    DatasetId, DatasetManifest, DatasetStatus, DeleteResource, EvidenceImport, EvidenceSnapshotId,
-    HardDeleteRequest, HistoryQuery, JobAttempt, JobControl, JobId, JobPayload, JobRecord,
-    JobSubmission, LabError, MarketDataOrigin, MarketId, PlanRequest, PolicyQuery, PolicyWrite,
-    ProbeCount, RequestId, ResultQuery, RunId, RunRequest, UtcRange,
+    ArtifactId, AttemptState, AutomationSessionQuery, AutomationSessionWrite, CandleInterval,
+    CandleObservation, CollectRequest, ContentHash, DatasetId, DatasetManifest, DatasetStatus,
+    DeleteResource, EvidenceImport, EvidenceSnapshotId, HardDeleteRequest, HistoryQuery,
+    JobAttempt, JobControl, JobId, JobPayload, JobRecord, JobSubmission, LabError,
+    MarketDataOrigin, MarketId, PaperSessionQuery, PaperSessionWrite, PlanRequest,
+    PolicyDeleteQueryRequest, PolicyDeleteWriteRequest, PolicyQuery, PolicyWrite, ProbeCount,
+    RequestId, ResultQuery, RunId, RunRequest, UtcRange,
 };
 use crate::database::DatabaseHandle;
 use crate::jobs::JobService;
 use crate::market_data::UpbitClient;
-use crate::storage::ResultPage;
+use crate::oauth::OAuthPermissions;
+use crate::storage::{PolicyDeleteAdmission, ResultPage};
+use crate::upbit::UpbitExchangeService;
+use crate::upbit::client::{UpbitOrderDetail, UpbitTestOrderRequest};
+use crate::upbit::control::{TradingControlRequest, TradingControlService};
+use crate::upbit::execution::OrderExecuteRequest;
+use crate::upbit::live_order_control::{LiveOrderControlRequest, LiveOrderControlService};
+use crate::upbit::preview::{OrderPreview, OrderPreviewRequest};
+use crate::upbit::reconciliation::{mock_cancel_order, reconcile_order_detail};
 use rmcp::{
-    ErrorData as McpError, ServerHandler,
+    ErrorData as McpError, RoleServer, ServerHandler,
     handler::server::router::tool::ToolRouter,
     model::{
-        CallToolResult, ContentBlock, Implementation, JsonObject, ProtocolVersion,
+        CallToolResult, ContentBlock, Implementation, JsonObject, MetaObject, ProtocolVersion,
         ServerCapabilities, ServerConfig,
     },
+    service::RequestContext,
     tool, tool_handler, tool_router,
 };
 use schemars::JsonSchema;
@@ -30,6 +41,39 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 const MAX_DATASET_PAGE_RECORDS: u32 = 100;
 const MAX_PUBLIC_JOB_ATTEMPTS: usize = 32;
+const POLICY_DELETE_TOOL_NAMES: &[&str] = &["policy_delete_write", "policy_delete_query"];
+const TRADING_READ_TOOL_NAMES: &[&str] = &[
+    "upbit_account_balances",
+    "upbit_order_chance",
+    "upbit_order_get",
+    "upbit_orders_open",
+    "upbit_orders_closed",
+    "automation_session_query",
+];
+const TRADING_CONTROL_TOOL_NAMES: &[&str] = &[
+    "automation_session_write",
+    "live_order_control",
+    "trading_control",
+];
+const TRADING_ACCESS_DENIED_MESSAGE: &str = "private Upbit account, order and control tools require the native desktop capability or an explicitly scoped OAuth trading grant";
+const DESKTOP_TOOL_NAMES: &[&str] = &[
+    "lab_status",
+    "automation_session_query",
+    "automation_session_write",
+    "result_query",
+    "history_query",
+    "policy_query",
+    "paper_session_query",
+    "paper_session_write",
+    "resource_delete_preview",
+    "policy_delete_write",
+    "policy_delete_query",
+    "upbit_account_balances",
+    "upbit_orders_open",
+    "upbit_orders_closed",
+    "trading_control",
+    "live_order_control",
+];
 
 fn default_market() -> String {
     "KRW-BTC".to_owned()
@@ -104,6 +148,11 @@ pub enum ResultQueryParams {
     Costs {
         run_id: RunId,
         model_id: crate::contracts::ModelId,
+    },
+    EquityChart {
+        run_id: RunId,
+        model_id: crate::contracts::ModelId,
+        max_points: u32,
     },
     PortfolioSummary {
         run_id: RunId,
@@ -208,6 +257,132 @@ struct PublicJobRecord {
     artifact_catalog_query: Option<crate::contracts::ArtifactQuery>,
 }
 
+/// Tool input for `upbit_order_chance`.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UpbitOrderChanceParams {
+    pub market: String,
+}
+
+/// Tool input for `upbit_order_get`.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UpbitOrderGetParams {
+    #[serde(default)]
+    pub uuid: Option<String>,
+    #[serde(default)]
+    pub identifier: Option<String>,
+}
+
+/// Tool input for `upbit_orders_open`.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UpbitOpenOrdersParams {
+    #[serde(default)]
+    pub market: Option<String>,
+    #[serde(default)]
+    pub page: Option<u32>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+/// Tool input for `upbit_orders_closed`.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UpbitClosedOrdersParams {
+    #[serde(default)]
+    pub market: Option<String>,
+    #[serde(default)]
+    pub start_time: Option<String>,
+    #[serde(default)]
+    pub end_time: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct UpbitOrdersPage {
+    venue: &'static str,
+    exchange_read_mode: &'static str,
+    order_scope: &'static str,
+    observed_at_utc: String,
+    page: Option<u32>,
+    limit: u32,
+    returned_count: u64,
+    records: Vec<UpbitOrderDetail>,
+    next_page: Option<u32>,
+    truncated_reason: Option<&'static str>,
+    start_time: Option<String>,
+    end_time: Option<String>,
+}
+
+/// Tool input for `upbit_order_preview`.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UpbitOrderPreviewParams {
+    pub market: String,
+    pub side: String,
+    pub ord_type: String,
+    #[serde(default)]
+    pub price: Option<String>,
+    #[serde(default)]
+    pub volume: Option<String>,
+    #[serde(default)]
+    pub current_krw_balance: Option<String>,
+    #[serde(default)]
+    pub current_coin_balance: Option<String>,
+}
+
+/// Tool input for `upbit_order_test`.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UpbitOrderTestParams {
+    pub market: String,
+    pub side: String,
+    pub ord_type: String,
+    #[serde(default)]
+    pub volume: Option<String>,
+    #[serde(default)]
+    pub price: Option<String>,
+    #[serde(default)]
+    pub identifier: Option<String>,
+}
+
+/// Tool input for `upbit_order_execute`.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UpbitOrderExecuteParams {
+    pub preview: serde_json::Value,
+    #[serde(default)]
+    pub human_approval_token: Option<String>,
+    #[serde(default)]
+    pub client_identifier: Option<String>,
+    #[serde(default)]
+    pub allow_mock_execution: bool,
+}
+
+/// Tool input for `upbit_order_reconcile`.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UpbitOrderReconcileParams {
+    #[serde(default)]
+    pub uuid: Option<String>,
+    #[serde(default)]
+    pub identifier: Option<String>,
+    pub expected_volume: String,
+}
+
+/// Tool input for `upbit_order_cancel`.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UpbitOrderCancelParams {
+    pub order_id: String,
+    #[serde(default)]
+    pub unfilled_volume: Option<String>,
+    #[serde(default)]
+    pub human_approval_token: Option<String>,
+}
+
 fn parse_arguments<T: DeserializeOwned>(arguments: JsonObject) -> Result<T, McpError> {
     serde_json::from_value(serde_json::Value::Object(arguments))
         .map_err(|error| McpError::invalid_params(error.to_string(), None))
@@ -249,6 +424,79 @@ fn tool_error(error: &LabError) -> Result<CallToolResult, McpError> {
             public_error_text(error),
         )]))
     }
+}
+
+#[derive(Clone, Copy)]
+enum TradingScope {
+    Read,
+    Control,
+}
+
+impl TradingScope {
+    const fn required(self) -> &'static str {
+        match self {
+            Self::Read => "mcp trading:read",
+            Self::Control => "mcp trading:read trading:control",
+        }
+    }
+
+    const fn description(self) -> &'static str {
+        match self {
+            Self::Read => "This operation requires trading:read.",
+            Self::Control => "This operation requires trading:control.",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TradingPermissionError {
+    Unavailable,
+    InsufficientScope(TradingScope),
+}
+
+fn declare_oauth_tool_scopes<S>(
+    route: &mut rmcp::handler::server::router::tool::ToolRoute<S>,
+    scopes: &[&str],
+) {
+    let meta = route.attr.meta.get_or_insert_with(MetaObject::new);
+    meta.0.insert(
+        "securitySchemes".to_owned(),
+        serde_json::json!([{ "type": "oauth2", "scopes": scopes }]),
+    );
+}
+
+fn insufficient_scope_tool_error(
+    resource_metadata_url: &str,
+    scope: TradingScope,
+) -> CallToolResult {
+    let challenge = format!(
+        "Bearer resource_metadata=\"{resource_metadata_url}\", error=\"insufficient_scope\", error_description=\"{}\", scope=\"{}\"",
+        scope.description(),
+        scope.required(),
+    );
+    let mut meta = MetaObject::new();
+    meta.0.insert(
+        "mcp/www_authenticate".to_owned(),
+        serde_json::json!([challenge]),
+    );
+    CallToolResult::error(vec![ContentBlock::text(format!(
+        "INSUFFICIENT_SCOPE: {TRADING_ACCESS_DENIED_MESSAGE}"
+    ))])
+    .with_meta(Some(meta))
+}
+
+fn typed_tool_error(value: &impl Serialize) -> Result<CallToolResult, McpError> {
+    let text = serde_json::to_string_pretty(value)
+        .map_err(|_| McpError::internal_error("serialize typed tool error", None))?;
+    Ok(CallToolResult::error(vec![ContentBlock::text(text)]))
+}
+
+fn upbit_tool_error(err: &impl std::fmt::Display) -> CallToolResult {
+    CallToolResult::error(vec![ContentBlock::text(err.to_string())])
+}
+
+fn upbit_invalid_params(msg: impl std::fmt::Display) -> McpError {
+    McpError::invalid_params(msg.to_string(), None)
 }
 
 fn text_result(value: &impl Serialize) -> Result<CallToolResult, McpError> {
@@ -506,7 +754,8 @@ fn portfolio_result_value(
             .transpose(),
         ResultQueryParams::Ledger { .. }
         | ResultQueryParams::Summary { .. }
-        | ResultQueryParams::Costs { .. } => {
+        | ResultQueryParams::Costs { .. }
+        | ResultQueryParams::EquityChart { .. } => {
             return Err(LabError::Internal(
                 "ordinary results cannot enter the portfolio projection adapter".into(),
             ));
@@ -529,6 +778,7 @@ fn tagged_schema<T: JsonSchema + 'static>() -> std::sync::Arc<JsonObject> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum McpExposure {
     Local,
+    Desktop,
     PublicNoAuth,
     Bearer,
     OAuth,
@@ -540,6 +790,7 @@ impl McpExposure {
     pub const fn auth_name(self) -> &'static str {
         match self {
             Self::Local | Self::PublicNoAuth => "none",
+            Self::Desktop => "desktop_bearer",
             Self::Bearer => "bearer",
             Self::OAuth => "oauth",
         }
@@ -556,14 +807,21 @@ impl McpExposure {
 pub struct LabMcpService {
     tool_router: ToolRouter<Self>,
     upbit: UpbitClient,
+    upbit_exchange: UpbitExchangeService,
+    trading_control: TradingControlService,
+    live_order_control: LiveOrderControlService,
     database: DatabaseHandle,
     jobs: JobService,
     exposure: McpExposure,
+    remote_trading_enabled: bool,
+    managed_send_gate_bound: bool,
+    oauth_resource_metadata_url: Option<String>,
 }
 
 #[tool_router]
 impl LabMcpService {
     /// Build the stateless adapter from process-wide storage, HTTP and job owners.
+    #[cfg(test)]
     #[must_use]
     pub fn new(
         database: DatabaseHandle,
@@ -571,12 +829,170 @@ impl LabMcpService {
         jobs: JobService,
         exposure: McpExposure,
     ) -> Self {
+        let upbit_exchange = UpbitExchangeService::new_mock();
+        Self::new_with_exchange(database, upbit, jobs, exposure, upbit_exchange)
+    }
+
+    /// Build an adapter around the process-owned exchange service.
+    #[must_use]
+    pub fn new_with_exchange(
+        database: DatabaseHandle,
+        upbit: UpbitClient,
+        jobs: JobService,
+        exposure: McpExposure,
+        upbit_exchange: UpbitExchangeService,
+    ) -> Self {
+        let managed_send_gate_bound = upbit_exchange.live_order_send_gate().is_some();
+        let mut tool_router = Self::tool_router();
+        if matches!(exposure, McpExposure::Desktop) {
+            tool_router
+                .map
+                .retain(|name, _route| DESKTOP_TOOL_NAMES.contains(&name.as_ref()));
+        } else {
+            tool_router
+                .map
+                .retain(|name, _route| !POLICY_DELETE_TOOL_NAMES.contains(&name.as_ref()));
+        }
+        if matches!(exposure, McpExposure::OAuth) {
+            for route in tool_router.map.values_mut() {
+                declare_oauth_tool_scopes(route, &["mcp"]);
+            }
+        }
+        let mut trading_control = TradingControlService::production_with_policy(
+            database.clone(),
+            upbit_exchange.risk_guard().clone(),
+            upbit_exchange.exchange_read_mode(),
+            upbit_exchange.live_execution_policy(),
+        );
+        if let Some(gate) = upbit_exchange.live_order_send_gate() {
+            trading_control = trading_control.with_live_order_send_gate(gate);
+        }
+        let live_order_control = LiveOrderControlService::new(
+            database.clone(),
+            upbit_exchange.live_execution_policy(),
+            upbit_exchange.live_order_send_gate(),
+            upbit_exchange.exchange_read_mode(),
+        );
         Self {
-            tool_router: Self::tool_router(),
+            tool_router,
             upbit,
+            upbit_exchange,
+            trading_control,
+            live_order_control,
             database,
             jobs,
             exposure,
+            remote_trading_enabled: false,
+            managed_send_gate_bound,
+            oauth_resource_metadata_url: None,
+        }
+    }
+
+    /// Provide a custom or pre-configured Upbit exchange service.
+    #[must_use]
+    pub fn with_exchange(mut self, exchange: UpbitExchangeService) -> Self {
+        self.managed_send_gate_bound = exchange.live_order_send_gate().is_some();
+        self.trading_control = TradingControlService::production_with_policy(
+            self.database.clone(),
+            exchange.risk_guard().clone(),
+            exchange.exchange_read_mode(),
+            exchange.live_execution_policy(),
+        );
+        if let Some(gate) = exchange.live_order_send_gate() {
+            self.trading_control = self.trading_control.with_live_order_send_gate(gate);
+        }
+        self.live_order_control = LiveOrderControlService::new(
+            self.database.clone(),
+            exchange.live_execution_policy(),
+            exchange.live_order_send_gate(),
+            exchange.exchange_read_mode(),
+        );
+        self.upbit_exchange = exchange;
+        self
+    }
+
+    /// Enable remote trading scopes using the OAuth owner's validated metadata URL.
+    #[must_use]
+    pub fn with_remote_trading_oauth(mut self, resource_metadata_url: String) -> Self {
+        self.remote_trading_enabled = true;
+        self.oauth_resource_metadata_url = Some(resource_metadata_url);
+        for name in TRADING_READ_TOOL_NAMES {
+            if let Some(route) = self.tool_router.map.get_mut(*name) {
+                declare_oauth_tool_scopes(route, &["mcp", "trading:read"]);
+            }
+        }
+        for name in TRADING_CONTROL_TOOL_NAMES {
+            if let Some(route) = self.tool_router.map.get_mut(*name) {
+                declare_oauth_tool_scopes(route, &["mcp", "trading:read", "trading:control"]);
+            }
+        }
+        self
+    }
+
+    fn require_trading_read(
+        &self,
+        context: &RequestContext<RoleServer>,
+    ) -> Result<(), TradingPermissionError> {
+        self.require_trading_permission(context, false)
+    }
+
+    fn require_trading_permission(
+        &self,
+        context: &RequestContext<RoleServer>,
+        control: bool,
+    ) -> Result<(), TradingPermissionError> {
+        if matches!(self.exposure, McpExposure::Desktop) {
+            return Ok(());
+        }
+        let permissions = context
+            .extensions
+            .get::<axum::http::request::Parts>()
+            .and_then(|parts| parts.extensions.get::<OAuthPermissions>())
+            .copied();
+        if self.remote_trading_enabled && matches!(self.exposure, McpExposure::OAuth) {
+            if permissions.is_some_and(|grant| {
+                if control {
+                    grant.can_control_trading()
+                } else {
+                    grant.can_read_trading()
+                }
+            }) {
+                return Ok(());
+            }
+            return Err(TradingPermissionError::InsufficientScope(if control {
+                TradingScope::Control
+            } else {
+                TradingScope::Read
+            }));
+        }
+        Err(TradingPermissionError::Unavailable)
+    }
+
+    fn trading_permission_error(
+        &self,
+        error: TradingPermissionError,
+    ) -> Result<CallToolResult, McpError> {
+        match error {
+            TradingPermissionError::Unavailable => {
+                tool_error(&LabError::Conflict(TRADING_ACCESS_DENIED_MESSAGE.into()))
+            }
+            TradingPermissionError::InsufficientScope(scope) => {
+                let Some(resource_metadata_url) = self.oauth_resource_metadata_url.as_deref()
+                else {
+                    return tool_error(&LabError::Conflict(TRADING_ACCESS_DENIED_MESSAGE.into()));
+                };
+                Ok(insufficient_scope_tool_error(resource_metadata_url, scope))
+            }
+        }
+    }
+
+    fn require_private_exchange_access(&self) -> Result<(), LabError> {
+        if matches!(self.exposure, McpExposure::Desktop) {
+            Ok(())
+        } else {
+            Err(LabError::Conflict(
+                "private Upbit account, order and control tools require the native desktop capability".into(),
+            ))
         }
     }
 
@@ -590,7 +1006,10 @@ impl LabMcpService {
             open_world_hint = false
         )
     )]
-    async fn lab_status(&self) -> Result<CallToolResult, McpError> {
+    async fn lab_status(
+        &self,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
         let jobs = match self.jobs.status().await {
             Ok(status) => status,
             Err(error) => return tool_error(&error),
@@ -636,15 +1055,32 @@ impl LabMcpService {
                 "policy_authoring": true,
                 "execution_history": true,
                 "typed_mcp": true,
+                "upbit_private_read_mcp": true,
+                "upbit_order_preview": true,
+                "upbit_order_test": true,
+                "upbit_risk_guard": true,
+                "upbit_human_approval_issuance": false,
+                "upbit_human_approval_verification": true,
+                "upbit_order_reconcile": true,
             },
             "scope": {
                 "venue": "upbit",
                 "markets": "any listed Upbit KRW-<SYMBOL> market (validated against the live market catalog at collection admission)",
                 "quote": "KRW",
                 "position_types": "long/cash only",
-                "private_api": "never",
-                "execution_origin": "SIMULATED_ONLY",
+                "private_api": if matches!(self.exposure, McpExposure::Desktop) {
+                    "DESKTOP_READ_ONLY_AND_CONTROL"
+                } else if self.require_trading_permission(&context, true).is_ok() {
+                    "SCOPED_OAUTH_TRADING_READ_AND_CONTROL"
+                } else if self.require_trading_read(&context).is_ok() {
+                    "SCOPED_OAUTH_TRADING_READ"
+                } else {
+                    "UNAVAILABLE_ON_THIS_EXPOSURE"
+                },
+                "execution_origin": if self.upbit_exchange.live_trading_enabled() { "MOCK_AND_GATED_LIVE_AUTOMATION" } else { "SIMULATED_ONLY" },
                 "fill_observed": false,
+                "upbit_private_mode": if self.upbit_exchange.client().is_live() { "LIVE_READ" } else { "MOCK" },
+                "live_trading_enabled": self.upbit_exchange.live_trading_enabled(),
             },
             "transport": {
                 "auth": self.exposure.auth_name(),
@@ -655,8 +1091,10 @@ impl LabMcpService {
             "deletion": {
                 "contract": "two_step_resource_delete_preview_then_resource_hard_delete",
                 "preview_ttl_seconds": crate::contracts::DELETE_PREVIEW_TTL_SECONDS,
-                "shared_by_all_callers": true,
-                "mode": if self.exposure.public_no_auth() {
+                "shared_by_all_callers": false,
+                "mode": if matches!(self.exposure, McpExposure::Desktop) {
+                    "PREVIEW_ONLY"
+                } else if self.exposure.public_no_auth() {
                     "DISABLED_IN_PUBLIC_NO_AUTH"
                 } else {
                     "HARD_DELETE_ROWS_AND_EXCLUSIVE_FILES"
@@ -666,6 +1104,17 @@ impl LabMcpService {
                 } else {
                     ""
                 },
+            },
+            "policy_deletion": {
+                "mode": if matches!(self.exposure, McpExposure::Desktop) {
+                    "POLICY_ONLY_CONFIRMED"
+                } else {
+                    "UNAVAILABLE"
+                },
+                "max_items": crate::contracts::MAX_POLICY_DELETE_ITEMS,
+                "archive_available": false,
+                "request_readback": true,
+                "confirmation_required": true,
             },
             "jobs": jobs,
             "storage": storage,
@@ -1026,6 +1475,108 @@ impl LabMcpService {
     }
 
     #[tool(
+        description = "Delete only explicitly confirmed USER policies whose current policy and owned-revision scope is unreferenced; every submitted item is revalidated and durably read back",
+        input_schema = tagged_schema::<PolicyDeleteWriteRequest>(),
+        annotations(
+            title = "Policy Delete Write",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn policy_delete_write(&self, arguments: JsonObject) -> Result<CallToolResult, McpError> {
+        if !matches!(self.exposure, McpExposure::Desktop) {
+            return result_or_error::<()>(Err(LabError::Conflict(
+                "policy deletion tools require the native desktop capability".into(),
+            )));
+        }
+        let request: PolicyDeleteWriteRequest = parse_arguments(arguments)?;
+        let admission_request = request.clone();
+        let admission = self
+            .database
+            .call("policy_delete_request_admit", move |store| {
+                store.begin_policy_delete_request(&admission_request)
+            })
+            .await;
+        let admission = match admission {
+            Ok(admission) => admission,
+            Err(error) => return tool_error(&error),
+        };
+        match admission {
+            PolicyDeleteAdmission::Rejected(error) => typed_tool_error(&error),
+            PolicyDeleteAdmission::Existing(readback) => text_result(&readback),
+            PolicyDeleteAdmission::Started => {
+                let mut policy_ids = request
+                    .items
+                    .iter()
+                    .map(|item| item.policy_id.clone())
+                    .collect::<Vec<_>>();
+                policy_ids.sort_unstable();
+                for policy_id in policy_ids {
+                    let request_id = request.request_id.clone();
+                    if let Err(error) = self
+                        .database
+                        .call("policy_delete_item", move |store| {
+                            store.apply_policy_delete_item(&request_id, &policy_id)
+                        })
+                        .await
+                    {
+                        // Do not retry an admitted item. The owner queue orders this
+                        // typed readback after the uncertain operation if it is live.
+                        let request_id = request.request_id.clone();
+                        return match self
+                            .database
+                            .call("policy_delete_readback", move |store| {
+                                store.policy_delete_readback(&request_id)
+                            })
+                            .await
+                        {
+                            Ok(readback) if readback.found => text_result(&readback),
+                            _ => tool_error(&error),
+                        };
+                    }
+                }
+                let request_id = request.request_id;
+                let readback = self
+                    .database
+                    .call("policy_delete_readback", move |store| {
+                        store.policy_delete_readback(&request_id)
+                    })
+                    .await;
+                result_or_error(readback)
+            }
+        }
+    }
+
+    #[tool(
+        description = "Read one policy-deletion request by its durable request ID without resuming work",
+        input_schema = tagged_schema::<PolicyDeleteQueryRequest>(),
+        annotations(
+            title = "Policy Delete Query",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn policy_delete_query(&self, arguments: JsonObject) -> Result<CallToolResult, McpError> {
+        if !matches!(self.exposure, McpExposure::Desktop) {
+            return result_or_error::<()>(Err(LabError::Conflict(
+                "policy deletion tools require the native desktop capability".into(),
+            )));
+        }
+        let request: PolicyDeleteQueryRequest = parse_arguments(arguments)?;
+        let readback = self
+            .database
+            .call("policy_delete_readback", move |store| {
+                store.policy_delete_readback(&request.request_id)
+            })
+            .await;
+        result_or_error(readback)
+    }
+
+    #[tool(
         description = "List bounded durable run or job history using stable opaque cursors",
         input_schema = tagged_schema::<HistoryQuery>(),
         annotations(
@@ -1187,6 +1738,19 @@ impl LabMcpService {
                         store
                             .load_model_cost_summary(&run_id, &model_id)?
                             .ok_or_else(|| LabError::InvalidConfig("unknown run/model ID".into()))
+                    })
+                    .await;
+                result_or_error(result)
+            }
+            ResultQueryParams::EquityChart {
+                run_id,
+                model_id,
+                max_points,
+            } => {
+                let result = self
+                    .database
+                    .call("mcp_equity_chart", move |store| {
+                        store.equity_chart_projection(&run_id, &model_id, max_points)
                     })
                     .await;
                 result_or_error(result)
@@ -1464,6 +2028,556 @@ impl LabMcpService {
         }
         result_or_error(self.jobs.storage_maintenance(action).await)
     }
+
+    #[tool(
+        description = "Query Upbit account balances and currency holdings",
+        annotations(
+            title = "Upbit Account Balances",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn upbit_account_balances(
+        &self,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(error) = self.require_trading_read(&context) {
+            return self.trading_permission_error(error);
+        }
+        match self.upbit_exchange.client().get_accounts().await {
+            Ok(balances) => {
+                let out = serde_json::json!({
+                    "venue": "upbit",
+                    "mode": if self.upbit_exchange.client().is_live() { "LIVE_HTTP_READ" } else { "HERMETIC_MOCK" },
+                    "observed_at_utc": chrono::Utc::now().to_rfc3339(),
+                    "accounts_count": balances.len(),
+                    "balances": balances,
+                });
+                text_result(&out)
+            }
+            Err(error) => Ok(upbit_tool_error(&error)),
+        }
+    }
+
+    #[tool(
+        description = "Query Upbit market order chance, fee structure, and limits",
+        input_schema = rmcp::handler::server::common::schema_for_type::<UpbitOrderChanceParams>(),
+        annotations(
+            title = "Upbit Order Chance",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn upbit_order_chance(
+        &self,
+        arguments: JsonObject,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(error) = self.require_trading_read(&context) {
+            return self.trading_permission_error(error);
+        }
+        let params: UpbitOrderChanceParams = parse_arguments(arguments)?;
+        match self
+            .upbit_exchange
+            .client()
+            .get_order_chance(&params.market)
+            .await
+        {
+            Ok(chance) => text_result(&chance),
+            Err(error) => Ok(upbit_tool_error(&error)),
+        }
+    }
+
+    #[tool(
+        description = "Query detailed information for an Upbit order by uuid or identifier",
+        input_schema = rmcp::handler::server::common::schema_for_type::<UpbitOrderGetParams>(),
+        annotations(
+            title = "Upbit Order Get",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn upbit_order_get(
+        &self,
+        arguments: JsonObject,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(error) = self.require_trading_read(&context) {
+            return self.trading_permission_error(error);
+        }
+        let params: UpbitOrderGetParams = parse_arguments(arguments)?;
+        match self
+            .upbit_exchange
+            .client()
+            .get_order(params.uuid.as_deref(), params.identifier.as_deref())
+            .await
+        {
+            Ok(order) => text_result(&order),
+            Err(error) => Ok(upbit_tool_error(&error)),
+        }
+    }
+
+    #[tool(
+        description = "Query currently open orders on Upbit",
+        input_schema = rmcp::handler::server::common::schema_for_type::<UpbitOpenOrdersParams>(),
+        annotations(
+            title = "Upbit Orders Open",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn upbit_orders_open(
+        &self,
+        arguments: JsonObject,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(error) = self.require_trading_read(&context) {
+            return self.trading_permission_error(error);
+        }
+        let params: UpbitOpenOrdersParams = parse_arguments(arguments)?;
+        let page = params.page.unwrap_or(1);
+        let limit = params.limit.unwrap_or(100);
+        match self
+            .upbit_exchange
+            .client()
+            .get_open_orders(params.market.as_deref(), params.page, params.limit)
+            .await
+        {
+            Ok(records) => {
+                let returned_count = u64::try_from(records.len())
+                    .map_err(|_| McpError::internal_error("open order count exceeds u64", None))?;
+                let full = returned_count == u64::from(limit);
+                text_result(&UpbitOrdersPage {
+                    venue: "upbit",
+                    exchange_read_mode: if self.upbit_exchange.client().is_live() {
+                        "LIVE_READ"
+                    } else {
+                        "MOCK"
+                    },
+                    order_scope: "OPEN",
+                    observed_at_utc: chrono::Utc::now().to_rfc3339(),
+                    page: Some(page),
+                    limit,
+                    returned_count,
+                    records,
+                    next_page: (full && page < 10_000).then_some(page + 1),
+                    truncated_reason: full.then_some("PAGE_LIMIT_REACHED"),
+                    start_time: None,
+                    end_time: None,
+                })
+            }
+            Err(error) => Ok(upbit_tool_error(&error)),
+        }
+    }
+
+    #[tool(
+        description = "Query closed/completed orders on Upbit",
+        input_schema = rmcp::handler::server::common::schema_for_type::<UpbitClosedOrdersParams>(),
+        annotations(
+            title = "Upbit Orders Closed",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn upbit_orders_closed(
+        &self,
+        arguments: JsonObject,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(error) = self.require_trading_read(&context) {
+            return self.trading_permission_error(error);
+        }
+        let params: UpbitClosedOrdersParams = parse_arguments(arguments)?;
+        let limit = params.limit.unwrap_or(100);
+        let start_time = params.start_time.clone();
+        let end_time = params.end_time.clone();
+        match self
+            .upbit_exchange
+            .client()
+            .get_closed_orders(
+                params.market.as_deref(),
+                params.start_time.as_deref(),
+                params.end_time.as_deref(),
+                params.limit,
+            )
+            .await
+        {
+            Ok(records) => {
+                let returned_count = u64::try_from(records.len()).map_err(|_| {
+                    McpError::internal_error("closed order count exceeds u64", None)
+                })?;
+                let full = returned_count == u64::from(limit);
+                text_result(&UpbitOrdersPage {
+                    venue: "upbit",
+                    exchange_read_mode: if self.upbit_exchange.client().is_live() {
+                        "LIVE_READ"
+                    } else {
+                        "MOCK"
+                    },
+                    order_scope: "CLOSED",
+                    observed_at_utc: chrono::Utc::now().to_rfc3339(),
+                    page: None,
+                    limit,
+                    returned_count,
+                    records,
+                    next_page: None,
+                    truncated_reason: full.then_some("TIME_RANGE_OR_LIMIT_REACHED"),
+                    start_time,
+                    end_time,
+                })
+            }
+            Err(error) => Ok(upbit_tool_error(&error)),
+        }
+    }
+
+    #[tool(
+        description = "Deterministically preview and validate an order with tick rules, minimum notional (5,000 KRW), fees, and cryptographic intent digest",
+        input_schema = rmcp::handler::server::common::schema_for_type::<UpbitOrderPreviewParams>(),
+        annotations(
+            title = "Upbit Order Preview",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn upbit_order_preview(&self, arguments: JsonObject) -> Result<CallToolResult, McpError> {
+        let params: UpbitOrderPreviewParams = parse_arguments(arguments)?;
+        let price = params
+            .price
+            .as_deref()
+            .map(std::str::FromStr::from_str)
+            .transpose()
+            .map_err(|e| upbit_invalid_params(format!("invalid price: {e}")))?;
+        let volume = params
+            .volume
+            .as_deref()
+            .map(std::str::FromStr::from_str)
+            .transpose()
+            .map_err(|e| upbit_invalid_params(format!("invalid volume: {e}")))?;
+        let current_krw_balance = params
+            .current_krw_balance
+            .as_deref()
+            .map(std::str::FromStr::from_str)
+            .transpose()
+            .map_err(|e| upbit_invalid_params(format!("invalid current_krw_balance: {e}")))?;
+        let current_coin_balance = params
+            .current_coin_balance
+            .as_deref()
+            .map(std::str::FromStr::from_str)
+            .transpose()
+            .map_err(|e| upbit_invalid_params(format!("invalid current_coin_balance: {e}")))?;
+
+        let req = OrderPreviewRequest {
+            market: params.market,
+            side: params.side,
+            ord_type: params.ord_type,
+            price,
+            volume,
+            current_krw_balance,
+            current_coin_balance,
+        };
+
+        match OrderPreview::build(req, chrono::Utc::now()) {
+            Ok(preview) => text_result(&preview),
+            Err(error) => Ok(upbit_tool_error(&error)),
+        }
+    }
+
+    #[tool(
+        description = "Send official non-executing test order to POST /v1/orders/test (zero execution, zero balance change)",
+        input_schema = rmcp::handler::server::common::schema_for_type::<UpbitOrderTestParams>(),
+        annotations(
+            title = "Upbit Order Test",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn upbit_order_test(&self, arguments: JsonObject) -> Result<CallToolResult, McpError> {
+        if let Err(error) = self.require_private_exchange_access() {
+            return tool_error(&error);
+        }
+        let params: UpbitOrderTestParams = parse_arguments(arguments)?;
+        let req = UpbitTestOrderRequest {
+            market: params.market,
+            side: params.side,
+            ord_type: params.ord_type,
+            volume: params.volume,
+            price: params.price,
+            identifier: params.identifier,
+        };
+        match self.upbit_exchange.client().post_order_test(&req).await {
+            Ok(response) => text_result(&response),
+            Err(error) => Ok(upbit_tool_error(&error)),
+        }
+    }
+
+    #[tool(
+        description = "Execute a Desktop simulated order intent behind risk and human approval checks; legacy raw LIVE execution remains disabled, and strategy execution uses separately gated automation",
+        input_schema = rmcp::handler::server::common::schema_for_type::<UpbitOrderExecuteParams>(),
+        annotations(
+            title = "Upbit Order Execute",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn upbit_order_execute(&self, arguments: JsonObject) -> Result<CallToolResult, McpError> {
+        if let Err(error) = self.require_private_exchange_access() {
+            return tool_error(&error);
+        }
+        let params: UpbitOrderExecuteParams = parse_arguments(arguments)?;
+        let preview: OrderPreview = serde_json::from_value(params.preview)
+            .map_err(|e| upbit_invalid_params(format!("invalid preview payload: {e}")))?;
+        let req = OrderExecuteRequest {
+            preview,
+            human_approval_token: params.human_approval_token,
+            client_identifier: params.client_identifier,
+            allow_mock_execution: params.allow_mock_execution,
+        };
+        match self
+            .upbit_exchange
+            .execution_service()
+            .execute(req, chrono::Utc::now())
+            .await
+        {
+            Ok(receipt) => text_result(&receipt),
+            Err(error) => Ok(upbit_tool_error(&error)),
+        }
+    }
+
+    #[tool(
+        description = "Reconcile order state, fills, partials, and residuals against exchange order details",
+        input_schema = rmcp::handler::server::common::schema_for_type::<UpbitOrderReconcileParams>(),
+        annotations(
+            title = "Upbit Order Reconcile",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn upbit_order_reconcile(
+        &self,
+        arguments: JsonObject,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(error) = self.require_private_exchange_access() {
+            return tool_error(&error);
+        }
+        let params: UpbitOrderReconcileParams = parse_arguments(arguments)?;
+        let expected_volume = params
+            .expected_volume
+            .parse::<rust_decimal::Decimal>()
+            .map_err(|e| upbit_invalid_params(format!("invalid expected_volume: {e}")))?;
+        match self
+            .upbit_exchange
+            .client()
+            .get_order(params.uuid.as_deref(), params.identifier.as_deref())
+            .await
+        {
+            Ok(detail) => {
+                let report = reconcile_order_detail(expected_volume, &detail);
+                text_result(&report)
+            }
+            Err(error) => Ok(upbit_tool_error(&error)),
+        }
+    }
+
+    #[tool(
+        description = "Cancel order in mock execution ledger (real exchange DELETE is disabled)",
+        input_schema = rmcp::handler::server::common::schema_for_type::<UpbitOrderCancelParams>(),
+        annotations(
+            title = "Upbit Order Cancel",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn upbit_order_cancel(&self, arguments: JsonObject) -> Result<CallToolResult, McpError> {
+        if let Err(error) = self.require_private_exchange_access() {
+            return tool_error(&error);
+        }
+        let params: UpbitOrderCancelParams = parse_arguments(arguments)?;
+        let unfilled = params
+            .unfilled_volume
+            .as_deref()
+            .map(std::str::FromStr::from_str)
+            .transpose()
+            .map_err(|e| upbit_invalid_params(format!("invalid unfilled_volume: {e}")))?;
+        let receipt = mock_cancel_order(
+            &params.order_id,
+            unfilled.unwrap_or(rust_decimal::Decimal::ZERO),
+        );
+        text_result(&receipt)
+    }
+
+    #[tool(
+        description = "Read persistent paper investment start options, session list, session detail, request receipt readback, or paged session events",
+        input_schema = tagged_schema::<PaperSessionQuery>(),
+        annotations(
+            title = "Paper Session Query",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn paper_session_query(&self, arguments: JsonObject) -> Result<CallToolResult, McpError> {
+        let query: PaperSessionQuery = parse_arguments(arguments)?;
+        validate_paper_session_query(&query).map_err(|error| invalid_params(&error))?;
+        result_or_error(self.jobs.paper_session_query(query).await)
+    }
+
+    #[tool(
+        description = "Create-and-start, pause, resume, or stop a persistent virtual paper investment session with request_id idempotency and expected_sequence CAS",
+        input_schema = tagged_schema::<PaperSessionWrite>(),
+        annotations(
+            title = "Paper Session Write",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn paper_session_write(&self, arguments: JsonObject) -> Result<CallToolResult, McpError> {
+        let write: PaperSessionWrite = parse_arguments(arguments)?;
+        if self.exposure.public_no_auth() {
+            return result_or_error::<()>(Err(LabError::Conflict(
+                "paper session mutation is disabled when public_no_auth is enabled; authenticated local, desktop, or bearer access required".into(),
+            )));
+        }
+        result_or_error(self.jobs.paper_session_write(write).await)
+    }
+
+    #[tool(
+        description = "Read private strategy automation sessions, daily starting baseline, exact decision candles and saved evaluations, linked order/fill events, deterministic performance reports, and hash-pinned CSV/JSON export chunks",
+        input_schema = tagged_schema::<AutomationSessionQuery>(),
+        annotations(
+            title = "Strategy Automation Query",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn automation_session_query(
+        &self,
+        arguments: JsonObject,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(error) = self.require_trading_read(&context) {
+            return self.trading_permission_error(error);
+        }
+        let query: AutomationSessionQuery = parse_arguments(arguments)?;
+        validate_automation_query(&query).map_err(|error| invalid_params(&error))?;
+        result_or_error(self.jobs.automation_session_query(query).await)
+    }
+
+    #[tool(
+        description = "Start a frozen-policy explicitly selected MOCK or LIVE strategy automation session, record/verify an account daily starting baseline, or pause, resume, stop, or explicitly cancel one owned mock order",
+        input_schema = tagged_schema::<AutomationSessionWrite>(),
+        annotations(
+            title = "Strategy Automation Write",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn automation_session_write(
+        &self,
+        arguments: JsonObject,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(error) = self.require_trading_permission(&context, true) {
+            return self.trading_permission_error(error);
+        }
+        let write: AutomationSessionWrite = parse_arguments(arguments)?;
+        if !matches!(self.exposure, McpExposure::Desktop)
+            && !matches!(
+                &write,
+                AutomationSessionWrite::Start { .. }
+                    | AutomationSessionWrite::Pause { .. }
+                    | AutomationSessionWrite::Resume { .. }
+                    | AutomationSessionWrite::Stop { .. }
+            )
+        {
+            return tool_error(&LabError::Conflict("OAuth trading control permits only start, pause, resume and stop; order cancellation and baseline changes require Desktop authority".into()));
+        }
+        result_or_error(self.jobs.automation_session_write(write).await)
+    }
+
+    #[tool(
+        description = "Read or explicitly enable/disable the shared live order-sending gate. Starts and restarts OFF in managed mode. Enable requires confirmation ENABLE_LIVE_ORDER_SENDING, request_id, expected_sequence and expected_epoch; disable blocks new sends and never cancels exchange orders. This does not start/resume strategies or clear emergency admission. Read a request receipt after uncertain replies.",
+        input_schema = rmcp::handler::server::common::schema_for_type::<LiveOrderControlRequest>(),
+        annotations(title = "Live Order Sending", read_only_hint = false, destructive_hint = false,
+            idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn live_order_control(
+        &self,
+        arguments: JsonObject,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(error) = self.require_trading_read(&context) {
+            return self.trading_permission_error(error);
+        }
+        let request: LiveOrderControlRequest = parse_arguments(arguments)?;
+        if request.action.is_mutation()
+            && let Err(error) = self.require_trading_permission(&context, true)
+        {
+            return self.trading_permission_error(error);
+        }
+        result_or_error(self.live_order_control.execute(request).await)
+    }
+
+    #[tool(
+        description = "Read or mutate the durable server-side trading admission control. Mutations require request_id and expected_sequence; Start/Resume require the independent operator effect gate and an explicitly authorized trading-control capability. Emergency stop only latches new-order admission and never submits or cancels exchange orders.",
+        input_schema = rmcp::handler::server::common::schema_for_type::<TradingControlRequest>(),
+        annotations(
+            title = "Trading Control",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn trading_control(
+        &self,
+        arguments: JsonObject,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(error) = self.require_trading_read(&context) {
+            return self.trading_permission_error(error);
+        }
+        let request: TradingControlRequest = parse_arguments(arguments)?;
+        if request.action.is_mutation() {
+            if let Err(error) = self.require_trading_permission(&context, true) {
+                return self.trading_permission_error(error);
+            }
+            if matches!(self.exposure, McpExposure::OAuth | McpExposure::Desktop) {
+                return result_or_error(
+                    self.trading_control
+                        .execute_with_operator_approval(request)
+                        .await,
+                );
+            }
+        }
+        result_or_error(self.trading_control.execute(request).await)
+    }
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
@@ -1502,6 +2616,41 @@ fn validate_policy_query(query: &PolicyQuery) -> Result<(), LabError> {
         | PolicyQuery::History { limit, .. }
         | PolicyQuery::Runs { limit, .. } => validate_history_limit(*limit),
         PolicyQuery::Get { .. } => Ok(()),
+    }
+}
+
+fn validate_paper_session_query(query: &PaperSessionQuery) -> Result<(), LabError> {
+    match query {
+        PaperSessionQuery::List { limit, .. } | PaperSessionQuery::Events { limit, .. } => {
+            validate_history_limit(*limit)
+        }
+        PaperSessionQuery::StartOptions
+        | PaperSessionQuery::Get { .. }
+        | PaperSessionQuery::Request { .. } => Ok(()),
+    }
+}
+
+fn validate_automation_query(query: &AutomationSessionQuery) -> Result<(), LabError> {
+    match query {
+        AutomationSessionQuery::List { limit, .. }
+        | AutomationSessionQuery::Events { limit, .. }
+        | AutomationSessionQuery::Ledger { limit, .. } => validate_history_limit(*limit),
+        AutomationSessionQuery::Decisions { limit, .. } => {
+            if (1..=100).contains(limit) {
+                Ok(())
+            } else {
+                Err(LabError::InvalidConfig(
+                    "automation decision page limit must be in 1..=100".into(),
+                ))
+            }
+        }
+        AutomationSessionQuery::Get { .. }
+        | AutomationSessionQuery::Request { .. }
+        | AutomationSessionQuery::Baseline { .. }
+        | AutomationSessionQuery::Decision { .. }
+        | AutomationSessionQuery::Performance { .. }
+        | AutomationSessionQuery::ExportManifest { .. }
+        | AutomationSessionQuery::ExportRead { .. } => Ok(()),
     }
 }
 
@@ -1593,13 +2742,22 @@ fn dataset_summary(manifest: DatasetManifest) -> Result<DatasetSummary, LabError
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for LabMcpService {
     fn get_info(&self) -> ServerConfig {
+        let instructions = if matches!(self.exposure, McpExposure::Desktop) {
+            "Native desktop account/order history, frozen MOCK/LIVE strategy sessions, durable trading admission, and shared live_order_control. Managed order sending starts OFF on every restart; enabling requires explicit confirmation and never starts or resumes a strategy. Raw live execute/test/cancel, withdrawals, arbitrary SQL, caller URLs, paths, and code execution are unavailable."
+        } else if matches!(self.exposure, McpExposure::OAuth)
+            && self.remote_trading_enabled
+            && self.managed_send_gate_bound
+        {
+            "Upbit research with owner-consented private account/order reads, supported strategy lifecycle, trading admission, and shared live_order_control. Managed full-trading OAuth consent turns the shared live-order send gate ON after owner-code approval and PKCE; this does not start or resume a strategy, and an already-running strategy may submit real orders. Every tool call still checks the verified grant, and risk and emergency controls remain separate. Raw live execute/test/cancel, withdrawals, arbitrary SQL, caller URLs, paths, and code execution are unavailable."
+        } else if matches!(self.exposure, McpExposure::OAuth) && self.remote_trading_enabled {
+            "Upbit research with owner-consented private account/order reads, supported strategy lifecycle and trading admission. The managed OAuth live-order send gate is not configured on this server, so OAuth consent does not turn it ON. Every tool call still checks the verified grant, and risk and emergency controls remain separate. Raw live execute/test/cancel, withdrawals, arbitrary SQL, caller URLs, paths, and code execution are unavailable."
+        } else {
+            "Upbit public-data research lab. Private account/order/control tools and live order execution are unavailable on this exposure. Quant policies use immutable revisions; durable jobs are polled by ID. Arbitrary SQL, caller URLs, paths, and code execution are disabled."
+        };
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::from_build_env())
             .with_protocol_version(ProtocolVersion::V_2025_06_18)
-            .with_instructions(
-                "Upbit public-data research lab. Quant policies use immutable revisions; runs and jobs expose bounded JSON history. Durable jobs are polled by ID. No trading, private exchange API, arbitrary SQL, URL, path, or code execution. The configured HTTP authentication mode and public-no-auth exposure are explicit in lab_status."
-                    .to_owned(),
-            )
+            .with_instructions(instructions.to_owned())
     }
 }
 
@@ -1631,3 +2789,6 @@ pub fn result_text(result: CallToolResult) -> String {
 mod closure_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod trading_tests;

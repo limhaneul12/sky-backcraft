@@ -3,9 +3,10 @@ use crate::contracts::{
     SignedAmount,
 };
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone)]
-pub(super) struct Account {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct Account {
     initial_cash: Decimal,
     cash_total: Decimal,
     cash_reserved: Decimal,
@@ -17,23 +18,23 @@ pub(super) struct Account {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct AppliedFill {
-    pub(super) removed_basis: Decimal,
-    pub(super) realized_price_pnl: Decimal,
+pub(crate) struct AppliedFill {
+    pub(crate) removed_basis: Decimal,
+    pub(crate) realized_price_pnl: Decimal,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct MarkedAccount {
-    pub(super) position_value: Decimal,
-    pub(super) gross_unrealized: Decimal,
-    pub(super) equity: Decimal,
-    pub(super) actual_weight: Decimal,
-    pub(super) peak_equity: Decimal,
-    pub(super) drawdown: Decimal,
+pub(crate) struct MarkedAccount {
+    pub(crate) position_value: Decimal,
+    pub(crate) gross_unrealized: Decimal,
+    pub(crate) equity: Decimal,
+    pub(crate) actual_weight: Decimal,
+    pub(crate) peak_equity: Decimal,
+    pub(crate) drawdown: Decimal,
 }
 
 impl Account {
-    pub(super) fn new(initial_cash: QuoteAmount) -> Self {
+    pub(crate) fn new(initial_cash: QuoteAmount) -> Self {
         let initial_cash = initial_cash.get();
         Self {
             initial_cash,
@@ -47,15 +48,15 @@ impl Account {
         }
     }
 
-    pub(super) fn cash_free(&self) -> Result<Decimal, LabError> {
+    pub(crate) fn cash_free(&self) -> Result<Decimal, LabError> {
         checked_sub(self.cash_total, self.cash_reserved, "free cash")
     }
 
-    pub(super) fn qty(&self) -> Decimal {
+    pub(crate) fn qty(&self) -> Decimal {
         self.qty
     }
 
-    pub(super) fn reserve(&mut self, amount: QuoteAmount) -> Result<(), LabError> {
+    pub(crate) fn reserve(&mut self, amount: QuoteAmount) -> Result<(), LabError> {
         if amount.get() > self.cash_free()? {
             return Err(invariant("reservation exceeds free cash"));
         }
@@ -63,7 +64,7 @@ impl Account {
         Ok(())
     }
 
-    pub(super) fn release(&mut self, amount: QuoteAmount) -> Result<(), LabError> {
+    pub(crate) fn release(&mut self, amount: QuoteAmount) -> Result<(), LabError> {
         if amount.get() > self.cash_reserved {
             return Err(invariant("release exceeds reserved cash"));
         }
@@ -71,7 +72,7 @@ impl Account {
         Ok(())
     }
 
-    pub(super) fn apply_fill(
+    pub(crate) fn apply_fill(
         &mut self,
         side: Side,
         price: PriceKrw,
@@ -151,7 +152,7 @@ impl Account {
         })
     }
 
-    pub(super) fn mark(&mut self, price: PriceKrw) -> Result<MarkedAccount, LabError> {
+    pub(crate) fn mark(&mut self, price: PriceKrw) -> Result<MarkedAccount, LabError> {
         let position_value = checked_mul(self.qty, price.get(), "position value")?;
         let gross_unrealized = checked_sub(position_value, self.price_basis, "gross unrealized")?;
         let equity = checked_add(self.cash_total, position_value, "equity")?;
@@ -199,7 +200,7 @@ impl Account {
         })
     }
 
-    pub(super) fn state(&self) -> Result<AccountState, LabError> {
+    pub(crate) fn state(&self) -> Result<AccountState, LabError> {
         Ok(AccountState {
             cash_total: QuoteAmount::new(self.cash_total)?,
             cash_free: QuoteAmount::new(self.cash_free()?)?,
@@ -211,7 +212,7 @@ impl Account {
         })
     }
 
-    fn validate(&self) -> Result<(), LabError> {
+    pub(crate) fn validate(&self) -> Result<(), LabError> {
         if self.cash_total < Decimal::ZERO
             || self.cash_reserved < Decimal::ZERO
             || self.cash_reserved > self.cash_total

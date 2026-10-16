@@ -8,13 +8,15 @@ use crate::contracts::policy::{
     PolicyIndicator, PolicyIndicatorKind, PolicyProgram, PolicyTarget, PolicyTrace, RulesProgram,
 };
 use crate::contracts::{
-    CandleInterval, CandleObservation, DatasetSnapshot, IndicatorSnapshot, LabError, MarketId,
-    PositionState, ReasonCode, ResolvedPlan, StrategyBinding, UtcRange, UtcTimestamp, Weight,
+    CandleInterval, CandleObservation, DatasetSnapshot, FrozenPolicyRevision, IndicatorSnapshot,
+    LabError, MarketId, PositionState, ReasonCode, ResolvedPlan, StrategyBinding, UtcRange,
+    UtcTimestamp, Weight, validate_frozen_policy,
 };
 use crate::evidence::EvidenceEvaluator;
 use crate::strategy::indicators::{Ema, RollingExtreme, RollingVol, Rsi, Sma, finite};
 use crate::strategy::{PositionView, StrategyEvaluation, StrategyEvaluator, decimal_f64};
 use rust_decimal::{Decimal, prelude::ToPrimitive};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
@@ -27,7 +29,7 @@ pub(crate) struct RuleEvaluation {
     pub(crate) completed_bars: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PolicyEvaluator {
     binding: StrategyBinding,
     inner: CompiledPolicy,
@@ -35,13 +37,48 @@ pub(crate) struct PolicyEvaluator {
     decision_warmup_bars: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 enum CompiledPolicy {
     Builtin(StrategyEvaluator),
     Rules(RulesEvaluator),
 }
 
 impl PolicyEvaluator {
+    /// Compile directly from one immutable policy revision for a live causal stream.
+    /// This path shares the same builtin and Rules evaluators as replay and paper.
+    /// # Errors
+    /// Rejects a corrupt revision or unsupported policy program.
+    pub(crate) fn compile_frozen_revision(
+        revision: &FrozenPolicyRevision,
+        market: MarketId,
+        interval: CandleInterval,
+    ) -> Result<Self, LabError> {
+        validate_frozen_policy(revision)?;
+        let binding = StrategyBinding::Policy {
+            reference: revision.reference.clone(),
+            family: revision.family,
+        };
+        let program = revision.definition.program.clone();
+        let decision_warmup_bars = match &program {
+            PolicyProgram::Builtin { strategy } => strategy.warmup_bars()?,
+            PolicyProgram::Rules { .. } => revision.definition.decision_warmup_bars(interval)?,
+        };
+        let inner = match program {
+            PolicyProgram::Builtin { strategy } => {
+                CompiledPolicy::Builtin(StrategyEvaluator::new(strategy, market, interval)?)
+            }
+            PolicyProgram::Rules { .. } => {
+                CompiledPolicy::Rules(RulesEvaluator::new(&revision.definition, market, interval)?)
+            }
+        };
+        Ok(Self {
+            binding,
+            inner,
+            decision_interval: interval,
+            decision_warmup_bars,
+        })
+    }
+
     pub(crate) fn compile(
         binding: StrategyBinding,
         plan: &ResolvedPlan,
@@ -144,6 +181,20 @@ impl PolicyEvaluator {
 
     pub(crate) fn decision_warmup_bars(&self) -> usize {
         self.decision_warmup_bars
+    }
+
+    pub(crate) fn completed_bars_seen(&self) -> u64 {
+        match &self.inner {
+            CompiledPolicy::Builtin(evaluator) => evaluator.completed_bars_seen(),
+            CompiledPolicy::Rules(evaluator) => evaluator.completed_bars,
+        }
+    }
+
+    pub(crate) fn cross_last_close(&self) -> BTreeMap<String, UtcTimestamp> {
+        match &self.inner {
+            CompiledPolicy::Builtin(_) => BTreeMap::new(),
+            CompiledPolicy::Rules(evaluator) => evaluator.cross_last_close.clone(),
+        }
     }
 
     /// Feed one completed source bar to one cross-interval indicator.
@@ -586,7 +637,7 @@ fn builtin_trace(evaluation: &StrategyEvaluation) -> Result<PolicyTrace, LabErro
     })
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct RulesEvaluator {
     program: RulesProgram,
     market: MarketId,
@@ -604,7 +655,7 @@ pub(crate) struct RulesEvaluator {
     requires_evidence: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 struct CrossSample {
     previous: Option<(f64, f64)>,
     current: (f64, f64),
@@ -622,7 +673,7 @@ struct EvalContext<'a> {
     crosses: &'a BTreeMap<String, CrossSample>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct IndicatorRuntime {
     id: String,
     kind: IndicatorState,
@@ -640,7 +691,7 @@ struct CandlePrices {
     close: f64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 enum IndicatorState {
     Open,
     High,

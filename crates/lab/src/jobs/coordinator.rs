@@ -29,6 +29,7 @@ impl JobService {
     pub(super) async fn coordinate(self) -> Result<(), LabError> {
         let mut poll = tokio::time::interval(std::time::Duration::from_secs(1));
         poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut tick_counter = 0_u64;
         loop {
             tokio::select! {
                 () = self.inner.stop.cancelled() => return Ok(()),
@@ -37,7 +38,12 @@ impl JobService {
             if !self.inner.admitting.load(Ordering::Acquire) {
                 return Ok(());
             }
-            self.coordinate_once(UtcTimestamp::now()).await?;
+            let now = UtcTimestamp::now();
+            self.coordinate_once(now).await?;
+            tick_counter = tick_counter.wrapping_add(1);
+            if tick_counter.is_multiple_of(15) {
+                self.poll_due_paper_markets(now).await;
+            }
         }
     }
 
@@ -54,6 +60,7 @@ impl JobService {
                 for id in recovery_ids {
                     store.reconcile_schedule_recovery(&id, now)?;
                 }
+                let _ = store.reconcile_running_paper_sessions(&[], now)?;
                 Ok((store.due_collection_schedules(now, 8)?, reconciled_recovery))
             })
             .await?;
@@ -106,10 +113,10 @@ impl JobService {
             };
             if admitted {
                 self.inner.wake.notify_one();
-                return Ok(());
+                break;
             }
         }
-        Ok(())
+        self.process_due_automation_sessions(now).await
     }
 
     async fn advance_suite_checked(

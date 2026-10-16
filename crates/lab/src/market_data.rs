@@ -230,6 +230,86 @@ impl UpbitClient {
         })
     }
 
+    /// Fetch completed candles for an active `RUNNING` paper session and return
+    /// the published raw object and ascending `CandleObservation`s.
+    pub(crate) async fn poll_paper_observations(
+        &self,
+        market: &MarketId,
+        interval: CandleInterval,
+        completed_count: ProbeCount,
+        database: &DatabaseHandle,
+    ) -> Result<
+        (
+            crate::contracts::RawObjectRef,
+            Vec<crate::contracts::CandleObservation>,
+        ),
+        LabError,
+    > {
+        let scheduled_probe = {
+            let mut next_probe = self.next_probe.lock().await;
+            let scheduled = Instant::now().max(*next_probe);
+            *next_probe = scheduled + PROBE_SPACING;
+            scheduled
+        };
+        tokio::time::sleep_until(scheduled_probe).await;
+        let fetched_at = UtcTimestamp::now();
+        let mut next_probe_after_response = scheduled_probe + PROBE_SPACING;
+        let response = self
+            .request_page(
+                market,
+                interval,
+                completed_count.get() + 1,
+                None,
+                fetched_at,
+                &mut next_probe_after_response,
+            )
+            .await;
+        if next_probe_after_response > scheduled_probe + PROBE_SPACING {
+            let mut next_probe = self.next_probe.lock().await;
+            *next_probe = (*next_probe).max(next_probe_after_response);
+        }
+        let response = response.map_err(|failure| failure.error)?;
+        let http_status = response.http_status;
+        let raw_sha256 = ContentHash::of_bytes(&response.body).to_string();
+        let published = database
+            .call("publish_paper_poll_raw", move |store| {
+                let result = store.publish_raw(RawObjectInput {
+                    source_url: response.source_url,
+                    fetched_at: response.fetched_at,
+                    persisted_at: UtcTimestamp::now(),
+                    http_status: response.http_status,
+                    remaining_req: response.remaining_req,
+                    origin: response.origin,
+                    body: response.body,
+                })?;
+                store.catalog_raw(&result.object)?;
+                Ok(result)
+            })
+            .await?;
+        let raw_file = format!("{}/body.json.gz", published.object.relative_path);
+        if !(200..300).contains(&http_status) {
+            return Err(http_error(http_status, &raw_sha256, Some(&raw_file)));
+        }
+        let mut candles = parse_candle_bytes(&published.body, market, interval, fetched_at)?;
+        let requested = usize::try_from(completed_count.get())
+            .map_err(|_| LabError::InvalidConfig("completed_count out of range".to_owned()))?;
+        candles.retain(|record| record.completed);
+        candles.truncate(requested);
+        candles.reverse();
+        let mut observations = Vec::with_capacity(candles.len());
+        for candle in candles {
+            let digest = crate::contracts::observation_digest(&candle)?;
+            observations.push(crate::contracts::CandleObservation {
+                id: crate::contracts::ObservationId::from_seed(digest.as_str()),
+                candle,
+                content_digest: digest,
+                raw_object_ids: vec![published.object.id.clone()],
+                constituent_ids: Vec::new(),
+            });
+        }
+        Ok((published.object, observations))
+    }
+
     /// Bounded collection request. Waiting only occurs in the single job runner;
     /// interactive probes still reject immediately. No persistence happens here.
     /// Fetch the live Upbit market catalog (`v1/market/all`). Validation

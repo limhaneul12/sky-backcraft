@@ -14,6 +14,7 @@ use crate::evidence::EvidenceEvaluator;
 use indicators::{Ema, RollingExtreme, RollingVol, Rsi, finite, finite_positive};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
+use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
 /// Actual filled holding context supplied by execution/accounting.
@@ -82,7 +83,7 @@ pub struct StrategyEvaluation {
 
 /// Stateful, prefix-causal evaluator. EMA, Wilder RSI, rolling sample
 /// volatility, and Donchian extremes are updated incrementally per bar.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StrategyEvaluator {
     spec: StrategySpec,
     market: MarketId,
@@ -156,6 +157,10 @@ impl StrategyEvaluator {
             exit_extreme,
             base_signal_state: PositionState::Cash,
         })
+    }
+
+    pub(crate) const fn completed_bars_seen(&self) -> u64 {
+        self.completed_bars_seen
     }
 
     /// Admit one completed bar and, after warmup, produce one deterministic decision.

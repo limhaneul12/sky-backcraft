@@ -1,5 +1,6 @@
 //! Public-data research with immutable inputs and simulated execution.
 
+pub mod automation;
 pub mod collection;
 pub mod contracts;
 pub mod database;
@@ -10,6 +11,7 @@ pub mod market_data;
 pub mod mcp;
 pub mod oauth;
 pub mod observability;
+pub mod paper;
 pub mod planning;
 mod policy_engine;
 pub mod portfolio;
@@ -22,4 +24,5 @@ pub mod scheduling;
 pub mod storage;
 pub mod strategy;
 pub mod transport;
+pub mod upbit;
 mod verification;

@@ -2,14 +2,15 @@
 
 use super::JobService;
 use crate::contracts::{
-    CollectionScheduleAction, JobId, LabError, ProbeCount, ResearchSuiteAction,
-    ResearchSuiteRequest, ScheduleId, ScheduleMutationOutcome, SourceProbeResult,
-    StorageMaintenanceAction, StorageMaintenanceResult, SuiteId, UtcTimestamp,
-    validate_research_page,
+    AutomationSessionCommandResponse, AutomationSessionQuery, AutomationSessionWrite,
+    CollectionScheduleAction, JobId, LabError, PaperSessionCommandResponse, PaperSessionQuery,
+    PaperSessionState, PaperSessionWrite, ProbeCount, ResearchSuiteAction, ResearchSuiteRequest,
+    ScheduleId, ScheduleMutationOutcome, SourceProbeResult, StorageMaintenanceAction,
+    StorageMaintenanceResult, SuiteId, UtcTimestamp, validate_research_page,
 };
 use crate::storage::Store;
 use serde_json::Value;
-use std::sync::atomic::Ordering;
+use std::sync::{Arc, atomic::Ordering};
 
 impl JobService {
     /// The single admission gate protects producer writes and ordinary job submission.
@@ -38,6 +39,86 @@ impl JobService {
                 work(store)
             })
             .await
+    }
+
+    async fn write_paper_session(
+        &self,
+        write: PaperSessionWrite,
+        now: UtcTimestamp,
+    ) -> Result<(PaperSessionCommandResponse, bool), LabError> {
+        if let PaperSessionWrite::Resume {
+            request_id,
+            session_id,
+            expected_sequence,
+        } = &write
+        {
+            let readback_id = request_id.clone();
+            let found_receipt = self
+                .inner
+                .database
+                .call("paper_resume_receipt_preflight", move |store| {
+                    Ok(store
+                        .paper_readback_request(&readback_id, UtcTimestamp::now())?
+                        .found)
+                })
+                .await?;
+            if found_receipt {
+                let response = self
+                    .admitted("paper_session_write", move |store| {
+                        store.paper_write(&write, UtcTimestamp::now())
+                    })
+                    .await?;
+                return Ok((response, true));
+            }
+
+            let preflight_session = session_id.clone();
+            let expected = *expected_sequence;
+            let requirements = self
+                .inner
+                .database
+                .call("paper_resume_feed_preflight", move |store| {
+                    store.paper_recovery_poll_requirements(&preflight_session, expected)
+                })
+                .await?;
+            if let Some(requirements) = requirements {
+                let count = ProbeCount::try_from(crate::paper::MAX_PAPER_RECOVERY_BARS)?;
+                let mut batches = Vec::with_capacity(requirements.len());
+                for requirement in &requirements {
+                    let batch = tokio::select! {
+                        () = self.inner.stop.cancelled() => {
+                            return Err(LabError::Cancelled(
+                                "paper feed-gap recovery fetch cancelled".into(),
+                            ));
+                        }
+                        result = self.inner.upbit.poll_paper_observations(
+                            &requirement.market,
+                            requirement.interval,
+                            count,
+                            &self.inner.database,
+                        ) => result?,
+                    };
+                    batches.push(batch);
+                }
+                let response = self
+                    .admitted("paper_session_write", move |store| {
+                        store.paper_write_for_feed_gap_resume(
+                            &write,
+                            &requirements,
+                            &batches,
+                            UtcTimestamp::now(),
+                        )
+                    })
+                    .await?;
+                return Ok((response, true));
+            }
+        }
+
+        let response = self
+            .admitted("paper_session_write", move |store| {
+                store.paper_write(&write, now)
+            })
+            .await?;
+        Ok((response, false))
     }
 
     /// Create/control/query a durable suite without running a second computation worker.
@@ -572,6 +653,285 @@ impl JobService {
             cancellation.cancel();
         }
         Ok(())
+    }
+
+    /// Execute a persistent paper-session lifecycle mutation (`start`, `pause`, `resume`, `stop`).
+    ///
+    /// # Errors
+    /// Propagates validation, CAS sequence conflict, idempotency conflict, or SQLite errors.
+    pub async fn paper_session_write(
+        &self,
+        write: PaperSessionWrite,
+    ) -> Result<PaperSessionCommandResponse, LabError> {
+        let now = UtcTimestamp::now();
+        let (mut response, feed_gap_resume_or_replay) =
+            self.write_paper_session(write, now).await?;
+        if response.session.state == PaperSessionState::Running && !feed_gap_resume_or_replay {
+            self.poll_due_paper_markets(now).await;
+            let session_id = response.session.session_id.clone();
+            if let Ok(refreshed) = self
+                .inner
+                .database
+                .call("paper_session_post_write_refresh", move |store| {
+                    store.paper_get_session(&session_id, now)
+                })
+                .await
+            {
+                response.session = refreshed.session;
+            }
+        }
+        Ok(response)
+    }
+
+    /// Query persistent paper sessions (`start_options`, `list`, `get`, `events`, `request`).
+    ///
+    /// # Errors
+    /// Propagates unknown session IDs, invalid pagination limits, or SQLite errors.
+    pub async fn paper_session_query(&self, query: PaperSessionQuery) -> Result<Value, LabError> {
+        let now = UtcTimestamp::now();
+        if matches!(
+            query,
+            PaperSessionQuery::List { .. }
+                | PaperSessionQuery::Get { .. }
+                | PaperSessionQuery::Events { .. }
+        ) {
+            self.poll_due_paper_markets(now).await;
+        }
+        match query {
+            PaperSessionQuery::StartOptions => {
+                self.inner
+                    .database
+                    .call("paper_start_options", |store| {
+                        Ok(serde_json::to_value(store.paper_start_options()?)?)
+                    })
+                    .await
+            }
+            PaperSessionQuery::List {
+                after_session_id,
+                limit,
+            } => {
+                self.inner
+                    .database
+                    .call("paper_list_sessions", move |store| {
+                        let _ = store.reconcile_running_paper_sessions(&[], now);
+                        Ok(serde_json::to_value(store.paper_list_sessions(
+                            after_session_id.as_ref(),
+                            limit,
+                            now,
+                        )?)?)
+                    })
+                    .await
+            }
+            PaperSessionQuery::Get { session_id } => {
+                self.inner
+                    .database
+                    .call("paper_get_session", move |store| {
+                        let _ = store.reconcile_running_paper_sessions(&[], now);
+                        Ok(serde_json::to_value(
+                            store.paper_get_session(&session_id, now)?,
+                        )?)
+                    })
+                    .await
+            }
+            PaperSessionQuery::Events {
+                session_id,
+                after_sequence,
+                limit,
+            } => {
+                self.inner
+                    .database
+                    .call("paper_list_events", move |store| {
+                        let _ = store.reconcile_running_paper_sessions(&[], now);
+                        Ok(serde_json::to_value(store.paper_list_events(
+                            &session_id,
+                            after_sequence,
+                            limit,
+                        )?)?)
+                    })
+                    .await
+            }
+            PaperSessionQuery::Request { request_id } => {
+                self.inner
+                    .database
+                    .call("paper_readback_request", move |store| {
+                        Ok(serde_json::to_value(
+                            store.paper_readback_request(&request_id, now)?,
+                        )?)
+                    })
+                    .await
+            }
+        }
+    }
+
+    /// Query private strategy-automation projections without venue or lifecycle effects.
+    /// # Errors
+    /// Propagates bounded-page validation and durable storage failures.
+    pub async fn automation_session_query(
+        &self,
+        query: AutomationSessionQuery,
+    ) -> Result<Value, LabError> {
+        match query {
+            AutomationSessionQuery::Performance { session_id } => {
+                let report = self
+                    .bounded_automation_review(
+                        "automation_review_performance",
+                        session_id,
+                        |snapshot| {
+                            crate::reporting::automation_review::build_performance(&snapshot)
+                        },
+                    )
+                    .await?;
+                Ok(serde_json::to_value(report)?)
+            }
+            AutomationSessionQuery::ExportManifest { session_id } => {
+                let manifest = self
+                    .bounded_automation_review(
+                        "automation_review_export_manifest",
+                        session_id,
+                        |snapshot| crate::reporting::automation_review::export_manifest(&snapshot),
+                    )
+                    .await?;
+                Ok(serde_json::to_value(manifest)?)
+            }
+            AutomationSessionQuery::ExportRead {
+                session_id,
+                file,
+                offset,
+                expected_sha256,
+                expected_snapshot_digest,
+            } => {
+                let chunk = self
+                    .bounded_automation_review(
+                        "automation_review_export_read",
+                        session_id,
+                        move |snapshot| {
+                            crate::reporting::automation_review::export_read(
+                                &snapshot,
+                                file,
+                                offset,
+                                &expected_sha256,
+                                &expected_snapshot_digest,
+                            )
+                        },
+                    )
+                    .await?;
+                Ok(serde_json::to_value(chunk)?)
+            }
+            query => {
+                let now = UtcTimestamp::now();
+                let live_execution_policy = self.live_execution_policy();
+                self.inner
+                    .database
+                    .call("automation_session_query", move |store| {
+                        store.automation_query_with_policy(query, now, live_execution_policy)
+                    })
+                    .await
+            }
+        }
+    }
+
+    async fn bounded_automation_review<T, F>(
+        &self,
+        operation: &'static str,
+        session_id: crate::contracts::AutomationSessionId,
+        calculate: F,
+    ) -> Result<T, LabError>
+    where
+        T: Send + 'static,
+        F: FnOnce(crate::contracts::AutomationReviewSnapshot) -> Result<T, LabError>
+            + Send
+            + 'static,
+    {
+        if self.inner.stop.is_cancelled() {
+            return Err(LabError::Cancelled(
+                "automation review stopped before snapshot admission".into(),
+            ));
+        }
+        let permit = self
+            .inner
+            .automation_review_budget
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                LabError::ResourceLimit("automation review compute capacity is full".into())
+            })?;
+        let permit = Arc::new(permit);
+        let storage_permit = Arc::clone(&permit);
+        let snapshot = self
+            .inner
+            .database
+            .call(operation, move |store| {
+                let _permit = storage_permit;
+                store.automation_review_snapshot(&session_id)
+            })
+            .await?;
+        if self.inner.stop.is_cancelled() {
+            return Err(LabError::Cancelled(
+                "automation review stopped before calculation".into(),
+            ));
+        }
+        let calculate_permit = permit;
+        tokio::task::spawn_blocking(move || {
+            let _permit = calculate_permit;
+            calculate(snapshot)
+        })
+        .await
+        .map_err(|_| LabError::Internal("automation review worker panicked".into()))?
+    }
+
+    /// Apply a durable strategy-automation lifecycle command or owned MOCK cancellation.
+    /// # Errors
+    /// Propagates CAS/idempotency conflicts, safety denials, unresolved effects, or storage failures.
+    pub async fn automation_session_write(
+        &self,
+        write: AutomationSessionWrite,
+    ) -> Result<AutomationSessionCommandResponse, LabError> {
+        self.write_automation_session(write).await
+    }
+
+    /// Best-effort completed-candle poll for `RUNNING` paper sessions whose latest boundary
+    /// is not yet present in `candle_observations`.
+    pub(super) async fn poll_due_paper_markets(&self, now: UtcTimestamp) {
+        let Ok(due) = self
+            .inner
+            .database
+            .call("due_paper_network_polls", move |store| {
+                let _ = store.reconcile_running_paper_sessions(&[], now)?;
+                store.due_paper_network_polls(now)
+            })
+            .await
+        else {
+            return;
+        };
+        if due.is_empty() {
+            return;
+        }
+        let Ok(count) = ProbeCount::try_from(crate::paper::MAX_PAPER_RECOVERY_BARS) else {
+            return;
+        };
+        let mut batches = Vec::new();
+        for req in due {
+            if self.inner.stop.is_cancelled() {
+                return;
+            }
+            if let Ok(batch) = self
+                .inner
+                .upbit
+                .poll_paper_observations(&req.market, req.interval, count, &self.inner.database)
+                .await
+            {
+                batches.push(batch);
+            }
+        }
+        if !batches.is_empty() {
+            let _ = self
+                .inner
+                .database
+                .call("reconcile_running_paper_sessions", move |store| {
+                    store.reconcile_running_paper_sessions(&batches, now)
+                })
+                .await;
+        }
     }
 }
 

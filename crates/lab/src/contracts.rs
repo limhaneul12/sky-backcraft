@@ -26,6 +26,8 @@ pub mod policy_binding;
 pub use policy_binding::*;
 pub mod delete;
 pub use delete::*;
+pub mod policy_delete;
+pub use policy_delete::*;
 pub mod experiment;
 pub use experiment::*;
 pub mod evidence;
@@ -48,6 +50,12 @@ pub mod portfolio;
 pub use portfolio::*;
 pub mod portfolio_query;
 pub use portfolio_query::*;
+pub mod paper;
+pub use paper::*;
+pub mod automation;
+pub use automation::*;
+pub mod automation_review;
+pub use automation_review::*;
 pub mod regime;
 pub use regime::*;
 pub mod maintenance;
@@ -166,13 +174,37 @@ impl From<rust_decimal::Error> for LabError {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Venue {
     Upbit,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum QuoteCurrency {
     Krw,
@@ -182,7 +214,9 @@ pub enum QuoteCurrency {
 /// listed Upbit `KRW` market is representable; symbol existence is validated
 /// against the live market catalog at collection admission, so this type
 /// enforces only the exchange symbol shape.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[schemars(with = "String")]
 pub struct Asset(String);
 
@@ -235,7 +269,9 @@ impl TryFrom<String> for Asset {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(into = "String", try_from = "String")]
 #[schemars(with = "String")]
 pub struct MarketId {
@@ -301,7 +337,19 @@ impl TryFrom<String> for MarketId {
 
 /// Candle width of raw observation data. Batch A probes `H1`; `M1`/`M5` stay
 /// opt-in for fine execution research, per the three-resolution contract.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CandleInterval {
     M1,

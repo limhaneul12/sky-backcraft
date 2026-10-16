@@ -25,6 +25,7 @@ use execution::{
     plan_passive_buy_request,
 };
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 
 const STRATEGY_VERSION: &str = "spot-lab-strategy-v1";
 const EXECUTION_POLICY_VERSION: &str = "next-bar-open-v2-decision-mark-fixed-base-quantity";
@@ -414,13 +415,13 @@ pub fn run_model(
     Ok(state.into_ledger())
 }
 
-#[derive(Debug)]
-struct PendingExecution {
-    signal_index: usize,
-    target: Weight,
-    request: PlannedFill,
-    order: OrderRecord,
-    decision_reference: PriceKrw,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PendingExecution {
+    pub(crate) signal_index: usize,
+    pub(crate) target: Weight,
+    pub(crate) request: PlannedFill,
+    pub(crate) order: OrderRecord,
+    pub(crate) decision_reference: PriceKrw,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -430,27 +431,27 @@ enum ExecutionMoment {
     TerminalClose,
 }
 
-#[derive(Debug)]
-struct EngineState {
-    run_id: RunId,
-    model_id: crate::contracts::ModelId,
-    market: crate::contracts::MarketId,
-    strategy: StrategyBinding,
-    account: Account,
-    seq: u64,
-    record_count: usize,
-    signals: Vec<SignalRecord>,
-    orders: Vec<OrderRecord>,
-    order_events: Vec<OrderRecord>,
-    fills: Vec<FillRecord>,
-    episodes: Vec<EpisodeRecord>,
-    active_episode: Option<ActiveEpisode>,
-    marks: Vec<AccountMark>,
-    last_target: Weight,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct EngineState {
+    pub(crate) run_id: RunId,
+    pub(crate) model_id: crate::contracts::ModelId,
+    pub(crate) market: crate::contracts::MarketId,
+    pub(crate) strategy: StrategyBinding,
+    pub(crate) account: Account,
+    pub(crate) seq: u64,
+    pub(crate) record_count: usize,
+    pub(crate) signals: Vec<SignalRecord>,
+    pub(crate) orders: Vec<OrderRecord>,
+    pub(crate) order_events: Vec<OrderRecord>,
+    pub(crate) fills: Vec<FillRecord>,
+    pub(crate) episodes: Vec<EpisodeRecord>,
+    pub(crate) active_episode: Option<ActiveEpisode>,
+    pub(crate) marks: Vec<AccountMark>,
+    pub(crate) last_target: Weight,
 }
 
 impl EngineState {
-    fn new(
+    pub(crate) fn new(
         run_id: RunId,
         admission: &ModelAdmission,
         strategy: StrategyBinding,
@@ -476,7 +477,7 @@ impl EngineState {
         })
     }
 
-    fn position_view(
+    pub(crate) fn position_view(
         &mut self,
         actual_weight: Decimal,
         at: UtcTimestamp,
@@ -506,7 +507,7 @@ impl EngineState {
         })
     }
 
-    fn push_signal(
+    pub(crate) fn push_signal(
         &mut self,
         bar: &CandleObservation,
         evaluation: &StrategyEvaluation,
@@ -555,7 +556,7 @@ impl EngineState {
         clippy::too_many_arguments,
         reason = "one ordered request-planning phase needs signal, liquidity, sizing and timing inputs"
     )]
-    fn create_pending(
+    pub(crate) fn create_pending(
         &mut self,
         signal_index: usize,
         target: Weight,
@@ -668,7 +669,7 @@ impl EngineState {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn process_pending_at(
+    pub(crate) fn process_pending_at(
         &mut self,
         pending: &mut Option<PendingExecution>,
         execution_bar: &CandleObservation,
@@ -731,7 +732,7 @@ impl EngineState {
         )
     }
 
-    fn process_passive_close(
+    pub(crate) fn process_passive_close(
         &mut self,
         pending: &mut Option<PendingExecution>,
         completed_bar: &CandleObservation,
@@ -793,7 +794,7 @@ impl EngineState {
         )
     }
 
-    fn cancel_pending(
+    pub(crate) fn cancel_pending(
         &mut self,
         pending: &PendingExecution,
         at: UtcTimestamp,
@@ -811,12 +812,18 @@ impl EngineState {
             None,
         )?;
         self.push_order_projection(projection)?;
-        self.signals[pending.signal_index].outcome = SignalOutcome::OrderUnfilled;
-        self.signals[pending.signal_index].reasons.push(reason);
+        if let Some(signal) = self
+            .signals
+            .get_mut(pending.signal_index)
+            .filter(|signal| signal.signal_id == pending.order.parent_signal_id)
+        {
+            signal.outcome = SignalOutcome::OrderUnfilled;
+            signal.reasons.push(reason);
+        }
         Ok(())
     }
 
-    fn expire_pending(
+    pub(crate) fn expire_pending(
         &mut self,
         pending: &PendingExecution,
         at: UtcTimestamp,
@@ -833,10 +840,14 @@ impl EngineState {
             None,
         )?;
         self.push_order_projection(projection)?;
-        self.signals[pending.signal_index].outcome = SignalOutcome::SignalExpired;
-        self.signals[pending.signal_index]
-            .reasons
-            .push(ReasonCode::SignalExpired);
+        if let Some(signal) = self
+            .signals
+            .get_mut(pending.signal_index)
+            .filter(|signal| signal.signal_id == pending.order.parent_signal_id)
+        {
+            signal.outcome = SignalOutcome::SignalExpired;
+            signal.reasons.push(ReasonCode::SignalExpired);
+        }
         Ok(())
     }
 
@@ -972,16 +983,20 @@ impl EngineState {
                 None,
             )?;
             self.push_order_projection(projection)?;
-            self.signals[pending.signal_index].outcome = match decision.reason {
-                ReasonCode::CapitalBlocked => SignalOutcome::CapitalBlocked,
-                ReasonCode::RuleBlocked | ReasonCode::QuantityRoundedToZero => {
-                    SignalOutcome::RuleBlocked
-                }
-                _ => SignalOutcome::OrderUnfilled,
-            };
-            self.signals[pending.signal_index]
-                .reasons
-                .push(decision.reason);
+            if let Some(signal) = self
+                .signals
+                .get_mut(pending.signal_index)
+                .filter(|signal| signal.signal_id == pending.order.parent_signal_id)
+            {
+                signal.outcome = match decision.reason {
+                    ReasonCode::CapitalBlocked => SignalOutcome::CapitalBlocked,
+                    ReasonCode::RuleBlocked | ReasonCode::QuantityRoundedToZero => {
+                        SignalOutcome::RuleBlocked
+                    }
+                    _ => SignalOutcome::OrderUnfilled,
+                };
+                signal.reasons.push(decision.reason);
+            }
             return Ok(());
         };
         if fill.side == Side::Buy {
@@ -1116,11 +1131,17 @@ impl EngineState {
         } else {
             self.push_order_projection(transition)?;
         }
-        self.signals[pending.signal_index].outcome = SignalOutcome::Executed;
+        if let Some(signal) = self
+            .signals
+            .get_mut(pending.signal_index)
+            .filter(|signal| signal.signal_id == pending.order.parent_signal_id)
+        {
+            signal.outcome = SignalOutcome::Executed;
+        }
         Ok(())
     }
 
-    fn push_rejected_order(
+    pub(crate) fn push_rejected_order(
         &mut self,
         signal_index: usize,
         created_at: UtcTimestamp,
@@ -1300,7 +1321,7 @@ impl EngineState {
         Ok(())
     }
 
-    fn push_mark(
+    pub(crate) fn push_mark(
         &mut self,
         kind: MarkKind,
         price: PriceKrw,
@@ -1394,7 +1415,7 @@ impl EngineState {
         Ok(())
     }
 
-    fn into_ledger(self) -> ModelLedger {
+    pub(crate) fn into_ledger(self) -> ModelLedger {
         ModelLedger {
             model_id: self.model_id,
             market: self.market,
@@ -1412,31 +1433,31 @@ impl EngineState {
     }
 }
 
-#[derive(Debug)]
-struct ActiveEpisode {
-    id: EpisodeId,
-    opened_at: UtcTimestamp,
-    closed_at: Option<UtcTimestamp>,
-    fill_ids: Vec<FillId>,
-    order_ids: Vec<OrderId>,
-    buy_notional: Decimal,
-    buy_qty: Decimal,
-    sell_notional: Decimal,
-    sell_qty: Decimal,
-    removed_basis: Decimal,
-    max_qty: Decimal,
-    quantity_seconds: Decimal,
-    last_qty: Decimal,
-    last_sample_at: UtcTimestamp,
-    realized: Decimal,
-    fees: Decimal,
-    start_equity: Decimal,
-    mae: Decimal,
-    mfe: Decimal,
-    mae_at: UtcTimestamp,
-    mfe_at: UtcTimestamp,
-    exit_reason: Option<ReasonCode>,
-    decision_marks_since_open: u64,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ActiveEpisode {
+    pub(crate) id: EpisodeId,
+    pub(crate) opened_at: UtcTimestamp,
+    pub(crate) closed_at: Option<UtcTimestamp>,
+    pub(crate) fill_ids: Vec<FillId>,
+    pub(crate) order_ids: Vec<OrderId>,
+    pub(crate) buy_notional: Decimal,
+    pub(crate) buy_qty: Decimal,
+    pub(crate) sell_notional: Decimal,
+    pub(crate) sell_qty: Decimal,
+    pub(crate) removed_basis: Decimal,
+    pub(crate) max_qty: Decimal,
+    pub(crate) quantity_seconds: Decimal,
+    pub(crate) last_qty: Decimal,
+    pub(crate) last_sample_at: UtcTimestamp,
+    pub(crate) realized: Decimal,
+    pub(crate) fees: Decimal,
+    pub(crate) start_equity: Decimal,
+    pub(crate) mae: Decimal,
+    pub(crate) mfe: Decimal,
+    pub(crate) mae_at: UtcTimestamp,
+    pub(crate) mfe_at: UtcTimestamp,
+    pub(crate) exit_reason: Option<ReasonCode>,
+    pub(crate) decision_marks_since_open: u64,
 }
 
 impl ActiveEpisode {
@@ -1705,7 +1726,7 @@ pub(crate) fn observations_for_range<'a>(
     Ok(observations)
 }
 
-fn add_millis(time: UtcTimestamp, millis: u64) -> Result<UtcTimestamp, LabError> {
+pub(crate) fn add_millis(time: UtcTimestamp, millis: u64) -> Result<UtcTimestamp, LabError> {
     let millis = i64::try_from(millis)
         .map_err(|_| LabError::InvalidConfig("latency does not fit timestamp arithmetic".into()))?;
     time.0

@@ -98,8 +98,28 @@ fn full_tool_catalog_and_malformed_inputs_use_protocol_contract()
             jobs.service(),
             McpExposure::Local,
         );
+        let (server_transport, client_transport) = tokio::io::duplex(16_384);
+        let (peer_tx, peer_rx) = tokio::sync::oneshot::channel();
+        let transport_service = service.clone();
+        let server_handle = tokio::spawn(async move {
+            let server = transport_service
+                .serve(server_transport)
+                .await
+                .map_err(|error| error.to_string())?;
+            let _ = peer_tx.send(server.peer().clone());
+            server.waiting().await.map_err(|error| error.to_string())?;
+            Ok::<(), String>(())
+        });
+        let client = ()
+            .serve(client_transport)
+            .await
+            .map_err(|error| LabError::Internal(format!("start MCP regression client: {error}")))?;
+
+        let peer = peer_rx.await.map_err(|error| LabError::Internal(error.to_string()))?;
+        let context = || RequestContext::new(rmcp::model::RequestId::Number(1), peer.clone());
         for (exposure, auth, public) in [
             (McpExposure::Local, "none", false),
+            (McpExposure::Desktop, "desktop_bearer", false),
             (McpExposure::PublicNoAuth, "none", true),
             (McpExposure::Bearer, "bearer", false),
             (McpExposure::OAuth, "oauth", false),
@@ -107,7 +127,7 @@ fn full_tool_catalog_and_malformed_inputs_use_protocol_contract()
             let mut projection = service.clone();
             projection.exposure = exposure;
             let status_result = projection
-                .lab_status()
+                .lab_status(context())
                 .await
                 .map_err(|error| LabError::Internal(format!("status projection: {error:?}")))?;
             let status: serde_json::Value = serde_json::from_str(&result_text(status_result))?;
@@ -124,21 +144,272 @@ fn full_tool_catalog_and_malformed_inputs_use_protocol_contract()
                     .is_some_and(|warning| !warning.is_empty()),
                 public
             );
+            let expected_deletion = if matches!(exposure, McpExposure::Desktop) {
+                "PREVIEW_ONLY"
+            } else if public {
+                "DISABLED_IN_PUBLIC_NO_AUTH"
+            } else {
+                "HARD_DELETE_ROWS_AND_EXCLUSIVE_FILES"
+            };
+            assert_eq!(status["deletion"]["mode"], expected_deletion);
+            assert_eq!(status["deletion"]["shared_by_all_callers"], false);
+            assert_eq!(
+                status["policy_deletion"],
+                serde_json::json!({
+                    "mode": if matches!(exposure, McpExposure::Desktop) {
+                        "POLICY_ONLY_CONFIRMED"
+                    } else {
+                        "UNAVAILABLE"
+                    },
+                    "max_items": 100,
+                    "archive_available": false,
+                    "request_readback": true,
+                    "confirmation_required": true,
+                })
+            );
         }
-        let (server_transport, client_transport) = tokio::io::duplex(16_384);
-        let server_handle = tokio::spawn(async move {
-            let server = service
-                .serve(server_transport)
-                .await
-                .map_err(|error| error.to_string())?;
-            server.waiting().await.map_err(|error| error.to_string())?;
-            Ok::<(), String>(())
-        });
-        let client = ()
-            .serve(client_transport)
+        let desktop = LabMcpService::new_with_exchange(
+            service.database.clone(),
+            service.upbit.clone(),
+            service.jobs.clone(),
+            McpExposure::Desktop,
+            UpbitExchangeService::credential_free_mock(),
+        );
+        let mut desktop_names = desktop
+            .tool_router
+            .map
+            .keys()
+            .map(std::convert::AsRef::as_ref)
+            .collect::<Vec<_>>();
+        desktop_names.sort_unstable();
+        let mut expected_desktop = DESKTOP_TOOL_NAMES.to_vec();
+        expected_desktop.sort_unstable();
+        assert_eq!(desktop_names, expected_desktop);
+        let local_private = service
+            .upbit_account_balances(context())
             .await
-            .map_err(|error| LabError::Internal(format!("start MCP regression client: {error}")))?;
-
+            .map_err(|error| LabError::Internal(format!("local private guard: {error:?}")))?;
+        assert_eq!(local_private.is_error, Some(true));
+        assert!(result_text(local_private).contains("require the native desktop capability"));
+        let desktop_private = desktop
+            .upbit_account_balances(context())
+            .await
+            .map_err(|error| LabError::Internal(format!("desktop private read: {error:?}")))?;
+        assert_ne!(desktop_private.is_error, Some(true));
+        let desktop_automation = desktop
+            .automation_session_query(object(serde_json::json!({
+                "action": "list", "offset": 0, "limit": 10
+            })), context())
+            .await
+            .map_err(|error| LabError::Internal(format!("desktop automation query: {error:?}")))?;
+        assert_ne!(desktop_automation.is_error, Some(true));
+        let rejected_request_id = crate::contracts::RequestId::new(
+            "automation-mcp-rejected-request",
+        )?;
+        let rejected_write = crate::contracts::AutomationSessionWrite::Start {
+            request_id: rejected_request_id.clone(),
+            policy_ref: crate::contracts::PolicyRevisionRef {
+                policy_id: crate::contracts::PolicyId::new("missing-automation-policy")?,
+                revision_id: crate::contracts::PolicyRevisionId::new(
+                    "missing-automation-revision",
+                )?,
+                definition_digest: crate::contracts::ContentHash::of_bytes(
+                    b"missing automation fixture",
+                ),
+            },
+            market: crate::contracts::MarketId::parse_upbit("KRW-BTC")?,
+            decision_interval: crate::contracts::CandleInterval::M1,
+            mode: crate::contracts::AutomationSessionMode::Mock,
+            risk: crate::contracts::AutomationRiskPolicy {
+                activation_loss_limit_krw: None,
+                max_order_notional_krw: crate::contracts::QuoteAmount::new(
+                    rust_decimal::Decimal::from(100_000),
+                )?,
+                max_daily_notional_krw: crate::contracts::QuoteAmount::new(
+                    rust_decimal::Decimal::from(1_000_000),
+                )?,
+                max_asset_exposure_krw: crate::contracts::QuoteAmount::new(
+                    rust_decimal::Decimal::from(100_000),
+                )?,
+                max_daily_loss_krw: crate::contracts::QuoteAmount::new(
+                    rust_decimal::Decimal::from(100_000),
+                )?,
+                max_open_orders: 1,
+                max_orders_per_interval: 1,
+                max_balance_age_seconds: 3_600,
+                max_feed_age_seconds: 3_600,
+            },
+        };
+        let rejected_write_args = serde_json::to_value(rejected_write)?
+            .as_object()
+            .cloned()
+            .ok_or_else(|| {
+                LabError::Internal("automation write did not serialize as an object".into())
+            })?;
+        let rejected_write_result = desktop
+            .automation_session_write(rejected_write_args.clone(), context())
+            .await
+            .map_err(|error| LabError::Internal(format!("desktop automation write: {error:?}")))?;
+        assert_eq!(rejected_write_result.is_error, Some(true));
+        let readback_args = object(serde_json::json!({
+            "action": "request",
+            "request_id": rejected_request_id.as_str(),
+        }));
+        let request_readback = desktop
+            .automation_session_query(readback_args, context())
+            .await
+            .map_err(|error| LabError::Internal(format!("desktop request readback: {error:?}")))?;
+        let request_readback: serde_json::Value =
+            serde_json::from_str(&result_text(request_readback))?;
+        assert_eq!(request_readback["state"], "REJECTED");
+        for exposure in [
+            McpExposure::PublicNoAuth,
+            McpExposure::OAuth,
+            McpExposure::Bearer,
+        ] {
+            let mut protected = service.clone();
+            protected.exposure = exposure;
+            let read = protected
+                .automation_session_query(object(serde_json::json!({
+                    "action": "list", "offset": 0, "limit": 10
+                })), context())
+                .await
+                .map_err(|error| LabError::Internal(format!("protected automation read: {error:?}")))?;
+            assert_eq!(read.is_error, Some(true));
+            assert!(result_text(read).contains("require the native desktop capability"));
+            let write = protected
+                .automation_session_write(rejected_write_args.clone(), context())
+                .await
+                .map_err(|error| LabError::Internal(format!("protected automation write: {error:?}")))?;
+            assert_eq!(write.is_error, Some(true));
+            assert!(result_text(write).contains("require the native desktop capability"));
+        }
+        let local_automation = service
+            .automation_session_query(object(serde_json::json!({
+                "action": "list", "offset": 0, "limit": 10
+            })), context())
+            .await
+            .map_err(|error| LabError::Internal(format!("local automation query: {error:?}")))?;
+        assert_eq!(local_automation.is_error, Some(true));
+        assert!(result_text(local_automation).contains("require the native desktop capability"));
+        for exposure in [
+            McpExposure::Local,
+            McpExposure::PublicNoAuth,
+            McpExposure::Bearer,
+            McpExposure::OAuth,
+        ] {
+            let mut protected = service.clone();
+            protected.exposure = exposure;
+            let write = protected
+                .policy_delete_write(object(serde_json::json!({})))
+                .await
+                .map_err(|error| LabError::Internal(format!("protected policy delete write: {error:?}")))?;
+            assert_eq!(write.is_error, Some(true));
+            assert!(result_text(write).contains("require the native desktop capability"));
+            let query = protected
+                .policy_delete_query(object(serde_json::json!({})))
+                .await
+                .map_err(|error| LabError::Internal(format!("protected policy delete query: {error:?}")))?;
+            assert_eq!(query.is_error, Some(true));
+            assert!(result_text(query).contains("require the native desktop capability"));
+        }
+        let missing_policy_delete = desktop
+            .policy_delete_query(object(serde_json::json!({
+                "request_id": "policy-delete-missing-query"
+            })))
+            .await
+            .map_err(|error| LabError::Internal(format!("desktop policy delete readback: {error:?}")))?;
+        let missing_policy_delete: serde_json::Value =
+            serde_json::from_str(&result_text(missing_policy_delete))?;
+        assert_eq!(missing_policy_delete["found"], false);
+        let mut definition = crate::contracts::builtin_policy_definitions()?[0].2.clone();
+        definition.name = "Synthetic MCP policy deletion".into();
+        let policy_write = PolicyWrite::Create {
+            request_id: RequestId::new("mcp-policy-delete-fixture-create")?,
+            definition,
+        };
+        let policy = desktop
+            .database
+            .call("mcp_test_policy_delete_fixture", move |store| {
+                store.write_policy(&policy_write, crate::contracts::UtcTimestamp::now())
+            })
+            .await?;
+        let preview = desktop
+            .resource_delete_preview(object(serde_json::json!({
+                "kind": "policy",
+                "policy_id": policy.snapshot.reference.policy_id.as_str(),
+            })))
+            .await
+            .map_err(|error| LabError::Internal(format!("synthetic policy preview: {error:?}")))?;
+        let preview: crate::contracts::DeletePreview =
+            serde_json::from_str(&result_text(preview))?;
+        let invalid_policy_delete = PolicyDeleteWriteRequest {
+            request_id: RequestId::new("mcp-policy-delete-invalid-confirm")?,
+            items: vec![crate::contracts::PolicyDeleteItemRequest {
+                policy_id: policy.snapshot.reference.policy_id.clone(),
+                preview: Some(crate::contracts::PolicyDeletePreviewEcho {
+                    scope_digest: Some(preview.scope_digest.clone()),
+                    expires_at: Some(preview.expires_at),
+                    confirmation_token: Some(preview.confirmation_token.clone()),
+                }),
+            }],
+            confirmation_text: "not the policy name or ID".into(),
+        };
+        let invalid_args = serde_json::to_value(&invalid_policy_delete)?
+            .as_object()
+            .cloned()
+            .ok_or_else(|| LabError::Internal("invalid policy delete was not an object".into()))?;
+        let invalid_result = desktop
+            .policy_delete_write(invalid_args)
+            .await
+            .map_err(|error| LabError::Internal(format!("invalid policy delete: {error:?}")))?;
+        assert_eq!(invalid_result.is_error, Some(true));
+        let invalid_error: crate::contracts::PolicyDeleteWriteError =
+            serde_json::from_str(&result_text(invalid_result))?;
+        assert_eq!(
+            invalid_error.error.code,
+            crate::contracts::PolicyDeleteWriteErrorCode::ConfirmationMismatch
+        );
+        let invalid_readback = desktop
+            .policy_delete_query(object(serde_json::json!({
+                "request_id": invalid_policy_delete.request_id.as_str(),
+            })))
+            .await
+            .map_err(|error| LabError::Internal(format!("invalid policy delete readback: {error:?}")))?;
+        let invalid_readback: serde_json::Value =
+            serde_json::from_str(&result_text(invalid_readback))?;
+        assert_eq!(invalid_readback["found"], false);
+        let policy_delete = PolicyDeleteWriteRequest {
+            request_id: RequestId::new("mcp-policy-delete-fixture-confirm")?,
+            items: vec![crate::contracts::PolicyDeleteItemRequest {
+                policy_id: policy.snapshot.reference.policy_id.clone(),
+                preview: Some(crate::contracts::PolicyDeletePreviewEcho {
+                    scope_digest: Some(preview.scope_digest),
+                    expires_at: Some(preview.expires_at),
+                    confirmation_token: Some(preview.confirmation_token),
+                }),
+            }],
+            confirmation_text: policy.snapshot.definition.name,
+        };
+        let policy_delete_args = serde_json::to_value(&policy_delete)?
+            .as_object()
+            .cloned()
+            .ok_or_else(|| LabError::Internal("policy delete request was not an object".into()))?;
+        let policy_delete = desktop
+            .policy_delete_write(policy_delete_args)
+            .await
+            .map_err(|error| LabError::Internal(format!("desktop policy delete write: {error:?}")))?;
+        assert_ne!(policy_delete.is_error, Some(true));
+        let policy_delete: crate::contracts::PolicyDeleteReadback =
+            serde_json::from_str(&result_text(policy_delete))?;
+        assert_eq!(
+            policy_delete.state,
+            Some(crate::contracts::PolicyDeleteRequestState::Complete)
+        );
+        assert_eq!(
+            policy_delete.items.as_ref().unwrap()[0].status,
+            crate::contracts::PolicyDeleteItemStatus::Deleted
+        );
         let tools = client
             .list_all_tools()
             .await
@@ -152,6 +423,8 @@ fn full_tool_catalog_and_malformed_inputs_use_protocol_contract()
             names,
             [
                 "artifact_query",
+                "automation_session_query",
+                "automation_session_write",
                 "collect_data",
                 "collection_schedule",
                 "dataset_query",
@@ -160,6 +433,9 @@ fn full_tool_catalog_and_malformed_inputs_use_protocol_contract()
                 "history_query",
                 "job_control",
                 "lab_status",
+                "live_order_control",
+                "paper_session_query",
+                "paper_session_write",
                 "plan_backtest",
                 "policy_query",
                 "policy_write",
@@ -171,6 +447,17 @@ fn full_tool_catalog_and_malformed_inputs_use_protocol_contract()
                 "result_query",
                 "run_backtests",
                 "storage_maintenance",
+                "trading_control",
+                "upbit_account_balances",
+                "upbit_order_cancel",
+                "upbit_order_chance",
+                "upbit_order_execute",
+                "upbit_order_get",
+                "upbit_order_preview",
+                "upbit_order_reconcile",
+                "upbit_order_test",
+                "upbit_orders_closed",
+                "upbit_orders_open",
                 "verify_run",
             ]
         );
@@ -182,19 +469,41 @@ fn full_tool_catalog_and_malformed_inputs_use_protocol_contract()
             let expected_read_only = matches!(
                 tool.name.as_ref(),
                 "lab_status"
+                    | "automation_session_query"
                     | "dataset_query"
                     | "history_query"
+                    | "paper_session_query"
                     | "policy_query"
                     | "result_query"
                     | "artifact_query"
                     | "resource_delete_preview"
+                    | "upbit_account_balances"
+                    | "upbit_order_chance"
+                    | "upbit_order_get"
+                    | "upbit_orders_open"
+                    | "upbit_orders_closed"
+                    | "upbit_order_preview"
+                    | "upbit_order_reconcile"
             );
             let expected_destructive = tool.name.as_ref() == "resource_hard_delete";
             assert_eq!(annotations.read_only_hint, Some(expected_read_only));
             assert_eq!(annotations.destructive_hint, Some(expected_destructive));
             assert_eq!(
                 annotations.open_world_hint,
-                Some(matches!(tool.name.as_ref(), "probe_upbit" | "collect_data" | "collection_schedule"))
+                Some(matches!(
+                    tool.name.as_ref(),
+                    "probe_upbit"
+                        | "collect_data"
+                        | "collection_schedule"
+                        | "upbit_account_balances"
+                        | "upbit_order_chance"
+                        | "upbit_order_get"
+                        | "upbit_orders_open"
+                        | "upbit_orders_closed"
+                        | "upbit_order_test"
+                        | "upbit_order_reconcile"
+                        | "automation_session_write"
+                ))
             );
             assert_eq!(
                 tool.input_schema.get("type"),
@@ -338,6 +647,22 @@ fn full_tool_catalog_and_malformed_inputs_use_protocol_contract()
             )));
         }
 
+        let mut paper_options = CallToolRequestParams::default();
+        paper_options.name = "paper_session_query".into();
+        paper_options.arguments = Some(object(serde_json::json!({
+            "action": "start_options"
+        })));
+        let paper_options = client
+            .call_tool(paper_options)
+            .await
+            .map_err(|error| LabError::Internal(format!("query paper start_options: {error}")))?;
+        if paper_options.is_error == Some(true) {
+            return Err(LabError::Internal(format!(
+                "paper_session_query start_options returned tool error: {}",
+                result_text(paper_options)
+            )));
+        }
+
         client.cancel().await.map_err(|error| {
             LabError::Internal(format!("cancel MCP regression client: {error}"))
         })?;
@@ -358,6 +683,10 @@ fn full_tool_catalog_and_malformed_inputs_use_protocol_contract()
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one transport journey verifies the full public-no-auth security boundary"
+)]
 fn public_no_auth_blocks_mutations_and_permits_reads() -> Result<(), Box<dyn std::error::Error>> {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
@@ -417,6 +746,21 @@ fn public_no_auth_blocks_mutations_and_permits_reads() -> Result<(), Box<dyn std
         assert_eq!(policy_output.is_error, Some(true));
         assert!(result_text(policy_output).contains("policy mutation is disabled"));
 
+        let mut paper_write_params = CallToolRequestParams::default();
+        paper_write_params.name = "paper_session_write".into();
+        paper_write_params.arguments = Some(object(serde_json::json!({
+            "action": "stop",
+            "request_id": "req-paper-blocked",
+            "session_id": "00000000-0000-0000-0000-000000000001",
+            "expected_sequence": 1
+        })));
+        let paper_write_output = client
+            .call_tool(paper_write_params)
+            .await
+            .map_err(|e| LabError::Internal(e.to_string()))?;
+        assert_eq!(paper_write_output.is_error, Some(true));
+        assert!(result_text(paper_write_output).contains("paper session mutation is disabled"));
+
         let mut compact_params = CallToolRequestParams::default();
         compact_params.name = "storage_maintenance".into();
         compact_params.arguments = Some(object(serde_json::json!({ "action": "compact" })));
@@ -445,6 +789,54 @@ fn public_no_auth_blocks_mutations_and_permits_reads() -> Result<(), Box<dyn std
             .await
             .map_err(|e| LabError::Internal(e.to_string()))?;
         assert_ne!(list_output.is_error, Some(true));
+
+        let mut paper_list_params = CallToolRequestParams::default();
+        paper_list_params.name = "paper_session_query".into();
+        paper_list_params.arguments =
+            Some(object(serde_json::json!({ "action": "list", "limit": 10 })));
+        let paper_list_output = client
+            .call_tool(paper_list_params)
+            .await
+            .map_err(|e| LabError::Internal(e.to_string()))?;
+        assert_ne!(paper_list_output.is_error, Some(true));
+
+        for (tool_name, arguments) in [
+            (
+                "automation_session_query",
+                serde_json::json!({ "action": "list", "offset": 0, "limit": 10 }),
+            ),
+            (
+                "automation_session_write",
+                serde_json::json!({
+                    "action": "stop",
+                    "request_id": "req-public-automation",
+                    "session_id": "automation-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "expected_sequence": 1
+                }),
+            ),
+            ("upbit_account_balances", serde_json::json!({})),
+            ("upbit_orders_open", serde_json::json!({"limit": 10})),
+            (
+                "upbit_order_cancel",
+                serde_json::json!({"order_id": "mock-order"}),
+            ),
+            ("trading_control", serde_json::json!({"action": "status"})),
+            ("live_order_control", serde_json::json!({"action": "status"})),
+            ("live_order_control", serde_json::json!({"action": "enable", "request_id":"public-denied", "expected_sequence":0, "expected_epoch":"uninitialized", "confirmation":"ENABLE_LIVE_ORDER_SENDING"})),
+        ] {
+            let mut request = CallToolRequestParams::default();
+            request.name = tool_name.into();
+            request.arguments = Some(object(arguments));
+            let output = client
+                .call_tool(request)
+                .await
+                .map_err(|error| LabError::Internal(error.to_string()))?;
+            assert_eq!(output.is_error, Some(true), "{tool_name} must be denied");
+            assert!(
+                result_text(output).contains("require the native desktop capability"),
+                "{tool_name} must fail before private-client access"
+            );
+        }
 
         client
             .cancel()

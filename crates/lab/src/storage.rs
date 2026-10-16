@@ -4,13 +4,18 @@
 //! module deliberately contains no async runtime bridge or hidden worker pool.
 
 mod artifact_read;
+mod automation_review;
+mod automation_store;
+mod control_store;
 mod delete_store;
+mod equity_chart;
 mod evidence_store;
 mod history_store;
 mod job_store;
 mod ledger_seal;
 mod maintenance_store;
 mod migrations;
+mod paper_store;
 mod plan_store;
 mod policy_store;
 mod portfolio_store;
@@ -22,8 +27,11 @@ pub use crate::contracts::{
     DatasetDigests, dataset_digests, dataset_id, normalized_request_digest, observation_digest,
 };
 pub use artifact_read::ArtifactChunkRead;
+pub(crate) use delete_store::PolicyDeleteAdmission;
+pub use equity_chart::EquityChartProjection;
 pub use job_store::AttemptPublication;
 pub use ledger_seal::RunLedgerSealStats;
+pub use paper_store::PaperPollRequirement;
 pub use plan_store::StoredPlan;
 pub use query_read::{
     JobQueueStatus, ModelCostSummary, ModelResultSummary, RunResultSummary, ValidationResultSummary,
@@ -468,6 +476,7 @@ impl Store {
         configure_database_capacity(&connection)?;
         migrations::apply(&mut connection)?;
         delete_store::recover_pending_file_removals(&mut connection, &root)?;
+        delete_store::recover_interrupted_policy_deletes(&mut connection)?;
         Ok(Self { connection, raw })
     }
 
@@ -1789,11 +1798,8 @@ fn validate_snapshot(snapshot: &DatasetSnapshot) -> Result<(), LabError> {
 }
 
 fn validate_snapshot_bounds(snapshot: &DatasetSnapshot) -> Result<(), LabError> {
-    let raw_limit = usize::try_from(MAX_COLLECTION_CALLS).map_err(|_| {
-        LabError::ResourceLimit("raw-object limit exceeds platform capacity".into())
-    })?;
     if snapshot.observations.len() > MAX_DATASET_ROWS
-        || snapshot.manifest.raw_objects.len() > raw_limit
+        || snapshot.manifest.raw_objects.len() > MAX_DATASET_ROWS
     {
         return Err(LabError::ResourceLimit(
             "dataset exceeds row or raw-object bounds".into(),
@@ -2043,7 +2049,10 @@ fn insert_dataset_quality(
     Ok(())
 }
 
-fn insert_raw(transaction: &Transaction<'_>, object: &RawObjectRef) -> Result<(), LabError> {
+pub(super) fn insert_raw(
+    transaction: &Transaction<'_>,
+    object: &RawObjectRef,
+) -> Result<(), LabError> {
     let json = serde_json::to_string(object).map_err(json_error)?;
     let existing = transaction
         .query_row(
@@ -2121,7 +2130,7 @@ fn query_collection_raw_bytes(
     u64::try_from(used).map_err(|_| LabError::DataCorrupt("negative collection byte usage".into()))
 }
 
-fn insert_observation(
+pub(super) fn insert_observation(
     transaction: &Transaction<'_>,
     observation: &CandleObservation,
 ) -> Result<(), LabError> {

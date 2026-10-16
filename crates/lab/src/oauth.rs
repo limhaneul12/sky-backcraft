@@ -1,9 +1,15 @@
 //! Small, bounded OAuth 2.1 authorization server for the MCP HTTP transport.
 //!
-//! The server intentionally keeps grants in process memory. Restarting the
-//! process invalidates clients, pending approvals, authorization codes and
-//! access tokens, which is appropriate for the operator-owned desktop app.
+//! Pending approvals, authorization codes, tokens and refresh grants stay in
+//! process memory. An optional operator-owned file can pin bounded public OAuth
+//! client IDs and callbacks across restarts; without it, DCR clients are ephemeral.
+//! Managed trading consent opens the shared send gate only after a fresh
+//! owner-approved authorization-code exchange completes PKCE; refresh never reopens it.
 
+use crate::upbit::live_order_control::{
+    LiveOrderControlAction, LiveOrderControlOutcome, LiveOrderControlRequest,
+    LiveOrderControlService,
+};
 use axum::Router;
 use axum::extract::{RawForm, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode, Uri, header};
@@ -11,7 +17,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read as _;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -25,6 +31,130 @@ const CODE_TTL: Duration = Duration::from_mins(5);
 const TOKEN_TTL: Duration = Duration::from_hours(1);
 const REFRESH_TOKEN_TTL: Duration = Duration::from_hours(30 * 24);
 const SCOPE: &str = "mcp";
+// This must match the private confirmation enforced by LiveOrderControlService.
+const LIVE_ORDER_ENABLE_CONFIRMATION: &str = "ENABLE_LIVE_ORDER_SENDING";
+
+/// Scope authority verified by the OAuth transport, never a tool argument.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OAuthPermissions {
+    Research,
+    TradingRead,
+    TradingControl,
+}
+
+impl OAuthPermissions {
+    fn parse(raw: Option<&str>, trading: bool) -> Option<Self> {
+        let mut research = false;
+        let mut read = false;
+        let mut control = false;
+        for scope in raw.unwrap_or(SCOPE).split_ascii_whitespace() {
+            match scope {
+                "mcp" => research = true,
+                "trading:read" if trading => read = true,
+                "trading:control" if trading => control = true,
+                _ => return None,
+            }
+        }
+        if !research || (control && !read) {
+            return None;
+        }
+        Some(if control {
+            Self::TradingControl
+        } else if read {
+            Self::TradingRead
+        } else {
+            Self::Research
+        })
+    }
+
+    #[must_use]
+    pub const fn can_read_trading(self) -> bool {
+        matches!(self, Self::TradingRead | Self::TradingControl)
+    }
+
+    #[must_use]
+    pub const fn can_control_trading(self) -> bool {
+        matches!(self, Self::TradingControl)
+    }
+
+    const fn description(self) -> &'static str {
+        match self {
+            Self::Research => {
+                "전략 연구·백테스트·결과 조회. 실계좌 조회와 거래 제어는 허용하지 않습니다."
+            }
+            Self::TradingRead => {
+                "전략 연구 및 실제 계좌·주문·체결 기록 조회. 거래 제어는 허용하지 않습니다."
+            }
+            Self::TradingControl => {
+                "실제 계좌·주문·체결 기록 조회와 자동매매 시작·일시중단·재개·정지. 실주문 전송 켜기·끄기도 허용합니다. 전송은 기본 OFF이며 별도 확인이 필요하고, 켜기만으로 전략을 시작하지 않습니다."
+            }
+        }
+    }
+
+    const fn scope(self) -> &'static str {
+        match self {
+            Self::Research => "mcp",
+            Self::TradingRead => "mcp trading:read",
+            Self::TradingControl => "mcp trading:read trading:control",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OAuthConsentPolicy {
+    ResearchOnly,
+    RequestedScope,
+    FullTradingOnOwnerApproval,
+}
+
+impl OAuthConsentPolicy {
+    const fn supports_trading_scopes(self) -> bool {
+        !matches!(self, Self::ResearchOnly)
+    }
+
+    const fn approved_permissions(self, requested: OAuthPermissions) -> OAuthPermissions {
+        match self {
+            Self::FullTradingOnOwnerApproval => OAuthPermissions::TradingControl,
+            Self::ResearchOnly | Self::RequestedScope => requested,
+        }
+    }
+
+    const fn consent_description(
+        self,
+        permissions: OAuthPermissions,
+        managed_send_gate_bound: bool,
+    ) -> &'static str {
+        match (self, permissions) {
+            (Self::FullTradingOnOwnerApproval, OAuthPermissions::TradingControl)
+                if managed_send_gate_bound =>
+            {
+                "실제 계좌·주문·체결 기록 조회, 자동매매 시작·일시중지·재개·정지, 거래 허용 제어와 실주문 전송을 허용합니다. 운영자 승인 코드와 OAuth PKCE 연결이 완료되면 공유 실주문 전송 스위치가 ON됩니다. 이 승인은 전략을 시작하거나 재개하지 않습니다. 이미 실행 중인 전략이 있으면 실제 주문이 전송될 수 있습니다."
+            }
+            (Self::FullTradingOnOwnerApproval, OAuthPermissions::TradingControl) => {
+                "실제 계좌·주문·체결 기록 조회, 자동매매 시작·일시중지·재개·정지와 거래 허용 제어를 허용합니다. 현재 서버에는 이 OAuth 동의와 연결된 관리형 실주문 전송 제어가 없어 연결 승인만으로 실주문 전송 게이트가 열리지 않습니다."
+            }
+            (_, permissions) => permissions.description(),
+        }
+    }
+
+    const fn consent_button_label(
+        self,
+        permissions: OAuthPermissions,
+        managed_send_gate_bound: bool,
+    ) -> &'static str {
+        match (self, permissions) {
+            (Self::FullTradingOnOwnerApproval, OAuthPermissions::TradingControl)
+                if managed_send_gate_bound =>
+            {
+                "실거래 권한 및 전송 허용 승인"
+            }
+            (Self::FullTradingOnOwnerApproval, OAuthPermissions::TradingControl) => {
+                "실거래 권한 승인"
+            }
+            _ => "승인",
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct OAuthState {
@@ -32,11 +162,13 @@ pub struct OAuthState {
 }
 
 struct OAuthInner {
+    consent_policy: OAuthConsentPolicy,
     public_url: String,
     public_host: String,
     resource: String,
     owner_code: String,
     grants: Mutex<Grants>,
+    managed_live_order_control: Mutex<Option<LiveOrderControlService>>,
 }
 
 #[derive(Default)]
@@ -53,9 +185,28 @@ struct Client {
     redirect_uris: Vec<String>,
     display_name: String,
     registered_at: Instant,
+    pinned: bool,
+}
+
+/// Operator-owned OAuth client registry. It stores public client identifiers
+/// and exact callback allowlists only; authorization grants remain ephemeral.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OAuthClientRegistryConfig {
+    pub issuer: String,
+    pub clients: Vec<OAuthClientConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OAuthClientConfig {
+    pub client_id: String,
+    pub redirect_uris: Vec<String>,
+    pub client_name: String,
 }
 
 struct PendingApproval {
+    permissions: OAuthPermissions,
     client_id: String,
     redirect_uri: String,
     state: String,
@@ -66,6 +217,7 @@ struct PendingApproval {
 }
 
 struct AuthorizationCode {
+    permissions: OAuthPermissions,
     client_id: String,
     redirect_uri: String,
     resource: String,
@@ -74,6 +226,7 @@ struct AuthorizationCode {
 }
 
 struct AccessToken {
+    permissions: OAuthPermissions,
     client_id: String,
     resource: String,
     expires_at: Instant,
@@ -89,6 +242,7 @@ enum GrantError {
     InvalidRequest,
     AccessDenied,
     InvalidGrant,
+    InvalidScope,
     Capacity,
 }
 
@@ -125,6 +279,160 @@ impl OAuthState {
     /// Returns an error when the public URL is not an HTTPS origin or the
     /// owner approval code does not satisfy the bounded secret contract.
     pub fn new(public_url: &str, owner_code: String) -> Result<Self, String> {
+        Self::create(public_url, owner_code, OAuthConsentPolicy::ResearchOnly)
+    }
+
+    /// Explicit operator opt-in to financial scopes; order sending is separate.
+    ///
+    /// # Errors
+    /// Returns the same origin/owner-secret validation errors as `new`.
+    pub fn new_with_trading_scopes(public_url: &str, owner_code: String) -> Result<Self, String> {
+        Self::create(public_url, owner_code, OAuthConsentPolicy::RequestedScope)
+    }
+
+    /// Use the production policy that requests all enabled trading capabilities
+    /// on the owner consent page for every accepted OAuth scope request.
+    ///
+    /// Each request must still pass client, callback, audience and PKCE checks,
+    /// and the owner must approve it before the full grant is issued.
+    ///
+    /// # Errors
+    /// Returns the same origin/owner-secret validation errors as `new`.
+    pub fn new_with_full_trading_on_consent(
+        public_url: &str,
+        owner_code: String,
+    ) -> Result<Self, String> {
+        Self::create(
+            public_url,
+            owner_code,
+            OAuthConsentPolicy::FullTradingOnOwnerApproval,
+        )
+    }
+
+    /// Pin an issuer-matched, operator-pre-registered public OAuth client set.
+    ///
+    /// This restores client IDs and callback allowlists after restart without
+    /// persisting or granting approvals, codes, access tokens or refresh tokens.
+    /// Dynamic registration remains enabled for other clients.
+    ///
+    /// # Errors
+    /// Returns an error for an issuer mismatch, invalid or duplicate client,
+    /// client collision, or a registry that exceeds the bounded client table.
+    pub fn with_pre_registered_clients(
+        self,
+        configuration: OAuthClientRegistryConfig,
+    ) -> Result<Self, String> {
+        if configuration.issuer != self.inner.public_url {
+            return Err(
+                "oauth-clients.json issuer must exactly match the validated OAuth issuer".into(),
+            );
+        }
+        if configuration.clients.len() > MAX_CLIENTS {
+            return Err(format!(
+                "oauth-clients.json supports at most {MAX_CLIENTS} clients"
+            ));
+        }
+
+        let mut configured_ids = HashSet::with_capacity(configuration.clients.len());
+        let mut clients = Vec::with_capacity(configuration.clients.len());
+        for configured in configuration.clients {
+            if configured.client_id.is_empty()
+                || configured.client_id.len() > 256
+                || configured
+                    .client_id
+                    .chars()
+                    .any(|character| character.is_whitespace() || character.is_control())
+                || !configured_ids.insert(configured.client_id.clone())
+            {
+                return Err("oauth-clients.json contains an invalid or duplicate client_id".into());
+            }
+            if configured.redirect_uris.is_empty()
+                || configured.redirect_uris.len() > 8
+                || configured
+                    .redirect_uris
+                    .iter()
+                    .any(|uri| !valid_redirect_uri(uri))
+            {
+                return Err(format!(
+                    "oauth-clients.json client {} has invalid redirect_uris",
+                    configured.client_id
+                ));
+            }
+            if configured.client_name.trim().is_empty()
+                || configured.client_name.chars().count() > 120
+                || configured.client_name.chars().any(char::is_control)
+            {
+                return Err(format!(
+                    "oauth-clients.json client {} has an invalid client_name",
+                    configured.client_id
+                ));
+            }
+            clients.push((
+                configured.client_id,
+                Client {
+                    redirect_uris: configured.redirect_uris,
+                    display_name: configured.client_name,
+                    registered_at: Instant::now(),
+                    pinned: true,
+                },
+            ));
+        }
+
+        let mut grants = self
+            .inner
+            .grants
+            .lock()
+            .map_err(|_| "OAuth client registry is unavailable".to_owned())?;
+        if grants.clients.len() + clients.len() > MAX_CLIENTS {
+            return Err("oauth-clients.json exceeds the remaining OAuth client capacity".into());
+        }
+        if clients
+            .iter()
+            .any(|(client_id, _)| grants.clients.contains_key(client_id))
+        {
+            return Err("oauth-clients.json client_id collides with an existing client".into());
+        }
+        for (client_id, client) in clients {
+            grants.clients.insert(client_id, client);
+        }
+        drop(grants);
+        Ok(self)
+    }
+
+    /// Bind the process-owned durable control service used after fresh,
+    /// owner-approved OAuth authorization-code exchanges.
+    ///
+    /// This is available only under the production full-consent policy and may
+    /// be bound once. The service retains the existing database and shared
+    /// order-send gate authority; OAuth stores no gate state.
+    ///
+    /// # Errors
+    /// Returns an error if the state uses another consent policy, the service
+    /// is already bound, or its owner mutex has been poisoned.
+    pub fn bind_managed_live_order_control(
+        &self,
+        service: LiveOrderControlService,
+    ) -> Result<(), String> {
+        if self.inner.consent_policy != OAuthConsentPolicy::FullTradingOnOwnerApproval {
+            return Err("managed OAuth order sending requires full-trading owner consent".into());
+        }
+        let mut bound = self
+            .inner
+            .managed_live_order_control
+            .lock()
+            .map_err(|_| "managed OAuth order control is unavailable".to_owned())?;
+        if bound.is_some() {
+            return Err("managed OAuth order control was already bound".into());
+        }
+        *bound = Some(service);
+        Ok(())
+    }
+
+    fn create(
+        public_url: &str,
+        owner_code: String,
+        consent_policy: OAuthConsentPolicy,
+    ) -> Result<Self, String> {
         let public_url = public_url.trim_end_matches('/').to_owned();
         let public_host = parse_public_origin(&public_url).ok_or_else(|| {
             "--public-url must be an https origin without a path, query, or fragment".to_owned()
@@ -134,11 +442,13 @@ impl OAuthState {
         }
         Ok(Self {
             inner: Arc::new(OAuthInner {
+                consent_policy,
                 resource: format!("{public_url}/mcp"),
                 public_url,
                 public_host,
                 owner_code,
                 grants: Mutex::new(Grants::default()),
+                managed_live_order_control: Mutex::new(None),
             }),
         })
     }
@@ -179,13 +489,120 @@ impl OAuthState {
 
     #[must_use]
     pub fn accepts_bearer(&self, headers: &HeaderMap) -> bool {
-        let Some(token) = bearer_token(headers) else {
-            return false;
-        };
-        let Ok(mut grants) = self.inner.grants.lock() else {
-            return false;
-        };
-        grants.valid_access_token(token, &self.inner.resource, Instant::now())
+        self.permissions_for_headers(headers).is_some()
+    }
+
+    #[must_use]
+    pub fn permissions_for_headers(&self, headers: &HeaderMap) -> Option<OAuthPermissions> {
+        let token = bearer_token(headers)?;
+        let mut grants = self.inner.grants.lock().ok()?;
+        grants.valid_access_permissions(token, &self.inner.resource, Instant::now())
+    }
+
+    fn supported_scopes(&self) -> Vec<&'static str> {
+        if self.inner.consent_policy.supports_trading_scopes() {
+            vec![SCOPE, "trading:read", "trading:control"]
+        } else {
+            vec![SCOPE]
+        }
+    }
+}
+
+/// Hash the one-use, owner-approved code into a fresh durable CAS identity.
+/// The authorization code and bearer tokens never appear in the request ID.
+fn consent_live_order_request_id(client_id: &str, code: &str, resource: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"sky-backcraft-oauth-live-order-consent-v1\0");
+    digest.update(client_id.as_bytes());
+    digest.update([0]);
+    digest.update(resource.as_bytes());
+    digest.update([0]);
+    digest.update(code.as_bytes());
+    format!("oauth-consent-{}", base64url(&digest.finalize()))
+}
+
+fn discard_unreturned_tokens(state: &OAuthState, access_token: &str, refresh_token: &str) {
+    if let Ok(mut grants) = state.inner.grants.lock() {
+        grants.tokens.remove(access_token);
+        grants.refresh_tokens.remove(refresh_token);
+    }
+}
+
+async fn enable_managed_live_order_sending_after_consent(
+    state: &OAuthState,
+    client_id: &str,
+    code: &str,
+    resource: &str,
+) -> Result<(), ()> {
+    let service = {
+        let bound = state
+            .inner
+            .managed_live_order_control
+            .lock()
+            .map_err(|_| ())?;
+        bound.clone()
+    };
+    let Some(service) = service else {
+        // Standalone OAuth without the managed gate remains operator hard-off.
+        return Ok(());
+    };
+    let status = service
+        .execute(LiveOrderControlRequest {
+            action: LiveOrderControlAction::Status,
+            request_id: None,
+            expected_sequence: None,
+            expected_epoch: None,
+            confirmation: None,
+        })
+        .await
+        .map_err(|_| ())?;
+    if !status.live_order_control_available || !status.confirmation_required {
+        return Err(());
+    }
+    if status.live_trading_enabled {
+        return Ok(());
+    }
+
+    let request_id = consent_live_order_request_id(client_id, code, resource);
+    let request = LiveOrderControlRequest {
+        action: LiveOrderControlAction::Enable,
+        request_id: Some(request_id.clone()),
+        expected_sequence: Some(status.sequence),
+        expected_epoch: Some(status.boot_epoch),
+        confirmation: Some(LIVE_ORDER_ENABLE_CONFIRMATION.to_owned()),
+    };
+    match service.execute(request).await {
+        Ok(response) if response.live_order_control_available && response.live_trading_enabled => {
+            Ok(())
+        }
+        Ok(_) => Err(()),
+        Err(_) => {
+            // Reconcile one uncertain result by its exact durable ID. Never
+            // retry the mutation from an authorization/token request.
+            let readback = service
+                .execute(LiveOrderControlRequest {
+                    action: LiveOrderControlAction::Request,
+                    request_id: Some(request_id.clone()),
+                    expected_sequence: None,
+                    expected_epoch: None,
+                    confirmation: None,
+                })
+                .await
+                .map_err(|_| ())?;
+            let acknowledged = readback.receipt.as_ref().is_some_and(|receipt| {
+                receipt.request_id == request_id
+                    && receipt.action == LiveOrderControlAction::Enable
+                    && receipt.outcome == LiveOrderControlOutcome::Acknowledged
+            });
+            if readback.live_order_control_available
+                && readback.live_trading_enabled
+                && acknowledged
+            {
+                Ok(())
+            } else {
+                Err(())
+            }
+        }
     }
 }
 
@@ -205,11 +622,16 @@ impl Grants {
     }
 
     fn insert_client_bounded(&mut self, client_id: String, client: Client) -> Result<(), ()> {
+        if self.clients.contains_key(&client_id) {
+            return Err(());
+        }
         if self.clients.len() >= MAX_CLIENTS {
             let oldest_unused = self
                 .clients
                 .iter()
-                .filter(|(candidate, _)| !self.client_has_issued_grant(candidate))
+                .filter(|(candidate, registered)| {
+                    !registered.pinned && !self.client_has_issued_grant(candidate)
+                })
                 .min_by_key(|(_, registered)| registered.registered_at)
                 .map(|(candidate, _)| candidate.clone());
             let Some(oldest_unused) = oldest_unused else {
@@ -290,6 +712,7 @@ impl Grants {
         self.codes.insert(
             code,
             AuthorizationCode {
+                permissions: pending.permissions,
                 client_id: pending.client_id,
                 redirect_uri: pending.redirect_uri,
                 resource: pending.resource,
@@ -305,7 +728,7 @@ impl Grants {
         request: CodeRedemption<'_>,
         issued: IssuedTokenPair,
         now: Instant,
-    ) -> Result<(), GrantError> {
+    ) -> Result<OAuthPermissions, GrantError> {
         self.prune(now);
         let Some(grant) = self.codes.get(request.code) else {
             return Err(GrantError::InvalidGrant);
@@ -331,6 +754,7 @@ impl Grants {
         self.tokens.insert(
             issued.access_token,
             AccessToken {
+                permissions: grant.permissions,
                 client_id: request.client_id.into(),
                 resource: grant.resource,
                 expires_at: now + TOKEN_TTL,
@@ -339,12 +763,13 @@ impl Grants {
         self.refresh_tokens.insert(
             issued.refresh_token,
             AccessToken {
+                permissions: grant.permissions,
                 client_id: request.client_id.into(),
                 resource: request.expected_resource.into(),
                 expires_at: now + REFRESH_TOKEN_TTL,
             },
         );
-        Ok(())
+        Ok(grant.permissions)
     }
 
     fn rotate_refresh(
@@ -352,7 +777,7 @@ impl Grants {
         request: RefreshRequest<'_>,
         issued: IssuedTokenPair,
         now: Instant,
-    ) -> Result<(), GrantError> {
+    ) -> Result<OAuthPermissions, GrantError> {
         self.prune(now);
         if !self.clients.contains_key(request.client_id) {
             return Err(GrantError::InvalidGrant);
@@ -367,15 +792,22 @@ impl Grants {
             self.refresh_tokens.remove(request.refresh_token);
             return Err(GrantError::InvalidGrant);
         }
+        if request
+            .requested_permissions
+            .is_some_and(|permissions| permissions != grant.permissions)
+        {
+            return Err(GrantError::InvalidScope);
+        }
         if self.tokens.len() >= MAX_TOKENS {
             return Err(GrantError::Capacity);
         }
-        let Some(_grant) = self.refresh_tokens.remove(request.refresh_token) else {
+        let Some(grant) = self.refresh_tokens.remove(request.refresh_token) else {
             return Err(GrantError::InvalidGrant);
         };
         self.tokens.insert(
             issued.access_token,
             AccessToken {
+                permissions: grant.permissions,
                 client_id: request.client_id.into(),
                 resource: request.expected_resource.into(),
                 expires_at: now + TOKEN_TTL,
@@ -384,23 +816,33 @@ impl Grants {
         self.refresh_tokens.insert(
             issued.refresh_token,
             AccessToken {
+                permissions: grant.permissions,
                 client_id: request.client_id.into(),
                 resource: request.expected_resource.into(),
                 expires_at: now + REFRESH_TOKEN_TTL,
             },
         );
-        Ok(())
+        Ok(grant.permissions)
     }
 
+    #[cfg(test)]
     fn valid_access_token(&mut self, token: &str, resource: &str, now: Instant) -> bool {
-        let Some(access) = self.tokens.get(token) else {
-            return false;
-        };
+        self.valid_access_permissions(token, resource, now)
+            .is_some()
+    }
+
+    fn valid_access_permissions(
+        &mut self,
+        token: &str,
+        resource: &str,
+        now: Instant,
+    ) -> Option<OAuthPermissions> {
+        let access = self.tokens.get(token)?;
         if access.resource == resource && access.expires_at > now {
-            return true;
+            return Some(access.permissions);
         }
         self.tokens.remove(token);
-        false
+        None
     }
 }
 
@@ -424,6 +866,7 @@ struct CodeRedemption<'a> {
 
 #[derive(Clone, Copy)]
 struct RefreshRequest<'a> {
+    requested_permissions: Option<OAuthPermissions>,
     refresh_token: &'a str,
     client_id: &'a str,
     resource: &'a str,
@@ -441,7 +884,7 @@ async fn protected_resource(State(state): State<OAuthState>) -> Response {
         &serde_json::json!({
             "resource": state.inner.resource,
             "authorization_servers": [state.inner.public_url],
-            "scopes_supported": [SCOPE],
+            "scopes_supported": state.supported_scopes(),
             "bearer_methods_supported": ["header"],
             "resource_name": "Sky Backcraft MCP"
         }),
@@ -461,7 +904,7 @@ async fn authorization_server(State(state): State<OAuthState>) -> Response {
             "grant_types_supported": ["authorization_code", "refresh_token"],
             "code_challenge_methods_supported": ["S256"],
             "token_endpoint_auth_methods_supported": ["none"],
-            "scopes_supported": [SCOPE],
+            "scopes_supported": state.supported_scopes(),
             "authorization_response_iss_parameter_supported": true
         }),
     )
@@ -505,6 +948,7 @@ async fn register(State(state): State<OAuthState>, body: String) -> Response {
         redirect_uris: request.redirect_uris.clone(),
         display_name: name.clone(),
         registered_at: Instant::now(),
+        pinned: false,
     };
     {
         let Ok(mut grants) = state.inner.grants.lock() else {
@@ -550,13 +994,22 @@ async fn authorize(State(state): State<OAuthState>, RawQuery(query): RawQuery) -
     };
     if params.get("response_type").map(String::as_str) != Some("code")
         || params.get("code_challenge_method").map(String::as_str) != Some("S256")
-        || params.get("scope").is_some_and(|scope| scope != SCOPE)
         || resource != &state.inner.resource
         || challenge.len() != 43
         || !challenge.bytes().all(is_base64url_byte)
     {
         return oauth_error(StatusCode::BAD_REQUEST, "invalid_request");
     }
+    let Some(requested_permissions) = OAuthPermissions::parse(
+        params.get("scope").map(String::as_str),
+        state.inner.consent_policy.supports_trading_scopes(),
+    ) else {
+        return oauth_error(StatusCode::BAD_REQUEST, "invalid_scope");
+    };
+    let permissions = state
+        .inner
+        .consent_policy
+        .approved_permissions(requested_permissions);
     let (client_name, redirect_registered) = {
         let Ok(grants) = state.inner.grants.lock() else {
             return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
@@ -579,6 +1032,7 @@ async fn authorize(State(state): State<OAuthState>, RawQuery(query): RawQuery) -
         return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
     };
     let pending = PendingApproval {
+        permissions,
         client_id: client_id.clone(),
         redirect_uri: redirect_uri.clone(),
         state: state_param.clone(),
@@ -599,7 +1053,20 @@ async fn authorize(State(state): State<OAuthState>, RawQuery(query): RawQuery) -
             return oauth_error(StatusCode::BAD_REQUEST, "unauthorized_client");
         }
     }
-    consent_response(consent_page(&client_name, redirect_uri, &flow_id, &csrf))
+    let managed_send_gate_bound = state
+        .inner
+        .managed_live_order_control
+        .lock()
+        .is_ok_and(|service| service.is_some());
+    consent_response(consent_page(
+        &client_name,
+        redirect_uri,
+        &flow_id,
+        &csrf,
+        permissions,
+        state.inner.consent_policy,
+        managed_send_gate_bound,
+    ))
 }
 
 async fn approve(State(state): State<OAuthState>, RawForm(body): RawForm) -> Response {
@@ -637,7 +1104,7 @@ async fn approve(State(state): State<OAuthState>, RawForm(body): RawForm) -> Res
             Ok(redirect) => redirect,
             Err(GrantError::AccessDenied) => {
                 return (
-                    StatusCode::OK,
+                    StatusCode::UNAUTHORIZED,
                     [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
                     r#"<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>승인 실패</title></head>
 <body style="font-family:-apple-system,sans-serif;max-width:560px;margin:60px auto;padding:0 20px;line-height:1.6">
@@ -717,11 +1184,11 @@ async fn token(State(state): State<OAuthState>, RawForm(body): RawForm) -> Respo
     let Ok(refresh_token) = random_token(32) else {
         return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
     };
-    {
+    let permissions = {
         let Ok(mut grants) = state.inner.grants.lock() else {
             return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
         };
-        if let Err(error) = grants.redeem_code(
+        match grants.redeem_code(
             CodeRedemption {
                 code,
                 client_id,
@@ -736,8 +1203,18 @@ async fn token(State(state): State<OAuthState>, RawForm(body): RawForm) -> Respo
             },
             Instant::now(),
         ) {
-            return grant_error_response(error);
+            Ok(permissions) => permissions,
+            Err(error) => return grant_error_response(error),
         }
+    };
+    if state.inner.consent_policy == OAuthConsentPolicy::FullTradingOnOwnerApproval
+        && permissions.can_control_trading()
+        && enable_managed_live_order_sending_after_consent(&state, client_id, code, resource)
+            .await
+            .is_err()
+    {
+        discard_unreturned_tokens(&state, &access_token, &refresh_token);
+        return oauth_error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable");
     }
     token_response(
         StatusCode::OK,
@@ -745,13 +1222,23 @@ async fn token(State(state): State<OAuthState>, RawForm(body): RawForm) -> Respo
             "access_token": access_token,
             "token_type": "Bearer",
             "expires_in": TOKEN_TTL.as_secs(),
-            "scope": SCOPE,
+            "scope": permissions.scope(),
             "refresh_token": refresh_token
         }),
     )
 }
 
 fn refresh_token(state: &OAuthState, params: &HashMap<String, String>) -> Response {
+    let requested_permissions = match params.get("scope") {
+        Some(scope) => match OAuthPermissions::parse(
+            Some(scope),
+            state.inner.consent_policy.supports_trading_scopes(),
+        ) {
+            Some(permissions) => Some(permissions),
+            None => return oauth_error(StatusCode::BAD_REQUEST, "invalid_scope"),
+        },
+        None => None,
+    };
     let (Some(refresh_token), Some(client_id), Some(resource)) = (
         params.get("refresh_token"),
         params.get("client_id"),
@@ -765,12 +1252,13 @@ fn refresh_token(state: &OAuthState, params: &HashMap<String, String>) -> Respon
     let Ok(next_refresh) = random_token(32) else {
         return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
     };
-    {
+    let permissions = {
         let Ok(mut grants) = state.inner.grants.lock() else {
             return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
         };
-        if let Err(error) = grants.rotate_refresh(
+        match grants.rotate_refresh(
             RefreshRequest {
+                requested_permissions,
                 refresh_token,
                 client_id,
                 resource,
@@ -782,37 +1270,50 @@ fn refresh_token(state: &OAuthState, params: &HashMap<String, String>) -> Respon
             },
             Instant::now(),
         ) {
-            return grant_error_response(error);
+            Ok(permissions) => permissions,
+            Err(error) => return grant_error_response(error),
         }
-    }
+    };
     token_response(
         StatusCode::OK,
         &serde_json::json!({
             "access_token": access_token,
             "token_type": "Bearer",
             "expires_in": TOKEN_TTL.as_secs(),
-            "scope": SCOPE,
+            "scope": permissions.scope(),
             "refresh_token": next_refresh
         }),
     )
 }
 
-fn consent_page(client_name: &str, redirect_uri: &str, flow_id: &str, csrf: &str) -> String {
+fn consent_page(
+    client_name: &str,
+    redirect_uri: &str,
+    flow_id: &str,
+    csrf: &str,
+    permissions: OAuthPermissions,
+    consent_policy: OAuthConsentPolicy,
+    managed_send_gate_bound: bool,
+) -> String {
     format!(
         "<!doctype html><html lang=\"ko\"><head><meta charset=\"utf-8\"><title>Sky Backcraft 승인</title></head>\
          <body style=\"font-family:-apple-system,sans-serif;max-width:560px;margin:60px auto;padding:0 20px;line-height:1.6\">\
          <h2>Sky Backcraft MCP 연결 승인</h2><p><strong>{}</strong> 앱이 Sky Backcraft MCP에 접근하려고 합니다.</p>\
+         <p>승인 후 부여될 권한: {}</p><p>{}</p>\
          <p style=\"word-break:break-all;color:#555\">돌아갈 주소: {}</p>\
          <form method=\"post\" action=\"/authorize/approve\">\
          <input type=\"hidden\" name=\"flow_id\" value=\"{}\"><input type=\"hidden\" name=\"csrf\" value=\"{}\">\
          <label for=\"owner_code\" style=\"font-weight:600\">앱에 표시된 운영자 승인 코드</label>\
          <p style=\"font-size:13px;color:#666;margin:4px 0 8px 0\">macOS 상단 메뉴 막대 아이콘 &gt; <strong>'OAuth 로그인 코드 복사'</strong>를 클릭하여 복사된 64자리 코드를 붙여넣으세요.</p>\
          <input id=\"owner_code\" name=\"owner_code\" type=\"password\" autocomplete=\"one-time-code\" required style=\"display:block;width:100%;padding:10px;margin:8px 0;box-sizing:border-box\">\
-         <button type=\"submit\" style=\"padding:10px 18px;cursor:pointer\">승인</button></form></body></html>",
+         <button type=\"submit\" style=\"padding:10px 18px;cursor:pointer\">{}</button></form></body></html>",
         html_escape(client_name),
+        html_escape(permissions.scope()),
+        html_escape(consent_policy.consent_description(permissions, managed_send_gate_bound)),
         html_escape(redirect_uri),
         html_escape(flow_id),
-        html_escape(csrf)
+        html_escape(csrf),
+        html_escape(consent_policy.consent_button_label(permissions, managed_send_gate_bound))
     )
 }
 
@@ -825,6 +1326,7 @@ fn grant_error_response(error: GrantError) -> Response {
         GrantError::InvalidRequest => oauth_error(StatusCode::BAD_REQUEST, "invalid_request"),
         GrantError::AccessDenied => oauth_error(StatusCode::FORBIDDEN, "access_denied"),
         GrantError::InvalidGrant => oauth_error(StatusCode::BAD_REQUEST, "invalid_grant"),
+        GrantError::InvalidScope => oauth_error(StatusCode::BAD_REQUEST, "invalid_scope"),
         GrantError::Capacity => {
             oauth_error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable")
         }
@@ -1044,11 +1546,13 @@ mod tests {
             redirect_uris: vec!["http://127.0.0.1/callback".into()],
             display_name: "Test client".into(),
             registered_at,
+            pinned: false,
         }
     }
 
     fn test_pending(client_id: &str, expires_at: Instant) -> PendingApproval {
         PendingApproval {
+            permissions: OAuthPermissions::Research,
             client_id: client_id.into(),
             redirect_uri: "http://127.0.0.1/callback".into(),
             state: "state".into(),
@@ -1061,6 +1565,7 @@ mod tests {
 
     fn test_access(client_id: &str, expires_at: Instant) -> AccessToken {
         AccessToken {
+            permissions: OAuthPermissions::Research,
             client_id: client_id.into(),
             resource: "https://skybackcraft.store/mcp".into(),
             expires_at,
@@ -1179,6 +1684,7 @@ mod tests {
         grants.codes.insert(
             "code".into(),
             AuthorizationCode {
+                permissions: OAuthPermissions::Research,
                 client_id: "client".into(),
                 redirect_uri: "http://127.0.0.1/callback".into(),
                 resource: "https://skybackcraft.store/mcp".into(),
@@ -1256,6 +1762,7 @@ mod tests {
                     display_name: format!("Client {index}"),
                     registered_at: now
                         + Duration::from_secs(u64::try_from(index).unwrap_or(u64::MAX)),
+                    pinned: false,
                 },
             );
             assert!(inserted.is_ok());
@@ -1263,6 +1770,7 @@ mod tests {
         grants.refresh_tokens.insert(
             "active-refresh".into(),
             AccessToken {
+                permissions: OAuthPermissions::Research,
                 client_id: "client-0".into(),
                 resource: "https://skybackcraft.store/mcp".into(),
                 expires_at: now + Duration::from_hours(1),
@@ -1277,6 +1785,7 @@ mod tests {
                         redirect_uris: vec!["http://127.0.0.1/callback".into()],
                         display_name: "New client".into(),
                         registered_at: now + Duration::from_hours(2),
+                        pinned: false,
                     },
                 )
                 .is_ok()
@@ -1305,6 +1814,7 @@ mod tests {
                 grants.codes.insert(
                     format!("code-{index}"),
                     AuthorizationCode {
+                        permissions: OAuthPermissions::Research,
                         client_id: "other".into(),
                         redirect_uri: "http://127.0.0.1/callback".into(),
                         resource: "https://skybackcraft.store/mcp".into(),
@@ -1345,6 +1855,7 @@ mod tests {
             grants.codes.insert(
                 "code".into(),
                 AuthorizationCode {
+                    permissions: OAuthPermissions::Research,
                     client_id: "client".into(),
                     redirect_uri: "http://127.0.0.1/callback".into(),
                     resource: "https://skybackcraft.store/mcp".into(),
@@ -1438,6 +1949,7 @@ mod tests {
         grants.codes.insert(
             "issued-code".into(),
             AuthorizationCode {
+                permissions: OAuthPermissions::Research,
                 client_id: "client-0".into(),
                 redirect_uri: "http://127.0.0.1/callback".into(),
                 resource: "https://skybackcraft.store/mcp".into(),
@@ -1502,3 +2014,6 @@ mod tests {
         assert!(!grants.pending.contains_key("flow-0"));
     }
 }
+
+#[cfg(test)]
+mod trading_tests;

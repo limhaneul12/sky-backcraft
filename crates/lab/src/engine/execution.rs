@@ -4,35 +4,36 @@ use crate::contracts::{
     PassiveFraction, PriceKrw, QuoteAmount, ReasonCode, Side, Weight,
 };
 use rust_decimal::{Decimal, RoundingStrategy};
+use serde::{Deserialize, Serialize};
 
 const BPS_DENOMINATOR: Decimal = Decimal::from_parts(10_000, 0, 0, false, 0);
 
-#[derive(Debug, Clone)]
-pub(super) struct PlannedFill {
-    pub(super) side: Side,
-    pub(super) price: PriceKrw,
-    pub(super) qty: AssetQuantity,
-    pub(super) notional: QuoteAmount,
-    pub(super) fee: QuoteAmount,
-    pub(super) fee_bps: BasisPoints,
-    pub(super) reserved_cash: QuoteAmount,
-    pub(super) price_cost_attribution: Decimal,
-    pub(super) reason: ReasonCode,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PlannedFill {
+    pub(crate) side: Side,
+    pub(crate) price: PriceKrw,
+    pub(crate) qty: AssetQuantity,
+    pub(crate) notional: QuoteAmount,
+    pub(crate) fee: QuoteAmount,
+    pub(crate) fee_bps: BasisPoints,
+    pub(crate) reserved_cash: QuoteAmount,
+    pub(crate) price_cost_attribution: Decimal,
+    pub(crate) reason: ReasonCode,
     /// Present only for taker fills priced by a dynamic proxy cost model.
-    pub(super) cost_provenance: Option<CostProvenance>,
+    pub(crate) cost_provenance: Option<CostProvenance>,
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct ExecutionDecision {
-    pub(super) fill: Option<PlannedFill>,
-    pub(super) reason: ReasonCode,
+pub(crate) struct ExecutionDecision {
+    pub(crate) fill: Option<PlannedFill>,
+    pub(crate) reason: ReasonCode,
 }
 
 #[allow(
     clippy::too_many_lines,
     reason = "the checked post-fee sizing equation is kept in one auditable phase"
 )]
-pub(super) fn plan_market_request(
+pub(crate) fn plan_market_request(
     account: &Account,
     target: Weight,
     decision_close: PriceKrw,
@@ -144,7 +145,7 @@ pub(super) fn plan_market_request(
     })
 }
 
-pub(super) fn plan_market_arrival(
+pub(crate) fn plan_market_arrival(
     account: &Account,
     request: &PlannedFill,
     execution_open: PriceKrw,

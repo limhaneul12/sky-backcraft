@@ -1,8 +1,13 @@
 //! Durable SQLite queue, one owned runner, and explicit cancellation acknowledgements.
 
+#[path = "automation/service.rs"]
+mod automation_service;
 mod coordinator;
 mod research_control;
 
+const AUTOMATION_REVIEW_WORK_CAPACITY: usize = 2;
+
+use crate::automation::{AutomationDueSessionCursor, PersistentMockVenue, VenueAdapter};
 use crate::contracts::{
     AccountMark, ArtifactId, AttemptState, ContentHash, DatasetStatus, ENGINE_VERSION,
     FailureRecord, FillRecord, INDICATOR_VERSION, JobAttempt, JobControl, JobId, JobOutput,
@@ -14,6 +19,10 @@ use crate::contracts::{
 use crate::database::DatabaseHandle;
 use crate::market_data::UpbitClient;
 use crate::storage::{AttemptPublication, ModelFactBatch, RootReservation};
+use crate::upbit::client::UpbitPrivateClient;
+use crate::upbit::control::{ExchangeReadMode, TradingControlService};
+use crate::upbit::execution::LiveExecutionPolicy;
+use crate::upbit::risk::{RiskConfig, RiskGuard};
 use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex,
@@ -34,15 +43,36 @@ enum CancellationAuthority {
     RuntimeOwner,
 }
 
+struct ActiveGuard<'a> {
+    inner: &'a Inner,
+}
+
+impl Drop for ActiveGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.inner.active.lock() {
+            *guard = None;
+        }
+    }
+}
+
 struct Inner {
     database: DatabaseHandle,
     upbit: UpbitClient,
+    automation_live_venue: UpbitPrivateClient,
+    automation_mock_venue: PersistentMockVenue,
+    risk_guard: RiskGuard,
+    automation_due_cursor: Mutex<Option<AutomationDueSessionCursor>>,
+    #[cfg(test)]
+    automation_mock_venue_override: Option<Arc<dyn VenueAdapter>>,
+    #[cfg(test)]
+    automation_live_venue_override: Option<Arc<dyn VenueAdapter>>,
     root: PathBuf,
     revision: Option<String>,
     wake: Notify,
     stop: CancellationToken,
     admitting: AtomicBool,
     admission_gate: Arc<tokio::sync::Mutex<()>>,
+    automation_review_budget: Arc<tokio::sync::Semaphore>,
     runner_available: AtomicBool,
     active: Mutex<Option<(JobId, CancellationToken)>>,
 }
@@ -81,6 +111,75 @@ impl JobRuntime {
         root: PathBuf,
         revision: Option<String>,
     ) -> Result<Self, LabError> {
+        Self::start_with_venue(
+            database,
+            upbit,
+            UpbitPrivateClient::new_mock(),
+            root,
+            revision,
+        )
+        .await
+    }
+
+    /// Start the joined `JobRuntime` with the selected private venue adapter.
+    /// The adapter's real POST/DELETE implementation remains independently hard-gated.
+    /// # Errors
+    /// Reports durable recovery, mock venue seed, storage, or runtime admission failures.
+    pub async fn start_with_venue(
+        database: DatabaseHandle,
+        upbit: UpbitClient,
+        automation_live_venue: UpbitPrivateClient,
+        root: PathBuf,
+        revision: Option<String>,
+    ) -> Result<Self, LabError> {
+        Self::start_with_venue_and_risk_guard(
+            database,
+            upbit,
+            automation_live_venue,
+            RiskGuard::new(RiskConfig::default()),
+            root,
+            revision,
+        )
+        .await
+    }
+
+    /// Start the joined runtime using the same process-local safety latch as
+    /// the exchange control service.
+    /// # Errors
+    /// Reports durable recovery, mock venue seed, storage, or runtime admission failures.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "startup seeds MOCK, fences restart recovery, builds the owned service and joins both runtime tasks"
+    )]
+    pub async fn start_with_venue_and_risk_guard(
+        database: DatabaseHandle,
+        upbit: UpbitClient,
+        automation_live_venue: UpbitPrivateClient,
+        risk_guard: RiskGuard,
+        root: PathBuf,
+        revision: Option<String>,
+    ) -> Result<Self, LabError> {
+        let exchange_read_mode = if automation_live_venue.is_live() {
+            ExchangeReadMode::LiveRead
+        } else {
+            ExchangeReadMode::Mock
+        };
+        // OAuth owner-consent is process-local. Fence any durable LIVE control
+        // grant before the coordinator can recover or admit automation work.
+        TradingControlService::production(database.clone(), risk_guard.clone(), exchange_read_mode)
+            .synchronize_from_storage()
+            .await?;
+        let automation_mock_venue = PersistentMockVenue::new(database.clone());
+        // Seed idempotently without snapshotting: a prior process may have a
+        // committed MOCK venue fill whose durable order is still UNKNOWN. The
+        // coordinator must GET its identifier and book the fill before the
+        // next account snapshot is validated against the ledger.
+        let mock_seed_at = UtcTimestamp::now();
+        database
+            .call("seed_automation_mock_venue", move |store| {
+                store.automation_seed_mock_venue(mock_seed_at)
+            })
+            .await?;
         database
             .call("recover_interrupted", |store| {
                 store.recover_interrupted(UtcTimestamp::now())
@@ -90,16 +189,40 @@ impl JobRuntime {
             inner: Arc::new(Inner {
                 database,
                 upbit,
+                automation_live_venue,
+                automation_mock_venue,
+                risk_guard,
+                automation_due_cursor: Mutex::new(None),
+                #[cfg(test)]
+                automation_mock_venue_override: None,
+                #[cfg(test)]
+                automation_live_venue_override: None,
                 root,
                 revision,
                 wake: Notify::new(),
                 stop: CancellationToken::new(),
                 admitting: AtomicBool::new(true),
                 admission_gate: Arc::new(tokio::sync::Mutex::new(())),
+                automation_review_budget: Arc::new(tokio::sync::Semaphore::new(
+                    AUTOMATION_REVIEW_WORK_CAPACITY,
+                )),
                 runner_available: AtomicBool::new(true),
                 active: Mutex::new(None),
             }),
         };
+        service.recover_pending_automation_requests().await?;
+        // A durable user Pause/Stop may have been committed before the previous
+        // process crashed. Apply those exact CAS commands against their original
+        // sequence before the internal restart fence advances any RUNNING row.
+        // Otherwise the fence would invalidate the user's intent and a later
+        // start could resume the session with its RESERVED orders still eligible.
+        service
+            .inner
+            .database
+            .call("automation_restart_reconciliation", |store| {
+                store.automation_require_restart_reconciliation(UtcTimestamp::now())
+            })
+            .await?;
         let owner = service.clone();
         let producer = service.clone();
         let supervisor = service.clone();
@@ -113,8 +236,8 @@ impl JobRuntime {
             supervisor.inner.admitting.store(false, Ordering::Release);
             supervisor.inner.stop.cancel();
             let (active, control_poisoned) = match supervisor.inner.active.lock() {
-                Ok(active) => (active.clone(), false),
-                Err(poisoned) => (poisoned.into_inner().clone(), true),
+                Ok(mut active) => (active.take(), false),
+                Err(poisoned) => (poisoned.into_inner().take(), true),
             };
             if let Some((id, token)) = active {
                 let cancellation = supervisor
@@ -128,11 +251,19 @@ impl JobRuntime {
                     );
                 }
             }
+            if let Ok(mut guard) = supervisor.inner.active.lock() {
+                *guard = None;
+            }
             // A completed or failed child never detaches its sibling, including blocking work.
             let second = if worker_finished {
                 coordinator.await
             } else {
                 worker.await
+            };
+            let (first_role, second_role) = if worker_finished {
+                ("worker", "coordinator")
+            } else {
+                ("coordinator", "worker")
             };
             supervisor
                 .inner
@@ -147,8 +278,19 @@ impl JobRuntime {
             let second = second
                 .map_err(|_| LabError::Internal("research runtime sibling panicked".into()))
                 .and_then(std::convert::identity);
+            if let Err(error) = &first {
+                tracing::error!(
+                    event = "research_runtime_child_failed",
+                    role = first_role,
+                    error = %error
+                );
+            }
             if let Err(error) = &second {
-                tracing::error!(event = "research_runtime_sibling_failed", error = %error);
+                tracing::error!(
+                    event = "research_runtime_sibling_failed",
+                    role = second_role,
+                    error = %error
+                );
             }
             let result = first.and(second);
             let result = if control_poisoned {
@@ -188,13 +330,10 @@ impl JobRuntime {
             let _admitted = self.service.inner.admission_gate.lock().await;
         }
         self.service.inner.stop.cancel();
-        let active = self
-            .service
-            .inner
-            .active
-            .lock()
-            .map(|guard| guard.clone())
-            .map_err(|_| LabError::Internal("job control lock poisoned".into()));
+        let active = match self.service.inner.active.lock() {
+            Ok(mut guard) => Ok(guard.take()),
+            Err(_) => Err(LabError::Internal("job control lock poisoned".into())),
+        };
         let cancellation = match active {
             Ok(Some((job_id, token))) => {
                 let persisted = self
@@ -223,6 +362,9 @@ impl JobRuntime {
             );
             (runner.await, true)
         };
+        if let Ok(mut guard) = self.service.inner.active.lock() {
+            *guard = None;
+        }
         joined.map_err(|_| LabError::Internal("job runner panicked".into()))??;
         cancellation?;
         if timed_out {
@@ -231,6 +373,34 @@ impl JobRuntime {
             ));
         }
         Ok(())
+    }
+}
+
+impl JobService {
+    pub(super) fn live_execution_policy(&self) -> LiveExecutionPolicy {
+        self.inner.automation_live_venue.live_execution_policy()
+    }
+
+    pub(super) fn automation_venue(
+        &self,
+        mode: crate::contracts::AutomationSessionMode,
+    ) -> &dyn VenueAdapter {
+        match mode {
+            crate::contracts::AutomationSessionMode::Mock => {
+                #[cfg(test)]
+                if let Some(venue) = self.inner.automation_mock_venue_override.as_deref() {
+                    return venue;
+                }
+                &self.inner.automation_mock_venue
+            }
+            crate::contracts::AutomationSessionMode::Live => {
+                #[cfg(test)]
+                if let Some(venue) = self.inner.automation_live_venue_override.as_deref() {
+                    return venue;
+                }
+                &self.inner.automation_live_venue
+            }
+        }
     }
 }
 
@@ -244,13 +414,19 @@ impl JobService {
             .database
             .call("job_queue_status", |store| store.job_queue_status())
             .await?;
-        let active_job_id = self
+        let mut active_guard = self
             .inner
             .active
             .lock()
-            .map_err(|_| LabError::Internal("job control lock poisoned".into()))?
-            .as_ref()
-            .map(|(id, _)| id.clone());
+            .map_err(|_| LabError::Internal("job control lock poisoned".into()))?;
+        let active_job_id = match active_guard.as_ref() {
+            Some((id, _)) if queue.running_attempts == 0 => {
+                *active_guard = None;
+                None
+            }
+            Some((id, _)) => Some(id.clone()),
+            None => None,
+        };
         Ok(JobServiceStatus {
             admission_open: self.inner.admitting.load(Ordering::Acquire),
             runner_available: self.inner.runner_available.load(Ordering::Acquire),
@@ -345,7 +521,7 @@ impl JobService {
                 let job = self
                     .persist_cancel(job_id.clone(), CancellationAuthority::Client)
                     .await?;
-                let active = self
+                let mut active = self
                     .inner
                     .active
                     .lock()
@@ -353,6 +529,11 @@ impl JobService {
                 if let Some((active_id, token)) = active.as_ref().filter(|(id, _)| id == &job_id) {
                     tracing::info!(event = "job_cancel_requested", job_id = %active_id);
                     token.cancel();
+                }
+                if job.attempts.last().is_some_and(|a| a.state.is_terminal())
+                    && active.as_ref().is_some_and(|(id, _)| id == &job_id)
+                {
+                    *active = None;
                 }
                 Ok(job)
             }
@@ -441,6 +622,7 @@ impl JobService {
                 .lock()
                 .map_err(|_| LabError::Internal("job control lock poisoned".into()))? =
                 Some((attempt.job_id.clone(), cancellation.clone()));
+            let active_guard = ActiveGuard { inner: &self.inner };
             // Active token is installed BEFORE re-reading persisted cancellation,
             // closing the claim/cancel race without losing a durable request.
             let job = self.get(attempt.job_id.clone()).await?;
@@ -507,47 +689,82 @@ impl JobService {
                     store.publish_attempt(&id, terminal, publication)
                 })
                 .await;
-            if let Err(error) = finished {
-                let refreshed = self.get(job.id.clone()).await?;
-                let published = refreshed
-                    .attempts
-                    .last()
-                    .filter(|record| record.id == attempt.id && record.state.is_terminal())
-                    .map(|record| ContentHash::of_value(&record.state))
-                    .transpose()?;
-                if published.as_ref() == Some(&expected_terminal) {
-                    tracing::warn!(event = "terminal_publication_reconciled", attempt_id = %attempt.id);
-                } else if refreshed.attempts.last().is_some_and(|a| {
-                    matches!(
-                        a.state,
-                        AttemptState::Running {
-                            cancel_requested_at: Some(_),
-                            ..
+            let finished_ok = match finished {
+                Ok(()) => true,
+                Err(error) => {
+                    let refreshed = self.get(job.id.clone()).await?;
+                    let published = refreshed
+                        .attempts
+                        .last()
+                        .filter(|record| record.id == attempt.id && record.state.is_terminal())
+                        .map(|record| ContentHash::of_value(&record.state))
+                        .transpose()?;
+                    if published.as_ref() == Some(&expected_terminal) {
+                        tracing::warn!(event = "terminal_publication_reconciled", attempt_id = %attempt.id);
+                        true
+                    } else if refreshed.attempts.last().is_some_and(|a| {
+                        matches!(
+                            a.state,
+                            AttemptState::Running {
+                                cancel_requested_at: Some(_),
+                                ..
+                            }
+                        )
+                    }) {
+                        let id = attempt.id.clone();
+                        self.inner
+                            .database
+                            .call("acknowledge_cancel", move |store| {
+                                store.finish_attempt(
+                                    &id,
+                                    AttemptState::Cancelled {
+                                        ended_at: UtcTimestamp::now(),
+                                        reason: "cancellation won terminal publication".into(),
+                                    },
+                                )
+                            })
+                            .await?;
+                        false
+                    } else {
+                        let id = attempt.id.clone();
+                        let failed_terminal = AttemptState::Failed {
+                            ended_at: UtcTimestamp::now(),
+                            error: failure_record(&error),
+                        };
+                        let recorded = self
+                            .inner
+                            .database
+                            .call("finish_failed_attempt", move |store| {
+                                match store.finish_attempt(&id, failed_terminal) {
+                                    Err(LabError::Cancelled(_)) => store.finish_attempt(
+                                        &id,
+                                        AttemptState::Cancelled {
+                                            ended_at: UtcTimestamp::now(),
+                                            reason: "cancellation won failed terminal publication"
+                                                .into(),
+                                        },
+                                    ),
+                                    other => other,
+                                }
+                            })
+                            .await;
+                        if let Err(record_err) = recorded {
+                            tracing::error!(
+                                event = "failed_attempt_publication_unrecorded",
+                                attempt_id = %attempt.id,
+                                error = %record_err
+                            );
+                            return Err(record_err);
                         }
-                    )
-                }) {
-                    let id = attempt.id.clone();
-                    self.inner
-                        .database
-                        .call("acknowledge_cancel", move |store| {
-                            store.finish_attempt(
-                                &id,
-                                AttemptState::Cancelled {
-                                    ended_at: UtcTimestamp::now(),
-                                    reason: "cancellation won terminal publication".into(),
-                                },
-                            )
-                        })
-                        .await?;
-                } else {
-                    return Err(error);
+                        false
+                    }
                 }
-            }
+            };
             // Seal the run's detailed ledger into content-addressed chunks and
             // compact the SQLite rows. A failure here never invalidates the
             // completed run: it stays DETAIL (rows intact) and the next
             // deployment's runner pass can seal it later.
-            if let Some(run_id) = sealed_run_id {
+            if let Some(run_id) = sealed_run_id.filter(|_| finished_ok) {
                 let sealed = self
                     .inner
                     .database
@@ -570,11 +787,7 @@ impl JobService {
                     ),
                 }
             }
-            *self
-                .inner
-                .active
-                .lock()
-                .map_err(|_| LabError::Internal("job control lock poisoned".into()))? = None;
+            drop(active_guard);
             tracing::info!(event = "job_attempt_finished", job_id = %job.id, attempt_id = %attempt.id);
         }
         Ok(())

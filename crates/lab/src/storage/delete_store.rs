@@ -549,6 +549,14 @@ impl Store {
                 "SELECT 'schedule:' || s.id FROM collection_schedules s WHERE s.last_success_dataset_id IN (SELECT id FROM del_datasets) ORDER BY s.id",
                 "a collection schedule retains this last-success dataset; preview-delete the schedule first",
             ),
+            (
+                "SELECT 'paper:' || p.session_id FROM paper_sessions p WHERE p.policy_id IN (SELECT id FROM del_policies) OR p.policy_revision_id IN (SELECT id FROM del_revisions) ORDER BY p.session_id",
+                "a persistent paper session retains this frozen policy revision",
+            ),
+            (
+                "SELECT 'automation:' || a.session_id FROM automation_sessions a WHERE json_extract(a.policy_ref_json, '$.policy_id') IN (SELECT id FROM del_policies) OR json_extract(a.policy_ref_json, '$.revision_id') IN (SELECT id FROM del_revisions) ORDER BY a.session_id",
+                "a strategy automation session retains this frozen policy revision and execution history",
+            ),
         ];
         for (sql, reason) in queries {
             let rows = self.string_column(sql)?;
@@ -1442,3 +1450,13 @@ const SCOPE_EDGES: &[&str] = &[
     // evidence snapshot consumers
     "INSERT OR IGNORE INTO del_plans SELECT id FROM plans WHERE evidence_snapshot_id IN (SELECT id FROM del_snapshots)",
 ];
+
+#[cfg(test)]
+mod automation_tests;
+#[cfg(test)]
+mod policy_tests;
+
+mod policy;
+
+pub(crate) use policy::PolicyDeleteAdmission;
+pub(super) use policy::recover_interrupted_policy_deletes;

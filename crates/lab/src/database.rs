@@ -35,18 +35,35 @@ impl DatabaseOwner {
     /// # Errors
     /// Reports filesystem/schema/SQLite/thread startup failures.
     pub fn open(root: PathBuf) -> Result<Self, LabError> {
-        Self::start(root, None)
+        Self::start(root, None, false)
+    }
+
+    /// Start the sole connection owner with the runtime order switch configured.
+    /// Startup always rotates the boot epoch and forces the send gate OFF.
+    /// # Errors
+    /// Reports filesystem/schema/SQLite/thread startup failures.
+    pub fn open_with_live_order_control(
+        root: PathBuf,
+        live_order_control_available: bool,
+    ) -> Result<Self, LabError> {
+        Self::start(root, None, live_order_control_available)
     }
 
     /// Restore into a new data root while retaining the process ownership lock.
     /// # Errors
     /// Rejects a busy/nonempty root, corrupt backup or failed owner startup.
     pub fn restore(backup: PathBuf, root: PathBuf) -> Result<Self, LabError> {
-        Self::start(root, Some(backup))
+        Self::start(root, Some(backup), false)
     }
 
-    fn start(root: PathBuf, backup: Option<PathBuf>) -> Result<Self, LabError> {
+    fn start(
+        root: PathBuf,
+        backup: Option<PathBuf>,
+        live_order_control_available: bool,
+    ) -> Result<Self, LabError> {
         let startup_time = crate::contracts::UtcTimestamp::now();
+        let startup_at = startup_time.to_rfc3339();
+        let boot_epoch = new_boot_epoch();
         let builtin_policies = crate::contracts::builtin_policy_definitions()?;
         std::fs::create_dir_all(&root)
             .map_err(|error| LabError::Internal(format!("create data root: {error}")))?;
@@ -99,6 +116,11 @@ impl DatabaseOwner {
                     None => Store::open(root),
                 }
                 .and_then(|mut store| {
+                    store.initialize_live_order_control(
+                        &boot_epoch,
+                        live_order_control_available,
+                        &startup_at,
+                    )?;
                     store.seed_builtin_policies_once(&builtin_policies, startup_time)?;
                     Ok(store)
                 });
@@ -170,6 +192,18 @@ impl DatabaseOwner {
             Ok(())
         }
     }
+}
+
+fn new_boot_epoch() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let serial = NEXT_EPOCH.fetch_add(1, Ordering::Relaxed);
+    format!("boot-{:x}-{nanos:x}-{serial:x}", std::process::id())
 }
 
 impl Drop for DatabaseOwner {
