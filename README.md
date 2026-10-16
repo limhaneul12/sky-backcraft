@@ -5,8 +5,12 @@ deterministic strategy simulation, exact accounting, durable research jobs and
 portable independent verification. The supported market boundary is
 `KRW-BTC`, `KRW-ETH` and `KRW-XRP`, long/cash only.
 
-The system never places an order and never uses an Upbit private API, credential,
-account balance or observed fill. Every execution is simulated. Fees, spread,
+Research and paper executions are simulated and do not place exchange orders.
+Private account reads and explicitly authorized LIVE strategy automation use
+separate authenticated surfaces. Managed order sending defaults OFF on every
+process start and requires an explicit GUI or private MCP enable action; see
+[trading control, strategy limits and review](docs/live-trading-mcp.md).
+For research, fees, spread,
 slippage, impact, tick rules and minimum notional are explicit research inputs,
 not claims about a historical market unless the request supplies matching
 provenance.
@@ -92,12 +96,19 @@ Docker/Cloudflare operation is documented separately in
 
 ## macOS desktop app
 
-Build the native menu bar app with `make package`, then extract the verified
-`dist/SkyBackcraft-macos.zip` into your local Applications folder and open
-`Sky Backcraft.app` there. Packaging checks signatures, helper byte identity,
-and bounded launch/self-tests both before and after an archive round trip.
-The unpacked `dist/Sky Backcraft.app` is a convenience copy: FileProvider may
-retag it after export, so use the verified ZIP for installation.
+Build with `make package`. Successful packaging keeps only the latest
+`dist/Sky Backcraft.app` and `dist/SkyBackcraft-plugin-marketplace.zip`.
+The plugin ZIP includes the skills, MCP configuration, and marketplace install guide.
+Each build replaces those outputs and removes old delivery folders, app backups,
+and macOS ZIPs. Signature checks, helper byte identity, and bounded launch/self-tests
+run before and after a temporary archive round trip; that app ZIP is not retained.
+Quit an app running from the output directory before rebuilding it, and do not
+reopen it until packaging finishes. Packaging checks for a running app/helper
+before replacement, serializes publishers, and restores preceding outputs if
+publication fails. Build or validation failures leave preceding outputs intact.
+An explicit `SKY_BACKCRAFT_PACKAGE_OUTPUT_DIR` outside repository `dist` can be
+used for isolated verification; version subdirectories inside `dist` are rejected.
+Copy `dist/Sky Backcraft.app` into your local Applications folder and open it there.
 The app bundles the Rust server and uses AppKit controls;
 its settings are the public domain, local port, and OAuth or no authentication.
 No project folder is required. The initial settings are `skybackcraft.store` and
@@ -128,6 +139,17 @@ S256 PKCE. Copy the OAuth login code from the app menu and enter it only on the
 server's consent page. The code is generated for the running server and is never
 saved in settings. Restarting the server invalidates its sessions, so reconnect
 ChatGPT afterward. No-auth mode uses a separate isolated public research root.
+
+With OAuth and financial MCP exposure configured, Settings and
+`live_order_control` share the server-owned send switch through the explicit
+`--live-order-control` capability. The switch is not a saved preference: every
+managed server start is OFF until a new trading OAuth approval. That approval
+and successful PKCE login give ChatGPT and Codex full trading-control scopes and
+enable the shared send switch automatically. Background token refresh does not
+reopen a switch explicitly turned OFF. Order-sending changes apply immediately;
+saving unchanged network/auth settings does not restart the backend. Strategy
+sessions use their selected policy and frozen limits. Building/installing the
+app or plugin does not itself create an order.
 
 For a read-only protocol check against the running app:
 
