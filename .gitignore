@@ -42,3 +42,9 @@ docs/
 
 # Local Python verification bytecode
 __pycache__/
+
+.env
+
+# Machine-local installation provenance and private delivery bundle
+/.codex/provenance.json
+/plugin-marketplace/

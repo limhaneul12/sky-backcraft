@@ -44,3 +44,11 @@ Only checks actually executed are VERIFIED. Report exact failures/blockers and u
 
 ## Final Report
 Report only meaningful changes, affected authority/runtime surfaces, exact validation outcomes, and unresolved risks or unverified lanes.
+
+## Project Subagents
+- Load `.codex/LUNA_TASK_CONTRACT.md` before delegation.
+- Use only these project role profiles: `backcraft_explorer`, `backcraft_backend`,
+  `backcraft_gui`, and `backcraft_verifier`.
+- All four use `gpt-6-luna` / `max`; Main retains its current model and final acceptance.
+- Maximum four concurrent children; no nested delegation or silent model fallback.
+- Give each writer disjoint explicit ownership. Verification must not repair its inputs.
