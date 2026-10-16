@@ -67,7 +67,7 @@ enum RuntimeStatus: Equatable {
     var menuTitle: String {
         switch self {
         case .stopped: return "MCP: 중지됨"
-        case .starting: return "MCP: 시작 중…"
+        case .starting: return "MCP: 시작 중 · macOS 파일 접근 승인 대기 가능"
         case .stopping: return "MCP: 중지 중…"
         case .running(let host): return "MCP: 실행 중 (\(host))"
         case .failed(let message): return "MCP 오류: \(message)"
@@ -97,17 +97,22 @@ private enum ChildRole {
 }
 
 final class RuntimeController {
+    private static let backendReadinessTimeoutSeconds: TimeInterval = 60
+
     private let queue = DispatchQueue(label: "store.skybackcraft.runtime")
     private let queueKey = DispatchSpecificKey<UInt8>()
     private let store: ConfigurationStore
     private let executableOverrides: RuntimeExecutables?
     private let lifecycle = RuntimeLifecycle()
     private var backend: Process?
+    private var backendOwnedHelperIdentity: NativeMCPOwnedHelperIdentity?
+    private var backendTransportContext: NativeMCPTransportContext?
     private var tunnel: Process?
     private let logWriter: BoundedLogWriter
     private var currentConfiguration: AppConfiguration?
     private var currentHost: String?
     private var ownerCode: String?
+    private var desktopToken: String?
     private var readinessBuffer = ""
     private var tunnelURLAccumulator = TunnelURLAccumulator()
     private var tunnelTimeout: DispatchWorkItem?
@@ -139,6 +144,9 @@ final class RuntimeController {
         case .oauth:
             guard let host, !host.isEmpty else { return arguments }
             arguments += ["--oauth", "--public-url", "https://\(host)"]
+            if configuration.tradingMcpEnabled {
+                arguments += ["--trading-mcp", "--live-order-control"]
+            }
         }
         return arguments
     }
@@ -153,6 +161,7 @@ final class RuntimeController {
         }
     }
     func connectorURL() -> String? { queue.sync { currentHost.map { "https://\($0)/mcp" } } }
+    func publicConnectorURL() -> String? { queue.sync { currentHost.map { "https://\($0)/public/mcp" } } }
     func oauthLoginCode() -> String? { queue.sync { ownerCode } }
     func statusSnapshot() -> RuntimeStatus { queue.sync { status } }
 
@@ -236,27 +245,58 @@ final class RuntimeController {
         guard let command = executableCommand(named: "spot-lab", allowPathLookup: false) else {
             throw AppError.runtime("앱 번들에서 spot-lab 실행 파일을 찾지 못했습니다.")
         }
+        let dataRoot = store.dataDirectory(for: configuration.authenticationMode)
         let arguments = try Self.backendArguments(
             configuration: configuration,
-            dataDirectory: store.dataDirectory(for: configuration.authenticationMode),
+            dataDirectory: dataRoot,
             effectiveHost: host
         )
         let process = Process()
+        let helperInstanceID = UUID()
         let output = Pipe()
         process.executableURL = command.executableURL
         process.arguments = command.prefixArguments + arguments
         process.standardOutput = output
         process.standardError = output
+        var environment = ProcessInfo.processInfo.environment
         if configuration.authenticationMode == .oauth {
             let code = try OwnerCode.make()
             ownerCode = code
-            var environment = ProcessInfo.processInfo.environment
             environment["SPOT_LAB_OAUTH_OWNER_CODE"] = code
-            process.environment = environment
         } else { ownerCode = nil }
+        let desktopToken = try OwnerCode.make()
+        self.desktopToken = desktopToken
+        environment["SERVICE_DESKTOP_ACCESS_TOKEN"] = desktopToken
+        // Rust is the only owner of exchange credential loading and signing.
+        let credentialPaths = [
+            store.supportDirectory.appendingPathComponent(".env"),
+            URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".env"),
+            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Documents/sky-financial-system/sky-backcraft/.env")
+        ]
+        if let path = credentialPaths.first(where: { FileManager.default.fileExists(atPath: $0.path) }) {
+            environment["SERVICE_UPBIT_CREDENTIAL_FILE"] = path.path
+        }
+        process.environment = environment
         backend = process
         currentHost = host
         readinessBuffer = ""
+        process.terminationHandler = { [weak self] process in
+            self?.queue.async {
+                self?.childExited(
+                    .backend,
+                    process: process,
+                    generation: generation,
+                    "MCP가 종료되었습니다. (코드 \(process.terminationStatus))",
+                )
+            }
+        }
+        try process.run()
+        let ownedHelper = NativeMCPOwnedHelperIdentity(
+            instanceID: helperInstanceID,
+            processID: process.processIdentifier,
+            dataRoot: dataRoot
+        )
+        backendOwnedHelperIdentity = ownedHelper
         output.fileHandleForReading.readabilityHandler = { [weak self, weak process] handle in
             let data = handle.availableData
             guard !data.isEmpty else { return }
@@ -273,31 +313,31 @@ final class RuntimeController {
                     if self.lifecycle.markRunning(generation) {
                         self.backendReadinessTimeout?.cancel()
                         self.backendReadinessTimeout = nil
+                        guard let context = NativeMCPClient.shared.configure(
+                            port: configuration.port,
+                            token: desktopToken,
+                            ownedHelper: ownedHelper
+                        ) else {
+                            self.beginFailureShutdown("MCP Desktop 연결 컨텍스트를 구성하지 못했습니다.")
+                            return
+                        }
+                        self.backendTransportContext = context
                         self.setStatus(.running(host: host))
                     }
                 }
             }
         }
-        process.terminationHandler = { [weak self] process in
-            self?.queue.async {
-                self?.childExited(
-                    .backend,
-                    process: process,
-                    generation: generation,
-                    "MCP가 종료되었습니다. (코드 \(process.terminationStatus))",
-                )
-            }
-        }
-        try process.run()
         appendLogLine("spot-lab 시작: 127.0.0.1:\(configuration.port), host=\(host)")
         let readinessTimeout = DispatchWorkItem { [weak self, weak process] in
             guard let self,
                   self.backend === process,
                   self.lifecycle.acceptsStartupCallback(generation) else { return }
-            self.beginFailureShutdown("MCP가 15초 안에 준비되지 않았습니다.")
+            self.beginFailureShutdown(
+                "MCP가 60초 안에 준비되지 않았습니다. macOS 파일 접근 승인 여부를 확인하세요."
+            )
         }
         backendReadinessTimeout = readinessTimeout
-        queue.asyncAfter(deadline: .now() + 15, execute: readinessTimeout)
+        queue.asyncAfter(deadline: .now() + Self.backendReadinessTimeoutSeconds, execute: readinessTimeout)
     }
 
     private func requestShutdownLocked(_ intent: RuntimeShutdownIntent) {
@@ -382,6 +422,7 @@ final class RuntimeController {
 
     private func finishShutdown(_ generation: UInt64) {
         guard let action = lifecycle.finishShutdown(generation) else { return }
+        confirmOwnedBackendExitIfStopped()
         resetLocked()
         performShutdownAction(action)
     }
@@ -420,6 +461,7 @@ final class RuntimeController {
         switch role {
         case .backend:
             guard backend === process else { return }
+            confirmOwnedBackendExit(process)
             backend = nil
             backendReadinessTimeout?.cancel()
             backendReadinessTimeout = nil
@@ -436,8 +478,29 @@ final class RuntimeController {
         requestShutdownLocked(.stop)
     }
 
+    private func confirmOwnedBackendExitIfStopped() {
+        guard let backend, !backend.isRunning else { return }
+        confirmOwnedBackendExit(backend)
+    }
+
+    private func confirmOwnedBackendExit(_ process: Process) {
+        guard backend === process,
+              !process.isRunning,
+              let identity = backendOwnedHelperIdentity,
+              identity.process_id == process.processIdentifier,
+              let context = backendTransportContext,
+              context.owned_helper == identity else { return }
+        NativeMCPClient.shared.confirmOwnedHelperExit(context)
+        backendOwnedHelperIdentity = nil
+        backendTransportContext = nil
+    }
+
     private func resetLocked() {
+        NativeMCPClient.shared.disconnect()
+        desktopToken = nil
         backend = nil
+        backendOwnedHelperIdentity = nil
+        backendTransportContext = nil
         tunnel = nil
         currentConfiguration = nil
         currentHost = nil
