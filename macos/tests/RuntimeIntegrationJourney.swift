@@ -20,8 +20,16 @@ private enum RuntimeIntegrationJourney {
                 backend: RuntimeCommand(executableURL: python, prefixArguments: [childScript.path, "backend"]),
                 tunnel: RuntimeCommand(executableURL: python, prefixArguments: [childScript.path, "tunnel"])
             )
+            let delayedBackendExecutables = RuntimeExecutables(
+                backend: RuntimeCommand(
+                    executableURL: python,
+                    prefixArguments: [childScript.path, "backend", "--test-ready-delay=22"]
+                ),
+                tunnel: RuntimeCommand(executableURL: python, prefixArguments: [childScript.path, "tunnel"])
+            )
 
             try stopRejectsLateTunnelURL(root: root, executables: executables)
+            try readinessWaitAllowsDelayedBackend(root: root, executables: delayedBackendExecutables)
             try overlappingRestartThenQuitJoinsOwnedChild(root: root, executables: executables)
             print("Sky Backcraft native runtime integration: PASS")
         } catch {
@@ -35,6 +43,17 @@ private enum RuntimeIntegrationJourney {
         try FileManager.default.createDirectory(at: markers, withIntermediateDirectories: true)
         setenv("SKY_BACKCRAFT_TEST_MARKERS", markers.path, 1)
         let store = try ConfigurationStore(supportDirectory: root.appendingPathComponent("late-store"))
+        var exitContexts: [NativeMCPTransportContext] = []
+        let exitObserver = NotificationCenter.default.addObserver(
+            forName: .nativeMCPOwnedHelperExited,
+            object: NativeMCPClient.shared,
+            queue: .main
+        ) { notification in
+            if let context = notification.userInfo?["context"] as? NativeMCPTransportContext {
+                exitContexts.append(context)
+            }
+        }
+        defer { NotificationCenter.default.removeObserver(exitObserver) }
         let runtime = RuntimeController(store: store, executableOverrides: executables)
         defer { drain(runtime) }
         let configuration = AppConfiguration(domain: "", port: try availablePort(), authenticationMode: .none)
@@ -46,6 +65,7 @@ private enum RuntimeIntegrationJourney {
         try waitUntil("runtime stop") { runtime.statusSnapshot() == .stopped }
         try require(markerLines("backend_starts", in: markers).isEmpty, "stale tunnel URL started a backend")
         try require(!processExists(tunnelPID), "stopped tunnel child was not joined")
+        try require(exitContexts.isEmpty, "tunnel exit was mistaken for owned Backend helper closure")
     }
 
     private static func overlappingRestartThenQuitJoinsOwnedChild(root: URL, executables: RuntimeExecutables) throws {
@@ -56,18 +76,69 @@ private enum RuntimeIntegrationJourney {
         let runtime = RuntimeController(store: store, executableOverrides: executables)
         defer { drain(runtime) }
         let port = try availablePort()
+        var exitContexts: [NativeMCPTransportContext] = []
+        var exitWasDeliveredBeforeQuit = false
+        let exitObserver = NotificationCenter.default.addObserver(
+            forName: .nativeMCPOwnedHelperExited,
+            object: NativeMCPClient.shared,
+            queue: .main
+        ) { notification in
+            if let context = notification.userInfo?["context"] as? NativeMCPTransportContext {
+                exitContexts.append(context)
+            }
+        }
+        defer { NotificationCenter.default.removeObserver(exitObserver) }
         runtime.start(AppConfiguration(domain: "initial.example", port: port, authenticationMode: .none))
         try waitUntil("initial backend readiness") { runtime.statusSnapshot() == .running(host: "initial.example") }
         let backendPID = try markerPID("backend_starts", in: markers)
+        guard let capturedContext = NativeMCPClient.shared.currentTransportContext(),
+              capturedContext.owned_helper?.process_id == backendPID,
+              capturedContext.owned_helper?.data_root_identity
+                == store.dataDirectory().resolvingSymlinksInPath().standardizedFileURL.path else {
+            throw AppError.runtime("Desktop transport did not retain the actual owned Backend PID and canonical data root")
+        }
 
         runtime.restart(AppConfiguration(domain: "b.example", port: port, authenticationMode: .none))
         runtime.restart(AppConfiguration(domain: "c.example", port: port, authenticationMode: .oauth))
         var quitCompleted = false
-        runtime.terminate { quitCompleted = true }
+        runtime.terminate {
+            exitWasDeliveredBeforeQuit = exitContexts == [capturedContext]
+            quitCompleted = true
+        }
         try waitUntil("priority quit completion") { quitCompleted }
         try require(runtime.statusSnapshot() == .stopped, "runtime did not finish stopped after quit")
         try require(markerLines("backend_starts", in: markers).count == 1, "restart spawned a backend after priority quit")
         try require(!processExists(backendPID), "quit did not join the owned backend")
+        try require(exitContexts == [capturedContext], "exact owned Backend process exit proof was not published once")
+        try require(exitWasDeliveredBeforeQuit, "owned Backend exit proof was not published before quit completion")
+    }
+
+    private static func readinessWaitAllowsDelayedBackend(root: URL, executables: RuntimeExecutables) throws {
+        let markers = root.appendingPathComponent("delayed-backend", isDirectory: true)
+        try FileManager.default.createDirectory(at: markers, withIntermediateDirectories: true)
+        setenv("SKY_BACKCRAFT_TEST_MARKERS", markers.path, 1)
+        let store = try ConfigurationStore(supportDirectory: root.appendingPathComponent("delayed-store"))
+        let runtime = RuntimeController(store: store, executableOverrides: executables)
+        defer { drain(runtime) }
+        let host = "delayed.example"
+        runtime.start(AppConfiguration(domain: host, port: try availablePort(), authenticationMode: .none))
+        try waitUntil("delayed backend start") { markerLines("backend_starts", in: markers).count == 1 }
+        let backendPID = try markerPID("backend_starts", in: markers)
+
+        let beyondPreviousDeadline = Date().addingTimeInterval(16)
+        while Date() < beyondPreviousDeadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+        }
+        try require(
+            runtime.statusSnapshot() == .starting && processExists(backendPID),
+            "the bounded readiness timeout stopped the owned child before its delayed file-access readiness marker"
+        )
+        try waitUntil("delayed backend readiness", timeout: 8) {
+            runtime.statusSnapshot() == .running(host: host)
+        }
+        runtime.stop()
+        try waitUntil("delayed backend stop") { runtime.statusSnapshot() == .stopped }
+        try require(!processExists(backendPID), "delayed backend child was not joined after stop")
     }
 
     private static func waitUntil(
@@ -148,6 +219,7 @@ private enum RuntimeIntegrationJourney {
 import os
 import signal
 import sys
+import time
 
 markers = os.environ["SKY_BACKCRAFT_TEST_MARKERS"]
 mode = sys.argv[1]
@@ -168,6 +240,12 @@ signal.signal(signal.SIGINT, stop)
 signal.signal(signal.SIGTERM, stop)
 append(mode + "_starts", str(os.getpid()) + " " + " ".join(sys.argv[2:]))
 if mode == "backend":
+    delay = next(
+        (float(value.split("=", 1)[1]) for value in sys.argv[2:] if value.startswith("--test-ready-delay=")),
+        0.0,
+    )
+    if delay > 0:
+        time.sleep(delay)
     print('{"event":"mcp_listening"}', file=sys.stderr, flush=True)
 while True:
     signal.pause()

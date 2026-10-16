@@ -1,0 +1,123 @@
+{
+  "fixture_scope": {
+    "kind": "SYNTHETIC_LOOPBACK_UI_FIXTURE",
+    "purpose": "Native UpbitLiveService DTO and UI presentation only",
+    "provider_requests": false,
+    "exchange_effects": false,
+    "production_sqlite_writes": false,
+    "control_mutations_are_simulated": true,
+    "control_state_persistence": "temporary fixture-root JSON only",
+    "read_mode_fields_are_wire_compatibility_values_not_provider_evidence": true
+  },
+  "account_balances": {
+    "venue": "upbit",
+    "mode": "LIVE_HTTP_READ",
+    "observed_at_utc": "2000-01-01T00:00:00Z",
+    "accounts_count": 3,
+    "balances": [
+      {
+        "currency": "KRW",
+        "balance": "1250000.00000000",
+        "locked": "12500.00000000",
+        "avg_buy_price": "0",
+        "avg_buy_price_modified": false,
+        "unit_currency": "KRW"
+      },
+      {
+        "currency": "BTC",
+        "balance": "0.01500000",
+        "locked": "0.00100000",
+        "avg_buy_price": "97000000",
+        "avg_buy_price_modified": false,
+        "unit_currency": "KRW"
+      },
+      {
+        "currency": "ETH",
+        "balance": "0.25000000",
+        "locked": "0",
+        "avg_buy_price": "4100000",
+        "avg_buy_price_modified": true,
+        "unit_currency": "KRW"
+      }
+    ]
+  },
+  "open_orders": {
+    "venue": "upbit",
+    "exchange_read_mode": "LIVE_READ",
+    "order_scope": "OPEN",
+    "observed_at_utc": "2000-01-01T00:00:00Z",
+    "page": 1,
+    "limit": 100,
+    "returned_count": 1,
+    "records": [
+      {
+        "uuid": "fixture-open-order-001",
+        "identifier": "fixture-open-identifier-001",
+        "side": "bid",
+        "ord_type": "limit",
+        "price": "100000000",
+        "state": "wait",
+        "market": "KRW-BTC",
+        "created_at": "2026-10-15T08:00:00Z",
+        "volume": "0.00200000",
+        "remaining_volume": "0.00150000",
+        "reserved_fee": "100.00000000",
+        "remaining_fee": "75.00000000",
+        "paid_fee": "25.00000000",
+        "locked": "150100.00000000",
+        "executed_volume": "0.00050000",
+        "trades_count": 1,
+        "trades": []
+      }
+    ],
+    "next_page": null,
+    "truncated_reason": null,
+    "start_time": null,
+    "end_time": null
+  },
+  "closed_orders": {
+    "venue": "upbit",
+    "exchange_read_mode": "LIVE_READ",
+    "order_scope": "CLOSED",
+    "observed_at_utc": "2000-01-01T00:00:00Z",
+    "page": null,
+    "limit": 100,
+    "returned_count": 1,
+    "records": [
+      {
+        "uuid": "fixture-closed-order-001",
+        "identifier": "fixture-closed-identifier-001",
+        "side": "ask",
+        "ord_type": "market",
+        "price": null,
+        "state": "done",
+        "market": "KRW-ETH",
+        "created_at": "2026-10-14T09:15:00Z",
+        "volume": "0.10000000",
+        "remaining_volume": "0",
+        "reserved_fee": "0",
+        "remaining_fee": "0",
+        "paid_fee": "41.25000000",
+        "locked": "0",
+        "executed_volume": "0.10000000",
+        "trades_count": 1,
+        "trades": []
+      }
+    ],
+    "next_page": null,
+    "truncated_reason": null,
+    "start_time": null,
+    "end_time": null
+  },
+  "trading_control": {
+    "exchange_read_mode": "LIVE_READ",
+    "live_trading_enabled": false,
+    "state": "DISABLED_BY_CONFIG",
+    "sequence": 0,
+    "observed_at_utc": "2000-01-01T00:00:00Z",
+    "order_admission_blocked": true,
+    "emergency_latched": false,
+    "denied_code": null,
+    "receipt": null
+  }
+}

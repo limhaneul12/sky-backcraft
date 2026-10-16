@@ -1,0 +1,474 @@
+{
+  "write_requests": {
+    "start_mock": {
+      "action": "start",
+      "request_id": "auto-start-001",
+      "policy_ref": {
+        "policy_id": "policy-example",
+        "revision_id": "revision-example-r1",
+        "definition_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      },
+      "market": "KRW-BTC",
+      "decision_interval": "m1",
+      "mode": "MOCK",
+      "risk": {
+        "max_order_notional_krw": "100000",
+        "max_daily_notional_krw": "1000000",
+        "max_asset_exposure_krw": "500000",
+        "max_daily_loss_krw": "50000",
+        "max_open_orders": 2,
+        "max_orders_per_interval": 1,
+        "max_balance_age_seconds": 30,
+        "max_feed_age_seconds": 90
+      }
+    },
+    "pause": {
+      "action": "pause",
+      "request_id": "auto-pause-001",
+      "session_id": "automation-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expected_sequence": 1
+    },
+    "resume": {
+      "action": "resume",
+      "request_id": "auto-resume-001",
+      "session_id": "automation-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expected_sequence": 2
+    },
+    "stop": {
+      "action": "stop",
+      "request_id": "auto-stop-001",
+      "session_id": "automation-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expected_sequence": 3
+    },
+    "cancel_order": {
+      "action": "cancel_order",
+      "request_id": "auto-cancel-001",
+      "session_id": "automation-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expected_sequence": 4,
+      "client_identifier": "auto-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "record_baseline": {
+      "action": "record_baseline",
+      "request_id": "auto-baseline-001",
+      "session_id": "automation-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expected_sequence": 5,
+      "baseline": {
+        "account_identity": "mock:upbit-default",
+        "day_utc": "2026-10-14",
+        "reference_time_utc": "2026-10-14T00:00:00Z",
+        "source": "DURABLE_MOCK_VENUE_SEED",
+        "assets": [
+          {
+            "currency": "KRW",
+            "free": "10000000",
+            "locked": "0",
+            "valuation_basis": "QUOTE_CURRENCY_PARITY"
+          },
+          {
+            "currency": "BTC",
+            "free": "0",
+            "locked": "0",
+            "valuation_basis": "ZERO_BALANCE"
+          }
+        ],
+        "operator_note": "operator daily start baseline attestation"
+      }
+    }
+  },
+  "query_requests": {
+    "list": {"action": "list", "offset": 0, "limit": 20},
+    "get": {
+      "action": "get",
+      "session_id": "automation-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "request": {"action": "request", "request_id": "auto-start-001"},
+    "baseline": {
+      "action": "baseline",
+      "session_id": "automation-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "day_utc": "2026-10-14"
+    },
+    "events": {
+      "action": "events",
+      "session_id": "automation-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "after_sequence": null,
+      "limit": 100
+    },
+    "ledger": {
+      "action": "ledger",
+      "session_id": "automation-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "after_sequence": null,
+      "limit": 100
+    }
+  },
+  "request_readback": {
+    "request_id": "auto-start-001",
+    "state": "NOT_RECORDED",
+    "response": null,
+    "reason": "request is not durably recorded; outcome is unconfirmed"
+  },
+  "session_view": {
+    "session_id": "automation-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "account_identity": "mock:upbit-default",
+    "mode": "MOCK",
+    "state": "RUNNING",
+    "sequence": 1,
+    "policy_ref": {
+      "policy_id": "policy-example",
+      "revision_id": "revision-example-r1",
+      "definition_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    },
+    "market": "KRW-BTC",
+    "decision_interval": "m1",
+    "risk": {
+      "max_order_notional_krw": "100000",
+      "max_daily_notional_krw": "1000000",
+      "max_asset_exposure_krw": "500000",
+      "max_daily_loss_krw": "50000",
+      "max_open_orders": 2,
+      "max_orders_per_interval": 1,
+      "max_balance_age_seconds": 30,
+      "max_feed_age_seconds": 90
+    },
+    "created_at_utc": "2026-10-14T00:00:00Z",
+    "updated_at_utc": "2026-10-14T00:00:00Z",
+    "last_finalized_candle_at": null,
+    "last_balance_observed_at": null,
+    "unresolved_order_count": 0,
+    "fill_count": 0,
+    "recovery_reason": null,
+    "account_risk": {
+      "balance": {
+        "source": "DURABLE_MOCK_VENUE",
+        "observed_at_utc": "2026-10-14T00:00:00Z",
+        "received_at_utc": "2026-10-14T00:00:00Z",
+        "freshness": "FRESH",
+        "quote_currency": "KRW",
+        "quote_total": "10000000",
+        "quote_free": "10000000",
+        "quote_exchange_locked": "0",
+        "quote_local_reserved": "0",
+        "base_currency": "BTC",
+        "base_total": "0",
+        "base_free": "0",
+        "base_exchange_locked": "0",
+        "base_local_reserved": "0"
+      },
+      "risk": {
+        "daily_notional_used_krw": "0",
+        "daily_notional_limit_krw": "1000000",
+        "daily_loss_used_krw": "0",
+        "daily_loss_limit_krw": "50000",
+        "asset_exposure_krw": "0",
+        "asset_exposure_limit_krw": "500000",
+        "open_order_count": 0,
+        "open_order_limit": 2,
+        "orders_in_interval": 0,
+        "orders_per_interval_limit": 1,
+        "emergency_latched": false,
+        "live_grant_active": false
+      },
+      "feed": {
+        "source": "UPBIT_PUBLIC_FEED",
+        "observation_close_at_utc": null,
+        "received_at_utc": null,
+        "freshness": "UNAVAILABLE"
+      },
+      "capabilities": {
+        "can_pause": true,
+        "can_resume": false,
+        "can_stop": true,
+        "can_cancel_order": false,
+        "can_submit_orders": true,
+        "live_effects_enabled": false,
+        "explicit_approval_required": false
+      },
+      "mock_assumptions": {
+        "initial_quote_balance_krw": "10000000",
+        "initial_base_balance": "0",
+        "fee_rate": "0.0005",
+        "fill_model": "immediate completed-candle close"
+      },
+      "day_baseline": {
+        "baseline_id": "baseline-0000000000000000000000000000000000000000000000000000000000000001",
+        "account_identity": "mock:upbit-default",
+        "mode": "MOCK",
+        "day_utc": "2026-10-14",
+        "reference_time_utc": "2026-10-14T00:00:00Z",
+        "recorded_at_utc": "2026-10-14T00:00:00Z",
+        "source": "DURABLE_MOCK_VENUE_SEED",
+        "verification_state": "VERIFIED",
+        "sufficient_for_risk_admission": true,
+        "total_equity_krw": "10000000",
+        "assets": [
+          {
+            "currency": "KRW",
+            "free": "10000000",
+            "locked": "0",
+            "total": "10000000",
+            "valuation_basis": "QUOTE_CURRENCY_PARITY",
+            "mark_price_krw": "1",
+            "valuation_krw": "10000000",
+            "candle_observation_id": null,
+            "candle_content_digest": null
+          },
+          {
+            "currency": "BTC",
+            "free": "0",
+            "locked": "0",
+            "total": "0",
+            "valuation_basis": "ZERO_BALANCE",
+            "mark_price_krw": null,
+            "valuation_krw": "0",
+            "candle_observation_id": null,
+            "candle_content_digest": null
+          }
+        ],
+        "exchange_evidence": null,
+        "block_reasons": [],
+        "baseline_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+        "request_id": "auto-start-001",
+        "operator_note": null
+      },
+      "admission_block_reasons": []
+    }
+  },
+  "command_response": {
+    "session": {
+      "session_id": "automation-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "account_identity": "mock:upbit-default",
+      "mode": "MOCK",
+      "state": "RUNNING",
+      "sequence": 1,
+      "policy_ref": {
+        "policy_id": "policy-example",
+        "revision_id": "revision-example-r1",
+        "definition_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      },
+      "market": "KRW-BTC",
+      "decision_interval": "m1",
+      "risk": {
+        "max_order_notional_krw": "100000",
+        "max_daily_notional_krw": "1000000",
+        "max_asset_exposure_krw": "500000",
+        "max_daily_loss_krw": "50000",
+        "max_open_orders": 2,
+        "max_orders_per_interval": 1,
+        "max_balance_age_seconds": 30,
+        "max_feed_age_seconds": 90
+      },
+      "created_at_utc": "2026-10-14T00:00:00Z",
+      "updated_at_utc": "2026-10-14T00:00:00Z",
+      "last_finalized_candle_at": null,
+      "last_balance_observed_at": null,
+      "unresolved_order_count": 0,
+      "fill_count": 0,
+      "recovery_reason": null,
+      "account_risk": {
+        "balance": {
+          "source": "DURABLE_MOCK_VENUE",
+          "observed_at_utc": "2026-10-14T00:00:00Z",
+          "received_at_utc": "2026-10-14T00:00:00Z",
+          "freshness": "FRESH",
+          "quote_currency": "KRW",
+          "quote_total": "10000000",
+          "quote_free": "10000000",
+          "quote_exchange_locked": "0",
+          "quote_local_reserved": "0",
+          "base_currency": "BTC",
+          "base_total": "0",
+          "base_free": "0",
+          "base_exchange_locked": "0",
+          "base_local_reserved": "0"
+        },
+        "risk": {
+          "daily_notional_used_krw": "0",
+          "daily_notional_limit_krw": "1000000",
+          "daily_loss_used_krw": "0",
+          "daily_loss_limit_krw": "50000",
+          "asset_exposure_krw": "0",
+          "asset_exposure_limit_krw": "500000",
+          "open_order_count": 0,
+          "open_order_limit": 2,
+          "orders_in_interval": 0,
+          "orders_per_interval_limit": 1,
+          "emergency_latched": false,
+          "live_grant_active": false
+        },
+        "feed": {
+          "source": "UPBIT_PUBLIC_FEED",
+          "observation_close_at_utc": null,
+          "received_at_utc": null,
+          "freshness": "UNAVAILABLE"
+        },
+        "capabilities": {
+          "can_pause": true,
+          "can_resume": false,
+          "can_stop": true,
+          "can_cancel_order": false,
+          "can_submit_orders": true,
+          "live_effects_enabled": false,
+          "explicit_approval_required": false
+        },
+        "mock_assumptions": {
+          "initial_quote_balance_krw": "10000000",
+          "initial_base_balance": "0",
+          "fee_rate": "0.0005",
+          "fill_model": "immediate completed-candle close"
+        },
+        "day_baseline": {
+          "baseline_id": "baseline-0000000000000000000000000000000000000000000000000000000000000001",
+          "account_identity": "mock:upbit-default",
+          "mode": "MOCK",
+          "day_utc": "2026-10-14",
+          "reference_time_utc": "2026-10-14T00:00:00Z",
+          "recorded_at_utc": "2026-10-14T00:00:00Z",
+          "source": "DURABLE_MOCK_VENUE_SEED",
+          "verification_state": "VERIFIED",
+          "sufficient_for_risk_admission": true,
+          "total_equity_krw": "10000000",
+          "assets": [
+            {
+              "currency": "KRW",
+              "free": "10000000",
+              "locked": "0",
+              "total": "10000000",
+              "valuation_basis": "QUOTE_CURRENCY_PARITY",
+              "mark_price_krw": "1",
+              "valuation_krw": "10000000",
+              "candle_observation_id": null,
+              "candle_content_digest": null
+            },
+            {
+              "currency": "BTC",
+              "free": "0",
+              "locked": "0",
+              "total": "0",
+              "valuation_basis": "ZERO_BALANCE",
+              "mark_price_krw": null,
+              "valuation_krw": "0",
+              "candle_observation_id": null,
+              "candle_content_digest": null
+            }
+          ],
+          "exchange_evidence": null,
+          "block_reasons": [],
+          "baseline_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+          "request_id": "auto-start-001",
+          "operator_note": null
+        },
+        "admission_block_reasons": []
+      }
+    },
+    "receipt": {
+      "request_id": "auto-start-001",
+      "action": "START",
+      "outcome": "APPLIED",
+      "sequence": 1,
+      "observed_at_utc": "2026-10-14T00:00:00Z",
+      "reason": null
+    },
+    "order": null,
+    "baseline": null
+  },
+  "baseline_status": {
+    "session_id": "automation-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "account_identity": "mock:upbit-default",
+    "mode": "MOCK",
+    "day_utc": "2026-10-14",
+    "admission_blocked": false,
+    "block_reasons": [],
+    "baseline": {
+      "baseline_id": "baseline-0000000000000000000000000000000000000000000000000000000000000001",
+      "account_identity": "mock:upbit-default",
+      "mode": "MOCK",
+      "day_utc": "2026-10-14",
+      "reference_time_utc": "2026-10-14T00:00:00Z",
+      "recorded_at_utc": "2026-10-14T00:00:00Z",
+      "source": "DURABLE_MOCK_VENUE_SEED",
+      "verification_state": "VERIFIED",
+      "sufficient_for_risk_admission": true,
+      "total_equity_krw": "10000000",
+      "assets": [
+        {
+          "currency": "KRW",
+          "free": "10000000",
+          "locked": "0",
+          "total": "10000000",
+          "valuation_basis": "QUOTE_CURRENCY_PARITY",
+          "mark_price_krw": "1",
+          "valuation_krw": "10000000",
+          "candle_observation_id": null,
+          "candle_content_digest": null
+        },
+        {
+          "currency": "BTC",
+          "free": "0",
+          "locked": "0",
+          "total": "0",
+          "valuation_basis": "ZERO_BALANCE",
+          "mark_price_krw": null,
+          "valuation_krw": "0",
+          "candle_observation_id": null,
+          "candle_content_digest": null
+        }
+      ],
+      "exchange_evidence": null,
+      "block_reasons": [],
+      "baseline_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "request_id": "auto-start-001",
+      "operator_note": null
+    }
+  },
+  "session_page": {
+    "items": [],
+    "returned_count": 0,
+    "total_count": 0,
+    "next_offset": null
+  },
+  "event_page": {
+    "items": [
+      {
+        "session_id": "automation-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sequence": 1,
+        "kind": "STARTED",
+        "at_utc": "2026-10-14T00:00:00Z",
+        "detail": {"mode": "MOCK"}
+      }
+    ],
+    "next_sequence": null
+  },
+  "ledger_page": {
+    "orders": [
+      {
+        "client_identifier": "auto-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "intent_id": "intent-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "market": "KRW-BTC",
+        "side": "BID",
+        "state": "FILLED",
+        "venue_order_uuid": "mock-order-0001",
+        "requested_notional_krw": "100000",
+        "reserved_fee_krw": "50",
+        "executed_volume": "0.001",
+        "paid_fee_krw": "50",
+        "locked_quote_krw": "0",
+        "locked_base": null,
+        "trade_count": 1,
+        "created_at_utc": "2026-10-14T00:01:00Z",
+        "updated_at_utc": "2026-10-14T00:01:00Z"
+      }
+    ],
+    "fills": [
+      {
+        "trade_uuid": "mock-trade-0001",
+        "client_identifier": "auto-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "market": "KRW-BTC",
+        "side": "BID",
+        "price_krw": "100000000",
+        "volume": "0.001",
+        "funds_krw": "100000",
+        "observed_at_utc": "2026-10-14T00:01:00Z"
+      }
+    ],
+    "next_sequence": null
+  }
+}

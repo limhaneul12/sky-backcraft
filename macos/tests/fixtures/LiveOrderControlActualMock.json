@@ -1,0 +1,81 @@
+{
+  "status_off": {
+    "boot_epoch": "boot-c45f-18dec285c95d83c0-1",
+    "live_order_control_available": true,
+    "live_trading_enabled": false,
+    "sequence": 0,
+    "observed_at_utc": "2026-10-15T16:59:41.931090+00:00",
+    "exchange_read_mode": "MOCK",
+    "order_admission_blocked": false,
+    "emergency_latched": false,
+    "confirmation_required": true
+  },
+  "enabled": {
+    "boot_epoch": "boot-c45f-18dec285c95d83c0-1",
+    "live_order_control_available": true,
+    "live_trading_enabled": true,
+    "sequence": 1,
+    "observed_at_utc": "2026-10-15T16:59:43.315361+00:00",
+    "exchange_read_mode": "MOCK",
+    "order_admission_blocked": false,
+    "emergency_latched": false,
+    "confirmation_required": true,
+    "receipt": {
+      "request_id": "first-enable",
+      "action": "enable",
+      "outcome": "ACKNOWLEDGED",
+      "sequence": 1,
+      "boot_epoch": "boot-c45f-18dec285c95d83c0-1",
+      "observed_at_utc": "2026-10-15T16:59:43.314968+00:00"
+    }
+  },
+  "disabled": {
+    "boot_epoch": "boot-c45f-18dec285c95d83c0-1",
+    "live_order_control_available": true,
+    "live_trading_enabled": false,
+    "sequence": 4,
+    "observed_at_utc": "2026-10-15T16:59:44.853045+00:00",
+    "exchange_read_mode": "MOCK",
+    "order_admission_blocked": false,
+    "emergency_latched": false,
+    "confirmation_required": true,
+    "receipt": {
+      "request_id": "normal-disable",
+      "action": "disable",
+      "outcome": "ACKNOWLEDGED",
+      "sequence": 4,
+      "boot_epoch": "boot-c45f-18dec285c95d83c0-1",
+      "observed_at_utc": "2026-10-15T16:59:44.852600+00:00"
+    }
+  },
+  "restarted_off": {
+    "boot_epoch": "boot-c496-18dec2871f970300-1",
+    "live_order_control_available": true,
+    "live_trading_enabled": false,
+    "sequence": 0,
+    "observed_at_utc": "2026-10-15T16:59:47.487713+00:00",
+    "exchange_read_mode": "MOCK",
+    "order_admission_blocked": false,
+    "emergency_latched": false,
+    "confirmation_required": true
+  },
+  "prior_boot_receipt": {
+    "boot_epoch": "boot-c496-18dec2871f970300-1",
+    "live_order_control_available": true,
+    "live_trading_enabled": false,
+    "sequence": 0,
+    "observed_at_utc": "2026-10-15T16:59:47.952015+00:00",
+    "exchange_read_mode": "MOCK",
+    "order_admission_blocked": false,
+    "emergency_latched": false,
+    "confirmation_required": true,
+    "receipt": {
+      "request_id": "enable-before-restart",
+      "action": "enable",
+      "outcome": "ACKNOWLEDGED",
+      "sequence": 9,
+      "boot_epoch": "boot-c45f-18dec285c95d83c0-1",
+      "observed_at_utc": "2026-10-15T16:59:47.173660+00:00"
+    }
+  }
+}

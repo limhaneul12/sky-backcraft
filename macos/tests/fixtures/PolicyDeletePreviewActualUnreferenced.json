@@ -1,0 +1,32 @@
+{
+  "resource": {
+    "kind": "policy",
+    "policy_id": "policy-55b263f8978e1a4af98db8495710c2cac343440cb6e75071ddf45b99cfbebd25"
+  },
+  "cascade_required": false,
+  "blockers": [],
+  "cascade": [
+    {
+      "kind": "policy",
+      "count": 1,
+      "examples": [
+        "policy-55b263f8978e1a4af98db8495710c2cac343440cb6e75071ddf45b99cfbebd25"
+      ]
+    },
+    {
+      "kind": "policy_revision",
+      "count": 1,
+      "examples": [
+        "policy-revision-c2ee1e6c1bc45435ad0b928df79b2fa409193d69077472316f8b9d3237e5ad28"
+      ]
+    }
+  ],
+  "retained_shared": [],
+  "reclaimable_file_bytes": 0,
+  "exclusive_file_count": 0,
+  "db_row_estimate": 2,
+  "scope_digest": "ae9aa38146ffc3a54da47793ddb11e2bd18928fb91c56eba34c1fa103e8e169e",
+  "expires_at": "2026-10-15T03:44:52.088382Z",
+  "confirmation_token": "5d575f0a7bf1b2a7637f0efde4a094644c3a560e5714f18e5ccf868dcc0cf34a",
+  "irreversible": true
+}
