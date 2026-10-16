@@ -75,11 +75,26 @@ impl ReviewFixture {
         action: &str,
         evaluation: &serde_json::Value,
     ) -> Result<AutomationIntentId, LabError> {
-        let close_hour = sequence + 1;
-        let open_hour = sequence;
-        let observation = observation(
-            open_hour,
-            close_hour,
+        let base = time("2026-10-14T00:00:00Z")?;
+        let open_at = UtcTimestamp(base.0 + chrono::Duration::hours(i64::from(sequence)));
+        self.add_decision_at(sequence, open_at, action, evaluation)
+    }
+
+    fn add_decision_at(
+        &mut self,
+        sequence: u32,
+        open_at: UtcTimestamp,
+        action: &str,
+        evaluation: &serde_json::Value,
+    ) -> Result<AutomationIntentId, LabError> {
+        let close_at = UtcTimestamp(open_at.0 + CandleInterval::H1.duration());
+        let open_text = open_at.0.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let close_text = close_at
+            .0
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let observation = observation_at(
+            &open_text,
+            &close_text,
             Decimal::from(100 + i64::from(sequence)),
         )?;
         let intent_id = AutomationIntentId::from_seed(&format!("review-decision-{sequence}"));
@@ -341,18 +356,6 @@ fn time(value: &str) -> Result<UtcTimestamp, LabError> {
     UtcTimestamp::parse_rfc3339(value)
 }
 
-fn observation(
-    open_hour: u32,
-    close_hour: u32,
-    close_price: Decimal,
-) -> Result<CandleObservation, LabError> {
-    observation_at(
-        &format!("2026-10-14T{open_hour:02}:00:00Z"),
-        &format!("2026-10-14T{close_hour:02}:00:00Z"),
-        close_price,
-    )
-}
-
 fn observation_at(
     open_at: &str,
     close_at: &str,
@@ -484,6 +487,172 @@ fn review_details_preserve_decisions_partial_fills_and_restart_identity() -> Res
     reopened.close()?;
     fs::remove_dir_all(root)
         .map_err(|error| LabError::Internal(format!("remove review test root: {error}")))?;
+    Ok(())
+}
+
+#[test]
+fn decision_pages_preserve_order_counts_cursors_and_signal_ownership() -> Result<(), LabError> {
+    const DECISION_COUNT: u32 = 205;
+    const PAGE_LIMIT: u32 = 100;
+
+    let mut fixture = ReviewFixture::new()?;
+    let base = time("2026-10-14T00:00:00Z")?;
+    let decision_capacity = usize::try_from(DECISION_COUNT)
+        .map_err(|_| LabError::Internal("fixture decision count overflow".into()))?;
+    let mut expected_rows = Vec::with_capacity(decision_capacity);
+    for index in 0..DECISION_COUNT {
+        let open_at = UtcTimestamp(base.0 + chrono::Duration::hours(i64::from(index)));
+        let close_at = UtcTimestamp(open_at.0 + CandleInterval::H1.duration());
+        let open_text = open_at.0.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let close_text = close_at
+            .0
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let evaluation = evaluation(&close_text, "PAGE_HOLD");
+        let expected_observation = observation_at(
+            &open_text,
+            &close_text,
+            Decimal::from(100 + i64::from(index)),
+        )?;
+        let intent_id = fixture.add_decision_at(index, open_at, "HOLD", &evaluation)?;
+        expected_rows.push((intent_id, expected_observation.id, close_at));
+    }
+
+    let mut actual_ids = Vec::with_capacity(expected_rows.len());
+    for offset in [0, PAGE_LIMIT, PAGE_LIMIT * 2] {
+        let page =
+            fixture
+                .store
+                .automation_review_decisions(&fixture.session_id, offset, PAGE_LIMIT)?;
+        let end = (offset + PAGE_LIMIT).min(DECISION_COUNT);
+        let start_index = usize::try_from(offset)
+            .map_err(|_| LabError::Internal("fixture page offset overflow".into()))?;
+        let end_index = usize::try_from(end)
+            .map_err(|_| LabError::Internal("fixture page end overflow".into()))?;
+        assert_eq!(page.total_count, u64::from(DECISION_COUNT));
+        assert_eq!(page.returned_count, u64::from(end - offset));
+        assert_eq!(page.next_offset, (end < DECISION_COUNT).then_some(end));
+        let page_ids = page
+            .items
+            .iter()
+            .map(|item| item.intent_id.clone())
+            .collect::<Vec<_>>();
+        let expected_page = &expected_rows[start_index..end_index];
+        assert_eq!(
+            page_ids,
+            expected_page
+                .iter()
+                .map(|(intent_id, _, _)| intent_id.clone())
+                .collect::<Vec<_>>()
+        );
+        for (item, (intent_id, observation_id, decision_time)) in
+            page.items.iter().zip(expected_page)
+        {
+            assert_eq!(&item.intent_id, intent_id);
+            assert_eq!(&item.observation_id, observation_id);
+            assert_eq!(item.decision_time_utc, *decision_time);
+            assert_eq!(item.action, AutomationReviewAction::Hold);
+        }
+        actual_ids.extend(page_ids);
+    }
+    assert_eq!(
+        actual_ids,
+        expected_rows
+            .iter()
+            .map(|(intent_id, _, _)| intent_id.clone())
+            .collect::<Vec<_>>()
+    );
+    fixture.close()?;
+    Ok(())
+}
+
+#[test]
+fn decision_pages_reject_missing_or_duplicate_signal_events() -> Result<(), LabError> {
+    let mut missing = ReviewFixture::new()?;
+    let intent_id = missing.add_decision(
+        0,
+        "HOLD",
+        &evaluation("2026-10-14T01:00:00Z", "MISSING_SIGNAL"),
+    )?;
+    let (sequence, detail_json): (i64, String) = missing
+        .store
+        .connection
+        .query_row(
+            "SELECT sequence,detail_json FROM automation_session_events \
+             WHERE session_id=?1 AND kind='SIGNAL_OBSERVED' \
+               AND json_extract(detail_json,'$.intent_id')=?2",
+            params![missing.session_id.as_str(), intent_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(super::super::sql_error)?;
+    let mut detail: serde_json::Value =
+        serde_json::from_str(&detail_json).map_err(super::super::json_error)?;
+    let unselected_id = AutomationIntentId::from_seed("unselected-page-signal");
+    detail["intent_id"] = serde_json::json!(unselected_id.as_str());
+    let detail_json = serde_json::to_string(&detail).map_err(super::super::json_error)?;
+    missing
+        .store
+        .connection
+        .execute(
+            "UPDATE automation_session_events SET detail_json=?1 \
+             WHERE session_id=?2 AND sequence=?3",
+            params![detail_json, missing.session_id.as_str(), sequence],
+        )
+        .map_err(super::super::sql_error)?;
+    assert!(matches!(
+        missing
+            .store
+            .automation_review_decisions(&missing.session_id, 0, 100),
+        Err(LabError::DataCorrupt(_))
+    ));
+    missing.close()?;
+
+    let mut duplicate = ReviewFixture::new()?;
+    let intent_id = duplicate.add_decision(
+        0,
+        "HOLD",
+        &evaluation("2026-10-14T01:00:00Z", "DUPLICATE_SIGNAL"),
+    )?;
+    let (at_utc, detail_json): (String, String) = duplicate
+        .store
+        .connection
+        .query_row(
+            "SELECT at_utc,detail_json FROM automation_session_events \
+             WHERE session_id=?1 AND kind='SIGNAL_OBSERVED' \
+               AND json_extract(detail_json,'$.intent_id')=?2",
+            params![duplicate.session_id.as_str(), intent_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(super::super::sql_error)?;
+    let next_sequence: i64 = duplicate
+        .store
+        .connection
+        .query_row(
+            "SELECT COALESCE(MAX(sequence),0)+1 FROM automation_session_events WHERE session_id=?1",
+            [duplicate.session_id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(super::super::sql_error)?;
+    duplicate
+        .store
+        .connection
+        .execute(
+            "INSERT INTO automation_session_events(session_id,sequence,kind,at_utc,detail_json) \
+             VALUES (?1,?2,'SIGNAL_OBSERVED',?3,?4)",
+            params![
+                duplicate.session_id.as_str(),
+                next_sequence,
+                at_utc,
+                detail_json,
+            ],
+        )
+        .map_err(super::super::sql_error)?;
+    assert!(matches!(
+        duplicate
+            .store
+            .automation_review_decisions(&duplicate.session_id, 0, 100),
+        Err(LabError::DataCorrupt(_))
+    ));
+    duplicate.close()?;
     Ok(())
 }
 
@@ -666,6 +835,12 @@ fn review_snapshot_rejects_changed_evaluation_and_missing_candle_links() -> Resu
         fixture
             .store
             .automation_review_detail(&fixture.session_id, &intent_id),
+        Err(LabError::DataCorrupt(_))
+    ));
+    assert!(matches!(
+        fixture
+            .store
+            .automation_review_decisions(&fixture.session_id, 0, 100),
         Err(LabError::DataCorrupt(_))
     ));
     fixture.close()?;

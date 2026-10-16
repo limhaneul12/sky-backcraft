@@ -182,6 +182,64 @@ fn refresh_events(s: &mut AutomationReviewSnapshot) {
     }
 }
 
+fn fixture_with_decision_count(decision_count: u32) -> AutomationReviewSnapshot {
+    assert!(decision_count >= 3);
+    let mut snapshot = fixture();
+    let base = ts(0, 0);
+    for index in 3..decision_count {
+        let open_at = UtcTimestamp(base.0 + chrono::Duration::hours(i64::from(index)));
+        let close_at = UtcTimestamp(open_at.0 + CandleInterval::H1.duration());
+        let close_text = close_at
+            .0
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let close = Decimal::from(100 + i64::from(index % 20));
+        let candle = CandleRecord {
+            market: "KRW-BTC".into(),
+            interval: CandleInterval::H1,
+            open_time_utc: open_at,
+            close_time_utc: close_at,
+            open: PriceKrw::new(close - Decimal::ONE).expect("probe open"),
+            high: PriceKrw::new(close + Decimal::ONE).expect("probe high"),
+            low: PriceKrw::new(close - Decimal::from(2)).expect("probe low"),
+            close: PriceKrw::new(close).expect("probe close"),
+            volume: AssetQuantity::new(Decimal::from(5)).expect("probe volume"),
+            quote_turnover: QuoteAmount::new(close * Decimal::from(5)).expect("probe turnover"),
+            completed: true,
+        };
+        let digest = observation_digest(&candle).expect("probe candle digest");
+        let observation = CandleObservation {
+            id: ObservationId::from_seed(digest.as_str()),
+            candle,
+            content_digest: digest,
+            raw_object_ids: Vec::new(),
+            constituent_ids: Vec::new(),
+        };
+        let evaluation = json!({
+            "decision_time_utc": close_text,
+            "reasons": ["PROBE_HOLD"],
+            "indicators": {"ema": "101.25", "volatility": "0.02"},
+            "policy_trace": {"matched_rule_id": "PROBE_HOLD"},
+        });
+        snapshot.decisions.push(AutomationDecisionRecord {
+            session_id: snapshot.session.session_id.clone(),
+            intent_id: AutomationIntentId::from_seed(&format!("export-probe-{index}")),
+            observation_id: observation.id.clone(),
+            decision_time_utc: close_at,
+            recorded_at_utc: close_at,
+            action: AutomationReviewAction::Hold,
+            state: "NO_ACTION".into(),
+            candle: observation.clone(),
+            evaluation_digest: ContentHash::of_value(&evaluation).expect("probe evaluation digest"),
+            evaluation,
+        });
+        snapshot.candles.push(observation);
+    }
+    let last_close = UtcTimestamp(base.0 + chrono::Duration::hours(i64::from(decision_count)));
+    snapshot.session.updated_at_utc = UtcTimestamp(last_close.0 + chrono::Duration::seconds(1));
+    refresh_events(&mut snapshot);
+    snapshot
+}
+
 #[test]
 fn hand_computed_partial_fill_cost_basis_is_not_cashflow() {
     // Buy 2*100 plus fee2; sell 1*150 less fee1.5. Cost/unit101.
@@ -332,32 +390,87 @@ fn unknown_opening_inventory_and_unreconciled_orders_do_not_invent_profit() {
 
 #[test]
 fn export_chunks_pin_snapshot_and_preserve_csv_text_safely() {
-    let mut snapshot = fixture();
+    let mut snapshot = fixture_with_decision_count(205);
     snapshot.decisions[0].evaluation["reasons"] = json!(["=HYPERLINK(\"bad\")\nnext,line"]);
     snapshot.decisions[0].evaluation_digest =
         ContentHash::of_value(&snapshot.decisions[0].evaluation).expect("digest");
     refresh_events(&mut snapshot);
     let manifest = export_manifest(&snapshot).expect("manifest");
     assert_eq!(manifest.files.len(), 6);
+    assert!(
+        manifest
+            .files
+            .iter()
+            .any(|file| file.bytes
+                > u64::try_from(AUTOMATION_REVIEW_CHUNK_BYTES).expect("chunk size")),
+        "fixture spans more than one export chunk"
+    );
+    let mut decisions_csv = None;
+    for file in &manifest.files {
+        let mut offset = 0_u64;
+        let mut reconstructed = Vec::new();
+        loop {
+            let chunk = export_read(
+                &snapshot,
+                file.file,
+                offset,
+                &file.sha256,
+                &manifest.snapshot_digest,
+            )
+            .expect("read pinned export chunk");
+            assert_eq!(chunk.snapshot_digest, manifest.snapshot_digest);
+            assert_eq!(chunk.sha256, file.sha256);
+            assert_eq!(chunk.total_bytes, file.bytes);
+            assert_eq!(chunk.offset, offset);
+            assert_eq!(chunk.data_hex.len() % 2, 0);
+            let bytes = decode_hex(&chunk.data_hex);
+            assert_eq!(
+                chunk.bytes,
+                u64::try_from(bytes.len()).expect("chunk length fits wire count")
+            );
+            assert_eq!(ContentHash::of_bytes(&bytes), chunk.chunk_sha256);
+            reconstructed.extend_from_slice(&bytes);
+            match chunk.next_offset {
+                Some(next_offset) => {
+                    assert_eq!(next_offset, offset + chunk.bytes);
+                    assert!(next_offset > offset);
+                    offset = next_offset;
+                }
+                None => break,
+            }
+        }
+        assert_eq!(
+            u64::try_from(reconstructed.len()).expect("file length fits wire count"),
+            file.bytes
+        );
+        assert_eq!(ContentHash::of_bytes(&reconstructed), file.sha256);
+        if file.file == AutomationReviewFile::DecisionsCsv {
+            decisions_csv = Some(reconstructed);
+        }
+    }
+    let text = String::from_utf8(decisions_csv.expect("decisions CSV manifest entry"))
+        .expect("CSV is UTF-8");
+    assert!(text.contains("'=HYPERLINK"));
+    assert!(text.contains("\r\n"));
+    let first_file = &manifest.files[0];
+    let wrong_file_hash = ContentHash::of_bytes(b"wrong export hash");
+    assert!(matches!(
+        export_read(
+            &snapshot,
+            first_file.file,
+            u64::MAX,
+            &wrong_file_hash,
+            &manifest.snapshot_digest,
+        ),
+        Err(LabError::InputHashMismatch(_))
+    ));
+    snapshot.session.updated_at_utc =
+        UtcTimestamp(snapshot.session.updated_at_utc.0 + chrono::Duration::seconds(1));
     let csv = manifest
         .files
         .iter()
-        .find(|f| f.file == AutomationReviewFile::DecisionsCsv)
-        .expect("csv");
-    let chunk = export_read(
-        &snapshot,
-        csv.file,
-        0,
-        &csv.sha256,
-        &manifest.snapshot_digest,
-    )
-    .expect("read");
-    let bytes = decode_hex(&chunk.data_hex);
-    assert_eq!(ContentHash::of_bytes(&bytes), csv.sha256);
-    let text = String::from_utf8(bytes).expect("utf8");
-    assert!(text.contains("'=HYPERLINK"));
-    assert!(text.contains("\r\n"));
-    snapshot.session.updated_at_utc = ts(4, 0);
+        .find(|file| file.file == AutomationReviewFile::DecisionsCsv)
+        .expect("decisions CSV entry");
     assert!(matches!(
         export_read(
             &snapshot,

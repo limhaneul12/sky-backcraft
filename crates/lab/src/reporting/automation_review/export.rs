@@ -4,7 +4,9 @@ use crate::contracts::{
     AutomationReviewExportManifest, AutomationReviewFile, AutomationReviewSnapshot, ContentHash,
     LabError, MAX_AUTOMATION_REVIEW_BYTES,
 };
+use sha2::{Digest, Sha256};
 use std::fmt::Write;
+use std::io::{self, BufWriter, Write as IoWrite};
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
@@ -16,6 +18,103 @@ const FILES: [AutomationReviewFile; 6] = [
     AutomationReviewFile::ReportMarkdown,
     AutomationReviewFile::SnapshotJson,
 ];
+
+struct HashWindowWriter {
+    hasher: Sha256,
+    bytes: usize,
+    window_start: Option<u64>,
+    window: Vec<u8>,
+    exceeded_limit: bool,
+    limit_message: &'static str,
+}
+
+struct RenderedFile {
+    bytes: usize,
+    sha256: ContentHash,
+    window: Vec<u8>,
+}
+
+impl HashWindowWriter {
+    fn new(window_start: Option<u64>, file: AutomationReviewFile) -> Self {
+        Self {
+            hasher: Sha256::new(),
+            bytes: 0,
+            window_start,
+            window: Vec::new(),
+            exceeded_limit: false,
+            limit_message: match file {
+                AutomationReviewFile::DecisionsCsv
+                | AutomationReviewFile::OrdersCsv
+                | AutomationReviewFile::FillsCsv => "automation review CSV exceeds byte cap",
+                _ => "automation review export file exceeds byte cap",
+            },
+        }
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), LabError> {
+        self.write_all(bytes).map_err(|_| self.limit_error())
+    }
+
+    fn limit_error(&self) -> LabError {
+        LabError::ResourceLimit(self.limit_message.into())
+    }
+
+    fn finish(self) -> Result<RenderedFile, LabError> {
+        if self.exceeded_limit {
+            return Err(self.limit_error());
+        }
+        Ok(RenderedFile {
+            bytes: self.bytes,
+            sha256: ContentHash::try_from(format!("{:x}", self.hasher.finalize()))?,
+            window: self.window,
+        })
+    }
+}
+
+impl IoWrite for HashWindowWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        let Some(next_bytes) = self.bytes.checked_add(bytes.len()) else {
+            self.exceeded_limit = true;
+            return Err(io::Error::other(
+                "automation review export file exceeds byte cap",
+            ));
+        };
+        if next_bytes > MAX_AUTOMATION_REVIEW_BYTES {
+            self.exceeded_limit = true;
+            return Err(io::Error::other(
+                "automation review export file exceeds byte cap",
+            ));
+        }
+
+        if let Some(window_start) = self.window_start {
+            let input_start = u64::try_from(self.bytes).map_err(io::Error::other)?;
+            let input_end = input_start
+                .checked_add(u64::try_from(bytes.len()).map_err(io::Error::other)?)
+                .ok_or_else(|| io::Error::other("automation review export offset overflow"))?;
+            let window_end = window_start.saturating_add(
+                u64::try_from(AUTOMATION_REVIEW_CHUNK_BYTES).map_err(io::Error::other)?,
+            );
+            let capture_start = input_start.max(window_start);
+            let capture_end = input_end.min(window_end);
+            if capture_start < capture_end {
+                let start =
+                    usize::try_from(capture_start - input_start).map_err(io::Error::other)?;
+                let end = usize::try_from(capture_end - input_start).map_err(io::Error::other)?;
+                self.window.extend_from_slice(&bytes[start..end]);
+            }
+        }
+        self.hasher.update(bytes);
+        self.bytes = next_bytes;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 fn file_metadata(file: AutomationReviewFile) -> (&'static str, &'static str) {
     match file {
@@ -38,14 +137,14 @@ pub fn export_manifest(
     let report = performance(&prepared)?;
     let mut files = Vec::new();
     for file in FILES {
-        let data = render(&prepared, &report, file)?;
+        let rendered = render_file(&prepared, &report, file, None)?;
         let (name, media) = file_metadata(file);
         files.push(AutomationReviewExportFile {
             file,
             file_name: name.into(),
             media_type: media.into(),
-            bytes: count(data.len())?,
-            sha256: ContentHash::of_bytes(&data),
+            bytes: count(rendered.bytes)?,
+            sha256: rendered.sha256,
         });
     }
     Ok(AutomationReviewExportManifest {
@@ -74,9 +173,8 @@ pub fn export_read(
         ));
     }
     let report = performance(&prepared)?;
-    let data = render(&prepared, &report, file)?;
-    let hash = ContentHash::of_bytes(&data);
-    if &hash != expected_sha256 {
+    let rendered = render_file(&prepared, &report, file, Some(offset))?;
+    if &rendered.sha256 != expected_sha256 {
         return Err(LabError::InputHashMismatch(
             "automation review file differs from manifest".into(),
         ));
@@ -84,18 +182,23 @@ pub fn export_read(
     let start = usize::try_from(offset).map_err(|_| {
         LabError::InvalidConfig("review export offset exceeds platform range".into())
     })?;
-    if start > data.len() {
+    if start > rendered.bytes {
         return Err(LabError::InvalidConfig(
             "review export offset exceeds file length".into(),
         ));
     }
     let end = start
         .saturating_add(AUTOMATION_REVIEW_CHUNK_BYTES)
-        .min(data.len());
-    let chunk = &data[start..end];
+        .min(rendered.bytes);
+    let chunk = rendered.window;
+    if chunk.len() != end - start {
+        return Err(LabError::Internal(
+            "automation review export window length differs from requested range".into(),
+        ));
+    }
     let (name, media) = file_metadata(file);
     let mut hex = String::with_capacity(chunk.len() * 2);
-    for byte in chunk {
+    for &byte in &chunk {
         hex.push(char::from(HEX[usize::from(byte >> 4)]));
         hex.push(char::from(HEX[usize::from(byte & 15)]));
     }
@@ -106,14 +209,14 @@ pub fn export_read(
         file,
         file_name: name.into(),
         media_type: media.into(),
-        total_bytes: count(data.len())?,
-        sha256: hash,
+        total_bytes: count(rendered.bytes)?,
+        sha256: rendered.sha256,
         offset,
         bytes: count(chunk.len())?,
-        chunk_sha256: ContentHash::of_bytes(chunk),
+        chunk_sha256: ContentHash::of_bytes(&chunk),
         encoding: "HEX".into(),
         data_hex: hex,
-        next_offset: if end < data.len() {
+        next_offset: if end < rendered.bytes {
             Some(count(end)?)
         } else {
             None
@@ -121,56 +224,93 @@ pub fn export_read(
     })
 }
 
-fn render(
+fn render_file(
     prepared: &PreparedReview,
     report: &crate::contracts::AutomationPerformanceReport,
     file: AutomationReviewFile,
-) -> Result<Vec<u8>, LabError> {
-    let bytes = match file {
-        AutomationReviewFile::DecisionsCsv => decisions_csv(prepared)?,
-        AutomationReviewFile::OrdersCsv => orders_csv(prepared)?,
-        AutomationReviewFile::FillsCsv => fills_csv(prepared)?,
-        AutomationReviewFile::ReportJson => serde_json::to_vec_pretty(report)?,
-        AutomationReviewFile::SnapshotJson => serde_json::to_vec_pretty(&prepared.snapshot)?,
-        AutomationReviewFile::ReportMarkdown => markdown(report)?.into_bytes(),
+    window_start: Option<u64>,
+) -> Result<RenderedFile, LabError> {
+    let mut writer = BufWriter::new(HashWindowWriter::new(window_start, file));
+    let result = match file {
+        AutomationReviewFile::DecisionsCsv => decisions_csv(prepared, &mut writer),
+        AutomationReviewFile::OrdersCsv => orders_csv(prepared, &mut writer),
+        AutomationReviewFile::FillsCsv => fills_csv(prepared, &mut writer),
+        AutomationReviewFile::ReportJson => {
+            serde_json::to_writer_pretty(&mut writer, report).map_err(Into::into)
+        }
+        AutomationReviewFile::SnapshotJson => {
+            serde_json::to_writer_pretty(&mut writer, &prepared.snapshot).map_err(Into::into)
+        }
+        AutomationReviewFile::ReportMarkdown => {
+            let markdown = markdown(report)?;
+            writer.get_mut().write_bytes(markdown.as_bytes())
+        }
     };
-    if bytes.len() > MAX_AUTOMATION_REVIEW_BYTES {
-        return Err(LabError::ResourceLimit(
-            "automation review export file exceeds byte cap".into(),
-        ));
+    if let Err(error) = result {
+        if writer.get_ref().exceeded_limit {
+            return Err(writer.get_ref().limit_error());
+        }
+        return Err(error);
     }
-    Ok(bytes)
+    if let Err(error) = writer.flush() {
+        if writer.get_ref().exceeded_limit {
+            return Err(writer.get_ref().limit_error());
+        }
+        return Err(LabError::Internal(format!(
+            "flush automation review export: {error}"
+        )));
+    }
+    let sink = match writer.into_inner() {
+        Ok(sink) => sink,
+        Err(error) => {
+            let message = error.error().to_string();
+            let writer = error.into_inner();
+            if writer.get_ref().exceeded_limit {
+                return Err(writer.get_ref().limit_error());
+            }
+            return Err(LabError::Internal(format!(
+                "finish automation review export: {message}"
+            )));
+        }
+    };
+    sink.finish()
 }
 
-fn csv_row(out: &mut String, fields: &[String]) -> Result<(), LabError> {
+fn csv_row(out: &mut BufWriter<HashWindowWriter>, fields: &[String]) -> Result<(), LabError> {
     for (index, field) in fields.iter().enumerate() {
         if index != 0 {
-            out.push(',');
+            write_buffered_bytes(out, b",")?;
         }
-        out.push('"');
+        write_buffered_bytes(out, b"\"")?;
         // Keep exact signed decimal fields numeric, but neutralize spreadsheet formulas in text.
         let first = field.trim_start().chars().next();
         if (first.is_some_and(|c| matches!(c, '=' | '+' | '-' | '@'))
             && rust_decimal::Decimal::from_str_exact(field).is_err())
             || field.starts_with(['\t', '\r', '\n'])
         {
-            out.push('\'');
+            write_buffered_bytes(out, b"'")?;
         }
-        for ch in field.chars() {
-            if ch == '"' {
-                out.push('"');
+        let bytes = field.as_bytes();
+        let mut start = 0;
+        for (index, byte) in bytes.iter().enumerate() {
+            if *byte == b'"' {
+                write_buffered_bytes(out, &bytes[start..=index])?;
+                write_buffered_bytes(out, b"\"")?;
+                start = index + 1;
             }
-            out.push(ch);
         }
-        out.push('"');
+        write_buffered_bytes(out, &bytes[start..])?;
+        write_buffered_bytes(out, b"\"")?;
     }
-    out.push_str("\r\n");
-    if out.len() > MAX_AUTOMATION_REVIEW_BYTES {
-        return Err(LabError::ResourceLimit(
-            "automation review CSV exceeds byte cap".into(),
-        ));
-    }
-    Ok(())
+    write_buffered_bytes(out, b"\r\n")
+}
+
+fn write_buffered_bytes(
+    out: &mut BufWriter<HashWindowWriter>,
+    bytes: &[u8],
+) -> Result<(), LabError> {
+    out.write_all(bytes)
+        .map_err(|error| LabError::Internal(format!("write automation review export: {error}")))
 }
 
 fn text<T: serde::Serialize>(value: &T) -> Result<String, LabError> {
@@ -182,10 +322,12 @@ fn mode(prepared: &PreparedReview) -> Result<String, LabError> {
         .into())
 }
 
-fn decisions_csv(p: &PreparedReview) -> Result<Vec<u8>, LabError> {
-    let mut out = String::new();
+fn decisions_csv(
+    p: &PreparedReview,
+    out: &mut BufWriter<HashWindowWriter>,
+) -> Result<(), LabError> {
     csv_row(
-        &mut out,
+        out,
         &[
             "session_id",
             "mode",
@@ -232,7 +374,7 @@ fn decisions_csv(p: &PreparedReview) -> Result<Vec<u8>, LabError> {
                 },
             );
         csv_row(
-            &mut out,
+            out,
             &[
                 s.session_id.to_string(),
                 mode(p)?,
@@ -257,13 +399,12 @@ fn decisions_csv(p: &PreparedReview) -> Result<Vec<u8>, LabError> {
             ],
         )?;
     }
-    Ok(out.into_bytes())
+    Ok(())
 }
 
-fn orders_csv(p: &PreparedReview) -> Result<Vec<u8>, LabError> {
-    let mut out = String::new();
+fn orders_csv(p: &PreparedReview, out: &mut BufWriter<HashWindowWriter>) -> Result<(), LabError> {
     csv_row(
-        &mut out,
+        out,
         &[
             "session_id",
             "mode",
@@ -287,7 +428,7 @@ fn orders_csv(p: &PreparedReview) -> Result<Vec<u8>, LabError> {
     for row in &p.snapshot.orders {
         let o = &row.order;
         csv_row(
-            &mut out,
+            out,
             &[
                 p.snapshot.session.session_id.to_string(),
                 mode(p)?,
@@ -310,13 +451,12 @@ fn orders_csv(p: &PreparedReview) -> Result<Vec<u8>, LabError> {
             ],
         )?;
     }
-    Ok(out.into_bytes())
+    Ok(())
 }
 
-fn fills_csv(p: &PreparedReview) -> Result<Vec<u8>, LabError> {
-    let mut out = String::new();
+fn fills_csv(p: &PreparedReview, out: &mut BufWriter<HashWindowWriter>) -> Result<(), LabError> {
     csv_row(
-        &mut out,
+        out,
         &[
             "session_id",
             "mode",
@@ -336,7 +476,7 @@ fn fills_csv(p: &PreparedReview) -> Result<Vec<u8>, LabError> {
     for row in &p.snapshot.fills {
         let f = &row.fill;
         csv_row(
-            &mut out,
+            out,
             &[
                 p.snapshot.session.session_id.to_string(),
                 mode(p)?,
@@ -353,7 +493,7 @@ fn fills_csv(p: &PreparedReview) -> Result<Vec<u8>, LabError> {
             ],
         )?;
     }
-    Ok(out.into_bytes())
+    Ok(())
 }
 
 fn metric_text(metric: &crate::contracts::AutomationReviewMetric) -> String {
@@ -408,4 +548,35 @@ fn markdown(r: &crate::contracts::AutomationPerformanceReport) -> Result<String,
         text.push_str("\nOpening inventory reference: unavailable; no zero position is inferred for executed trades.\n");
     }
     Ok(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HashWindowWriter, MAX_AUTOMATION_REVIEW_BYTES};
+    use crate::contracts::{AutomationReviewFile, LabError};
+
+    #[test]
+    fn hash_window_sink_rejects_the_first_byte_over_the_file_cap() {
+        const BUFFER_BYTES: usize = 32 * 1024;
+        let buffer = vec![b'x'; BUFFER_BYTES];
+        let mut writer = HashWindowWriter::new(None, AutomationReviewFile::SnapshotJson);
+        let full_buffers = MAX_AUTOMATION_REVIEW_BYTES / BUFFER_BYTES;
+        let remainder = MAX_AUTOMATION_REVIEW_BYTES % BUFFER_BYTES;
+
+        for _ in 0..full_buffers {
+            writer
+                .write_bytes(&buffer)
+                .expect("bounded buffer stays within file cap");
+        }
+        if remainder > 0 {
+            writer
+                .write_bytes(&buffer[..remainder])
+                .expect("final partial buffer reaches file cap");
+        }
+
+        assert!(matches!(
+            writer.write_bytes(b"x"),
+            Err(LabError::ResourceLimit(_))
+        ));
+    }
 }

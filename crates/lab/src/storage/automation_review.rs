@@ -12,7 +12,10 @@ use crate::contracts::{
     PolicyRevisionRef, PriceKrw, QuoteAmount, UtcTimestamp, observation_digest,
     validate_frozen_policy,
 };
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OptionalExtension, TransactionBehavior, params, params_from_iter,
+    types::Value as SqlValue,
+};
 use rust_decimal::Decimal;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -40,43 +43,26 @@ impl Store {
             "SELECT COUNT(*) FROM automation_intents WHERE session_id=?1",
             session_id,
         )?;
-        let mut statement = transaction
-            .prepare(
-                "SELECT intent_id FROM automation_intents WHERE session_id=?1 \
-                 ORDER BY decision_time_utc,intent_id LIMIT ?2 OFFSET ?3",
-            )
-            .map_err(super::sql_error)?;
-        let raw_ids = statement
-            .query_map(
-                params![session_id.as_str(), i64::from(limit), i64::from(offset)],
-                |row| row.get::<_, String>(0),
-            )
-            .map_err(super::sql_error)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(super::sql_error)?;
-        drop(statement);
-
-        let decisions = raw_ids
+        let decisions = load_review_decision_rows(
+            &transaction,
+            session_id,
+            &session,
+            &frozen_policy,
+            Some((offset, limit)),
+        )?;
+        let intent_ids = decisions
             .iter()
-            .map(|raw_id| {
-                let intent_id = AutomationIntentId::new(raw_id.clone())?;
-                let decision = load_decision(
-                    &transaction,
-                    &session,
-                    &frozen_policy,
-                    session_id,
-                    &intent_id,
-                )?
-                .ok_or_else(|| {
-                    LabError::DataCorrupt(
-                        "automation decision disappeared inside its read snapshot".into(),
-                    )
-                })?;
-                let signal_events = load_signal_events(&transaction, session_id, &intent_id)?;
-                validate_signal_event(&decision, &signal_events)?;
-                Ok(decision)
-            })
-            .collect::<Result<Vec<_>, LabError>>()?;
+            .map(|decision| decision.intent_id.clone())
+            .collect::<Vec<_>>();
+        let signal_events = load_signal_events_for_intents(&transaction, session_id, &intent_ids)?;
+        for decision in &decisions {
+            validate_signal_event(
+                decision,
+                signal_events
+                    .get(&decision.intent_id)
+                    .map_or(&[], Vec::as_slice),
+            )?;
+        }
         let items = decisions
             .into_iter()
             .map(|decision| AutomationDecisionSummary {
@@ -201,53 +187,111 @@ fn load_review_session(
     ))
 }
 
-fn load_decision(
+const REVIEW_DECISION_SELECT: &str = "SELECT i.intent_id,i.observation_id,i.decision_time_utc,i.action,i.state,i.evaluation_json,\
+            i.created_at_utc,c.observation_id,c.close_time_utc,c.content_digest,c.candle_json \
+     FROM automation_intents i LEFT JOIN automation_candles c \
+       ON c.session_id=i.session_id AND c.observation_id=i.observation_id \
+     WHERE i.session_id=?1 ORDER BY i.decision_time_utc,i.intent_id";
+
+type StoredReviewDecisionRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+fn read_review_decision_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredReviewDecisionRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+    ))
+}
+
+fn load_review_decision_rows(
     connection: &Connection,
+    session_id: &AutomationSessionId,
+    session: &AutomationReviewSession,
+    frozen_policy: &FrozenPolicyRevision,
+    page: Option<(u32, u32)>,
+) -> Result<Vec<AutomationDecisionRecord>, LabError> {
+    let query = if page.is_some() {
+        format!("{REVIEW_DECISION_SELECT} LIMIT ?2 OFFSET ?3")
+    } else {
+        REVIEW_DECISION_SELECT.to_owned()
+    };
+    let mut statement = connection.prepare(&query).map_err(super::sql_error)?;
+    let mut rows = match page {
+        Some((offset, limit)) => statement
+            .query(params![
+                session_id.as_str(),
+                i64::from(limit),
+                i64::from(offset)
+            ])
+            .map_err(super::sql_error)?,
+        None => statement
+            .query([session_id.as_str()])
+            .map_err(super::sql_error)?,
+    };
+    let mut decisions = Vec::new();
+    while let Some(row) = rows.next().map_err(super::sql_error)? {
+        decisions.push(decode_review_decision(
+            read_review_decision_row(row).map_err(super::sql_error)?,
+            session,
+            frozen_policy,
+            session_id,
+        )?);
+    }
+    Ok(decisions)
+}
+
+fn decode_review_decision(
+    row: StoredReviewDecisionRow,
     session: &AutomationReviewSession,
     frozen_policy: &FrozenPolicyRevision,
     session_id: &AutomationSessionId,
-    intent_id: &AutomationIntentId,
-) -> Result<Option<AutomationDecisionRecord>, LabError> {
-    let row = connection
-        .query_row(
-            "SELECT i.observation_id,i.decision_time_utc,i.action,i.state,i.evaluation_json,\
-                    i.created_at_utc,c.observation_id,c.close_time_utc,c.content_digest,c.candle_json \
-             FROM automation_intents i LEFT JOIN automation_candles c \
-               ON c.session_id=i.session_id AND c.observation_id=i.observation_id \
-             WHERE i.session_id=?1 AND i.intent_id=?2",
-            params![session_id.as_str(), intent_id.as_str()],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, Option<String>>(7)?,
-                    row.get::<_, Option<String>>(8)?,
-                    row.get::<_, Option<String>>(9)?,
-                ))
-            },
-        )
-        .optional()
-        .map_err(super::sql_error)?;
-    let Some(row) = row else {
-        return Ok(None);
-    };
-    let observation_id = ObservationId::new(row.0.clone())?;
-    let decision_time_utc = UtcTimestamp::parse_rfc3339(&row.1)?;
-    let action = parse_action(&row.2)?;
-    validate_intent_state(&row.3)?;
-    let evaluation: serde_json::Value = serde_json::from_str(&row.4).map_err(super::json_error)?;
+) -> Result<AutomationDecisionRecord, LabError> {
+    let (
+        raw_intent_id,
+        raw_observation_id,
+        raw_decision_time,
+        raw_action,
+        state,
+        evaluation_json,
+        raw_recorded_at,
+        candle_observation_id,
+        candle_close_time,
+        candle_digest,
+        candle_json,
+    ) = row;
+    let intent_id = AutomationIntentId::new(raw_intent_id)?;
+    let observation_id = ObservationId::new(raw_observation_id)?;
+    let decision_time_utc = UtcTimestamp::parse_rfc3339(&raw_decision_time)?;
+    let action = parse_action(&raw_action)?;
+    validate_intent_state(&state)?;
+    let evaluation: serde_json::Value =
+        serde_json::from_str(&evaluation_json).map_err(super::json_error)?;
     let evaluation_digest = ContentHash::of_value(&evaluation)?;
-    let recorded_at_utc = UtcTimestamp::parse_rfc3339(&row.5)?;
-    let candle_row = row
-        .6
-        .zip(row.7)
-        .zip(row.8)
-        .zip(row.9)
+    let recorded_at_utc = UtcTimestamp::parse_rfc3339(&raw_recorded_at)?;
+    let candle_row = candle_observation_id
+        .zip(candle_close_time)
+        .zip(candle_digest)
+        .zip(candle_json)
         .map(|(((observation, close), digest), candle)| (observation, close, digest, candle))
         .ok_or_else(|| LabError::DataCorrupt("automation decision has no linked candle".into()))?;
     if candle_row.0 != observation_id.as_str() {
@@ -274,7 +318,7 @@ fn load_decision(
     }
     validate_prestart_policy_warmup(
         action,
-        &row.3,
+        &state,
         &evaluation,
         decision_time_utc,
         recorded_at_utc,
@@ -286,18 +330,18 @@ fn load_decision(
         &frozen_policy.reference,
         action,
     )?;
-    Ok(Some(AutomationDecisionRecord {
+    Ok(AutomationDecisionRecord {
         session_id: session_id.clone(),
-        intent_id: intent_id.clone(),
+        intent_id,
         observation_id,
         decision_time_utc,
         recorded_at_utc,
         action,
-        state: row.3,
+        state,
         candle,
         evaluation,
         evaluation_digest,
-    }))
+    })
 }
 
 fn validate_prestart_policy_warmup(
@@ -435,26 +479,7 @@ fn load_review_decisions(
     session: &AutomationReviewSession,
     frozen_policy: &FrozenPolicyRevision,
 ) -> Result<Vec<AutomationDecisionRecord>, LabError> {
-    let mut statement = connection
-        .prepare(
-            "SELECT intent_id FROM automation_intents WHERE session_id=?1 \
-             ORDER BY decision_time_utc,intent_id",
-        )
-        .map_err(super::sql_error)?;
-    let raw_ids = statement
-        .query_map([session_id.as_str()], |row| row.get::<_, String>(0))
-        .map_err(super::sql_error)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(super::sql_error)?;
-    raw_ids
-        .iter()
-        .map(|raw| {
-            let intent_id = AutomationIntentId::new(raw.clone())?;
-            load_decision(connection, session, frozen_policy, session_id, &intent_id)?.ok_or_else(
-                || LabError::DataCorrupt("automation decision vanished from snapshot".into()),
-            )
-        })
-        .collect()
+    load_review_decision_rows(connection, session_id, session, frozen_policy, None)
 }
 
 fn load_review_orders(
@@ -1152,41 +1177,62 @@ fn load_session_events(
         .collect()
 }
 
-fn load_signal_events(
+fn load_signal_events_for_intents(
     connection: &Connection,
     session_id: &AutomationSessionId,
-    intent_id: &AutomationIntentId,
-) -> Result<Vec<AutomationEvent>, LabError> {
-    let mut statement = connection
-        .prepare(
-            "SELECT sequence,kind,at_utc,detail_json FROM automation_session_events \
-             WHERE session_id=?1 AND kind='SIGNAL_OBSERVED' \
-               AND json_extract(detail_json,'$.intent_id')=?2 ORDER BY sequence",
-        )
+    intent_ids: &[AutomationIntentId],
+) -> Result<BTreeMap<AutomationIntentId, Vec<AutomationEvent>>, LabError> {
+    if intent_ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let selected_ids = intent_ids.iter().cloned().collect::<BTreeSet<_>>();
+    let placeholders = (2..=intent_ids.len() + 1)
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let query = format!(
+        "SELECT sequence,kind,at_utc,detail_json,\
+                json_extract(detail_json,'$.intent_id') \
+         FROM automation_session_events WHERE session_id=?1 \
+           AND kind='SIGNAL_OBSERVED' \
+           AND json_extract(detail_json,'$.intent_id') IN ({placeholders}) \
+         ORDER BY sequence"
+    );
+    let mut values = Vec::with_capacity(intent_ids.len() + 1);
+    values.push(SqlValue::Text(session_id.to_string()));
+    values.extend(
+        intent_ids
+            .iter()
+            .map(|intent_id| SqlValue::Text(intent_id.to_string())),
+    );
+    let mut statement = connection.prepare(&query).map_err(super::sql_error)?;
+    let mut rows = statement
+        .query(params_from_iter(values.iter()))
         .map_err(super::sql_error)?;
-    statement
-        .query_map(params![session_id.as_str(), intent_id.as_str()], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })
-        .map_err(super::sql_error)?
-        .map(|row| {
-            let (sequence, kind, at, detail) = row.map_err(super::sql_error)?;
-            Ok(AutomationEvent {
-                session_id: session_id.clone(),
-                sequence: u64::try_from(sequence).map_err(|_| {
-                    LabError::DataCorrupt("negative automation signal sequence".into())
-                })?,
-                kind: parse_event_kind(&kind)?,
-                at_utc: UtcTimestamp::parse_rfc3339(&at)?,
-                detail: serde_json::from_str(&detail).map_err(super::json_error)?,
-            })
-        })
-        .collect()
+    let mut grouped = BTreeMap::<AutomationIntentId, Vec<AutomationEvent>>::new();
+    while let Some(row) = rows.next().map_err(super::sql_error)? {
+        let sequence = row.get::<_, i64>(0).map_err(super::sql_error)?;
+        let kind = row.get::<_, String>(1).map_err(super::sql_error)?;
+        let at = row.get::<_, String>(2).map_err(super::sql_error)?;
+        let detail_json = row.get::<_, String>(3).map_err(super::sql_error)?;
+        let raw_intent_id = row.get::<_, String>(4).map_err(super::sql_error)?;
+        let intent_id = AutomationIntentId::new(raw_intent_id)?;
+        if !selected_ids.contains(&intent_id) {
+            return Err(LabError::DataCorrupt(
+                "signal event query returned an unselected decision".into(),
+            ));
+        }
+        let event = AutomationEvent {
+            session_id: session_id.clone(),
+            sequence: u64::try_from(sequence)
+                .map_err(|_| LabError::DataCorrupt("negative automation signal sequence".into()))?,
+            kind: parse_event_kind(&kind)?,
+            at_utc: UtcTimestamp::parse_rfc3339(&at)?,
+            detail: serde_json::from_str(&detail_json).map_err(super::json_error)?,
+        };
+        grouped.entry(intent_id).or_default().push(event);
+    }
+    Ok(grouped)
 }
 
 fn event_matches(
@@ -1208,6 +1254,11 @@ fn validate_all_signal_events(
     decisions: &[AutomationDecisionRecord],
     events: &[AutomationEvent],
 ) -> Result<(), LabError> {
+    // Validate each event ID before lookup; borrow canonical ID text to avoid cloning the index.
+    let decision_by_id = decisions
+        .iter()
+        .map(|decision| (decision.intent_id.as_str(), decision))
+        .collect::<BTreeMap<_, _>>();
     let mut seen = BTreeMap::<&AutomationIntentId, usize>::new();
     for event in events {
         if event.kind == AutomationEventKind::SignalObserved {
@@ -1219,9 +1270,9 @@ fn validate_all_signal_events(
                     LabError::DataCorrupt("signal event has no intent identity".into())
                 })?;
             let intent_id = AutomationIntentId::new(raw_intent.to_owned())?;
-            let decision = decisions
-                .iter()
-                .find(|decision| decision.intent_id == intent_id)
+            let decision = decision_by_id
+                .get(intent_id.as_str())
+                .copied()
                 .ok_or_else(|| {
                     LabError::DataCorrupt("signal event has no stored decision".into())
                 })?;
