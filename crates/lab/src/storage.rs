@@ -935,6 +935,10 @@ impl Store {
     ///
     /// # Errors
     /// Returns an error for corrupt serialized state, invalid identities, or SQLite failure.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one ordered snapshot read validates members and hydrates both relation streams without per-row SQL"
+    )]
     pub fn load_dataset(&self, id: &DatasetId) -> Result<Option<DatasetSnapshot>, LabError> {
         let manifest = self
             .connection
@@ -949,38 +953,93 @@ impl Store {
             return Ok(None);
         };
         let manifest = serde_json::from_str(&manifest).map_err(json_error)?;
-        let mut statement = self.connection.prepare("SELECT o.observation_json FROM dataset_members m JOIN candle_observations o ON o.id=m.observation_id WHERE m.dataset_id=?1 ORDER BY m.position").map_err(sql_error)?;
+        let mut statement = self.connection.prepare(
+            "SELECT m.position,m.observation_id,o.observation_json FROM dataset_members m JOIN candle_observations o ON o.id=m.observation_id WHERE m.dataset_id=?1 ORDER BY m.position",
+        ).map_err(sql_error)?;
         let rows = statement
-            .query_map([id.as_str()], |row| row.get::<_, String>(0))
+            .query_map([id.as_str()], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
             .map_err(sql_error)?;
-        let mut observations = Vec::new();
+        let mut members = Vec::new();
         for row in rows {
+            let (position, member_id, observation_json) = row.map_err(sql_error)?;
             let mut observation: CandleObservation =
-                serde_json::from_str(&row.map_err(sql_error)?).map_err(json_error)?;
-            let mut raw_statement = self.connection.prepare(
-                "SELECT raw_object_id FROM dataset_observation_raw_objects WHERE dataset_id=?1 AND observation_id=?2 ORDER BY position",
-            ).map_err(sql_error)?;
-            let raw_rows = raw_statement
-                .query_map(params![id.as_str(), observation.id.as_str()], |row| {
-                    row.get::<_, String>(0)
-                })
-                .map_err(sql_error)?;
-            observation.raw_object_ids = raw_rows
-                .map(|raw| RawObjectId::new(raw.map_err(sql_error)?))
-                .collect::<Result<_, _>>()?;
-            let mut constituent_statement = self.connection.prepare(
-                "SELECT constituent_id FROM dataset_observation_constituents WHERE dataset_id=?1 AND observation_id=?2 ORDER BY position",
-            ).map_err(sql_error)?;
-            let constituent_rows = constituent_statement
-                .query_map(params![id.as_str(), observation.id.as_str()], |row| {
-                    row.get::<_, String>(0)
-                })
-                .map_err(sql_error)?;
-            observation.constituent_ids = constituent_rows
-                .map(|constituent| ObservationId::new(constituent.map_err(sql_error)?))
-                .collect::<Result<_, _>>()?;
-            observations.push(observation);
+                serde_json::from_str(&observation_json).map_err(json_error)?;
+            if observation.id.as_str() != member_id.as_str() {
+                return Err(LabError::DataCorrupt(
+                    "dataset member ID disagrees with stored observation JSON".into(),
+                ));
+            }
+            observation.raw_object_ids = Vec::new();
+            observation.constituent_ids = Vec::new();
+            members.push((position, observation));
         }
+
+        let mut raw_statement = self.connection.prepare(
+            "SELECT m.position,r.raw_object_id FROM dataset_members m JOIN dataset_observation_raw_objects r ON r.dataset_id=m.dataset_id AND r.observation_id=m.observation_id WHERE m.dataset_id=?1 ORDER BY m.position,r.position",
+        ).map_err(sql_error)?;
+        let raw_rows = raw_statement
+            .query_map([id.as_str()], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(sql_error)?;
+        let mut member_index = 0;
+        for row in raw_rows {
+            let (position, raw_id) = row.map_err(sql_error)?;
+            while member_index < members.len() && members[member_index].0 < position {
+                member_index += 1;
+            }
+            let Some((member_position, observation)) = members.get_mut(member_index) else {
+                return Err(LabError::DataCorrupt(
+                    "dataset raw link has no matching member".into(),
+                ));
+            };
+            if *member_position != position {
+                return Err(LabError::DataCorrupt(
+                    "dataset raw link position has no matching member".into(),
+                ));
+            }
+            observation.raw_object_ids.push(RawObjectId::new(raw_id)?);
+        }
+
+        let mut constituent_statement = self.connection.prepare(
+            "SELECT m.position,c.constituent_id FROM dataset_members m JOIN dataset_observation_constituents c ON c.dataset_id=m.dataset_id AND c.observation_id=m.observation_id WHERE m.dataset_id=?1 ORDER BY m.position,c.position",
+        ).map_err(sql_error)?;
+        let constituent_rows = constituent_statement
+            .query_map([id.as_str()], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(sql_error)?;
+        member_index = 0;
+        for row in constituent_rows {
+            let (position, constituent_id) = row.map_err(sql_error)?;
+            while member_index < members.len() && members[member_index].0 < position {
+                member_index += 1;
+            }
+            let Some((member_position, observation)) = members.get_mut(member_index) else {
+                return Err(LabError::DataCorrupt(
+                    "dataset constituent link has no matching member".into(),
+                ));
+            };
+            if *member_position != position {
+                return Err(LabError::DataCorrupt(
+                    "dataset constituent link position has no matching member".into(),
+                ));
+            }
+            observation
+                .constituent_ids
+                .push(ObservationId::new(constituent_id)?);
+        }
+
+        let observations = members
+            .into_iter()
+            .map(|(_, observation)| observation)
+            .collect();
         Ok(Some(DatasetSnapshot {
             manifest,
             observations,

@@ -5,7 +5,6 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
-use std::io::{self, Write};
 
 /// Lowercase SHA-256, validated at every serialized input boundary.
 #[derive(
@@ -25,25 +24,14 @@ impl ContentHash {
     /// # Errors
     /// Returns a contract error if serialization fails.
     pub fn of_value(value: &impl Serialize) -> Result<Self, LabError> {
-        let mut writer = HashWriter(Sha256::new());
+        let mut writer = Sha256::new();
         serde_json::to_writer(&mut writer, value)?;
-        Ok(Self(format!("{:x}", writer.0.finalize())))
+        Ok(Self(format!("{:x}", writer.finalize())))
     }
 
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
-    }
-}
-
-struct HashWriter(Sha256);
-impl Write for HashWriter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.update(bytes);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
     }
 }
 
@@ -158,6 +146,7 @@ identifier!(SuiteId, "suite");
 identifier!(SuiteCaseId, "suite-case");
 identifier!(ScheduleId, "schedule");
 identifier!(BackupId, "backup");
+identifier!(PaperSessionId, "paper-session");
 
 impl ArtifactId {
     /// Derive an immutable file identity within an explicit package/storage namespace.

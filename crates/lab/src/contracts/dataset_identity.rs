@@ -14,6 +14,29 @@ pub struct DatasetDigests {
     pub provenance: ContentHash,
 }
 
+// Field order preserves the lexical map order of the original json! payloads.
+// Nested maps remain Value so their own canonical key ordering is unchanged.
+#[derive(Serialize)]
+struct SemanticIdentity<'a, T> {
+    coverage: [i64; 2],
+    gap_policy: &'a str,
+    normalizer_version: &'a str,
+    observations: &'a [T],
+    origin: String,
+    quality: &'a [serde_json::Value],
+    request: &'a serde_json::Value,
+    schema_version: &'a str,
+    status: String,
+}
+
+#[derive(Serialize)]
+struct ProvenanceIdentity<'a, T> {
+    observation_sources: &'a [T],
+    quality_issues: serde_json::Value,
+    raw_objects: &'a [(&'a str, &'a str, &'a str)],
+    semantic: &'a str,
+}
+
 /// Calculate normalized request, economic semantic, and retrieval provenance identities.
 ///
 /// `DUPLICATE_IDENTICAL/INFO` describes retrieval overlap, so it affects provenance
@@ -64,17 +87,20 @@ pub fn dataset_digests(snapshot: &DatasetSnapshot) -> Result<DatasetDigests, Lab
             }))
         })
         .collect::<Result<_, LabError>>()?;
-    let semantic = ContentHash::of_value(&serde_json::json!({
-        "schema_version": snapshot.manifest.schema_version,
-        "request": request,
-        "coverage": [timestamp_ms(snapshot.manifest.coverage.start()), timestamp_ms(snapshot.manifest.coverage.end())],
-        "status": enum_text(&snapshot.manifest.status)?,
-        "normalizer_version": snapshot.manifest.normalizer_version,
-        "gap_policy": snapshot.manifest.gap_policy,
-        "origin": enum_text(&snapshot.manifest.origin)?,
-        "observations": observations,
-        "quality": quality
-    }))?;
+    let semantic = ContentHash::of_value(&SemanticIdentity {
+        coverage: [
+            timestamp_ms(snapshot.manifest.coverage.start()),
+            timestamp_ms(snapshot.manifest.coverage.end()),
+        ],
+        gap_policy: &snapshot.manifest.gap_policy,
+        normalizer_version: &snapshot.manifest.normalizer_version,
+        observations: &observations,
+        origin: enum_text(&snapshot.manifest.origin)?,
+        quality: &quality,
+        request: &request,
+        schema_version: &snapshot.manifest.schema_version,
+        status: enum_text(&snapshot.manifest.status)?,
+    })?;
     let provenance = provenance_digest(snapshot, &semantic)?;
     Ok(DatasetDigests {
         normalized_request,
@@ -120,12 +146,12 @@ fn provenance_digest(
         })
         .collect();
     observation_sources.sort_unstable();
-    ContentHash::of_value(&serde_json::json!({
-        "semantic": semantic.as_str(),
-        "raw_objects": raw,
-        "observation_sources": observation_sources,
-        "quality_issues": snapshot.manifest.quality_issues
-    }))
+    ContentHash::of_value(&ProvenanceIdentity {
+        observation_sources: &observation_sources,
+        quality_issues: serde_json::to_value(&snapshot.manifest.quality_issues)?,
+        raw_objects: &raw,
+        semantic: semantic.as_str(),
+    })
 }
 
 /// Derive immutable snapshot identity from separate economic and provenance digests.

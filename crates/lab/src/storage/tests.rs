@@ -147,6 +147,44 @@ fn snapshot(
     snapshot
 }
 
+fn ordered_link_snapshot(store: &Store, request_id: &str) -> DatasetSnapshot {
+    let first_raw = publish(
+        store,
+        b"ordered-link source A",
+        time("2024-01-01T02:00:00Z"),
+    );
+    let second_raw = publish(
+        store,
+        b"ordered-link source B",
+        time("2024-01-01T03:00:00Z"),
+    );
+    let start = time("2024-01-01T00:00:00Z");
+    let end = UtcTimestamp(start.0 + chrono::Duration::hours(3));
+    let range = UtcRange::new(start, end).expect("three-hour range");
+    let mut collect_request = request(request_id);
+    collect_request.range = range;
+
+    let mut first = observation_at(&first_raw.object, "2024-01-01T00:00:00Z", "100");
+    first.raw_object_ids = vec![second_raw.object.id.clone(), first_raw.object.id.clone()];
+    let mut second = observation_at(&first_raw.object, "2024-01-01T01:00:00Z", "101");
+    second.raw_object_ids = vec![first_raw.object.id.clone()];
+    second.constituent_ids = vec![first.id.clone()];
+    let mut third = observation_at(&first_raw.object, "2024-01-01T02:00:00Z", "102");
+    third.raw_object_ids = vec![second_raw.object.id.clone(), first_raw.object.id.clone()];
+    third.constituent_ids = vec![second.id.clone(), first.id.clone()];
+
+    let mut dataset = snapshot(collect_request, first_raw.object.clone(), first.clone());
+    dataset.manifest.coverage = range;
+    dataset.manifest.row_count = 3;
+    dataset.manifest.raw_objects = vec![first_raw.object, second_raw.object];
+    dataset.observations = vec![first, second, third];
+    let digests = dataset_digests(&dataset).expect("ordered-link dataset digests");
+    dataset.manifest.id = dataset_id(&digests);
+    dataset.manifest.semantic_digest = digests.semantic;
+    dataset.manifest.provenance_digest = digests.provenance;
+    dataset
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "one exact fixture binds a real immutable dataset and complete frozen portfolio plan for publication/reopen tests"
@@ -709,6 +747,58 @@ fn repeated_economic_rows_create_distinct_immutable_provenance_snapshots() {
             .provenance,
         second_loaded.manifest.provenance_digest
     );
+}
+
+#[test]
+fn multi_member_dataset_preserves_ordered_raw_constituent_links_and_provenance_on_round_trip() {
+    let root = TempRoot::new("dataset-ordered-links");
+    let mut store = Store::open(&root.0).expect("open test store");
+    let expected = ordered_link_snapshot(&store, "request-ordered-links");
+    let expected_semantic = expected.manifest.semantic_digest.clone();
+    let expected_provenance = expected.manifest.provenance_digest.clone();
+
+    let id = store
+        .finish_dataset(&expected)
+        .expect("finish ordered-link dataset");
+    assert_eq!(id, expected.manifest.id);
+    let loaded = store
+        .load_dataset(&id)
+        .expect("load ordered-link dataset")
+        .expect("dataset exists");
+
+    assert_eq!(
+        serde_json::to_vec(&loaded).expect("serialize loaded dataset"),
+        serde_json::to_vec(&expected).expect("serialize expected dataset")
+    );
+    let loaded_digests = dataset_digests(&loaded).expect("loaded dataset digests");
+    assert_eq!(loaded_digests.semantic, expected_semantic);
+    assert_eq!(loaded_digests.provenance, expected_provenance);
+}
+
+#[test]
+fn load_dataset_rejects_member_json_identity_mismatch() {
+    let root = TempRoot::new("dataset-member-json-identity");
+    let mut store = Store::open(&root.0).expect("open test store");
+    let expected = ordered_link_snapshot(&store, "request-member-json-identity");
+    let id = store.finish_dataset(&expected).expect("finish dataset");
+    let stored_member_id = expected.observations[0].id.as_str();
+    let mut mismatched_observation = expected.observations[0].clone();
+    mismatched_observation.id = expected.observations[1].id.clone();
+    let malformed_json =
+        serde_json::to_string(&mismatched_observation).expect("serialize mismatched observation");
+    let changed = store
+        .connection
+        .execute(
+            "UPDATE candle_observations SET observation_json=?1 WHERE id=?2",
+            rusqlite::params![malformed_json, stored_member_id],
+        )
+        .expect("inject member/JSON identity mismatch");
+    assert_eq!(changed, 1);
+
+    assert!(matches!(
+        store.load_dataset(&id),
+        Err(LabError::DataCorrupt(_))
+    ));
 }
 
 #[test]
@@ -2946,4 +3036,70 @@ fn hard_delete_batch_contract_keeps_per_resource_echo_and_bound() {
             .is_err(),
         "stale preview replay must fail"
     );
+}
+
+#[test]
+fn dataset_identity_canonical_quality_and_source_order_goldens() {
+    let root = TempRoot::new("dataset-identity-goldens");
+    let store = Store::open(&root.0).expect("fixture store");
+    let mut dataset = ordered_link_snapshot(&store, "dataset-identity-goldens");
+    let base = dataset_digests(&dataset).expect("base digests");
+    dataset.observations.reverse();
+    dataset.manifest.raw_objects.reverse();
+    assert_eq!(dataset_digests(&dataset).expect("reordered digests"), base);
+    dataset.observations.reverse();
+    dataset.manifest.raw_objects.reverse();
+    dataset.observations[0].raw_object_ids.reverse();
+    let source_reordered = dataset_digests(&dataset).expect("source-order digests");
+    assert_eq!(source_reordered.semantic, base.semantic);
+    assert_ne!(source_reordered.provenance, base.provenance);
+    dataset.observations[0].raw_object_ids.reverse();
+    dataset.manifest.quality_issues.push(QualityIssue {
+        kind: QualityKind::DuplicateIdentical,
+        severity: QualitySeverity::Info,
+        market: MarketId::parse_upbit("KRW-BTC").expect("market"),
+        start: dataset.manifest.coverage.start(),
+        end: dataset.manifest.coverage.end(),
+        count: 2,
+        raw_object_ids: dataset.observations[0].raw_object_ids.clone(),
+        detail: "중복 \"quoted\"\nsource".into(),
+    });
+    let duplicate = dataset_digests(&dataset).expect("duplicate digests");
+    assert_eq!(duplicate.semantic, base.semantic);
+    assert_ne!(duplicate.provenance, base.provenance);
+    dataset.manifest.status = DatasetStatus::BlockedData;
+    dataset.manifest.quality_issues[0].kind = QualityKind::DuplicateConflict;
+    dataset.manifest.quality_issues[0].severity = QualitySeverity::Error;
+    let blocked = dataset_digests(&dataset).expect("blocked digests");
+    assert_ne!(blocked.semantic, base.semantic);
+    // Fixed digests captured from the original Value-based canonical encoding.
+    for (digests, semantic, provenance) in [
+        (
+            base,
+            "6d71aa34c383b4d57d0fcc39ab3e71513126c08d424adaaf5c893bf83d4026bc",
+            "a1e368752bc4a22afbc3adc5caa06d06aa455ea38b26000332963b62e0f5c5b2",
+        ),
+        (
+            source_reordered,
+            "6d71aa34c383b4d57d0fcc39ab3e71513126c08d424adaaf5c893bf83d4026bc",
+            "8813300ece3782ad7039e6690a911edb87b8a495a84d07a283c35a40470d84a5",
+        ),
+        (
+            duplicate,
+            "6d71aa34c383b4d57d0fcc39ab3e71513126c08d424adaaf5c893bf83d4026bc",
+            "170481c901ed8fbb618cfe3be607c6762fee4316dd53e1a9a0bfbe8b8984ee68",
+        ),
+        (
+            blocked,
+            "045f8b8d9db6a0be6d97dcf448e21c2c01f4584f047dbbe2b4cfadcd434fde1b",
+            "f851c1f8baa3ea19e30a1f2496769cebbd689cad65b7562fe3c149042eaeca6f",
+        ),
+    ] {
+        assert_eq!(
+            digests.normalized_request.as_str(),
+            "e392a3ee648a20e671020ce8369839f84d84de2e95d78c3ff6a0dd21bc4ed25b"
+        );
+        assert_eq!(digests.semantic.as_str(), semantic);
+        assert_eq!(digests.provenance.as_str(), provenance);
+    }
 }
