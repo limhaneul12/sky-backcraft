@@ -1,0 +1,378 @@
+{
+  "items": [
+    {
+      "account_marks": [],
+      "candle": {
+        "close_time": "2026-10-14T21:17:00Z",
+        "content_digest": "d3af0fa421e0281a95a33173b993d27020e602345401c9deb457580a9d7e399f",
+        "interval": "m1",
+        "observation_id": "obs-25f8dfaf563602a8d9601b43e9f05585debeae77d64853666c8e1280e1b2cc08",
+        "open_time": "2026-10-14T21:16:00Z"
+      },
+      "control": null,
+      "episodes": [],
+      "fills": [],
+      "finalized_at": "2026-10-14T21:17:00Z",
+      "kind": "CANDLE_PROCESSED",
+      "market": "KRW-BTC",
+      "order_events": [],
+      "orders": [],
+      "sequence": 1,
+      "signals": [],
+      "source_event_at": "2026-10-14T21:17:01.020475Z"
+    },
+    {
+      "account_marks": [
+        {
+          "actual_weight": "0.7780809392563292538429608098",
+          "context": {
+            "accounting_event_time": "2026-10-14T21:17:00Z",
+            "event_seq": 5,
+            "market": "KRW-BTC",
+            "model_id": "model-paper-session-2bf2d1dbb991a29a4140822bfa81f3589db08caa9f249436175ad63a0c8e2391-krw-btc",
+            "run_id": "run-paper-session-2bf2d1dbb991a29a4140822bfa81f3589db08caa9f249436175ad63a0c8e2391"
+          },
+          "drawdown": "0.000777476",
+          "equity": "9992225.24000",
+          "gross_unrealized": "0.00",
+          "kind": "AFTER_FILL",
+          "mark_price": "111068000",
+          "peak_equity": "10000000",
+          "position_value": "7774760.00",
+          "source_bar_id": "obs-e426b37f138191405db02dd16b0bfc9d08209562a83a215793a8bf8ac3e73bbc",
+          "state": {
+            "cash_free": "1105434.32000",
+            "cash_reserved": "1112030.92000",
+            "cash_total": "2217465.24000",
+            "cumulative_fees": "7774.76000",
+            "gross_realized": "0",
+            "price_basis": "7774760.00",
+            "qty": "0.07"
+          },
+          "target_weight": "1"
+        }
+      ],
+      "candle": {
+        "close_time": "2026-10-14T21:18:00Z",
+        "content_digest": "f3faee5bcb405fabca01c0b5d779b997b8603e9c8544a2834a06c6f29fcc2f87",
+        "interval": "m1",
+        "observation_id": "obs-e426b37f138191405db02dd16b0bfc9d08209562a83a215793a8bf8ac3e73bbc",
+        "open_time": "2026-10-14T21:17:00Z"
+      },
+      "control": null,
+      "episodes": [],
+      "fills": [
+        {
+          "accounting_mark_seq": 5,
+          "adverse_slippage_bps": "-0.2700975051993769750880070000",
+          "arrival_mid": null,
+          "arrival_mid_null_reason": "DATA_NOT_CAPTURED",
+          "artificial_terminal_exit": false,
+          "bar_open_proxy": "111068000.00000000",
+          "context": {
+            "accounting_event_time": "2026-10-14T21:17:00Z",
+            "event_seq": 4,
+            "market": "KRW-BTC",
+            "model_id": "model-paper-session-2bf2d1dbb991a29a4140822bfa81f3589db08caa9f249436175ad63a0c8e2391-krw-btc",
+            "run_id": "run-paper-session-2bf2d1dbb991a29a4140822bfa81f3589db08caa9f249436175ad63a0c8e2391"
+          },
+          "decision_reference": "111071000.00000000",
+          "episode_id": "episode-bff3582994c7d641f1ee41ed2cbe964cca4c90f0bbc14e2b207206649f66c78e",
+          "execution_origin": "SIMULATED_ONLY",
+          "fee": "7774.76000",
+          "fee_bps": "10",
+          "fee_currency": "KRW",
+          "fill_id": "fill-f1c24ade46f28aa6e41b6d26ad8b19275b82210c13dd3afe6444facfdcf8739a",
+          "fill_observed": false,
+          "liquidity_role_assumption": "TAKER_SCENARIO_PRIOR_COMPLETED_VOLUME",
+          "liquidity_source_bar_id": "obs-25f8dfaf563602a8d9601b43e9f05585debeae77d64853666c8e1280e1b2cc08",
+          "liquidity_source_close_time": "2026-10-14T21:17:00Z",
+          "model_version": "spot-lab-engine-v2-policy-state",
+          "notional": "7774760.00",
+          "order_id": "order-836f71e180f2faa41144d83dfaa56debca8fdec4bf621d46eb1b39455d8be14a",
+          "price": "111068000",
+          "price_cost_attribution": "0.00000000",
+          "qty": "0.07",
+          "side": "BUY",
+          "source_bar_id": "obs-e426b37f138191405db02dd16b0bfc9d08209562a83a215793a8bf8ac3e73bbc",
+          "timing": {
+            "at": "2026-10-14T21:17:00Z",
+            "kind": "EXACT"
+          }
+        }
+      ],
+      "finalized_at": "2026-10-14T21:18:00Z",
+      "kind": "CANDLE_PROCESSED",
+      "market": "KRW-BTC",
+      "order_events": [
+        {
+          "context": {
+            "accounting_event_time": "2026-10-14T21:17:00Z",
+            "event_seq": 2,
+            "market": "KRW-BTC",
+            "model_id": "model-paper-session-2bf2d1dbb991a29a4140822bfa81f3589db08caa9f249436175ad63a0c8e2391-krw-btc",
+            "run_id": "run-paper-session-2bf2d1dbb991a29a4140822bfa81f3589db08caa9f249436175ad63a0c8e2391"
+          },
+          "created_at": "2026-10-14T21:17:00Z",
+          "cumulative_filled_qty": "0",
+          "effective_at": "2026-10-14T21:17:00Z",
+          "episode_id": null,
+          "expires_at": "2100-01-01T00:00:00Z",
+          "order_id": "order-836f71e180f2faa41144d83dfaa56debca8fdec4bf621d46eb1b39455d8be14a",
+          "order_origin": "SIMULATED",
+          "order_type": "MARKET",
+          "parent_signal_id": "signal-48f1c682a7c79f239d5b6685b330817a16e1a1187cfec1002ba73b63dff08dba",
+          "policy_version": "next-bar-open-v2-decision-mark-fixed-base-quantity",
+          "reason": "START_FROM_CASH",
+          "requested_price": null,
+          "requested_qty": "0.08",
+          "reserved_cash": "8894565.68000",
+          "rule_snapshot_id": "rule-paper-simulated-scenario",
+          "side": "BUY",
+          "status": "CREATED"
+        },
+        {
+          "context": {
+            "accounting_event_time": "2026-10-14T21:17:00Z",
+            "event_seq": 3,
+            "market": "KRW-BTC",
+            "model_id": "model-paper-session-2bf2d1dbb991a29a4140822bfa81f3589db08caa9f249436175ad63a0c8e2391-krw-btc",
+            "run_id": "run-paper-session-2bf2d1dbb991a29a4140822bfa81f3589db08caa9f249436175ad63a0c8e2391"
+          },
+          "created_at": "2026-10-14T21:17:00Z",
+          "cumulative_filled_qty": "0.07",
+          "effective_at": "2026-10-14T21:17:00Z",
+          "episode_id": "episode-bff3582994c7d641f1ee41ed2cbe964cca4c90f0bbc14e2b207206649f66c78e",
+          "expires_at": "2100-01-01T00:00:00Z",
+          "order_id": "order-836f71e180f2faa41144d83dfaa56debca8fdec4bf621d46eb1b39455d8be14a",
+          "order_origin": "SIMULATED",
+          "order_type": "MARKET",
+          "parent_signal_id": "signal-48f1c682a7c79f239d5b6685b330817a16e1a1187cfec1002ba73b63dff08dba",
+          "policy_version": "next-bar-open-v2-decision-mark-fixed-base-quantity",
+          "reason": "VOLUME_CAP",
+          "requested_price": null,
+          "requested_qty": "0.08",
+          "reserved_cash": "8894565.68000",
+          "rule_snapshot_id": "rule-paper-simulated-scenario",
+          "side": "BUY",
+          "status": "PARTIALLY_FILLED"
+        },
+        {
+          "context": {
+            "accounting_event_time": "2026-10-14T21:17:00Z",
+            "event_seq": 6,
+            "market": "KRW-BTC",
+            "model_id": "model-paper-session-2bf2d1dbb991a29a4140822bfa81f3589db08caa9f249436175ad63a0c8e2391-krw-btc",
+            "run_id": "run-paper-session-2bf2d1dbb991a29a4140822bfa81f3589db08caa9f249436175ad63a0c8e2391"
+          },
+          "created_at": "2026-10-14T21:17:00Z",
+          "cumulative_filled_qty": "0.07",
+          "effective_at": "2026-10-14T21:17:00Z",
+          "episode_id": "episode-bff3582994c7d641f1ee41ed2cbe964cca4c90f0bbc14e2b207206649f66c78e",
+          "expires_at": "2100-01-01T00:00:00Z",
+          "order_id": "order-836f71e180f2faa41144d83dfaa56debca8fdec4bf621d46eb1b39455d8be14a",
+          "order_origin": "SIMULATED",
+          "order_type": "MARKET",
+          "parent_signal_id": "signal-48f1c682a7c79f239d5b6685b330817a16e1a1187cfec1002ba73b63dff08dba",
+          "policy_version": "next-bar-open-v2-decision-mark-fixed-base-quantity",
+          "reason": "CANCELLED",
+          "requested_price": null,
+          "requested_qty": "0.08",
+          "reserved_cash": "8894565.68000",
+          "rule_snapshot_id": "rule-paper-simulated-scenario",
+          "side": "BUY",
+          "status": "CANCELLED"
+        }
+      ],
+      "orders": [
+        {
+          "context": {
+            "accounting_event_time": "2026-10-14T21:17:00Z",
+            "event_seq": 6,
+            "market": "KRW-BTC",
+            "model_id": "model-paper-session-2bf2d1dbb991a29a4140822bfa81f3589db08caa9f249436175ad63a0c8e2391-krw-btc",
+            "run_id": "run-paper-session-2bf2d1dbb991a29a4140822bfa81f3589db08caa9f249436175ad63a0c8e2391"
+          },
+          "created_at": "2026-10-14T21:17:00Z",
+          "cumulative_filled_qty": "0.07",
+          "effective_at": "2026-10-14T21:17:00Z",
+          "episode_id": "episode-bff3582994c7d641f1ee41ed2cbe964cca4c90f0bbc14e2b207206649f66c78e",
+          "expires_at": "2100-01-01T00:00:00Z",
+          "order_id": "order-836f71e180f2faa41144d83dfaa56debca8fdec4bf621d46eb1b39455d8be14a",
+          "order_origin": "SIMULATED",
+          "order_type": "MARKET",
+          "parent_signal_id": "signal-48f1c682a7c79f239d5b6685b330817a16e1a1187cfec1002ba73b63dff08dba",
+          "policy_version": "next-bar-open-v2-decision-mark-fixed-base-quantity",
+          "reason": "CANCELLED",
+          "requested_price": null,
+          "requested_qty": "0.08",
+          "reserved_cash": "8894565.68000",
+          "rule_snapshot_id": "rule-paper-simulated-scenario",
+          "side": "BUY",
+          "status": "CANCELLED"
+        }
+      ],
+      "sequence": 2,
+      "signals": [
+        {
+          "constrained_target_weight": "1",
+          "context": {
+            "accounting_event_time": "2026-10-14T21:17:00Z",
+            "event_seq": 1,
+            "market": "KRW-BTC",
+            "model_id": "model-paper-session-2bf2d1dbb991a29a4140822bfa81f3589db08caa9f249436175ad63a0c8e2391-krw-btc",
+            "run_id": "run-paper-session-2bf2d1dbb991a29a4140822bfa81f3589db08caa9f249436175ad63a0c8e2391"
+          },
+          "decision_available_at": "2026-10-14T21:17:00Z",
+          "evidence_effect": null,
+          "indicators": {
+            "annual_vol": null,
+            "bar_sigma": null,
+            "completed_bars_seen": 1,
+            "ema": null,
+            "entry_high": null,
+            "exit_low": null,
+            "rsi": null,
+            "version": "ema-sma-seed-rsi-wilder-sample-vol-v1"
+          },
+          "intended_side": "BUY",
+          "outcome": "EXECUTED",
+          "policy_ref": {
+            "definition_digest": "a3d359a14870bb0fea47929a43c9ae843e9f41285a98849ca0a5cfcd40a0b271",
+            "policy_id": "builtin-buy-and-hold",
+            "revision_id": "policy-revision-0e32574e45bf5cb877a8e0fc4bbe4de7fc31d142f5ad4faa0a1c87d54b4763ee"
+          },
+          "policy_trace": {
+            "evidence": null,
+            "matched_rule_id": null,
+            "state_after": [],
+            "state_before": []
+          },
+          "raw_target_weight": "1",
+          "reasons": [
+            "START_FROM_CASH"
+          ],
+          "signal_id": "signal-48f1c682a7c79f239d5b6685b330817a16e1a1187cfec1002ba73b63dff08dba",
+          "signal_time": "2026-10-14T21:17:00Z",
+          "source_bar_ids": [
+            "obs-25f8dfaf563602a8d9601b43e9f05585debeae77d64853666c8e1280e1b2cc08"
+          ],
+          "state_after": "LONG",
+          "state_before": "CASH",
+          "strategy": "BUY_AND_HOLD",
+          "strategy_version": "spot-lab-strategy-v1",
+          "valid_until": "2100-01-01T00:00:00Z"
+        }
+      ],
+      "source_event_at": "2026-10-14T21:18:02.054590Z"
+    },
+    {
+      "account_marks": [],
+      "candle": null,
+      "control": {
+        "action": "pause",
+        "cancelled_pending_orders": []
+      },
+      "episodes": [],
+      "fills": [],
+      "finalized_at": null,
+      "kind": "PAUSE",
+      "market": null,
+      "order_events": [],
+      "orders": [],
+      "sequence": 3,
+      "signals": [],
+      "source_event_at": null
+    },
+    {
+      "account_marks": [],
+      "candle": null,
+      "control": {
+        "action": "resume",
+        "cancelled_pending_orders": []
+      },
+      "episodes": [],
+      "fills": [],
+      "finalized_at": null,
+      "kind": "RESUME",
+      "market": null,
+      "order_events": [],
+      "orders": [],
+      "sequence": 4,
+      "signals": [],
+      "source_event_at": null
+    },
+    {
+      "account_marks": [
+        {
+          "actual_weight": "0.7781135819386863752311102094",
+          "context": {
+            "accounting_event_time": "2026-10-14T21:18:00Z",
+            "event_seq": 7,
+            "market": "KRW-BTC",
+            "model_id": "model-paper-session-2bf2d1dbb991a29a4140822bfa81f3589db08caa9f249436175ad63a0c8e2391-krw-btc",
+            "run_id": "run-paper-session-2bf2d1dbb991a29a4140822bfa81f3589db08caa9f249436175ad63a0c8e2391"
+          },
+          "drawdown": "0.0006304760",
+          "equity": "9993695.2400000000",
+          "gross_unrealized": "1470.0000000000",
+          "kind": "EXECUTION_CLOSE",
+          "mark_price": "111089000.00000000",
+          "peak_equity": "10000000",
+          "position_value": "7776230.0000000000",
+          "source_bar_id": "obs-e426b37f138191405db02dd16b0bfc9d08209562a83a215793a8bf8ac3e73bbc",
+          "state": {
+            "cash_free": "2217465.24000",
+            "cash_reserved": "0.00000",
+            "cash_total": "2217465.24000",
+            "cumulative_fees": "7774.76000",
+            "gross_realized": "0",
+            "price_basis": "7774760.00",
+            "qty": "0.07"
+          },
+          "target_weight": "1"
+        }
+      ],
+      "candle": {
+        "close_time": "2026-10-14T21:19:00Z",
+        "content_digest": "1d287ae39fd42932078c42d154afc538184c3e1ad4a0ca02cde258946db2893e",
+        "interval": "m1",
+        "observation_id": "obs-27b175aeb3a141bfdfd170032a4cb1ee6d2ecfffe37bd00be3d25c07d8be72a2",
+        "open_time": "2026-10-14T21:18:00Z"
+      },
+      "control": null,
+      "episodes": [],
+      "fills": [],
+      "finalized_at": "2026-10-14T21:19:00Z",
+      "kind": "CANDLE_PROCESSED",
+      "market": "KRW-BTC",
+      "order_events": [],
+      "orders": [],
+      "sequence": 5,
+      "signals": [],
+      "source_event_at": "2026-10-14T21:19:01.479290Z"
+    },
+    {
+      "account_marks": [],
+      "candle": null,
+      "control": {
+        "action": "pause",
+        "cancelled_pending_orders": []
+      },
+      "episodes": [],
+      "fills": [],
+      "finalized_at": null,
+      "kind": "PAUSE",
+      "market": null,
+      "order_events": [],
+      "orders": [],
+      "sequence": 6,
+      "signals": [],
+      "source_event_at": null
+    }
+  ],
+  "next_cursor": null,
+  "returned_count": 6,
+  "session_id": "paper-session-2bf2d1dbb991a29a4140822bfa81f3589db08caa9f249436175ad63a0c8e2391",
+  "total_count": 6
+}
