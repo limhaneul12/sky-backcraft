@@ -367,12 +367,7 @@ pub fn run_portfolio(
             reason = "the loop mutates and reads several market slots by index"
         )]
         for slot_index in 0..slots.len() {
-            let Some(bar) = slots[slot_index]
-                .decision_bars
-                .iter()
-                .find(|bar| bar.candle.close_time_utc == *time)
-                .cloned()
-            else {
+            let Some(bar) = decision_bar_at(&slots[slot_index], *time).cloned() else {
                 return Err(LabError::DataGap(format!(
                     "market {} lacks a decision bar at {time}",
                     slots[slot_index].market
@@ -845,6 +840,22 @@ fn close_at(slot: &MarketSlot, time: UtcTimestamp) -> Result<Decimal, LabError> 
         })
 }
 
+/// Find one exact close in the prepared, strictly ordered decision grid.
+fn decision_bar_at(slot: &MarketSlot, time: UtcTimestamp) -> Option<&CandleObservation> {
+    let index = slot
+        .decision_bars
+        .binary_search_by_key(&time, |bar| bar.candle.close_time_utc)
+        .ok()?;
+    slot.decision_bars.get(index)
+}
+
+/// Find one exact open in the prepared, strictly ordered execution grid.
+fn execution_bar_index_at(slot: &MarketSlot, time: UtcTimestamp) -> Option<usize> {
+    slot.execution_bars
+        .binary_search_by_key(&time, |bar| bar.candle.open_time_utc)
+        .ok()
+}
+
 /// Unrealized profit of every position at `time` (mark value minus basis).
 fn unrealized_at(slots: &[MarketSlot], time: UtcTimestamp) -> Result<Decimal, LabError> {
     let mut total = Decimal::ZERO;
@@ -926,10 +937,7 @@ fn arbitrate_and_fill(
     }
     for (rank, signal) in sells.iter().enumerate() {
         let slot = &slots[signal.slot_index];
-        let bar = slot
-            .decision_bars
-            .iter()
-            .find(|bar| bar.candle.close_time_utc == time)
+        let bar = decision_bar_at(slot, time)
             .cloned()
             .ok_or_else(|| LabError::Internal("sell signal lost its decision bar".into()))?;
         let position_value = checked_mul(slot.qty, bar.candle.close.get(), "position value")?;
@@ -945,25 +953,29 @@ fn arbitrate_and_fill(
         )?;
         let qty = checked_div(requested, bar.candle.close.get(), "sell quantity")?;
         let slot_index = signal.slot_index;
+        let execution_index =
+            execution_bar_index_at(&slots[slot_index], time).ok_or_else(|| {
+                LabError::DataGap(format!("execution bar missing at decision time {time}"))
+            })?;
         let execution_bar = slots[slot_index]
             .execution_bars
-            .iter()
-            .find(|bar| bar.candle.open_time_utc == time)
+            .get(execution_index)
             .cloned()
             .ok_or_else(|| {
                 LabError::DataGap(format!("execution bar missing at decision time {time}"))
             })?;
-        let liquidity_index = slots[slot_index]
+        let liquidity_index = execution_index.checked_sub(1).ok_or_else(|| {
+            LabError::InsufficientWarmup("portfolio execution needs one prior liquidity bar".into())
+        })?;
+        let liquidity_source = slots[slot_index]
             .execution_bars
-            .iter()
-            .position(|bar| bar.candle.open_time_utc == time)
-            .and_then(|index| index.checked_sub(1))
+            .get(liquidity_index)
+            .cloned()
             .ok_or_else(|| {
                 LabError::InsufficientWarmup(
                     "portfolio execution needs one prior liquidity bar".into(),
                 )
             })?;
-        let liquidity_source = slots[slot_index].execution_bars[liquidity_index].clone();
         execute_fill(
             &mut slots[slot_index],
             cash,
@@ -1362,10 +1374,7 @@ fn execute_buy(
     participation_cap: Weight,
 ) -> Result<(), LabError> {
     let slot = &slots[signal.slot_index];
-    let bar = slot
-        .decision_bars
-        .iter()
-        .find(|bar| bar.candle.close_time_utc == time)
+    let bar = decision_bar_at(slot, time)
         .cloned()
         .ok_or_else(|| LabError::Internal("buy allocation lost its decision bar".into()))?;
     let fees = plan.spec.fee_policy_at(time)?;
@@ -1384,26 +1393,32 @@ fn execute_buy(
     cash.reserve(reserved)?;
     let requested_qty = checked_div(notional, bar.candle.close.get(), "buy quantity")?;
     let slot_index = signal.slot_index;
-    let execution_bar = slots[slot_index]
-        .execution_bars
-        .iter()
-        .find(|bar| bar.candle.open_time_utc == time)
-        .cloned();
-    let Some(execution_bar) = execution_bar else {
+    let Some(execution_index) = execution_bar_index_at(&slots[slot_index], time) else {
         cash.release(reserved)?;
         return Err(LabError::DataGap(format!(
             "execution bar missing at decision time {time}"
         )));
     };
-    let liquidity_index = slots[slot_index]
+    let Some(execution_bar) = slots[slot_index]
         .execution_bars
-        .iter()
-        .position(|bar| bar.candle.open_time_utc == time)
-        .and_then(|index| index.checked_sub(1))
+        .get(execution_index)
+        .cloned()
+    else {
+        cash.release(reserved)?;
+        return Err(LabError::DataGap(format!(
+            "execution bar missing at decision time {time}"
+        )));
+    };
+    let liquidity_index = execution_index.checked_sub(1).ok_or_else(|| {
+        LabError::InsufficientWarmup("portfolio execution needs one prior liquidity bar".into())
+    })?;
+    let liquidity_source = slots[slot_index]
+        .execution_bars
+        .get(liquidity_index)
+        .cloned()
         .ok_or_else(|| {
             LabError::InsufficientWarmup("portfolio execution needs one prior liquidity bar".into())
         })?;
-    let liquidity_source = slots[slot_index].execution_bars[liquidity_index].clone();
     let qty = fill_quantity(
         requested_qty,
         Some(reserved),
@@ -1829,15 +1844,16 @@ pub fn portfolio_benchmarks(
             plan.spec.execution_resolution,
             None,
         )?;
+        let first_index =
+            bars.partition_point(|bar| bar.candle.open_time_utc < plan.spec.range.start());
         let first_open = bars
-            .iter()
-            .find(|bar| bar.candle.open_time_utc >= plan.spec.range.start())
+            .get(first_index)
             .map(|bar| bar.candle.open.get())
             .ok_or_else(|| LabError::DataGap("benchmark first open missing".into()))?;
         let terminal_close = bars
-            .iter()
-            .rev()
-            .find(|bar| bar.candle.close_time_utc == plan.spec.range.end())
+            .binary_search_by_key(&plan.spec.range.end(), |bar| bar.candle.close_time_utc)
+            .ok()
+            .and_then(|index| bars.get(index))
             .map(|bar| bar.candle.close.get())
             .ok_or_else(|| LabError::DataGap("benchmark terminal close missing".into()))?;
         let qty = checked_div(initial, first_open, "benchmark quantity")?;
@@ -1882,15 +1898,16 @@ pub fn portfolio_benchmarks(
                 plan.spec.execution_resolution,
                 None,
             )?;
+            let first_index =
+                bars.partition_point(|bar| bar.candle.open_time_utc < plan.spec.range.start());
             let first_open = bars
-                .iter()
-                .find(|bar| bar.candle.open_time_utc >= plan.spec.range.start())
+                .get(first_index)
                 .map(|bar| bar.candle.open.get())
                 .ok_or_else(|| LabError::DataGap("static benchmark open missing".into()))?;
             let close = bars
-                .iter()
-                .rev()
-                .find(|bar| bar.candle.close_time_utc == plan.spec.range.end())
+                .binary_search_by_key(&plan.spec.range.end(), |bar| bar.candle.close_time_utc)
+                .ok()
+                .and_then(|index| bars.get(index))
                 .map(|bar| bar.candle.close.get())
                 .ok_or_else(|| LabError::DataGap("static benchmark close missing".into()))?;
             let qty = checked_div(per_asset, first_open, "static quantity")?;
