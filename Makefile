@@ -52,6 +52,7 @@ native-check:
 	./scripts/shell/test-native-realtime.sh
 	./scripts/shell/test-native-automation.sh
 	./scripts/shell/test-native-read-projections.sh
+	./scripts/shell/test-native-decision-analysis.sh
 
 # Verify a built helper without installing or restarting the operating app.
 verify-helper:

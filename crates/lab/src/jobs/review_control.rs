@@ -2,9 +2,9 @@
 
 use super::JobService;
 use crate::contracts::{
-    ContentHash, LabError, MAX_PAPER_REVIEW_OUTPUT_BYTES, MachineContractFact, PaperDecisionReview,
-    PaperReviewQuery, PaperReviewSelection, ReviewAuditBasis, ReviewAuditDiagnostic,
-    ReviewAuditDiagnosticCode, ReviewAuditKind,
+    ContentHash, DecisionAnalysisQuery, LabError, MAX_PAPER_REVIEW_OUTPUT_BYTES,
+    MachineContractFact, PaperDecisionReview, PaperReviewQuery, PaperReviewSelection,
+    ReviewAuditBasis, ReviewAuditDiagnostic, ReviewAuditDiagnosticCode, ReviewAuditKind,
 };
 use crate::reporting::review_audit;
 use crate::storage::Store;
@@ -12,6 +12,27 @@ use serde_json::Value;
 use std::sync::Arc;
 
 impl JobService {
+    /// Read bounded saved decisions through the shared paper/automation projection.
+    /// # Errors
+    /// Rejects malformed selections, changed automation snapshots, or exceeded read budgets.
+    pub async fn decision_analysis_query(
+        &self,
+        query: DecisionAnalysisQuery,
+    ) -> Result<Value, LabError> {
+        query.validate()?;
+        let started = std::time::Instant::now();
+        let load_query = query.clone();
+        self.bounded_saved_review(
+            "decision_analysis",
+            move |store| store.decision_analysis_snapshot(&load_query),
+            move |snapshot| {
+                let response = crate::reporting::decision_analysis::analyze(snapshot, query)?;
+                crate::reporting::decision_analysis::with_measurement(response, &started)
+            },
+        )
+        .await
+    }
+
     /// Analyze a saved prefix without polling, reconciliation, venue or lifecycle effects.
     /// # Errors
     /// Rejects invalid identities, unavailable capacity and oversized responses.

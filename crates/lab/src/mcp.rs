@@ -8,8 +8,8 @@
 use crate::contracts::{
     ArtifactId, AttemptState, AutomationSessionQuery, AutomationSessionWrite, CandleInterval,
     CandleObservation, CollectRequest, ContentHash, DatasetId, DatasetManifest, DatasetStatus,
-    DeleteResource, EvidenceImport, EvidenceSnapshotId, HardDeleteRequest, HistoryQuery,
-    JobAttempt, JobControl, JobId, JobPayload, JobRecord, JobSubmission, LabError,
+    DecisionAnalysisQuery, DeleteResource, EvidenceImport, EvidenceSnapshotId, HardDeleteRequest,
+    HistoryQuery, JobAttempt, JobControl, JobId, JobPayload, JobRecord, JobSubmission, LabError,
     MarketDataOrigin, MarketId, PaperReviewQuery, PaperSessionQuery, PaperSessionWrite,
     PlanRequest, PolicyDeleteQueryRequest, PolicyDeleteWriteRequest, PolicyQuery, PolicyWrite,
     ProbeCount, RequestId, ResultQuery, RunId, RunRequest, UtcRange,
@@ -41,6 +41,8 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 const MAX_DATASET_PAGE_RECORDS: u32 = 100;
 const MAX_PUBLIC_JOB_ATTEMPTS: usize = 32;
+// Reserve framing space after measuring the real JSON-RPC id and encoded result.
+const MAX_DECISION_ANALYSIS_ENCODED_BYTES: usize = crate::transport::MAX_RESPONSE_BYTES - 1_024;
 const POLICY_DELETE_TOOL_NAMES: &[&str] = &["policy_delete_write", "policy_delete_query"];
 const TRADING_READ_TOOL_NAMES: &[&str] = &[
     "upbit_account_balances",
@@ -65,6 +67,7 @@ const DESKTOP_TOOL_NAMES: &[&str] = &[
     "history_query",
     "policy_query",
     "paper_review_query",
+    "decision_analysis_query",
     "paper_session_query",
     "paper_session_write",
     "resource_delete_preview",
@@ -514,6 +517,26 @@ fn result_or_error<T: Serialize>(result: Result<T, LabError>) -> Result<CallTool
     }
 }
 
+fn decision_analysis_result(
+    result: Result<serde_json::Value, LabError>,
+    request_id: &rmcp::model::RequestId,
+) -> Result<CallToolResult, McpError> {
+    let result = result_or_error(result)?;
+    let envelope = rmcp::model::JsonRpcResponse {
+        jsonrpc: rmcp::model::JsonRpcVersion2_0,
+        id: request_id.clone(),
+        result: &result,
+    };
+    let encoded = serde_json::to_vec(&envelope)
+        .map_err(|_| McpError::internal_error("serialize analysis response envelope", None))?;
+    if encoded.len() > MAX_DECISION_ANALYSIS_ENCODED_BYTES {
+        return tool_error(&LabError::ResourceLimit(
+            "decision analysis encoded response exceeds wire byte budget; request a smaller list page or source population; no partial totals were returned".into(),
+        ));
+    }
+    Ok(result)
+}
+
 fn sanitize_attempt(attempt: &mut JobAttempt) {
     match &mut attempt.state {
         AttemptState::Failed { error, .. } => {
@@ -916,6 +939,12 @@ struct PaperReviewCounterfactualInput {
 #[must_use]
 pub fn paper_review_tool_input_schema() -> std::sync::Arc<JsonObject> {
     tagged_schema::<PaperReviewToolInput>()
+}
+
+/// Host-extensible schema over the same typed contract used by saved-fact analysis.
+#[must_use]
+pub fn decision_analysis_tool_input_schema() -> std::sync::Arc<JsonObject> {
+    tagged_schema::<DecisionAnalysisQuery>()
 }
 
 #[derive(Clone, Copy)]
@@ -2966,6 +2995,32 @@ impl LabMcpService {
             started_at,
         );
         response
+    }
+
+    #[tool(
+        description = "Read complete bounded period decision counts, exact matching saved decisions, original explanation, or previous/selected recorded-decision comparisons. Uses one explicit PAPER or AUTOMATION session and immutable policy identity. Follow-ups require the overview selection fence: paper event prefix or unchanged saved automation snapshot digest. Changed automation evidence requires explicit refresh. Distinguishes strategy/constrained actions, execution, nonexclusive reasons, condition occurrences and missing capture; no AI, replay, polling, reconciliation or order effects. AUTOMATION requires the existing private trading-read permission.",
+        input_schema = decision_analysis_tool_input_schema(),
+        annotations(
+            title = "Saved Decision Analysis",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn decision_analysis_query(
+        &self,
+        arguments: JsonObject,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let query: DecisionAnalysisQuery = parse_arguments(arguments)?;
+        query.validate().map_err(|error| invalid_params(&error))?;
+        if query.requires_trading_read()
+            && let Err(error) = self.require_trading_read(&context)
+        {
+            return self.trading_permission_error(error);
+        }
+        decision_analysis_result(self.jobs.decision_analysis_query(query).await, &context.id)
     }
 
     #[tool(

@@ -26,6 +26,7 @@ COMMANDS = {
     "critical_smoke": f"cargo test -p spot-lab --lib {SMOKE}",
 }
 SCHEMAS = {
+    "decision_analysis_query": "decision-analysis-query",
     "paper_review_query": "paper-review-tool-input",
     "policy_write": "policy-write",
     "research_suite": "research-suite-action",
@@ -34,6 +35,7 @@ SCHEMAS = {
     "result_query": "mcp-result-query",
 }
 OUTPUT_SCHEMAS = {
+    "decision-analysis-response",
     "paper-decision-review", "paper-review-audit-response", "counterfactual-report",
     "sweep-preflight-report", "schedule-recovery-state",
     "portfolio-result-summary", "portfolio-equity", "portfolio-allocations",

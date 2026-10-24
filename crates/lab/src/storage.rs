@@ -7,6 +7,7 @@ mod artifact_read;
 mod automation_review;
 mod automation_store;
 mod control_store;
+pub(crate) mod decision_analysis;
 mod delete_store;
 mod equity_chart;
 mod evidence_store;
@@ -31,6 +32,7 @@ pub use crate::contracts::{
     DatasetDigests, dataset_digests, dataset_id, normalized_request_digest, observation_digest,
 };
 pub use artifact_read::ArtifactChunkRead;
+pub(crate) use decision_analysis::{DecisionAnalysisReadSnapshot, DecisionAnalysisSourceData};
 pub(crate) use delete_store::PolicyDeleteAdmission;
 pub use equity_chart::EquityChartProjection;
 pub use job_store::AttemptPublication;

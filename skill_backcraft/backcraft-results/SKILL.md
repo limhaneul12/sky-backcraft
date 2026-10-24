@@ -127,6 +127,29 @@ null 사유를 보존한다. 현재 시세로 과거 판단을 재실행하거�
 
 ## 엔진이 기록한 매수·미매수 이유
 
+기간별 현황과 개별 판단 비교는 현재 도구 목록에 `decision_analysis_query`가
+제공될 때 사용한다. `overview`의 `population`에 원본 세션을
+`source:{family:"paper"|"automation",session_id}`로 명시하고 UTC 반개구간
+`period:{start,end}` 및 필요한 저장 정책·종목을 지정한다. 반환된
+`source_snapshot.selection`을 그대로 유지해 `decisions`의 목록과 `decision`의
+원본 근거를 읽는다. 목록은 `page:{offset,limit}`과 선택적인 단계·원본 사유·
+전략/제약 후 action·execution 상태 필터를 사용한다. `compare`의
+`against:{kind:"previous"}`는 같은 세션·종목·근거 경계의 직전 실제 판단을
+비교하며, 필터에 남은 직전 행을 뜻하지 않는다. 선택 기간 이전 기록이면
+`compared_source_snapshot`의 별도 비교 구간을 보존하고 기간 총계에 합치지 않는다. 명시 비교는
+`against:{kind:"selected",selection,decision_id}`로 각 선택의 근거 경계를 유지한다.
+
+`totals.decisions`는 판단 시각이 선택 기간에 속하는 기록 수다.
+`unplaced_decisions`와 목록의 `unplaced_count`는 기간 포함 여부를 확인할 수
+없는 별도 기록이며 기간 총계로 합치지 않는다. 조건 occurrence와 사유별
+distinct_decisions, 주문·체결 수의 단위를 구분하고 비율이나 수익 기여도를
+추정하지 않는다. Paper는 event prefix를, automation은 변경되지 않은 현재
+저장 스냅샷 digest를 사용한다. Automation stale 응답은 과거 복원 불가를
+뜻하므로 조용히 최신 근거로 바꾸지 말고 명시적 새로고침으로 새 조회를 만든다.
+조회 한도 초과를 잘린 기간 통계로 바꾸지 않는다. Automation 조회는 기존
+trading-read 권한이 필요하며 이 분석을 위해 게이트를 켜거나 전략을 재개하지 않는다.
+도구가 아직 없으면 기존 단건 조회의 제공 범위와 배포 필요성을 구분해 알린다.
+
 실제 도구 스키마와 저장 응답을 먼저 확인한다. Paper는 `paper_review_query`의
 `decision`에 `selection:{session_id,event_sequence,as_of_sequence,signal_id}`를
 넣고 선택한 원본 signal ID와 inclusive cutoff를 고정한다. `signal_id`는 해당

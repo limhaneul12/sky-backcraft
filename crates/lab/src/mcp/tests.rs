@@ -5,6 +5,385 @@ use rmcp::{
 };
 
 #[test]
+fn decision_analysis_wire_budget_includes_escaping_and_rpc_envelope()
+-> Result<(), Box<dyn std::error::Error>> {
+    let request_id = rmcp::model::RequestId::Number(17);
+    let empty = text_result(&serde_json::json!({"value": ""}))?;
+    let overhead = serde_json::to_vec(&rmcp::model::JsonRpcResponse {
+        jsonrpc: rmcp::model::JsonRpcVersion2_0,
+        id: request_id.clone(),
+        result: empty,
+    })?
+    .len();
+    let maximum_ascii = MAX_DECISION_ANALYSIS_ENCODED_BYTES - overhead;
+    let at_limit = decision_analysis_result(
+        Ok(serde_json::json!({"value": "x".repeat(maximum_ascii)})),
+        &request_id,
+    )?;
+    assert_ne!(at_limit.is_error, Some(true));
+    assert_eq!(
+        serde_json::to_vec(&rmcp::model::JsonRpcResponse {
+            jsonrpc: rmcp::model::JsonRpcVersion2_0,
+            id: request_id.clone(),
+            result: at_limit,
+        })?
+        .len(),
+        MAX_DECISION_ANALYSIS_ENCODED_BYTES
+    );
+    let over_limit = decision_analysis_result(
+        Ok(serde_json::json!({"value": "x".repeat(maximum_ascii + 1)})),
+        &request_id,
+    )?;
+    assert_eq!(over_limit.is_error, Some(true));
+
+    let escaped = serde_json::json!({"value": "\n".repeat(180_000)});
+    assert!(
+        serde_json::to_vec(&escaped)?.len() < crate::contracts::MAX_DECISION_ANALYSIS_OUTPUT_BYTES
+    );
+    let rejected = decision_analysis_result(Ok(escaped), &request_id)?;
+    assert_eq!(rejected.is_error, Some(true));
+    assert!(result_text(rejected).contains("no partial totals were returned"));
+    Ok(())
+}
+
+async fn analysis_rpc(
+    peer: &rmcp::service::Peer<rmcp::RoleClient>,
+    query: crate::contracts::DecisionAnalysisQuery,
+) -> Result<serde_json::Value, LabError> {
+    let mut request = CallToolRequestParams::default();
+    request.name = "decision_analysis_query".into();
+    request.arguments = Some(object(serde_json::to_value(query)?));
+    let result = peer
+        .call_tool(request)
+        .await
+        .map_err(|error| LabError::Internal(format!("decision analysis MCP call: {error}")))?;
+    if result.is_error == Some(true) {
+        return Err(LabError::Internal(format!(
+            "decision analysis MCP tool error: {}",
+            result_text(result)
+        )));
+    }
+    Ok(serde_json::from_str(&result_text(result))?)
+}
+
+fn save_analysis_wire(name: &str, value: &serde_json::Value) -> Result<(), LabError> {
+    if let Some(directory) = std::env::var_os("SKY_BACKCRAFT_DECISION_ANALYSIS_WIRE_DIR") {
+        let directory = std::path::PathBuf::from(directory);
+        std::fs::create_dir_all(&directory)
+            .map_err(|error| LabError::Internal(format!("create test wire directory: {error}")))?;
+        std::fs::write(directory.join(name), serde_json::to_vec_pretty(value)?)
+            .map_err(|error| LabError::Internal(format!("save test wire: {error}")))?;
+    }
+    Ok(())
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one real MCP journey proves both saved source families, period/page units and original comparison wire"
+)]
+fn saved_decision_analysis_mcp_workflow_preserves_both_source_families()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::contracts::{
+        DecisionAnalysisComparisonTarget, DecisionAnalysisDecisionFilter,
+        DecisionAnalysisPageRequest, DecisionAnalysisQuery, DecisionAnalysisSelection,
+        RecordedDecisionAction,
+    };
+
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "spot-lab-decision-analysis-mcp-{}-{nonce}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&root)?;
+    let owner = crate::database::DatabaseOwner::open(root.clone())?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(async {
+        let fixture = owner
+            .handle()
+            .call("seed_decision_analysis_mcp_fixture", |store| {
+                store.seed_decision_analysis_fixture()
+            })
+            .await?;
+        let upbit = UpbitClient::synthetic_local("http://127.0.0.1:1")?;
+        let jobs =
+            crate::jobs::JobRuntime::start(owner.handle(), upbit.clone(), root.clone(), None)
+                .await?;
+        let service =
+            LabMcpService::new(owner.handle(), upbit, jobs.service(), McpExposure::Desktop);
+        let (server_transport, client_transport) = tokio::io::duplex(32_768);
+        let server = tokio::spawn(async move {
+            service
+                .serve(server_transport)
+                .await
+                .map_err(|error| error.to_string())?
+                .waiting()
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok::<(), String>(())
+        });
+        let client = ().serve(client_transport).await?;
+        let journey = async {
+            for (family, population, previous, selected) in [
+                (
+                    "paper",
+                    fixture.paper_population,
+                    fixture.paper_previous,
+                    fixture.paper_selected,
+                ),
+                (
+                    "automation",
+                    fixture.automation_population,
+                    fixture.automation_previous,
+                    fixture.automation_selected,
+                ),
+            ] {
+                let overview = analysis_rpc(
+                    client.peer(),
+                    DecisionAnalysisQuery::Overview {
+                        population: population.clone(),
+                    },
+                )
+                .await?;
+                assert_eq!(overview["schema_version"], "1.0");
+                assert_eq!(overview["population_complete"], true);
+                assert_eq!(overview["totals"]["decisions"], 2);
+                assert_eq!(overview["totals"]["unplaced_decisions"], 0);
+                let selection: DecisionAnalysisSelection =
+                    serde_json::from_value(overview["source_snapshot"]["selection"].clone())?;
+                let page = analysis_rpc(
+                    client.peer(),
+                    DecisionAnalysisQuery::Decisions {
+                        selection: selection.clone(),
+                        page: DecisionAnalysisPageRequest {
+                            offset: 0,
+                            limit: 1,
+                        },
+                        filter: None,
+                    },
+                )
+                .await?;
+                assert_eq!(page["page"]["returned_count"], 1);
+                assert_eq!(page["page"]["total_count"], 2);
+                assert_eq!(page["page"]["in_period_count"], 2);
+                assert_eq!(page["page"]["unplaced_count"], 0);
+                assert_eq!(
+                    page["page"]["items"][0]["decision_id"],
+                    serde_json::to_value(&previous)?
+                );
+                let next_page = analysis_rpc(
+                    client.peer(),
+                    DecisionAnalysisQuery::Decisions {
+                        selection: selection.clone(),
+                        page: DecisionAnalysisPageRequest {
+                            offset: 1,
+                            limit: 1,
+                        },
+                        filter: None,
+                    },
+                )
+                .await?;
+                assert_eq!(
+                    next_page["page"]["items"][0]["decision_id"],
+                    serde_json::to_value(&selected)?
+                );
+                let detail = analysis_rpc(
+                    client.peer(),
+                    DecisionAnalysisQuery::Decision {
+                        selection: selection.clone(),
+                        decision_id: selected.clone(),
+                    },
+                )
+                .await?;
+                assert_eq!(
+                    detail["decision"]["row"]["decision_id"],
+                    serde_json::to_value(&selected)?
+                );
+                let comparison = analysis_rpc(
+                    client.peer(),
+                    DecisionAnalysisQuery::Compare {
+                        selection: selection.clone(),
+                        decision_id: selected.clone(),
+                        against: DecisionAnalysisComparisonTarget::Previous,
+                    },
+                )
+                .await?;
+                assert_eq!(comparison["comparison"]["kind"], "previous");
+                assert_eq!(
+                    comparison["comparison"]["unavailable_reason"],
+                    serde_json::Value::Null
+                );
+                assert_eq!(
+                    comparison["comparison"]["compared"]["row"]["decision_id"],
+                    serde_json::to_value(&previous)?
+                );
+                let mut complete_history = population.clone();
+                complete_history.period.start = crate::contracts::UtcTimestamp::parse_rfc3339(
+                    "2026-10-01T00:00:00Z",
+                )?;
+                let history_overview = analysis_rpc(
+                    client.peer(),
+                    DecisionAnalysisQuery::Overview { population: complete_history },
+                )
+                .await?;
+                let history_selection: DecisionAnalysisSelection = serde_json::from_value(
+                    history_overview["source_snapshot"]["selection"].clone(),
+                )?;
+                let earliest_page = analysis_rpc(
+                    client.peer(),
+                    DecisionAnalysisQuery::Decisions {
+                        selection: history_selection.clone(),
+                        page: DecisionAnalysisPageRequest { offset: 0, limit: 1 },
+                        filter: None,
+                    },
+                )
+                .await?;
+                assert_eq!(earliest_page["page"]["returned_count"], 1);
+                let earliest_id = serde_json::from_value(
+                    earliest_page["page"]["items"][0]["decision_id"].clone(),
+                )?;
+                let unavailable = analysis_rpc(
+                    client.peer(),
+                    DecisionAnalysisQuery::Compare {
+                        selection: history_selection,
+                        decision_id: earliest_id,
+                        against: DecisionAnalysisComparisonTarget::Previous,
+                    },
+                )
+                .await?;
+                assert_eq!(unavailable["comparison"]["unavailable_reason"], "no_previous_decision");
+                assert!(unavailable["comparison"]["compared"].is_null());
+                assert!(unavailable["compared_source_snapshot"].is_null());
+                save_analysis_wire(&format!("{family}-no-previous-compare.json"), &unavailable)?;
+
+                let mut all_markets = population.clone();
+                all_markets.market = None;
+                let all_overview = analysis_rpc(
+                    client.peer(),
+                    DecisionAnalysisQuery::Overview { population: all_markets.clone() },
+                )
+                .await?;
+                let all_selection = serde_json::from_value(
+                    all_overview["source_snapshot"]["selection"].clone(),
+                )?;
+                let all_comparison = analysis_rpc(
+                    client.peer(),
+                    DecisionAnalysisQuery::Compare {
+                        selection: all_selection,
+                        decision_id: selected.clone(),
+                        against: DecisionAnalysisComparisonTarget::Previous,
+                    },
+                )
+                .await?;
+                assert!(all_comparison["selected_source_snapshot"]["selection"]["population"]["market"].is_null());
+                assert!(all_comparison["compared_source_snapshot"]["selection"]["population"]["market"].is_null());
+                assert_eq!(all_comparison["comparison"]["compared"]["row"]["decision_id"], serde_json::to_value(&previous)?);
+                save_analysis_wire(&format!("{family}-all-markets-compare.json"), &all_comparison)?;
+                if family == "automation" {
+                    all_markets.period.start = crate::contracts::UtcTimestamp::parse_rfc3339(
+                        detail["decision"]["row"]["decision_time"].as_str()
+                            .ok_or_else(|| LabError::Internal("fixture decision time absent".into()))?,
+                    )?;
+                    let context_overview = analysis_rpc(
+                        client.peer(),
+                        DecisionAnalysisQuery::Overview { population: all_markets },
+                    )
+                    .await?;
+                    assert_eq!(context_overview["totals"]["decisions"], 1);
+                    let context_selection = serde_json::from_value(context_overview["source_snapshot"]["selection"].clone())?;
+                    let context_comparison = analysis_rpc(
+                        client.peer(),
+                        DecisionAnalysisQuery::Compare {
+                            selection: context_selection,
+                            decision_id: selected.clone(),
+                            against: DecisionAnalysisComparisonTarget::Previous,
+                        },
+                    )
+                    .await?;
+                    assert!(context_comparison["compared_source_snapshot"]["selection"]["population"]["market"].is_null());
+                    assert_eq!(context_comparison["comparison"]["compared"]["row"]["decision_id"], serde_json::to_value(&previous)?);
+                    save_analysis_wire("automation-preperiod-all-markets-compare.json", &context_comparison)?;
+                }
+                let explicit_comparison = analysis_rpc(
+                    client.peer(),
+                    DecisionAnalysisQuery::Compare {
+                        selection: selection.clone(),
+                        decision_id: selected.clone(),
+                        against: DecisionAnalysisComparisonTarget::Selected {
+                            selection: Box::new(selection.clone()),
+                            decision_id: previous.clone(),
+                        },
+                    },
+                )
+                .await?;
+                assert_eq!(explicit_comparison["comparison"]["kind"], "selected");
+                let buys = analysis_rpc(
+                    client.peer(),
+                    DecisionAnalysisQuery::Decisions {
+                        selection: selection.clone(),
+                        page: DecisionAnalysisPageRequest {
+                            offset: 0,
+                            limit: 10,
+                        },
+                        filter: Some(DecisionAnalysisDecisionFilter {
+                            strategy_action: Some(RecordedDecisionAction::Buy),
+                            ..DecisionAnalysisDecisionFilter::default()
+                        }),
+                    },
+                )
+                .await?;
+                assert_eq!(buys["page"]["total_count"], 1);
+                assert_eq!(
+                    buys["page"]["items"][0]["decision_id"],
+                    serde_json::to_value(&previous)?
+                );
+                let reread = analysis_rpc(
+                    client.peer(),
+                    DecisionAnalysisQuery::Overview { population },
+                )
+                .await?;
+                assert_eq!(reread["source_snapshot"], overview["source_snapshot"]);
+                assert_eq!(reread["totals"], overview["totals"]);
+                for (kind, value) in [
+                    ("overview", &overview),
+                    ("decisions", &page),
+                    ("decision", &detail),
+                    ("compare", &comparison),
+                    ("selected-compare", &explicit_comparison),
+                    ("buy-decisions", &buys),
+                ] {
+                    save_analysis_wire(&format!("{family}-{kind}.json"), value)?;
+                }
+            }
+            Ok::<(), LabError>(())
+        }
+        .await;
+        let client_closed = client.cancel().await;
+        let server_closed = server.await;
+        let jobs_closed = jobs.shutdown().await;
+        if journey.is_err() {
+            eprintln!("decision analysis fixture runtime shutdown: {jobs_closed:?}");
+        }
+        journey?;
+        client_closed?;
+        server_closed?.map_err(std::io::Error::other)?;
+        jobs_closed?;
+        Ok::<(), Box<dyn std::error::Error>>(())
+    });
+    drop(runtime);
+    let closed = owner.shutdown();
+    let removed = std::fs::remove_dir_all(root);
+    result?;
+    closed?;
+    removed?;
+    Ok(())
+}
+
+#[test]
 fn tagged_schema_preserves_action_constraints_and_serde_closure()
 -> Result<(), Box<dyn std::error::Error>> {
     let original = serde_json::to_value(
@@ -609,6 +988,7 @@ fn full_tool_catalog_and_malformed_inputs_use_protocol_contract()
                 "collect_data",
                 "collection_schedule",
                 "dataset_query",
+                "decision_analysis_query",
                 "evidence_register",
                 "export_report",
                 "history_query",
@@ -644,6 +1024,38 @@ fn full_tool_catalog_and_malformed_inputs_use_protocol_contract()
                 "verify_run",
             ]
         );
+        let analysis_tool = tools
+            .iter()
+            .find(|tool| tool.name.as_ref() == "decision_analysis_query")
+            .expect("saved decision analysis is in the catalog");
+        assert_eq!(
+            serde_json::to_value(&analysis_tool.input_schema)?,
+            serde_json::to_value(decision_analysis_tool_input_schema().as_ref())?
+        );
+        for exposure in [
+            McpExposure::Local,
+            McpExposure::PublicNoAuth,
+            McpExposure::Bearer,
+            McpExposure::OAuth,
+        ] {
+            let mut protected = service.clone();
+            protected.exposure = exposure;
+            let denied = protected
+                .decision_analysis_query(
+                    object(serde_json::json!({
+                        "action": "overview",
+                        "population": {
+                            "source": {"family": "automation", "session_id": "analysis-private-fixture"},
+                            "period": {"start": "2026-10-01T00:00:00Z", "end": "2026-11-01T00:00:00Z"}
+                        }
+                    })),
+                    context(),
+                )
+                .await
+                .map_err(|error| LabError::Internal(format!("protected decision analysis: {error:?}")))?;
+            assert_eq!(denied.is_error, Some(true));
+            assert!(result_text(denied).contains("require the native desktop capability"));
+        }
         let review_tool = tools
             .iter()
             .find(|tool| tool.name.as_ref() == "paper_review_query")
@@ -758,6 +1170,7 @@ fn full_tool_catalog_and_malformed_inputs_use_protocol_contract()
                     | "realtime_status"
                     | "automation_session_query"
                     | "dataset_query"
+                    | "decision_analysis_query"
                     | "history_query"
                     | "policy_query"
                     | "paper_review_query"
@@ -799,6 +1212,17 @@ fn full_tool_catalog_and_malformed_inputs_use_protocol_contract()
         }
 
         for (tool_name, arguments, expected) in [
+            (
+                "decision_analysis_query",
+                serde_json::json!({
+                    "action": "overview",
+                    "population": {
+                        "source": {"family": "paper", "session_id": "analysis-period-fixture"},
+                        "period": {"start": "2026-11-01T00:00:00Z", "end": "2026-10-01T00:00:00Z"}
+                    }
+                }),
+                "decision analysis period requires start < end",
+            ),
             (
                 "paper_review_query",
                 serde_json::json!({"action":"decision","selection":{"session_id":"fixture","event_sequence":0,"as_of_sequence":1}}),

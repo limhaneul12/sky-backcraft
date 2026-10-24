@@ -70,6 +70,8 @@ pub mod review;
 pub use review::*;
 pub mod decision;
 pub use decision::*;
+pub mod decision_analysis;
+pub use decision_analysis::*;
 pub mod decision_preparation;
 pub use decision_preparation::*;
 pub mod review_audit;

@@ -6,6 +6,7 @@
 
 pub mod automation_review;
 pub mod comparison;
+pub(crate) mod decision_analysis;
 pub(crate) mod decision_explanation;
 pub mod export;
 pub mod metrics;

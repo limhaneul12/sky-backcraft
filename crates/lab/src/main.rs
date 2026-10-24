@@ -2076,6 +2076,18 @@ fn run_schemas(args: &[String]) -> Result<(), LabError> {
         .map_err(|error| LabError::InvalidConfig(format!("create {}: {error}", out.display())))?;
     let schemas = [
         (
+            "decision-analysis-query",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::DecisionAnalysisQuery
+            ))?,
+        ),
+        (
+            "decision-analysis-response",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::DecisionAnalysisResponse
+            ))?,
+        ),
+        (
             "recorded-decision-explanation",
             schema_json(&schemars::schema_for!(
                 spot_lab::contracts::RecordedDecisionExplanation

@@ -49,6 +49,8 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
     private var isVisibleWorkspace = false
     private var reviewWindowController: AutomationReviewWindowController?
     private var reviewWindowSessionID: String?
+    private var decisionAnalysisWindowController: DecisionAnalysisWindowController?
+    private var decisionAnalysisWindowSessionID: String?
 
     private var currentPolicy: RealPolicy?
     private var currentPolicyDetail: PolicyDetailSnapshot?
@@ -108,6 +110,7 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
     private let riskLimitsDisclosureButton = NSButton(title: "필수 위험 한도 접기", target: nil, action: nil)
     private let startButton = NSButton(title: "전략 세션 생성 및 시작", target: nil, action: nil)
     private let reviewButton = NSButton(title: "복기 · 성과", target: nil, action: nil)
+    private let decisionAnalysisButton = NSButton(title: "판단 분석", target: nil, action: nil)
     private var riskLimitsStack: NSStackView?
     private var riskFields: [String: NSTextField] = [:]
 
@@ -176,6 +179,7 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
         }
         pollTimer?.invalidate()
         activeReadRequest?.cancel()
+        closeDecisionAnalysisWindow()
     }
 
     override func viewDidChangeEffectiveAppearance() {
@@ -194,6 +198,7 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
     func refreshPrivacyPresentation() {
         renderWorkspace()
         reviewWindowController?.refreshPrivacyPresentation()
+        decisionAnalysisWindowController?.refreshPrivacyPresentation()
     }
 
     func setWorkspaceVisible(_ visible: Bool) {
@@ -214,6 +219,7 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
             pollTimer = nil
             marketFeedInvalidation.clearPending()
             closeReviewWindow()
+            closeDecisionAnalysisWindow()
             readGeneration &+= 1
             activeReadRequest?.cancel()
             activeReadRequest = nil
@@ -253,6 +259,8 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
         configureButton(nextLedgerButton, action: #selector(handleLoadNextLedger), label: "다음 주문·체결 내역 더 보기")
         configureButton(startButton, action: #selector(handleStartSession), label: "선택한 모드, 동결 전략과 위험 한도로 전략 세션 시작")
         configureButton(reviewButton, action: #selector(handleOpenReview), label: "선택한 전략 세션의 캔들·지표·판단 이유·성과 복기 열기")
+        configureButton(decisionAnalysisButton, action: #selector(handleOpenDecisionAnalysis), label: "선택한 전략 세션의 저장 판단 분석 열기")
+        decisionAnalysisButton.toolTip = "저장된 판단·조건·이유와 snapshot 비교를 조회합니다. 세션 제어, 원장 변경, 주문 전송을 하지 않습니다."
         configureButton(recordBaselineButton, action: #selector(handleRecordBaseline), label: "선택한 세션 계좌의 일일 시작 기준선 기록 및 검증")
         configureButton(queryBaselineButton, action: #selector(handleQueryBaseline), label: "선택한 세션 계좌의 일일 시작 기준선 상태 조회")
 
@@ -268,7 +276,7 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
             ("fills", "체결", 66)
         ])
         let sessionScroll = tableScroll(sessionTable, height: 155)
-        let sessionControls = NSStackView(views: [pauseButton, resumeButton, stopButton, reviewButton, readbackButton])
+        let sessionControls = NSStackView(views: [pauseButton, resumeButton, stopButton, reviewButton, decisionAnalysisButton, readbackButton])
         sessionControls.orientation = TerminalTheme.textScale >= 1.5 ? .vertical : .horizontal
         sessionControls.alignment = TerminalTheme.textScale >= 1.5 ? .leading : .centerY
         sessionControls.spacing = 8
@@ -1323,6 +1331,7 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
         }
         let riskValid = riskValidationError == nil
         reviewButton.isEnabled = isVisibleWorkspace && selectedSession != nil
+        decisionAnalysisButton.isEnabled = isVisibleWorkspace && selectedSession != nil
         let market = marketField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         let interval = intervalPopup.selectedItem?.title
         var startBlockReasons: [String] = []
@@ -1477,6 +1486,10 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
     }
 
     private func renderWorkspace() {
+        if let decisionAnalysisWindowSessionID,
+           selectedSession?.session_id != decisionAnalysisWindowSessionID {
+            closeDecisionAnalysisWindow()
+        }
         privacyButton.title = privacyIsMasked() ? "계좌 금액 표시" : "계좌 금액 숨기기"
         if let session = selectedSession {
             let effects = (session.account_risk?.capabilities.live_effects_enabled).map { $0 ? "ON" : "OFF" } ?? "미확인"
@@ -2628,6 +2641,7 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
         let session = sessions[row]
         guard selectedSessionID != session.session_id else { return }
         closeReviewWindow()
+        closeDecisionAnalysisWindow()
         selectedSessionID = session.session_id
         selectedSession = session
         projectionMissingForSelectedSession = session.account_risk == nil
@@ -2681,10 +2695,36 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
         controller.showReview()
     }
 
+    @objc private func handleOpenDecisionAnalysis() {
+        guard isVisibleWorkspace, let session = selectedSession else { return }
+        if decisionAnalysisWindowSessionID == session.session_id,
+           let decisionAnalysisWindowController {
+            decisionAnalysisWindowController.showAnalysis(for: .automation(session))
+            return
+        }
+        closeDecisionAnalysisWindow()
+        let controller = DecisionAnalysisWindowController(privacyIsMasked: privacyIsMasked)
+        controller.onClose = { [weak self, weak controller] in
+            guard let self, self.decisionAnalysisWindowController === controller else { return }
+            self.decisionAnalysisWindowController = nil
+            self.decisionAnalysisWindowSessionID = nil
+        }
+        decisionAnalysisWindowController = controller
+        decisionAnalysisWindowSessionID = session.session_id
+        controller.showAnalysis(for: .automation(session))
+    }
+
     private func closeReviewWindow() {
         let controller = reviewWindowController
         reviewWindowController = nil
         reviewWindowSessionID = nil
+        controller?.close()
+    }
+
+    private func closeDecisionAnalysisWindow() {
+        let controller = decisionAnalysisWindowController
+        decisionAnalysisWindowController = nil
+        decisionAnalysisWindowSessionID = nil
         controller?.close()
     }
 

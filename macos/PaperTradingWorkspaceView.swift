@@ -128,6 +128,9 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
     private let stopButton = NSButton(title: "세션 종료 (Stop)", target: nil, action: nil)
     private let copyIdButton = NSButton(title: "세션·리비전 ID 복사", target: nil, action: nil)
     private let refreshButton = NSButton(title: "새로고침", target: nil, action: nil)
+    private let decisionAnalysisButton = NSButton(title: "판단 분석", target: nil, action: nil)
+    private var decisionAnalysisWindowController: DecisionAnalysisWindowController?
+    private var decisionAnalysisWindowSessionID: String?
 
     // Status & summary banners
     private let statusBanner = NSTextField(
@@ -189,6 +192,7 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
         activeEventsReadRequest?.cancel()
         activeDecisionReadRequest?.cancel()
         activeWriteRequest?.cancel()
+        closeDecisionAnalysisWindow()
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -224,6 +228,7 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
             cancelEventsRead()
             activeReadRequest?.cancel()
             activeReadRequest = nil
+            closeDecisionAnalysisWindow()
             startOptionsAreFresh = false
             sessionSnapshotIsFresh = false
         }
@@ -411,10 +416,21 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
         controlRow.alignment = .centerY
         controlRow.spacing = 8
 
-        let sessionControlStack = NSStackView(views: [controlTitle, controlRow])
+        decisionAnalysisButton.bezelStyle = .rounded
+        decisionAnalysisButton.target = self
+        decisionAnalysisButton.action = #selector(handleOpenDecisionAnalysis)
+        decisionAnalysisButton.setAccessibilityLabel("선택한 지속 PAPER 세션의 저장 판단 분석 열기")
+        decisionAnalysisButton.setAccessibilityHelp("저장된 판단·조건·이유와 snapshot 비교를 조회합니다. 세션 제어, 원장 변경, 주문 전송을 하지 않습니다.")
+        let analysisRow = NSStackView(views: [decisionAnalysisButton, NSView()])
+        analysisRow.orientation = .horizontal
+        analysisRow.alignment = .centerY
+        analysisRow.spacing = 8
+
+        let sessionControlStack = NSStackView(views: [controlTitle, controlRow, analysisRow])
         sessionControlStack.orientation = .vertical
         sessionControlStack.alignment = .leading
         sessionControlStack.spacing = 8
+        analysisRow.widthAnchor.constraint(equalTo: sessionControlStack.widthAnchor).isActive = true
         embedInBox(sessionControlStack, into: controlBox)
 
         // 3. Per-market independent virtual accounts table
@@ -921,6 +937,10 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
     }
 
     private func renderSelectedSession() {
+        if let decisionAnalysisWindowSessionID,
+           selectedSession?.session_id != decisionAnalysisWindowSessionID {
+            closeDecisionAnalysisWindow()
+        }
         marketsTable.reloadData()
         renderMarketTimingDetails()
         guard let session = selectedSession else {
@@ -1106,6 +1126,7 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
             eventsFirstPageButton.isEnabled = false
             eventsNextPageButton.isEnabled = false
         }
+        decisionAnalysisButton.isEnabled = isVisibleWorkspace && selectedSession != nil
         updateDecisionReviewEnablement()
     }
 
@@ -1176,6 +1197,32 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
 
     @objc private func handleManualRefresh() {
         reloadWorkspace(preserveSelection: true)
+    }
+
+    @objc private func handleOpenDecisionAnalysis() {
+        guard isVisibleWorkspace, let session = selectedSession else { return }
+        if decisionAnalysisWindowSessionID == session.session_id,
+           let decisionAnalysisWindowController {
+            decisionAnalysisWindowController.showAnalysis(for: .paper(session))
+            return
+        }
+        closeDecisionAnalysisWindow()
+        let controller = DecisionAnalysisWindowController()
+        controller.onClose = { [weak self, weak controller] in
+            guard let self, self.decisionAnalysisWindowController === controller else { return }
+            self.decisionAnalysisWindowController = nil
+            self.decisionAnalysisWindowSessionID = nil
+        }
+        decisionAnalysisWindowController = controller
+        decisionAnalysisWindowSessionID = session.session_id
+        controller.showAnalysis(for: .paper(session))
+    }
+
+    private func closeDecisionAnalysisWindow() {
+        let controller = decisionAnalysisWindowController
+        decisionAnalysisWindowController = nil
+        decisionAnalysisWindowSessionID = nil
+        controller?.close()
     }
 
     @objc private func handleLoadFirstEvents() {

@@ -116,6 +116,95 @@ impl Store {
             recorded_decision: Some(recorded_decision),
         })
     }
+
+    /// Project already indexed prefix facts with the single-decision lifecycle invariants.
+    pub(in crate::storage) fn paper_recorded_decision_from_lifecycle(
+        signal: &SignalRecord,
+        policy_ref: &crate::contracts::PolicyRevisionRef,
+        event_sequence: u64,
+        as_of_sequence: u64,
+        order_facts: Vec<(u64, u64, OrderRecord)>,
+        fill_facts: Vec<(u64, FillRecord)>,
+    ) -> Result<crate::contracts::RecordedDecisionExplanation, LabError> {
+        if signal
+            .policy_ref
+            .as_ref()
+            .is_some_and(|saved| saved != policy_ref)
+        {
+            return Err(LabError::DataCorrupt(
+                "paper signal/session policy mismatch".into(),
+            ));
+        }
+        if order_facts.len() > MAX_LINKED_PAPER_ORDER_FACTS {
+            return Err(LabError::ResourceLimit(
+                "paper decision linked-order fact cap exceeded".into(),
+            ));
+        }
+        let mut order_bytes = 0;
+        for (_, sequence, order) in &order_facts {
+            validate_indexed_prefix_sequence(*sequence, event_sequence, as_of_sequence)?;
+            validate_linked_paper_order(signal, order)?;
+            order_bytes = add_linked_fact_bytes(
+                order_bytes,
+                serialized_linked_fact_bytes(order)?,
+                MAX_LINKED_PAPER_ORDER_BYTES,
+                "paper linked-order bytes",
+            )?;
+        }
+        let history = fold_linked_paper_orders(order_facts)?;
+        if fill_facts.len() > MAX_LINKED_PAPER_FILL_FACTS {
+            return Err(LabError::ResourceLimit(
+                "paper decision linked-fill fact cap exceeded".into(),
+            ));
+        }
+        let mut fills = Vec::with_capacity(fill_facts.len());
+        let mut fill_ids = BTreeSet::new();
+        let mut fill_bytes = 0;
+        for (sequence, fill) in fill_facts {
+            validate_indexed_prefix_sequence(sequence, event_sequence, as_of_sequence)?;
+            fill_bytes = add_linked_fact_bytes(
+                fill_bytes,
+                serialized_linked_fact_bytes(&fill)?,
+                MAX_LINKED_PAPER_FILL_BYTES,
+                "paper linked-fill bytes",
+            )?;
+            validate_linked_paper_fill(
+                signal,
+                &fill,
+                &history.latest_by_id,
+                &history.creation_by_id,
+                &mut fill_ids,
+            )?;
+            fills.push(fill);
+        }
+        fills.sort_by(|left, right| {
+            (left.context.event_seq, &left.fill_id).cmp(&(right.context.event_seq, &right.fill_id))
+        });
+        crate::reporting::decision_explanation::paper_recorded_decision(
+            Some(signal),
+            Some(policy_ref),
+            &history.latest_by_id.into_values().collect::<Vec<_>>(),
+            &fills,
+        )
+    }
+}
+
+fn validate_indexed_prefix_sequence(
+    sequence: u64,
+    selected: u64,
+    cutoff: u64,
+) -> Result<(), LabError> {
+    if sequence < selected || sequence > cutoff {
+        return Err(LabError::DataCorrupt(
+            "paper lifecycle fact escaped its selected prefix".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn serialized_linked_fact_bytes(value: &impl serde::Serialize) -> Result<i64, LabError> {
+    i64::try_from(serde_json::to_vec(value)?.len())
+        .map_err(|_| LabError::ResourceLimit("paper linked fact size exceeds SQLite range".into()))
 }
 
 fn paper_source_observations(
@@ -374,27 +463,13 @@ fn load_linked_paper_fills(
             }
             let fill: FillRecord = serde_json::from_str(&raw)
                 .map_err(|_| LabError::DataCorrupt("paper linked fill JSON is invalid".into()))?;
-            let Some(order) = orders_by_id.get(fill.order_id.as_str()) else {
-                return Err(LabError::DataCorrupt(
-                    "paper linked fill points to an absent selected-signal order".into(),
-                ));
-            };
-            let Some(creation) = creation_orders.get(fill.order_id.as_str()) else {
-                return Err(LabError::DataCorrupt(
-                    "paper linked fill has no earliest order fact".into(),
-                ));
-            };
-            if fill.context.run_id != signal.context.run_id
-                || fill.context.model_id != signal.context.model_id
-                || fill.context.market != signal.context.market
-                || fill.context.event_seq <= creation.context.event_seq
-                || fill.side != order.side
-                || !fill_ids.insert(fill.fill_id.as_str().to_owned())
-            {
-                return Err(LabError::DataCorrupt(
-                    "paper fill identity does not match its signal/order lifecycle".into(),
-                ));
-            }
+            validate_linked_paper_fill(
+                signal,
+                &fill,
+                orders_by_id,
+                creation_orders,
+                &mut fill_ids,
+            )?;
             fills.push(fill);
             count += 1;
         }
@@ -403,6 +478,33 @@ fn load_linked_paper_fills(
         (left.context.event_seq, &left.fill_id).cmp(&(right.context.event_seq, &right.fill_id))
     });
     Ok(fills)
+}
+
+fn validate_linked_paper_fill(
+    signal: &SignalRecord,
+    fill: &FillRecord,
+    orders_by_id: &BTreeMap<String, OrderRecord>,
+    creation_orders: &BTreeMap<String, OrderRecord>,
+    fill_ids: &mut BTreeSet<String>,
+) -> Result<(), LabError> {
+    let order = orders_by_id.get(fill.order_id.as_str()).ok_or_else(|| {
+        LabError::DataCorrupt("paper linked fill points to an absent selected-signal order".into())
+    })?;
+    let creation = creation_orders.get(fill.order_id.as_str()).ok_or_else(|| {
+        LabError::DataCorrupt("paper linked fill has no earliest order fact".into())
+    })?;
+    if fill.context.run_id != signal.context.run_id
+        || fill.context.model_id != signal.context.model_id
+        || fill.context.market != signal.context.market
+        || fill.context.event_seq <= creation.context.event_seq
+        || fill.side != order.side
+        || !fill_ids.insert(fill.fill_id.as_str().to_owned())
+    {
+        return Err(LabError::DataCorrupt(
+            "paper fill identity does not match its signal/order lifecycle".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_linked_paper_event_json(

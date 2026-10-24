@@ -15,6 +15,13 @@ private order/asset changes trigger reconciliation. See the
 [realtime feed and recovery contract](REALTIME.md).
 For external JSON review of saved facts, see the
 [read-only review contract and examples](docs/json-review.md).
+Saved decision analysis is shared by the native GUI and the read-only
+`decision_analysis_query` MCP surface: complete bounded period counts, matching
+original decisions, saved explanation and previous/selected-record comparison.
+It uses no built-in AI or policy replay. Each view names its source/session,
+saved policy and evidence boundary; missing capture remains unknown, and changed
+automation snapshots require an explicit refresh. Period totals exclude records
+whose original decision time is unknown; those records remain separately visible.
 For research, fees, spread,
 slippage, impact, tick rules and minimum notional are explicit research inputs,
 not claims about a historical market unless the request supplies matching

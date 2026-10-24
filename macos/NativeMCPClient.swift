@@ -315,6 +315,7 @@ final class NativeMCPClient {
     private static let allowedTools: Set<String> = [
         "lab_status", "result_query", "history_query", "policy_query",
         "realtime_status",
+        "decision_analysis_query",
         "resource_delete_preview", "policy_delete_write", "policy_delete_query",
         "upbit_account_balances", "upbit_orders_open",
         "upbit_orders_closed", "trading_control",
