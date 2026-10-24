@@ -90,8 +90,74 @@ private struct NativeReadProjectionRegression {
         try verifyMarks(root: root, name: "large", rowCount: 25_000, maxPoints: 1_000)
         try verifyEmptyMarkBehavior(root: root)
         try verifyHiddenInvalidMarkRows(root: root)
+        try verifyBlockedModelComparisonBehavior(root: root)
         try verifyLedgerTimestampBehavior()
         try verifyPolicyTimestampBehavior()
+        try verifyStrictDecimalAndTimestampEdgeCases()
+        try verifyConcurrentReadAndGenerationDefense(root: root)
+    }
+
+    private static func verifyConcurrentReadAndGenerationDefense(root: URL) throws {
+        let supportDirectory = root.appendingPathComponent("concurrent-wal", isDirectory: true)
+        try createMarkDatabase(at: supportDirectory, count: 2_000)
+        let reader = DatabaseReader(supportDirectory: supportDirectory)
+        let baseline = try reader.fetchAccountMarks(for: fixtureRunId, modelId: fixtureModelId, maxPoints: 200)
+        try expect(baseline.count == 200, "concurrent baseline must return 200 sampled marks")
+
+        let gate = ReadGenerationGate()
+        let t1 = gate.begin()
+        let t2 = gate.begin()
+        try expect(!gate.isCurrent(t1), "superseded generation token must not remain current")
+        try expect(gate.isCurrent(t2), "latest generation token must be current")
+
+        let workerCount = 8
+        let iterationsPerWorker = 10
+        let group = DispatchGroup()
+        let queue = DispatchQueue(label: "test.concurrent.readers", attributes: .concurrent)
+        let lock = NSLock()
+        var failures: [String] = []
+
+        for worker in 0..<workerCount {
+            group.enter()
+            queue.async {
+                defer { group.leave() }
+                for iteration in 0..<iterationsPerWorker {
+                    do {
+                        let marks = try reader.fetchAccountMarks(
+                            for: fixtureRunId,
+                            modelId: fixtureModelId,
+                            maxPoints: 200
+                        )
+                        if marks.count != baseline.count || marks.first?.seq != baseline.first?.seq || marks.last?.seq != baseline.last?.seq {
+                            lock.lock()
+                            failures.append("worker \(worker) iteration \(iteration) produced mismatched marks")
+                            lock.unlock()
+                        }
+                    } catch {
+                        lock.lock()
+                        failures.append("worker \(worker) iteration \(iteration) failed: \(error)")
+                        lock.unlock()
+                    }
+                }
+            }
+        }
+        group.wait()
+        try expect(failures.isEmpty, "concurrent reader stress test failed: \(failures.joined(separator: "; "))")
+    }
+
+    private static func verifyStrictDecimalAndTimestampEdgeCases() throws {
+        try expect(StrictDecimal.isValid("79228162514264337593543950335"), "max Decimal coefficient must be accepted")
+        try expect(!StrictDecimal.isValid("79228162514264337593543950336"), "max+1 Decimal coefficient must be rejected")
+        try expect(StrictDecimal.isValid("-0.0000000000000000000000000001"), "28-digit fraction must be accepted")
+        try expect(!StrictDecimal.isValid("0.00000000000000000000000000001"), "29-digit fraction must be rejected")
+        try expect(!StrictDecimal.isValid("00"), "leading zero integer must be rejected")
+        try expect(!StrictDecimal.isValid(""), "empty Decimal must be rejected")
+
+        let parser = ReadTimestampParser()
+        try expect(parser.ordinaryThenFractional("2024-02-29T23:59:59.125Z") != nil, "leap year Feb 29 must parse")
+        try expect(parser.ordinaryThenFractional("2100-02-29T00:00:00Z") == nil, "non-leap century Feb 29 must fail")
+        try expect(parser.ordinaryThenFractional("2024-01-01T09:00:00+09:00")?.timeIntervalSince1970 == fixtureBaseEpoch,
+                   "non-Z offset must fall back to ISO8601DateFormatter accurately")
     }
 
     private static func verifyMarks(root: URL, name: String, rowCount: Int, maxPoints: Int) throws {
@@ -178,6 +244,127 @@ private struct NativeReadProjectionRegression {
         } catch let error as LedgerReadError {
             guard case .invalidJSON(let operation, _) = error,
                   operation == "account mark \(fixtureRunId)/\(fixtureModelId)" else { throw error }
+        }
+    }
+
+    private static func verifyBlockedModelComparisonBehavior(root: URL) throws {
+        let supportDirectory = root.appendingPathComponent("model-comparisons", isDirectory: true)
+        let researchDirectory = supportDirectory.appendingPathComponent("research", isDirectory: true)
+        try FileManager.default.createDirectory(at: researchDirectory, withIntermediateDirectories: true)
+        let databaseURL = researchDirectory.appendingPathComponent("lab.sqlite")
+        var optionalDB: OpaquePointer?
+        let openResult = sqlite3_open_v2(
+            databaseURL.path, &optionalDB,
+            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, nil
+        )
+        guard openResult == SQLITE_OK, let db = optionalDB else {
+            throw FixtureFailure.sqlite("open returned \(openResult)")
+        }
+        defer { sqlite3_close(db) }
+
+        try execute(db, """
+        CREATE TABLE run_models (
+            run_id TEXT NOT NULL,
+            model_id TEXT NOT NULL,
+            market TEXT NOT NULL,
+            status TEXT NOT NULL,
+            fill_count INTEGER NOT NULL,
+            account_mark_count INTEGER NOT NULL,
+            episode_count INTEGER NOT NULL,
+            policy_id TEXT,
+            policy_revision_id TEXT,
+            policy_definition_digest TEXT,
+            PRIMARY KEY(run_id, model_id)
+        );
+        CREATE TABLE run_model_comparisons (
+            run_id TEXT NOT NULL,
+            model_id TEXT NOT NULL,
+            comparison_json TEXT NOT NULL,
+            PRIMARY KEY(run_id, model_id)
+        );
+        CREATE TABLE policy_revisions (
+            policy_id TEXT NOT NULL,
+            revision_id TEXT NOT NULL,
+            definition_digest TEXT NOT NULL,
+            PRIMARY KEY(policy_id, revision_id)
+        );
+        CREATE TABLE validation_results (
+            run_id TEXT NOT NULL,
+            check_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            PRIMARY KEY(run_id, check_id)
+        );
+        """)
+        let completedJSON = try jsonString([
+            "run_id": fixtureRunId,
+            "model_id": "model-completed",
+            "market": "KRW-BTC",
+            "status": "COMPLETED",
+            "initial_equity": "10000",
+            "final_equity": "11000",
+            "net_pnl": "1000",
+            "net_return": ["value": 0.1, "null_reason": NSNull()],
+            "max_drawdown": ["value": 0.0, "null_reason": NSNull()],
+            "turnover": ["value": 0.5, "null_reason": NSNull()],
+            "cumulative_fees": "0",
+            "closed_episodes": 0
+        ])
+        let blockedJSON = try jsonString([
+            "run_id": fixtureRunId,
+            "model_id": "model-blocked",
+            "market": "KRW-BTC",
+            "status": "BLOCKED_DATA",
+            "initial_equity": NSNull(),
+            "final_equity": NSNull(),
+            "net_pnl": NSNull(),
+            "net_return": ["value": NSNull(), "null_reason": "NO_ACCOUNT_MARKS"],
+            "max_drawdown": ["value": NSNull(), "null_reason": "NO_ACCOUNT_MARKS"],
+            "turnover": ["value": NSNull(), "null_reason": "ZERO_DENOMINATOR"],
+            "cumulative_fees": NSNull(),
+            "closed_episodes": NSNull()
+        ])
+        try execute(db, """
+        INSERT INTO policy_revisions (policy_id, revision_id, definition_digest) VALUES
+            ('builtin-buy-and-hold', 'rev-bh', '\(fixtureDigest)'),
+            ('builtin-s2', 'rev-s2', '\(fixtureDigest)');
+        INSERT INTO run_models (run_id, model_id, market, status, fill_count, account_mark_count, episode_count, policy_id, policy_revision_id, policy_definition_digest) VALUES
+            ('\(fixtureRunId)', 'model-completed', 'KRW-BTC', 'COMPLETED', 1, 2, 0, 'builtin-buy-and-hold', 'rev-bh', '\(fixtureDigest)'),
+            ('\(fixtureRunId)', 'model-blocked', 'KRW-BTC', 'BLOCKED_DATA', 0, 0, 0, 'builtin-s2', 'rev-s2', '\(fixtureDigest)');
+        INSERT INTO run_model_comparisons (run_id, model_id, comparison_json) VALUES
+            ('\(fixtureRunId)', 'model-completed', '\(completedJSON)'),
+            ('\(fixtureRunId)', 'model-blocked', '\(blockedJSON)');
+        """)
+
+        let reader = DatabaseReader(supportDirectory: supportDirectory)
+        let comparisons = try reader.fetchModelComparisons(for: [fixtureRunId])
+        try expect(comparisons.count == 1, "blocked model comparison must be skipped while preserving completed siblings")
+        try expect(comparisons[0].modelId == "model-completed", "completed model comparison identity changed")
+        try expect(comparisons[0].policyId == "builtin-buy-and-hold", "completed model policy identity changed")
+
+        let invalidCompletedJSON = try jsonString([
+            "run_id": fixtureRunId,
+            "model_id": "model-blocked",
+            "market": "KRW-BTC",
+            "status": "COMPLETED",
+            "initial_equity": NSNull(),
+            "final_equity": "11000",
+            "net_pnl": "1000",
+            "net_return": ["value": 0.1, "null_reason": NSNull()],
+            "max_drawdown": ["value": 0.0, "null_reason": NSNull()],
+            "turnover": ["value": 0.5, "null_reason": NSNull()],
+            "cumulative_fees": "0",
+            "closed_episodes": 0
+        ])
+        try execute(db, """
+        UPDATE run_models SET status = 'COMPLETED' WHERE run_id = '\(fixtureRunId)' AND model_id = 'model-blocked';
+        UPDATE run_model_comparisons SET comparison_json = '\(invalidCompletedJSON)' WHERE run_id = '\(fixtureRunId)' AND model_id = 'model-blocked';
+        """)
+        do {
+            _ = try reader.fetchModelComparisons(for: [fixtureRunId])
+            throw FixtureFailure.assertion("completed model comparison missing financial fields must fail closed")
+        } catch let error as LedgerReadError {
+            guard case .inconsistentData(let operation, _) = error,
+                  operation == "model comparison \(fixtureRunId)/model-blocked" else { throw error }
         }
     }
 

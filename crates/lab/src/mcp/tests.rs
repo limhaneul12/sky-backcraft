@@ -5,6 +5,185 @@ use rmcp::{
 };
 
 #[test]
+fn tagged_schema_preserves_action_constraints_and_serde_closure()
+-> Result<(), Box<dyn std::error::Error>> {
+    let original = serde_json::to_value(
+        rmcp::handler::server::common::schema_for_type::<PaperReviewToolInput>().as_ref(),
+    )?;
+    let projected = serde_json::to_value(tagged_schema::<PaperReviewToolInput>().as_ref())?;
+    let original_branches = original["oneOf"]
+        .as_array()
+        .expect("paper review input is an internally tagged enum");
+    let projected_branches = projected["oneOf"]
+        .as_array()
+        .expect("projected paper review input remains a tagged union");
+    assert_eq!(projected_branches.len(), original_branches.len());
+
+    let mut union_fields = std::collections::BTreeSet::new();
+    for branch in original_branches {
+        let fields = branch["properties"]
+            .as_object()
+            .expect("supported action branches declare object properties");
+        union_fields.extend(fields.keys().cloned());
+    }
+    let root_properties = union_fields
+        .iter()
+        .map(|name| (name.clone(), serde_json::json!({})))
+        .collect::<serde_json::Map<_, _>>();
+    assert_eq!(
+        projected["properties"],
+        serde_json::Value::Object(root_properties),
+        "the root declares every action field without weakening branch constraints"
+    );
+    assert_eq!(projected["additionalProperties"], false);
+    assert!(projected["properties"].get("link_id").is_none());
+
+    for (original_branch, projected_branch) in original_branches.iter().zip(projected_branches) {
+        let branch_fields = original_branch["properties"]
+            .as_object()
+            .expect("action branch properties remain available");
+        let branch_field_names = branch_fields
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let absent_guards = union_fields
+            .difference(&branch_field_names)
+            .map(|name| serde_json::json!({"required": [name]}))
+            .collect::<Vec<_>>();
+
+        let mut expected_branch = original_branch.clone();
+        let expected_object = expected_branch
+            .as_object_mut()
+            .expect("action branch is an object schema");
+        assert_eq!(
+            expected_object.remove("additionalProperties"),
+            Some(serde_json::Value::Bool(false))
+        );
+        if !absent_guards.is_empty() {
+            expected_object.insert(
+                "not".to_owned(),
+                serde_json::json!({"anyOf": absent_guards}),
+            );
+        }
+        if let Some(selection) = original_branch["properties"].get("selection") {
+            assert_eq!(selection["additionalProperties"], false);
+        }
+        assert_eq!(
+            projected_branch, &expected_branch,
+            "original properties, required fields, and nested schemas remain intact"
+        );
+    }
+    assert_eq!(projected["$defs"], original["$defs"]);
+
+    let original_struct = serde_json::to_value(
+        rmcp::handler::server::common::schema_for_type::<crate::contracts::PaperReviewSelection>()
+            .as_ref(),
+    )?;
+    let projected_struct =
+        serde_json::to_value(tagged_schema::<crate::contracts::PaperReviewSelection>().as_ref())?;
+    let mut expected_struct = original_struct;
+    expected_struct["type"] = serde_json::json!("object");
+    assert_eq!(
+        projected_struct, expected_struct,
+        "struct schemas stay unchanged"
+    );
+
+    let valid = serde_json::json!({
+        "action": "decision",
+        "selection": {
+            "session_id": "6c9b0244-359d-4d2f-96d0-bb3ce810e2e4",
+            "event_sequence": 1,
+            "as_of_sequence": 1
+        }
+    });
+    assert!(serde_json::from_value::<PaperReviewQuery>(valid.clone()).is_ok());
+
+    let mut cross_action_field = valid.clone();
+    cross_action_field["max_source_bars"] = serde_json::json!(32);
+    assert!(serde_json::from_value::<PaperReviewQuery>(cross_action_field).is_err());
+
+    let mut host_only_field = valid.clone();
+    host_only_field["link_id"] = serde_json::json!("host-routing-id");
+    assert!(serde_json::from_value::<PaperReviewQuery>(host_only_field).is_err());
+
+    let mut missing_required = valid;
+    missing_required
+        .as_object_mut()
+        .unwrap()
+        .remove("selection");
+    assert!(serde_json::from_value::<PaperReviewQuery>(missing_required).is_err());
+    Ok(())
+}
+
+#[test]
+fn tagged_schema_static_tool_catalog_keeps_root_compositions_host_extensible()
+-> Result<(), Box<dyn std::error::Error>> {
+    let tools = LabMcpService::tool_router().list_all();
+    let mut composed_tools = 0;
+    for tool in tools {
+        let schema = serde_json::to_value(&tool.input_schema)?;
+        let composition_names = ["oneOf", "anyOf", "allOf"]
+            .into_iter()
+            .filter(|name| schema.get(*name).is_some())
+            .collect::<Vec<_>>();
+        if composition_names.is_empty() {
+            continue;
+        }
+        composed_tools += 1;
+
+        assert_eq!(schema["type"], "object", "{} input schema", tool.name);
+        assert_eq!(
+            schema["additionalProperties"], false,
+            "{} input root must close unknown fields",
+            tool.name
+        );
+        let root_properties = schema["properties"]
+            .as_object()
+            .expect("composed MCP input schema declares root properties");
+        let mut union_fields = std::collections::BTreeSet::new();
+        for composition in &composition_names {
+            let branches = schema[*composition]
+                .as_array()
+                .expect("root JSON Schema composition is an array");
+            for branch in branches {
+                assert_ne!(
+                    branch.get("additionalProperties"),
+                    Some(&serde_json::Value::Bool(false)),
+                    "{} {composition} branch cannot close host-added root properties",
+                    tool.name
+                );
+                if let Some(properties) =
+                    branch.get("properties").and_then(|value| value.as_object())
+                {
+                    union_fields.extend(properties.keys().cloned());
+                }
+            }
+        }
+        assert_eq!(
+            root_properties
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            union_fields,
+            "{} root properties declare exactly the composed action fields",
+            tool.name
+        );
+        assert!(
+            root_properties
+                .values()
+                .all(|value| value == &serde_json::json!({})),
+            "{} root declarations leave action-specific constraints in branches",
+            tool.name
+        );
+    }
+    assert!(
+        composed_tools > 0,
+        "the tool catalog contains composed schemas"
+    );
+    Ok(())
+}
+
+#[test]
 fn ledger_projection_preserves_page_metadata_cost_units_and_open_exit()
 -> Result<(), Box<dyn std::error::Error>> {
     use crate::contracts::{EpisodeStatus, Page, QueryCursor};
@@ -136,6 +315,8 @@ fn full_tool_catalog_and_malformed_inputs_use_protocol_contract()
                 serde_json::json!({
                     "auth": auth, "public_no_auth": public, "progress_stream": false,
                     "job_results": "poll job_control by opaque job_id",
+                    "realtime_status_stream": "/realtime/events",
+                    "realtime_stream_semantics": "latest health snapshots; durable results remain queryable",
                 })
             );
             assert_eq!(
@@ -434,6 +615,7 @@ fn full_tool_catalog_and_malformed_inputs_use_protocol_contract()
                 "job_control",
                 "lab_status",
                 "live_order_control",
+                "paper_review_query",
                 "paper_session_query",
                 "paper_session_write",
                 "plan_backtest",
@@ -441,6 +623,7 @@ fn full_tool_catalog_and_malformed_inputs_use_protocol_contract()
                 "policy_write",
                 "portfolio_backtest",
                 "probe_upbit",
+                "realtime_status",
                 "research_suite",
                 "resource_delete_preview",
                 "resource_hard_delete",
@@ -461,6 +644,109 @@ fn full_tool_catalog_and_malformed_inputs_use_protocol_contract()
                 "verify_run",
             ]
         );
+        let review_tool = tools
+            .iter()
+            .find(|tool| tool.name.as_ref() == "paper_review_query")
+            .expect("paper review tool is in the catalog");
+        let review_schema = serde_json::to_value(&review_tool.input_schema)?;
+        assert_eq!(
+            review_schema,
+            serde_json::to_value(paper_review_tool_input_schema().as_ref())?
+        );
+        let review_variants = review_schema["oneOf"]
+            .as_array()
+            .expect("paper review input schema is a tagged union");
+        let mut review_actions = review_variants
+            .iter()
+            .map(|variant| {
+                variant["properties"]["action"]["const"]
+                    .as_str()
+                    .expect("paper review variant has a string action")
+            })
+            .collect::<Vec<_>>();
+        review_actions.sort_unstable();
+        assert_eq!(
+            review_actions,
+            [
+                "audit_indicators",
+                "audit_rules",
+                "compare_contract",
+                "counterfactual",
+                "decision",
+            ]
+        );
+        let expected_selection = serde_json::json!({
+            "type": "object",
+            "description": "An immutable event inside an explicitly selected saved prefix.",
+            "properties": {
+                "session_id": {"type": "string"},
+                "event_sequence": {"type": "integer", "format": "uint64", "minimum": 0},
+                "as_of_sequence": {"type": "integer", "format": "uint64", "minimum": 0},
+                "signal_id": {"type": ["string", "null"]},
+            },
+            "required": ["session_id", "event_sequence", "as_of_sequence"],
+            "additionalProperties": false,
+        });
+        let selection_schemas = review_variants
+            .iter()
+            .filter_map(|variant| variant["properties"].get("selection"))
+            .collect::<Vec<_>>();
+        assert_eq!(selection_schemas.len(), 4);
+        for selection_schema in selection_schemas {
+            assert_eq!(selection_schema, &expected_selection);
+        }
+        let domain_review_schema =
+            serde_json::to_value(tagged_schema::<PaperReviewQuery>().as_ref())?;
+        let domain_review_variants = domain_review_schema["oneOf"]
+            .as_array()
+            .expect("domain paper review schema is a tagged union");
+        for action in [
+            "decision",
+            "audit_rules",
+            "audit_indicators",
+            "compare_contract",
+        ] {
+            let tool_variant = review_variants
+                .iter()
+                .find(|variant| variant["properties"]["action"]["const"] == action)
+                .expect("MCP schema includes each original review action");
+            let domain_variant = domain_review_variants
+                .iter()
+                .find(|variant| variant["properties"]["action"]["const"] == action)
+                .expect("domain schema includes each original review action");
+            assert_eq!(tool_variant, domain_variant, "original branch {action}");
+        }
+        let counterfactual_variant = review_variants
+            .iter()
+            .find(|variant| variant["properties"]["action"]["const"] == "counterfactual")
+            .expect("MCP schema includes the counterfactual action");
+        let request_schema = &counterfactual_variant["properties"]["request"];
+        let counterfactual_request = request_schema
+            .get("$ref")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|reference| reference.strip_prefix('#'))
+            .and_then(|pointer| review_schema.pointer(pointer))
+            .unwrap_or(request_schema);
+        assert_eq!(counterfactual_request["type"], "object");
+        assert_eq!(
+            counterfactual_request["required"],
+            serde_json::json!(["candidates", "variants"])
+        );
+        for (name, max_items) in [
+            ("candidates", crate::contracts::MAX_COUNTERFACTUAL_CANDIDATES),
+            ("variants", crate::contracts::MAX_COUNTERFACTUAL_VARIANTS),
+        ] {
+            let array = &counterfactual_request["properties"][name];
+            assert_eq!(array["type"], "array");
+            assert_eq!(array["minItems"], 1);
+            assert_eq!(array["maxItems"], serde_json::json!(max_items));
+            assert_eq!(array["items"]["type"], "object");
+            assert!(array["items"].get("properties").is_none());
+            assert!(!matches!(
+                array["items"].get("additionalProperties"),
+                Some(serde_json::Value::Bool(false))
+            ));
+        }
         for tool in &tools {
             let annotations = tool
                 .annotations
@@ -469,11 +755,12 @@ fn full_tool_catalog_and_malformed_inputs_use_protocol_contract()
             let expected_read_only = matches!(
                 tool.name.as_ref(),
                 "lab_status"
+                    | "realtime_status"
                     | "automation_session_query"
                     | "dataset_query"
                     | "history_query"
-                    | "paper_session_query"
                     | "policy_query"
+                    | "paper_review_query"
                     | "result_query"
                     | "artifact_query"
                     | "resource_delete_preview"
@@ -512,6 +799,24 @@ fn full_tool_catalog_and_malformed_inputs_use_protocol_contract()
         }
 
         for (tool_name, arguments, expected) in [
+            (
+                "paper_review_query",
+                serde_json::json!({"action":"decision","selection":{"session_id":"fixture","event_sequence":0,"as_of_sequence":1}}),
+                "paper review requires 1 <= event_sequence <= as_of_sequence",
+            ),
+            (
+                "paper_review_query",
+                serde_json::json!({"action":"audit_indicators","selection":{"session_id":"fixture","event_sequence":1,"as_of_sequence":1},"max_source_bars":0}),
+                "source review limit must be in 1..=4096",
+            ),
+            (
+                "paper_review_query",
+                serde_json::json!({
+                    "action": "counterfactual",
+                    "request": {"candidates": [], "variants": []}
+                }),
+                "counterfactual candidates require 1..=",
+            ),
             (
                 "probe_upbit",
                 serde_json::json!({"count": 0}),
@@ -848,6 +1153,372 @@ fn public_no_auth_blocks_mutations_and_permits_reads() -> Result<(), Box<dyn std
             .map_err(LabError::Internal)?;
         jobs.shutdown().await?;
         Ok::<(), LabError>(())
+    });
+    drop(runtime);
+    let closed = database.shutdown();
+    let removed = std::fs::remove_dir_all(root);
+    result?;
+    closed?;
+    removed?;
+    Ok(())
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one real TCP MCP journey checks correlation, privacy and parse/validation/dispatch outcomes"
+)]
+fn paper_query_diagnostics_correlate_and_redact_over_http() -> Result<(), Box<dyn std::error::Error>>
+{
+    const CHILD_PROCESS_ENV: &str = "SPOT_LAB_PAPER_QUERY_DIAGNOSTICS_CHILD";
+    const CHILD_PROCESS_VALUE: &str = "isolated-v1";
+    const CHILD_TEST: &str = "mcp::tests::paper_query_diagnostics_correlate_and_redact_over_http";
+
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::fmt::MakeWriter;
+    use tracing_subscriber::{Layer as _, layer::SubscriberExt as _};
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl<'writer> MakeWriter<'writer> for Capture {
+        type Writer = CaptureWriter;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            CaptureWriter(Arc::clone(&self.0))
+        }
+    }
+
+    impl Write for CaptureWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|_| io::Error::other("trace capture poisoned"))?
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // Keep this HTTP correlation check separate from other parallel scoped-subscriber tests.
+    let is_isolated_child = std::env::var_os(CHILD_PROCESS_ENV).as_deref()
+        == Some(std::ffi::OsStr::new(CHILD_PROCESS_VALUE));
+    if !is_isolated_child {
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", CHILD_TEST, "--nocapture"])
+            .env(CHILD_PROCESS_ENV, CHILD_PROCESS_VALUE)
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "isolated test process failed ({:?})\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            )
+            .into());
+        }
+        let child_stdout = String::from_utf8_lossy(&output.stdout);
+        let child_stderr = String::from_utf8_lossy(&output.stderr);
+        let child_evidence = format!("{child_stdout}{child_stderr}");
+        let expected_test_line = format!("test {CHILD_TEST} ... ok");
+        let executed_exactly_one_test = child_evidence.contains("running 1 test")
+            && child_evidence.contains(&expected_test_line)
+            && child_evidence.contains("test result: ok. 1 passed; 0 failed;");
+        if !executed_exactly_one_test {
+            return Err(format!(
+                "isolated child did not report exactly one passing test:\n{child_evidence}"
+            )
+            .into());
+        }
+        println!("{child_evidence}");
+        return Ok(());
+    }
+
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "spot-lab-paper-query-diagnostics-{}-{nonce}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&root)?;
+    let database = crate::database::DatabaseOwner::open(root.clone())?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let capture = Capture::default();
+    let layer = tracing_subscriber::fmt::layer()
+        .json()
+        .flatten_event(true)
+        .with_current_span(false)
+        .with_span_list(false)
+        .with_writer(capture.clone())
+        .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
+            metadata.target() == "spot_lab::mcp::paper_query_diagnostics"
+        }));
+    let subscriber = tracing_subscriber::registry().with(layer);
+
+    let result = tracing::subscriber::with_default(subscriber, || {
+        runtime.block_on(async {
+            use axum::serve::Listener as _;
+            use rmcp::transport::streamable_http_server::{
+                StreamableHttpServerConfig, StreamableHttpService,
+                session::local::LocalSessionManager,
+            };
+            use tokio_util::sync::CancellationToken;
+
+            let upbit = UpbitClient::new()?;
+            let jobs = crate::jobs::JobRuntime::start(
+                database.handle(),
+                upbit.clone(),
+                root.clone(),
+                None,
+            )
+            .await?;
+            let mcp_service =
+                LabMcpService::new(database.handle(), upbit, jobs.service(), McpExposure::Local);
+
+            let shutdown = CancellationToken::new();
+            let config = StreamableHttpServerConfig::default()
+                .with_legacy_session_mode(false)
+                .with_json_response(true)
+                .with_cancellation_token(shutdown.child_token());
+            let session_service = StreamableHttpService::new(
+                move || Ok(mcp_service.clone()),
+                LocalSessionManager::default().into(),
+                config,
+            );
+            let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let listener = crate::transport::BoundedListener::new(
+                tcp,
+                crate::transport::TransportLimits::default(),
+            );
+            let address = listener.local_addr()?;
+            let router = axum::Router::new().nest_service("/mcp", session_service);
+            let router = crate::transport::apply_limits(router, listener.state());
+            let server_shutdown = shutdown.clone();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, router)
+                    .with_graceful_shutdown(server_shutdown.cancelled_owned())
+                    .await
+            });
+
+            let endpoint = format!("http://{address}/mcp");
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()?;
+            let initialized = client
+                .post(&endpoint)
+                .header(
+                    reqwest::header::ACCEPT,
+                    "application/json, text/event-stream",
+                )
+                .json(&serde_json::json!({
+                    "jsonrpc":"2.0",
+                    "id":1,
+                    "method":"initialize",
+                    "params":{
+                        "protocolVersion":"2025-03-26",
+                        "capabilities":{},
+                        "clientInfo":{"name":"diagnostic-test","version":"1"}
+                    }
+                }))
+                .send()
+                .await?;
+            let session_id = initialized
+                .headers()
+                .get("mcp-session-id")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            let initialized_body = initialized.bytes().await?;
+            let initialized_json: serde_json::Value = serde_json::from_slice(&initialized_body)?;
+            assert!(initialized_json["result"].is_object());
+
+            let calls = [
+                (
+                    "paper_review_query",
+                    "jsonrpc-id-secret-sentinel-unknown",
+                    serde_json::json!({
+                        "action":"raw-action-secret-sentinel",
+                        "selection":{
+                            "session_id":"6c9b0244-359d-4d2f-96d0-bb3ce810e2e4",
+                            "event_sequence":3329.0,
+                            "as_of_sequence":3329.0
+                        }
+                    }),
+                    "parse_error",
+                    "other",
+                    "object",
+                    "floating_point",
+                    "floating_point",
+                    "invalid_params",
+                    Some("?query-secret-sentinel=hidden"),
+                ),
+                (
+                    "paper_session_query",
+                    "jsonrpc-id-secret-sentinel-session",
+                    serde_json::json!({
+                        "action":"review_events",
+                        "session_id":"6c9b0244-359d-4d2f-96d0-bb3ce810e2e4",
+                        "after_sequence":0,
+                        "as_of_sequence":0,
+                        "limit":0
+                    }),
+                    "validation_error",
+                    "review_events",
+                    "not_applicable",
+                    "not_applicable",
+                    "unsigned_integer",
+                    "invalid_params",
+                    None,
+                ),
+                (
+                    "paper_review_query",
+                    "jsonrpc-id-secret-sentinel-dispatch",
+                    serde_json::json!({
+                        "action":"decision",
+                        "selection":{
+                            "session_id":"6c9b0244-359d-4d2f-96d0-bb3ce810e2e4",
+                            "event_sequence":3329,
+                            "as_of_sequence":3329
+                        }
+                    }),
+                    "dispatch",
+                    "decision",
+                    "object",
+                    "unsigned_integer",
+                    "unsigned_integer",
+                    "tool_error",
+                    None,
+                ),
+            ];
+            let mut request_ids = Vec::with_capacity(calls.len());
+            for (
+                tool,
+                rpc_id,
+                arguments,
+                expected_stage,
+                expected_action,
+                expected_selection_shape,
+                expected_event_sequence_repr,
+                expected_as_of_sequence_repr,
+                expected_outcome,
+                query,
+            ) in calls
+            {
+                let request_url =
+                    query.map_or_else(|| endpoint.clone(), |query| format!("{endpoint}{query}"));
+                let mut request = client
+                    .post(request_url)
+                    .header(
+                        reqwest::header::ACCEPT,
+                        "application/json, text/event-stream",
+                    )
+                    .header("MCP-Protocol-Version", "2025-03-26")
+                    .header("x-diagnostic-secret", "raw-header-secret-sentinel")
+                    .json(&serde_json::json!({
+                        "jsonrpc":"2.0",
+                        "id":rpc_id,
+                        "method":"tools/call",
+                        "params":{"name":tool,"arguments":arguments}
+                    }));
+                if let Some(session_id) = &session_id {
+                    request = request.header("Mcp-Session-Id", session_id);
+                }
+                let response = request.send().await?;
+                assert_eq!(response.status(), reqwest::StatusCode::OK);
+                let request_id = response
+                    .headers()
+                    .get("x-request-id")
+                    .and_then(|value| value.to_str().ok())
+                    .ok_or("HTTP response omitted x-request-id")?
+                    .to_owned();
+                let body = response.bytes().await?;
+                let rpc_response: serde_json::Value = serde_json::from_slice(&body)?;
+                if expected_stage == "dispatch" {
+                    assert!(rpc_response["result"].is_object());
+                } else {
+                    assert_eq!(rpc_response["error"]["code"], -32602);
+                }
+                request_ids.push((
+                    request_id,
+                    tool,
+                    expected_stage,
+                    expected_action,
+                    expected_selection_shape,
+                    expected_event_sequence_repr,
+                    expected_as_of_sequence_repr,
+                    expected_outcome,
+                ));
+            }
+
+            shutdown.cancel();
+            server.await??;
+            jobs.shutdown().await?;
+
+            let trace = capture
+                .0
+                .lock()
+                .map_err(|_| io::Error::other("trace capture poisoned"))?
+                .clone();
+            let text = String::from_utf8(trace)?;
+            for secret in [
+                "raw-action-secret-sentinel",
+                "6c9b0244-359d-4d2f-96d0-bb3ce810e2e4",
+                "raw-header-secret-sentinel",
+                "jsonrpc-id-secret-sentinel",
+                "query-secret-sentinel",
+                "3329.0",
+            ] {
+                assert!(!text.contains(secret), "diagnostic leaked {secret}");
+            }
+            let events = text
+                .lines()
+                .map(serde_json::from_str::<serde_json::Value>)
+                .collect::<Result<Vec<_>, _>>()?;
+            for (
+                request_id,
+                tool,
+                stage,
+                action,
+                selection_shape,
+                event_sequence_repr,
+                as_of_sequence_repr,
+                outcome,
+            ) in request_ids
+            {
+                let entry = events
+                    .iter()
+                    .find(|event| {
+                        event["event"] == "paper_query_entry" && event["request_id"] == request_id
+                    })
+                    .ok_or("paper query entry was not correlated to x-request-id")?;
+                let completion = events
+                    .iter()
+                    .find(|event| {
+                        event["event"] == "paper_query_completion"
+                            && event["request_id"] == request_id
+                    })
+                    .ok_or("paper query completion was not correlated to x-request-id")?;
+                assert_eq!(entry["tool"], tool);
+                assert_eq!(entry["context_origin"], "http");
+                assert_eq!(entry["action"], action);
+                assert_eq!(entry["selection_shape"], selection_shape);
+                assert_eq!(entry["event_sequence_repr"], event_sequence_repr);
+                assert_eq!(entry["as_of_sequence_repr"], as_of_sequence_repr);
+                assert_eq!(entry["protocol_version_header"], "known_2025_03_26");
+                assert_eq!(completion["stage"], stage);
+                assert_eq!(completion["outcome"], outcome);
+                assert!(completion["elapsed_ms"].as_u64().is_some());
+            }
+            Ok::<(), Box<dyn std::error::Error>>(())
+        })
     });
     drop(runtime);
     let closed = database.shutdown();

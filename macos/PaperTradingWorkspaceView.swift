@@ -71,6 +71,8 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
     override var wantsDefaultClipping: Bool { true }
 
     private let service: PaperSessionMCPService
+    private let realtimeFeedService: RealtimeFeedMCPService
+    private let realtimeStatusView: RealtimeConnectionStatusView
     private let jobsQueueView: NSView
     private let onSummaryChanged: (String) -> Void
 
@@ -83,8 +85,13 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
     private var events: [PaperSessionEvent] = []
     private var nextEventAfterSequence: UInt64?
     private var totalEventCount: UInt64 = 0
+    private var eventsAsOfSequence: UInt64?
+    private var eventsSnapshotSessionID: String?
+    private var selectedDecisionEvent: PaperSessionEvent?
 
     private var activeReadRequest: NativeMCPRequest?
+    private var activeEventsReadRequest: NativeMCPRequest?
+    private var activeDecisionReadRequest: NativeMCPRequest?
     private var activeWriteRequest: NativeMCPRequest?
     private var pendingUnknownRequestId: String?
     private var pendingReadbackConfirmationRequestId: String?
@@ -92,6 +99,10 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
     private var sessionSnapshotIsFresh = false
     private var readFailureMessage: String?
     private var readGeneration: UInt64 = 0
+    private var eventsReadGeneration: UInt64 = 0
+    private var decisionReadGeneration: UInt64 = 0
+    private var realtimeFeedObserverID: UUID?
+    private var marketFeedInvalidation = RealtimeReconciliationInvalidation()
     private var pollTimer: Timer?
     private var isVisibleWorkspace = false
 
@@ -134,18 +145,34 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
     private let eventsPageLabel = NSTextField(labelWithString: "이벤트 0건")
     private let eventsFirstPageButton = NSButton(title: "첫 페이지", target: nil, action: nil)
     private let eventsNextPageButton = NSButton(title: "다음 이벤트", target: nil, action: nil)
+    private let decisionSignalPopup = NSPopUpButton()
+    private let decisionReviewButton = NSButton(title: "선택 판단 근거 보기", target: nil, action: nil)
+    private let decisionReviewStatusLabel = NSTextField(wrappingLabelWithString: "이벤트 행을 선택한 뒤 당시 저장 근거를 조회하세요.")
+    private let decisionReviewText = NSTextView()
 
     init(
         service: PaperSessionMCPService = PaperSessionMCPService(),
+        realtimeFeedService: RealtimeFeedMCPService = .shared,
         jobsQueueView: NSView,
         onSummaryChanged: @escaping (String) -> Void
     ) {
         self.service = service
+        self.realtimeFeedService = realtimeFeedService
+        self.realtimeStatusView = RealtimeConnectionStatusView(service: realtimeFeedService)
         self.jobsQueueView = jobsQueueView
         self.onSummaryChanged = onSummaryChanged
         super.init(frame: .zero)
         buildView()
         updateControlEnablement()
+        realtimeFeedObserverID = realtimeFeedService.observe { [weak self] presentation in
+            guard let self else { return }
+            _ = self.marketFeedInvalidation.observe(
+                presentation.status?.market.last_reconciled_at_utc,
+                hasProjection: presentation.status != nil,
+                isVisible: self.isVisibleWorkspace
+            )
+            self.drainPendingMarketFeedInvalidation()
+        }
     }
 
     @available(*, unavailable)
@@ -154,8 +181,13 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
     }
 
     deinit {
+        if let realtimeFeedObserverID {
+            realtimeFeedService.removeObserver(realtimeFeedObserverID)
+        }
         pollTimer?.invalidate()
         activeReadRequest?.cancel()
+        activeEventsReadRequest?.cancel()
+        activeDecisionReadRequest?.cancel()
         activeWriteRequest?.cancel()
     }
 
@@ -177,8 +209,10 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
             if pollTimer == nil {
                 pollTimer = Timer.scheduledTimer(withTimeInterval: 15.0, repeats: true) { [weak self] _ in
                     guard let self, self.isVisibleWorkspace else { return }
-                    if self.activeReadRequest == nil && self.activeWriteRequest == nil {
-                        self.reloadSessionsAndDetail(preserveSelection: true)
+                    if self.activeReadRequest == nil && self.activeEventsReadRequest == nil
+                        && self.activeDecisionReadRequest == nil
+                        && self.activeWriteRequest == nil {
+                        self.reloadSessionsAndDetail(preserveSelection: true, refreshEvents: false)
                     }
                 }
             }
@@ -186,6 +220,8 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
             readGeneration &+= 1
             pollTimer?.invalidate()
             pollTimer = nil
+            marketFeedInvalidation.clearPending()
+            cancelEventsRead()
             activeReadRequest?.cancel()
             activeReadRequest = nil
             startOptionsAreFresh = false
@@ -202,28 +238,70 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
         outerScroll.translatesAutoresizingMaskIntoConstraints = false
         addSubview(outerScroll)
 
-        let documentView = FlippedDocumentView()
+        let documentView = TerminalFlippedDocumentView()
         documentView.translatesAutoresizingMaskIntoConstraints = false
         outerScroll.documentView = documentView
 
-        let titleLabel = NSTextField(labelWithString: "지속 모의투자 (Persistent Paper Sessions)")
-        titleLabel.font = .systemFont(ofSize: 19, weight: .bold)
+        let titleLabel = NSTextField(wrappingLabelWithString: "지속 모의투자 (Persistent Paper Sessions)")
+        let titleFont = TerminalTheme.screenTitle
+        titleLabel.font = titleFont
+        let titleLineHeight = titleFont.ascender - titleFont.descender + titleFont.leading
+        titleLabel.heightAnchor.constraint(greaterThanOrEqualToConstant: ceil(titleLineHeight + 4)).isActive = true
+        titleLabel.maximumNumberOfLines = 0
+        titleLabel.lineBreakMode = .byWordWrapping
+        titleLabel.setAccessibilityLabel("지속 모의투자 세션")
 
-        let virtualBadge = NSTextField(labelWithString: " VIRTUAL / SIMULATED · 실주문 없음 · 확정 봉(Completed Candle) 폴링 ")
-        virtualBadge.font = .monospacedSystemFont(ofSize: 11, weight: .bold)
+        let virtualBadge = NSTextField(wrappingLabelWithString: "VIRTUAL / SIMULATED · 실주문 없음 · 확정 봉 폴링")
+        let badgeFont = TerminalTheme.monospacedFont(ofSize: 11, weight: .bold)
+        virtualBadge.font = badgeFont
+        let badgeLineHeight = badgeFont.ascender - badgeFont.descender + badgeFont.leading
+        virtualBadge.heightAnchor.constraint(greaterThanOrEqualToConstant: ceil(badgeLineHeight + 4)).isActive = true
+        virtualBadge.maximumNumberOfLines = 0
+        virtualBadge.lineBreakMode = .byWordWrapping
         virtualBadge.textColor = TerminalTheme.accent
         virtualBadge.wantsLayer = true
         virtualBadge.layer?.cornerRadius = 4
         virtualBadge.layer?.borderWidth = 1
         virtualBadge.layer?.borderColor = TerminalTheme.accent.cgColor
+        virtualBadge.setAccessibilityLabel("VIRTUAL / SIMULATED · 실제 주문 없음 · 확정 봉 폴링")
 
         let headerRow = NSStackView(views: [titleLabel, virtualBadge])
-        headerRow.orientation = .horizontal
-        headerRow.alignment = .centerY
-        headerRow.spacing = 12
+        let usesStackedHeader = TerminalTheme.textScale >= 1.5
+        headerRow.orientation = usesStackedHeader ? .vertical : .horizontal
+        headerRow.alignment = usesStackedHeader ? .leading : .centerY
+        headerRow.spacing = usesStackedHeader ? 6 : 12
+        if usesStackedHeader {
+            titleLabel.widthAnchor.constraint(equalTo: headerRow.widthAnchor).isActive = true
+            virtualBadge.widthAnchor.constraint(equalTo: headerRow.widthAnchor).isActive = true
+        }
 
-        statusBanner.font = .monospacedSystemFont(ofSize: 12, weight: .medium)
+        sessionSummaryLabel.font = TerminalTheme.monospacedFont(ofSize: 11)
+        sessionSummaryLabel.textColor = TerminalTheme.secondaryText
+        sessionSummaryLabel.maximumNumberOfLines = 0
+        sessionSummaryLabel.lineBreakMode = .byWordWrapping
+        sessionSummaryLabel.setAccessibilityLabel("선택한 지속 모의 세션과 동결 정책 identity")
+
+        statusBanner.font = TerminalTheme.monospacedFont(ofSize: 11, weight: .medium)
         statusBanner.textColor = TerminalTheme.secondaryText
+        statusBanner.maximumNumberOfLines = 4
+        statusBanner.lineBreakMode = .byWordWrapping
+        statusBanner.setAccessibilityLabel("지속 모의 작업 상태와 복구 안내")
+
+        let summaryBox = makePanelBox()
+        let summaryStack = NSStackView(views: [sessionSummaryLabel, statusBanner])
+        summaryStack.orientation = .vertical
+        summaryStack.alignment = .leading
+        summaryStack.spacing = 4
+        sessionSummaryLabel.widthAnchor.constraint(equalTo: summaryStack.widthAnchor).isActive = true
+        statusBanner.widthAnchor.constraint(equalTo: summaryStack.widthAnchor).isActive = true
+        embedInBox(summaryStack, into: summaryBox)
+
+        let fixedHeader = NSStackView(views: [headerRow, summaryBox])
+        fixedHeader.orientation = .vertical
+        fixedHeader.alignment = .leading
+        fixedHeader.spacing = 8
+        fixedHeader.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(fixedHeader)
 
         // 1. Creation box
         let createBox = makePanelBox()
@@ -274,8 +352,11 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
             NSTextField(labelWithString: "시장:"), btcCheck, ethCheck, solCheck
         ])
         formRow1.orientation = .horizontal
-        formRow1.alignment = .centerY
-        formRow1.spacing = 10
+        if TerminalTheme.textScale >= 1.5 {
+            formRow1.orientation = .vertical
+        }
+        formRow1.alignment = TerminalTheme.textScale >= 1.5 ? .leading : .centerY
+        formRow1.spacing = TerminalTheme.textScale >= 1.5 ? 6 : 10
 
         let formRow2 = NSStackView(views: [
             NSTextField(labelWithString: "시장별 초기 가상 자본(KRW):"), initialCashField,
@@ -284,8 +365,11 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
             startButton, readbackButton
         ])
         formRow2.orientation = .horizontal
-        formRow2.alignment = .centerY
-        formRow2.spacing = 10
+        if TerminalTheme.textScale >= 1.5 {
+            formRow2.orientation = .vertical
+        }
+        formRow2.alignment = TerminalTheme.textScale >= 1.5 ? .leading : .centerY
+        formRow2.spacing = TerminalTheme.textScale >= 1.5 ? 6 : 10
 
         scenarioRuleLabel.font = .systemFont(ofSize: 11)
         scenarioRuleLabel.textColor = TerminalTheme.secondaryText
@@ -327,14 +411,11 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
         controlRow.alignment = .centerY
         controlRow.spacing = 8
 
-        sessionSummaryLabel.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
-        sessionSummaryLabel.textColor = .labelColor
-
-        let controlStack = NSStackView(views: [controlTitle, controlRow, sessionSummaryLabel])
-        controlStack.orientation = .vertical
-        controlStack.alignment = .leading
-        controlStack.spacing = 8
-        embedInBox(controlStack, into: controlBox)
+        let sessionControlStack = NSStackView(views: [controlTitle, controlRow])
+        sessionControlStack.orientation = .vertical
+        sessionControlStack.alignment = .leading
+        sessionControlStack.spacing = 8
+        embedInBox(sessionControlStack, into: controlBox)
 
         // 3. Per-market independent virtual accounts table
         let marketsHeader = NSTextField(
@@ -392,22 +473,86 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
         eventsScroll.hasHorizontalScroller = true
         eventsScroll.heightAnchor.constraint(equalToConstant: 210).isActive = true
 
-        // 5. Existing background job queue view preserved at bottom
-        jobsQueueView.heightAnchor.constraint(equalToConstant: 210).isActive = true
+        decisionSignalPopup.isHidden = true
+        decisionSignalPopup.setAccessibilityLabel("선택한 이벤트의 판단 신호")
+        decisionSignalPopup.setAccessibilityHelp("이벤트에 여러 신호가 있으면 설명할 저장 신호를 선택합니다.")
+        decisionSignalPopup.target = self
+        decisionSignalPopup.action = #selector(handleDecisionSignalSelectionChanged)
+        decisionReviewButton.bezelStyle = .rounded
+        decisionReviewButton.target = self
+        decisionReviewButton.action = #selector(handleReviewSelectedDecision)
+        decisionReviewButton.isEnabled = false
+        decisionReviewButton.setAccessibilityLabel("선택한 저장 이벤트의 판단 근거를 고정 시점으로 조회")
+        decisionReviewButton.toolTip = "저장된 판단 근거만 조회합니다. 전략을 다시 실행하지 않습니다."
+        let decisionControlsRow = NSStackView(views: [decisionSignalPopup, NSView(), decisionReviewButton])
+        decisionControlsRow.orientation = .horizontal
+        decisionControlsRow.alignment = .centerY
+        decisionControlsRow.spacing = 8
 
+        decisionReviewStatusLabel.font = TerminalTheme.table
+        decisionReviewStatusLabel.textColor = TerminalTheme.secondaryText
+        decisionReviewStatusLabel.maximumNumberOfLines = 0
+        decisionReviewStatusLabel.lineBreakMode = .byWordWrapping
+        decisionReviewStatusLabel.setAccessibilityLabel("선택 판단 기록의 session, 이벤트, cutoff identity와 조회 상태")
+        decisionReviewText.isEditable = false
+        decisionReviewText.isSelectable = true
+        decisionReviewText.font = TerminalTheme.monospacedFont(ofSize: 11)
+        decisionReviewText.textColor = .labelColor
+        decisionReviewText.backgroundColor = TerminalTheme.chart
+        decisionReviewText.setAccessibilityLabel("엔진이 저장한 결정 행동, 조건 평가, 이유, 주문과 체결")
+        let decisionReviewScroll = TerminalWrappingTextScrollView()
+        decisionReviewScroll.configureWrapping(textView: decisionReviewText)
+        decisionReviewScroll.drawsBackground = true
+        decisionReviewScroll.backgroundColor = TerminalTheme.chart
+        decisionReviewScroll.heightAnchor.constraint(equalToConstant: 180).isActive = true
+        let decisionReviewPanel = makePanelBox()
+        let decisionReviewContent = NSStackView(views: [decisionReviewStatusLabel, decisionReviewScroll])
+        decisionReviewContent.orientation = .vertical
+        decisionReviewContent.alignment = .leading
+        decisionReviewContent.spacing = 8
+        decisionReviewStatusLabel.widthAnchor.constraint(equalTo: decisionReviewContent.widthAnchor).isActive = true
+        decisionReviewScroll.widthAnchor.constraint(equalTo: decisionReviewContent.widthAnchor).isActive = true
+        embedInBox(decisionReviewContent, into: decisionReviewPanel)
+
+        let marketsBox = makePanelBox()
+        let marketsStack = NSStackView(views: [marketsHeader, marketsScroll])
+        marketsStack.orientation = .vertical
+        marketsStack.alignment = .leading
+        marketsStack.spacing = 8
+        marketsHeader.widthAnchor.constraint(equalTo: marketsStack.widthAnchor).isActive = true
+        marketsScroll.widthAnchor.constraint(equalTo: marketsStack.widthAnchor).isActive = true
+        embedInBox(marketsStack, into: marketsBox)
+
+        let timingBox = makePanelBox()
+        let timingStack = NSStackView(views: [timingHeader, marketTimingStatusLabel, marketTimingScroll])
+        timingStack.orientation = .vertical
+        timingStack.alignment = .leading
+        timingStack.spacing = 8
+        timingHeader.widthAnchor.constraint(equalTo: timingStack.widthAnchor).isActive = true
+        marketTimingStatusLabel.widthAnchor.constraint(equalTo: timingStack.widthAnchor).isActive = true
+        marketTimingScroll.widthAnchor.constraint(equalTo: timingStack.widthAnchor).isActive = true
+        embedInBox(timingStack, into: timingBox)
+
+        let eventsBox = makePanelBox()
+        let eventsStack = NSStackView(views: [eventsHeaderRow, eventsScroll, decisionControlsRow])
+        eventsStack.orientation = .vertical
+        eventsStack.alignment = .leading
+        eventsStack.spacing = 8
+        eventsHeaderRow.widthAnchor.constraint(equalTo: eventsStack.widthAnchor).isActive = true
+        eventsScroll.widthAnchor.constraint(equalTo: eventsStack.widthAnchor).isActive = true
+        decisionControlsRow.widthAnchor.constraint(equalTo: eventsStack.widthAnchor).isActive = true
+        embedInBox(eventsStack, into: eventsBox)
+
+        // The dashboard owns the embedded job queue and its table sizing.
         let mainStack = NSStackView(views: [
-            headerRow,
-            statusBanner,
+            jobsQueueView,
+            realtimeStatusView,
             createBox,
             controlBox,
-            marketsHeader,
-            marketsScroll,
-            timingHeader,
-            marketTimingStatusLabel,
-            marketTimingScroll,
-            eventsHeaderRow,
-            eventsScroll,
-            jobsQueueView
+            marketsBox,
+            timingBox,
+            eventsBox,
+            decisionReviewPanel
         ])
         mainStack.orientation = .vertical
         mainStack.alignment = .leading
@@ -418,8 +563,12 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
         NSLayoutConstraint.activate([
             outerScroll.leadingAnchor.constraint(equalTo: leadingAnchor),
             outerScroll.trailingAnchor.constraint(equalTo: trailingAnchor),
-            outerScroll.topAnchor.constraint(equalTo: topAnchor),
+            outerScroll.topAnchor.constraint(equalTo: fixedHeader.bottomAnchor, constant: 10),
             outerScroll.bottomAnchor.constraint(equalTo: bottomAnchor),
+
+            fixedHeader.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 20),
+            fixedHeader.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -20),
+            fixedHeader.topAnchor.constraint(equalTo: topAnchor, constant: 16),
 
             documentView.widthAnchor.constraint(equalTo: outerScroll.contentView.widthAnchor),
             mainStack.leadingAnchor.constraint(equalTo: documentView.leadingAnchor, constant: 20),
@@ -427,21 +576,23 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
             mainStack.topAnchor.constraint(equalTo: documentView.topAnchor, constant: 16),
             mainStack.bottomAnchor.constraint(equalTo: documentView.bottomAnchor, constant: -16),
 
-            statusBanner.widthAnchor.constraint(equalTo: mainStack.widthAnchor),
+            headerRow.widthAnchor.constraint(equalTo: fixedHeader.widthAnchor),
+            summaryBox.widthAnchor.constraint(equalTo: fixedHeader.widthAnchor),
+            jobsQueueView.widthAnchor.constraint(equalTo: mainStack.widthAnchor),
+            realtimeStatusView.widthAnchor.constraint(equalTo: mainStack.widthAnchor),
             createBox.widthAnchor.constraint(equalTo: mainStack.widthAnchor),
             controlBox.widthAnchor.constraint(equalTo: mainStack.widthAnchor),
-            marketsScroll.widthAnchor.constraint(equalTo: mainStack.widthAnchor),
-            marketTimingStatusLabel.widthAnchor.constraint(equalTo: mainStack.widthAnchor),
-            marketTimingScroll.widthAnchor.constraint(equalTo: mainStack.widthAnchor),
-            eventsScroll.widthAnchor.constraint(equalTo: mainStack.widthAnchor),
-            jobsQueueView.widthAnchor.constraint(equalTo: mainStack.widthAnchor)
+            marketsBox.widthAnchor.constraint(equalTo: mainStack.widthAnchor),
+            timingBox.widthAnchor.constraint(equalTo: mainStack.widthAnchor),
+            eventsBox.widthAnchor.constraint(equalTo: mainStack.widthAnchor),
+            decisionReviewPanel.widthAnchor.constraint(equalTo: mainStack.widthAnchor)
         ])
     }
 
     private func makePanelBox() -> NSBox {
         let box = NSBox()
         box.boxType = .custom
-        box.cornerRadius = 6
+        box.cornerRadius = 8
         box.borderWidth = 1
         box.borderColor = TerminalTheme.border
         box.fillColor = TerminalTheme.panel
@@ -476,7 +627,7 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
             ("Fees", "누적 수수료", 105),
             ("MDD", "현재 낙폭", 105),
             ("Benchmark", "벤치마크(B&H)", 145),
-            ("F08", "독립 검산(F08)", 210)
+            ("F08", "독립 회계·이벤트 검산", 210)
         ]
         for (id, title, width) in cols {
             let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(id))
@@ -538,6 +689,9 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
         }
         eventsTable.dataSource = self
         eventsTable.delegate = self
+        eventsTable.allowsEmptySelection = true
+        eventsTable.allowsMultipleSelection = false
+        eventsTable.setAccessibilityLabel("고정 cutoff에 대한 저장된 모의 세션 이벤트")
         TerminalTheme.prepareTable(eventsTable)
     }
 
@@ -545,6 +699,8 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
 
     func reloadWorkspace(preserveSelection: Bool) {
         guard isVisibleWorkspace else { return }
+        marketFeedInvalidation.clearPending()
+        cancelEventsRead()
         readGeneration &+= 1
         let generation = readGeneration
         activeReadRequest?.cancel()
@@ -577,20 +733,23 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
                       self.activeReadRequest === composite else { return }
                 _ = composite.complete()
                 self.activeReadRequest = nil
-                self.applySessionListResult(listResult, preserveSelection: preserveSelection)
+                self.applySessionListResult(listResult, preserveSelection: preserveSelection, refreshEvents: true)
                 self.finishConfirmedWorkspaceReadIfReady()
+                self.drainPendingMarketFeedInvalidation()
             }
             _ = composite.addChild(listReq)
         }
         _ = composite.addChild(optReq)
     }
 
-    private func reloadSessionsAndDetail(preserveSelection: Bool) {
+    private func reloadSessionsAndDetail(preserveSelection: Bool, refreshEvents: Bool) {
         guard isVisibleWorkspace else {
             sessionSnapshotIsFresh = false
             updateControlEnablement()
             return
         }
+        marketFeedInvalidation.clearPending()
+        if refreshEvents { cancelEventsRead() }
         readGeneration &+= 1
         let generation = readGeneration
         activeReadRequest?.cancel()
@@ -604,10 +763,41 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
                   self.activeReadRequest === composite else { return }
             _ = composite.complete()
             self.activeReadRequest = nil
-            self.applySessionListResult(listResult, preserveSelection: preserveSelection)
+            self.applySessionListResult(
+                listResult,
+                preserveSelection: preserveSelection,
+                refreshEvents: refreshEvents
+            )
             self.updateControlEnablement()
+            self.drainPendingMarketFeedInvalidation()
         }
         _ = composite.addChild(listRequest)
+    }
+
+    private func drainPendingMarketFeedInvalidation() {
+        guard marketFeedInvalidation.takeIfReady(
+            isVisible: isVisibleWorkspace,
+            readInFlight: activeReadRequest != nil || activeEventsReadRequest != nil
+                || activeDecisionReadRequest != nil,
+            writeInFlight: activeWriteRequest != nil
+        ) else { return }
+        reloadSessionsAndDetail(preserveSelection: true, refreshEvents: false)
+    }
+
+    private func cancelEventsRead() {
+        eventsReadGeneration &+= 1
+        decisionReadGeneration &+= 1
+        activeEventsReadRequest?.cancel()
+        activeEventsReadRequest = nil
+        activeDecisionReadRequest?.cancel()
+        activeDecisionReadRequest = nil
+        selectedDecisionEvent = nil
+        eventsTable.deselectAll(nil)
+        decisionSignalPopup.removeAllItems()
+        decisionSignalPopup.isHidden = true
+        decisionReviewStatusLabel.stringValue = "이벤트 행을 선택한 뒤 당시 저장 근거를 조회하세요."
+        decisionReviewText.string = ""
+        updateDecisionReviewEnablement()
     }
 
     private func populateStartOptions(_ options: PaperSessionStartOptions) {
@@ -646,7 +836,11 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
         updateControlEnablement()
     }
 
-    private func applySessionListResult(_ result: Result<PaperSessionPage, Error>, preserveSelection: Bool) {
+    private func applySessionListResult(
+        _ result: Result<PaperSessionPage, Error>,
+        preserveSelection: Bool,
+        refreshEvents: Bool
+    ) {
         switch result {
         case .failure(let error):
             sessionSnapshotIsFresh = false
@@ -686,6 +880,8 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
                 events = []
                 nextEventAfterSequence = nil
                 totalEventCount = 0
+                eventsAsOfSequence = nil
+                eventsSnapshotSessionID = nil
                 statusBanner.stringValue = "원장에 등록된 지속 모의 세션이 없습니다. 위 생성 폼에서 새 VIRTUAL 세션을 시작할 수 있습니다."
                 statusBanner.textColor = TerminalTheme.secondaryText
                 renderSelectedSession()
@@ -717,7 +913,10 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
             }
             renderSelectedSession()
             updateControlEnablement()
-            loadEventsForSelectedSession(afterSequence: nil)
+            if refreshEvents || eventsAsOfSequence == nil
+                || eventsSnapshotSessionID != selectedSession?.session_id {
+                loadEventsForSelectedSession(afterSequence: nil)
+            }
         }
     }
 
@@ -726,13 +925,17 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
         renderMarketTimingDetails()
         guard let session = selectedSession else {
             sessionSummaryLabel.stringValue = "선택된 지속 모의 세션이 없습니다."
+            sessionSummaryLabel.toolTip = sessionSummaryLabel.stringValue
+            sessionSummaryLabel.setAccessibilityHelp(sessionSummaryLabel.stringValue)
             return
         }
         let evalText = session.last_evaluated_at ?? "예열/대기 중 (확정 봉 미관측)"
         let pausedText = session.paused_at.map { " · 일시정지: \($0)" } ?? ""
         let stoppedText = session.stopped_at.map { " · 종료: \($0)" } ?? ""
         let recoveryText: String
-        if session.canOfferFeedGapRecoveryResume {
+        if session.state == "RECOVERY_REQUIRED" && session.recovery_cause == "PROVIDER_GAP" {
+            recoveryText = "\n공급자 공백 복구 · 원문 근거를 검증하고 실제 봉만으로 기존 상태를 동기화합니다. 현재 경계까지 확인하면 같은 정책·세션으로 이어서 처리합니다. 미확인 공백은 보류합니다.\n근거: \(session.recovery_detail ?? "확인된 공급자 공백")"
+        } else if session.canOfferFeedGapRecoveryResume {
             recoveryText = "\n복구 사유: FEED_GAP · 사용자가 ‘복구 후 재개’를 선택할 때만 확정 봉을 확인하고 재개합니다. 과거 판단은 다시 만들지 않습니다."
         } else if session.state == "RECOVERY_REQUIRED" {
             recoveryText = "\n복구 재개 차단 · 원인: \(session.recovery_cause ?? "미확인") · 안전한 재개 경로가 없습니다. Stop으로 안전 종료를 요청할 수 있습니다."
@@ -743,8 +946,10 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
         세션 ID: \(session.session_id) · 모드: \(session.mode) (VIRTUAL) · 상태: \(session.stateDisplay) · Sequence: \(session.sequence) · 이벤트: \(session.event_count)건
         동결 정책: \(session.policy_ref.policy_id) · 리비전: \(session.policy_ref.revision_id) · Digest: \(String(session.policy_ref.definition_digest.prefix(16)))…
         간격/체결: \(session.decision_interval) → \(session.execution_resolution) · 시장 수: \(session.markets.count)개 (시장별 독립 가상 계좌)
-        시작 시각(UTC): \(session.started_at) · 마지막 평가(UTC): \(evalText)\(pausedText)\(stoppedText)\(recoveryText)
+        시작 시각(UTC): \(session.started_at) · 마지막 세션 처리(UTC): \(evalText)\(pausedText)\(stoppedText)\(recoveryText)
         """
+        sessionSummaryLabel.toolTip = sessionSummaryLabel.stringValue
+        sessionSummaryLabel.setAccessibilityHelp(sessionSummaryLabel.stringValue)
     }
 
     private func renderMarketTimingDetails() {
@@ -752,7 +957,7 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
         let formatter = PaperMarketTimingFormatter()
         marketTimingStatusLabel.stringValue = """
         화면 관측 시각(UTC): \(formatter.utcLabel(for: now)) · 마지막 응답 수신(UTC): \(formatter.receivedLabel(sessionSnapshotReceivedAt, at: now)) · 화면 재조회 설정: 15초(보이는 동안)
-        서버 입력: 제한된 확정 봉 폴링 · WebSocket 연결/heartbeat 상태는 이 투영에 없음
+        세션 입력: 제한된 확정 봉 폴링 · WebSocket 상태 snapshot은 별도 연결 투영이며 확정 봉/세션 입력 신선도의 증거가 아닙니다.
         """
         marketTimingStatusLabel.toolTip = marketTimingStatusLabel.stringValue
         marketTimingStatusLabel.setAccessibilityLabel(marketTimingStatusLabel.stringValue)
@@ -761,21 +966,63 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
     }
 
     private func loadEventsForSelectedSession(afterSequence: UInt64?) {
-        guard let session = selectedSession else { return }
+        guard let session = selectedSession else {
+            cancelEventsRead()
+            events = []
+            nextEventAfterSequence = nil
+            totalEventCount = 0
+            eventsAsOfSequence = nil
+            eventsSnapshotSessionID = nil
+            eventsTable.reloadData()
+            eventsPageLabel.stringValue = "이벤트 0건 · 세션 없음"
+            drainPendingMarketFeedInvalidation()
+            return
+        }
+        let fixedCutoff: UInt64
+        if afterSequence == nil {
+            fixedCutoff = session.sequence
+        } else if let eventsAsOfSequence {
+            fixedCutoff = eventsAsOfSequence
+        } else {
+            eventsPageLabel.stringValue = "고정 cutoff가 없어 후속 페이지 조회를 중단했습니다. 첫 페이지를 다시 여세요."
+            return
+        }
+        cancelEventsRead()
+        if afterSequence == nil {
+            eventsAsOfSequence = nil
+            eventsSnapshotSessionID = nil
+        }
         let targetId = session.session_id
-        _ = service.listEvents(sessionId: targetId, afterSequence: afterSequence, limit: 50) { [weak self] result in
-            guard let self, self.selectedSession?.session_id == targetId else { return }
+        let ticket = eventsReadGeneration
+        let request = service.reviewEvents(
+            sessionId: targetId,
+            asOfSequence: fixedCutoff,
+            afterSequence: afterSequence,
+            limit: 50
+        ) { [weak self] result in
+            guard let self, self.isVisibleWorkspace,
+                  self.eventsReadGeneration == ticket,
+                  self.selectedSession?.session_id == targetId else { return }
+            self.activeEventsReadRequest = nil
             switch result {
             case .failure(let error):
                 self.eventsPageLabel.stringValue = "이벤트 조회 오류: \(error.localizedDescription)"
             case .success(let page):
-                self.events = page.items
-                self.nextEventAfterSequence = page.next_cursor?.sequence
-                self.totalEventCount = page.total_count
-                self.eventsPageLabel.stringValue = "표시 \(page.items.count)건 / 총 \(page.total_count)건"
+                self.events = page.page.items
+                self.eventsAsOfSequence = page.as_of_sequence
+                self.eventsSnapshotSessionID = targetId
+                self.nextEventAfterSequence = page.page.next_cursor?.sequence
+                self.totalEventCount = page.page.total_count
+                self.eventsPageLabel.stringValue = "표시 \(page.page.items.count)건 / 총 \(page.page.total_count)건 · 고정 cutoff #\(page.as_of_sequence)"
+                self.eventsTable.deselectAll(nil)
                 self.eventsTable.reloadData()
+                self.updateDecisionSelectionPresentation()
                 self.updateControlEnablement()
             }
+            self.drainPendingMarketFeedInvalidation()
+        }
+        if eventsReadGeneration == ticket && request.isPending {
+            activeEventsReadRequest = request
         }
     }
 
@@ -859,6 +1106,61 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
             eventsFirstPageButton.isEnabled = false
             eventsNextPageButton.isEnabled = false
         }
+        updateDecisionReviewEnablement()
+    }
+
+    private func updateDecisionReviewEnablement() {
+        guard let event = selectedDecisionEvent,
+              let asOfSequence = eventsAsOfSequence,
+              event.sequence <= asOfSequence else {
+            decisionReviewButton.isEnabled = false
+            return
+        }
+        let signalSelectionIsReady = event.signals.count <= 1
+            || (decisionSignalPopup.selectedItem?.tag ?? -1) >= 0
+        decisionReviewButton.isEnabled = isVisibleWorkspace
+            && activeEventsReadRequest == nil
+            && activeDecisionReadRequest == nil
+            && activeReadRequest == nil
+            && signalSelectionIsReady
+    }
+
+    private func updateDecisionSelectionPresentation() {
+        decisionReviewText.string = ""
+        decisionSignalPopup.removeAllItems()
+        guard let event = selectedDecisionEvent else {
+            decisionSignalPopup.isHidden = true
+            decisionReviewStatusLabel.stringValue = "이벤트 행을 선택한 뒤 당시 저장 근거를 조회하세요."
+            updateDecisionReviewEnablement()
+            return
+        }
+
+        if event.signals.count > 1 {
+            decisionSignalPopup.addItem(withTitle: "설명할 신호 선택…")
+            decisionSignalPopup.lastItem?.tag = -1
+            decisionSignalPopup.lastItem?.toolTip = "선택 신호를 고르기 전에는 조회하지 않습니다."
+            for (index, signal) in event.signals.enumerated() {
+                decisionSignalPopup.addItem(
+                    withTitle: "\(signal.strategy) · \(signal.state_before) → \(signal.state_after) · \(String(signal.signal_id.prefix(8)))"
+                )
+                decisionSignalPopup.lastItem?.tag = index
+                decisionSignalPopup.lastItem?.toolTip = "signal_id: \(signal.signal_id) · \(signal.outcome)"
+            }
+            decisionSignalPopup.selectItem(at: 0)
+            decisionSignalPopup.isHidden = false
+        } else {
+            decisionSignalPopup.isHidden = true
+        }
+
+        let cutoff = eventsAsOfSequence.map(String.init) ?? "미확인"
+        let market = event.market ?? "SESSION"
+        let selection = event.signals.count > 1
+            ? "신호 여러 개 · 조회할 신호 선택 필요"
+            : (event.signals.first.map { "신호 \($0.signal_id)" } ?? "신호 없음 · 비판단 이벤트 여부 조회")
+        decisionReviewStatusLabel.stringValue = "VIRTUAL / SIMULATED · \(selectedSession?.session_id ?? "세션 미확인") · \(market) · 이벤트 #\(event.sequence) · 고정 cutoff #\(cutoff) · \(selection)"
+        decisionReviewStatusLabel.toolTip = decisionReviewStatusLabel.stringValue
+        decisionReviewStatusLabel.setAccessibilityValue(decisionReviewStatusLabel.stringValue)
+        updateDecisionReviewEnablement()
     }
 
     // MARK: - Actions
@@ -883,6 +1185,87 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
     @objc private func handleLoadNextEvents() {
         guard let after = nextEventAfterSequence else { return }
         loadEventsForSelectedSession(afterSequence: after)
+    }
+
+    @objc private func handleDecisionSignalSelectionChanged() {
+        updateDecisionReviewEnablement()
+    }
+
+    @objc private func handleReviewSelectedDecision() {
+        guard isVisibleWorkspace,
+              let session = selectedSession,
+              let event = selectedDecisionEvent,
+              let cutoff = eventsAsOfSequence,
+              event.sequence <= cutoff else { return }
+        let signalID: String?
+        if event.signals.isEmpty {
+            signalID = nil
+        } else if event.signals.count == 1 {
+            signalID = event.signals.first?.signal_id
+        } else if let item = decisionSignalPopup.selectedItem, item.tag >= 0,
+                  event.signals.indices.contains(item.tag) {
+            signalID = event.signals[item.tag].signal_id
+        } else {
+            decisionReviewStatusLabel.stringValue = "여러 신호가 있는 이벤트입니다. 설명할 신호를 선택하세요."
+            decisionReviewStatusLabel.textColor = TerminalTheme.negative
+            return
+        }
+
+        activeDecisionReadRequest?.cancel()
+        decisionReadGeneration &+= 1
+        let ticket = decisionReadGeneration
+        let sessionID = session.session_id
+        let eventSequence = event.sequence
+        let policyReference = session.policy_ref
+        decisionReviewStatusLabel.stringValue = "저장 판단 읽는 중 · 이벤트 #\(eventSequence) · 고정 cutoff #\(cutoff)"
+        decisionReviewStatusLabel.textColor = TerminalTheme.secondaryText
+        decisionReviewText.string = ""
+        updateDecisionReviewEnablement()
+        let request = service.reviewDecision(
+            sessionId: sessionID,
+            eventSequence: eventSequence,
+            asOfSequence: cutoff,
+            signalID: signalID,
+            expectedPolicyReference: policyReference
+        ) { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self, self.isVisibleWorkspace,
+                      self.decisionReadGeneration == ticket,
+                      self.selectedSession?.session_id == sessionID,
+                      self.selectedDecisionEvent?.sequence == eventSequence,
+                      self.eventsAsOfSequence == cutoff else { return }
+                self.activeDecisionReadRequest = nil
+                switch result {
+                case .failure(let error):
+                    self.decisionReviewStatusLabel.stringValue = "저장 판단 조회 실패 · \(error.localizedDescription)"
+                    self.decisionReviewStatusLabel.textColor = TerminalTheme.negative
+                    self.decisionReviewText.string = ""
+                case .success(let review):
+                    let policy = review.policy.reference
+                    let selectedSignal = review.selected_signal_id ?? "미기록"
+                    self.decisionReviewStatusLabel.stringValue = "VIRTUAL / SIMULATED · \(review.selection.session_id) · 이벤트 #\(review.selection.event_sequence) · as_of #\(review.selection.as_of_sequence) · \(review.event.market ?? "SESSION") · 정책 \(policy.policy_id) / \(policy.revision_id) / \(policy.definition_digest) · 신호 \(selectedSignal) · 원장 시각 \(review.event.occurredAtDisplay)"
+                    self.decisionReviewStatusLabel.textColor = TerminalTheme.secondaryText
+                    self.decisionReviewStatusLabel.toolTip = self.decisionReviewStatusLabel.stringValue
+                    self.decisionReviewStatusLabel.setAccessibilityValue(self.decisionReviewStatusLabel.stringValue)
+                    let preparation = RecordedDecisionPresentation.preparationLines(
+                        for: review.event.preparation,
+                        masked: false
+                    )
+                    let decision = RecordedDecisionPresentation.lines(
+                        for: review.recorded_decision,
+                        masked: false
+                    )
+                    self.decisionReviewText.string = (preparation + decision).joined(separator: "\n")
+                    self.decisionReviewText.setAccessibilityValue(self.decisionReviewText.string)
+                }
+                self.updateDecisionReviewEnablement()
+                self.drainPendingMarketFeedInvalidation()
+            }
+        }
+        if decisionReadGeneration == ticket && request.isPending {
+            activeDecisionReadRequest = request
+        }
+        updateDecisionReviewEnablement()
     }
 
     @objc private func handleCopySessionIdentity() {
@@ -1058,6 +1441,7 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
                 }
             }
             self.updateControlEnablement()
+            self.drainPendingMarketFeedInvalidation()
         }
         updateControlEnablement()
     }
@@ -1082,11 +1466,20 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
             readFailureMessage = nil
             statusBanner.stringValue = "\(actionLabel) 완료 [\(response.receipt.outcome)] · 세션 \(response.session.session_id) · 상태 \(response.session.state) · seq \(response.session.sequence)"
             statusBanner.textColor = TerminalTheme.positive
-            reloadSessionsAndDetail(preserveSelection: true)
+            reloadSessionsAndDetail(preserveSelection: true, refreshEvents: true)
         }
+        drainPendingMarketFeedInvalidation()
     }
 
     // MARK: - NSTableViewDataSource & Delegate
+
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        guard let table = notification.object as? NSTableView, table === eventsTable else { return }
+        let row = table.selectedRow
+        selectedDecisionEvent = events.indices.contains(row) ? events[row] : nil
+        decisionReviewStatusLabel.textColor = TerminalTheme.secondaryText
+        updateDecisionSelectionPresentation()
+    }
 
     func numberOfRows(in tableView: NSTableView) -> Int {
         if tableView === marketTimingTable {
@@ -1301,8 +1694,4 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
         tf.toolTip = text
         return tf
     }
-}
-
-private final class FlippedDocumentView: NSView {
-    override var isFlipped: Bool { true }
 }

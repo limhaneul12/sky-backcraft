@@ -1,11 +1,14 @@
 //! Small, bounded OAuth 2.1 authorization server for the MCP HTTP transport.
 //!
 //! Pending approvals, authorization codes, tokens and refresh grants stay in
-//! process memory. An optional operator-owned file can pin bounded public OAuth
-//! client IDs and callbacks across restarts; without it, DCR clients are ephemeral.
+//! process memory. Production composition may persist bounded public DCR client
+//! IDs and callback allowlists through `DatabaseOwner`; an optional operator-owned
+//! file can additionally pin configured clients across restarts.
 //! Managed trading consent opens the shared send gate only after a fresh
 //! owner-approved authorization-code exchange completes PKCE; refresh never reopens it.
 
+use crate::database::DatabaseHandle;
+use crate::storage::{NewOAuthClientRecord, StoredOAuthClientRecord};
 use crate::upbit::live_order_control::{
     LiveOrderControlAction, LiveOrderControlOutcome, LiveOrderControlRequest,
     LiveOrderControlService,
@@ -168,12 +171,15 @@ struct OAuthInner {
     resource: String,
     owner_code: String,
     grants: Mutex<Grants>,
+    client_database: Mutex<Option<DatabaseHandle>>,
     managed_live_order_control: Mutex<Option<LiveOrderControlService>>,
 }
 
 #[derive(Default)]
 struct Grants {
     clients: HashMap<String, Client>,
+    next_registration_order: u64,
+    reserved_client_evictions: HashSet<String>,
     pending: HashMap<String, PendingApproval>,
     codes: HashMap<String, AuthorizationCode>,
     tokens: HashMap<String, AccessToken>,
@@ -184,7 +190,7 @@ struct Grants {
 struct Client {
     redirect_uris: Vec<String>,
     display_name: String,
-    registered_at: Instant,
+    registration_order: u64,
     pinned: bool,
 }
 
@@ -272,7 +278,9 @@ struct RegistrationResponse {
 }
 
 impl OAuthState {
-    /// Builds an isolated in-memory grant owner for one HTTPS MCP origin.
+    /// Builds an isolated in-memory OAuth state for one HTTPS MCP origin.
+    /// Hermetic callers may use it directly; production servers bind persistent
+    /// public-client metadata before exposing the OAuth router.
     ///
     /// # Errors
     ///
@@ -372,7 +380,7 @@ impl OAuthState {
                 Client {
                     redirect_uris: configured.redirect_uris,
                     display_name: configured.client_name,
-                    registered_at: Instant::now(),
+                    registration_order: 0,
                     pinned: true,
                 },
             ));
@@ -392,10 +400,107 @@ impl OAuthState {
         {
             return Err("oauth-clients.json client_id collides with an existing client".into());
         }
-        for (client_id, client) in clients {
+        for (client_id, mut client) in clients {
+            client.registration_order = grants.next_registration_order;
+            grants.next_registration_order = grants.next_registration_order.saturating_add(1);
             grants.clients.insert(client_id, client);
         }
         drop(grants);
+        Ok(self)
+    }
+
+    /// Restore public DCR metadata from the application's single SQLite owner.
+    ///
+    /// Only client IDs, exact callback allowlists, names and registration ordering are loaded.
+    /// Pending approvals, codes and tokens remain ephemeral. The listener is composed only
+    /// after this startup read succeeds.
+    ///
+    /// # Errors
+    /// Rejects corrupt metadata, issuer/static-client conflicts, capacity overflow or storage
+    /// failures.
+    pub async fn with_persistent_clients(
+        self,
+        database: DatabaseHandle,
+    ) -> Result<Self, crate::contracts::LabError> {
+        {
+            let bound = self.inner.client_database.lock().map_err(|_| {
+                crate::contracts::LabError::Internal("OAuth client store lock poisoned".into())
+            })?;
+            if bound.is_some() {
+                return Err(crate::contracts::LabError::Conflict(
+                    "OAuth client store was already bound".into(),
+                ));
+            }
+        }
+        let stored_clients = database
+            .call("oauth_load_public_clients", {
+                let issuer = self.inner.public_url.clone();
+                move |store| store.load_oauth_clients(&issuer, MAX_CLIENTS)
+            })
+            .await?;
+
+        let mut restored = Vec::with_capacity(stored_clients.len());
+        let mut previous_sequence = 0_u64;
+        for stored in stored_clients {
+            validate_stored_oauth_client(&stored, &self.inner.public_url)?;
+            if stored.registration_sequence <= previous_sequence {
+                return Err(crate::contracts::LabError::DataCorrupt(
+                    "stored OAuth client order is not strictly increasing".into(),
+                ));
+            }
+            previous_sequence = stored.registration_sequence;
+            restored.push(stored);
+        }
+
+        let mut grants = self.inner.grants.lock().map_err(|_| {
+            crate::contracts::LabError::Internal("OAuth grant lock poisoned".into())
+        })?;
+        let mut additions = Vec::with_capacity(restored.len());
+        for stored in restored {
+            if let Some(configured) = grants.clients.get(&stored.client_id) {
+                if configured.pinned
+                    && configured.redirect_uris == stored.redirect_uris
+                    && configured.display_name == stored.client_name
+                {
+                    continue;
+                }
+                return Err(crate::contracts::LabError::DataCorrupt(
+                    "stored OAuth client conflicts with configured client identity".into(),
+                ));
+            }
+            additions.push((
+                stored.client_id,
+                Client {
+                    redirect_uris: stored.redirect_uris,
+                    display_name: stored.client_name,
+                    registration_order: stored.registration_sequence,
+                    pinned: false,
+                },
+            ));
+        }
+        if grants.clients.len().saturating_add(additions.len()) > MAX_CLIENTS {
+            return Err(crate::contracts::LabError::ResourceLimit(
+                "configured and persisted OAuth clients exceed the 64-client limit".into(),
+            ));
+        }
+        for (client_id, client) in additions {
+            grants.next_registration_order = grants
+                .next_registration_order
+                .max(client.registration_order.saturating_add(1));
+            grants.clients.insert(client_id, client);
+        }
+        drop(grants);
+
+        let mut bound = self.inner.client_database.lock().map_err(|_| {
+            crate::contracts::LabError::Internal("OAuth client store lock poisoned".into())
+        })?;
+        if bound.is_some() {
+            return Err(crate::contracts::LabError::Conflict(
+                "OAuth client store was already bound".into(),
+            ));
+        }
+        *bound = Some(database);
+        drop(bound);
         Ok(self)
     }
 
@@ -448,6 +553,7 @@ impl OAuthState {
                 public_host,
                 owner_code,
                 grants: Mutex::new(Grants::default()),
+                client_database: Mutex::new(None),
                 managed_live_order_control: Mutex::new(None),
             }),
         })
@@ -510,6 +616,37 @@ impl OAuthState {
 
 /// Hash the one-use, owner-approved code into a fresh durable CAS identity.
 /// The authorization code and bearer tokens never appear in the request ID.
+fn validate_stored_oauth_client(
+    client: &StoredOAuthClientRecord,
+    expected_issuer: &str,
+) -> Result<(), crate::contracts::LabError> {
+    let valid_client_id = !client.client_id.is_empty()
+        && client.client_id.len() <= 256
+        && !client
+            .client_id
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control());
+    let valid_name = !client.client_name.trim().is_empty()
+        && client.client_name.chars().count() <= 120
+        && !client.client_name.chars().any(char::is_control);
+    if client.issuer != expected_issuer
+        || !valid_client_id
+        || !valid_name
+        || client.redirect_uris.is_empty()
+        || client.redirect_uris.len() > 8
+        || client
+            .redirect_uris
+            .iter()
+            .any(|uri| !valid_redirect_uri(uri))
+        || crate::contracts::UtcTimestamp::parse_rfc3339(&client.registered_at_utc).is_err()
+    {
+        return Err(crate::contracts::LabError::DataCorrupt(
+            "stored OAuth client metadata violates the issuer or callback contract".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn consent_live_order_request_id(client_id: &str, code: &str, resource: &str) -> String {
     let mut digest = Sha256::new();
     digest.update(b"sky-backcraft-oauth-live-order-consent-v1\0");
@@ -621,26 +758,79 @@ impl Grants {
             .retain(|_, value| value.expires_at > now);
     }
 
-    fn insert_client_bounded(&mut self, client_id: String, client: Client) -> Result<(), ()> {
+    fn client_eviction_candidate(&self, client_id: &str) -> Result<Option<String>, ()> {
+        if self.clients.contains_key(client_id) {
+            return Err(());
+        }
+        if self.clients.len() < MAX_CLIENTS {
+            return Ok(None);
+        }
+        self.clients
+            .iter()
+            .filter(|(candidate, registered)| {
+                !registered.pinned
+                    && !self.reserved_client_evictions.contains(*candidate)
+                    && !self.client_has_issued_grant(candidate)
+            })
+            .min_by(|(left_id, left), (right_id, right)| {
+                left.registration_order
+                    .cmp(&right.registration_order)
+                    .then_with(|| left_id.cmp(right_id))
+            })
+            .map(|(candidate, _)| candidate.clone())
+            .map(Some)
+            .ok_or(())
+    }
+
+    fn insert_client_bounded(&mut self, client_id: String, mut client: Client) -> Result<(), ()> {
+        let evict = self.client_eviction_candidate(&client_id)?;
+        client.registration_order = self.next_registration_order;
+        self.apply_client_insert(client_id, client, evict)
+    }
+
+    fn reserve_client_eviction(&mut self, client_id: &str) -> Result<Option<String>, ()> {
+        let candidate = self.client_eviction_candidate(client_id)?;
+        if let Some(candidate) = &candidate
+            && !self.reserved_client_evictions.insert(candidate.clone())
+        {
+            return Err(());
+        }
+        Ok(candidate)
+    }
+
+    fn release_client_eviction(&mut self, candidate: Option<&str>) {
+        if let Some(candidate) = candidate {
+            self.reserved_client_evictions.remove(candidate);
+        }
+    }
+
+    fn apply_client_insert(
+        &mut self,
+        client_id: String,
+        client: Client,
+        evict_client_id: Option<String>,
+    ) -> Result<(), ()> {
         if self.clients.contains_key(&client_id) {
             return Err(());
         }
-        if self.clients.len() >= MAX_CLIENTS {
-            let oldest_unused = self
-                .clients
-                .iter()
-                .filter(|(candidate, registered)| {
-                    !registered.pinned && !self.client_has_issued_grant(candidate)
-                })
-                .min_by_key(|(_, registered)| registered.registered_at)
-                .map(|(candidate, _)| candidate.clone());
-            let Some(oldest_unused) = oldest_unused else {
+        if self.clients.len() >= MAX_CLIENTS && evict_client_id.is_none() {
+            return Err(());
+        }
+        if let Some(evict_client_id) = evict_client_id {
+            let Some(evict) = self.clients.get(&evict_client_id) else {
                 return Err(());
             };
-            self.clients.remove(&oldest_unused);
+            if evict.pinned || self.client_has_issued_grant(&evict_client_id) {
+                return Err(());
+            }
+            self.clients.remove(&evict_client_id);
+            self.reserved_client_evictions.remove(&evict_client_id);
             self.pending
-                .retain(|_, pending| pending.client_id != oldest_unused);
+                .retain(|_, pending| pending.client_id != evict_client_id);
         }
+        self.next_registration_order = self
+            .next_registration_order
+            .max(client.registration_order.saturating_add(1));
         self.clients.insert(client_id, client);
         Ok(())
     }
@@ -698,6 +888,9 @@ impl Grants {
         {
             self.pending.remove(request.flow_id);
             return Err(GrantError::AccessDenied);
+        }
+        if self.reserved_client_evictions.contains(&pending.client_id) {
+            return Err(GrantError::Capacity);
         }
         if self.codes.len() >= MAX_CODES {
             return Err(GrantError::Capacity);
@@ -910,6 +1103,63 @@ async fn authorization_server(State(state): State<OAuthState>) -> Response {
     )
 }
 
+async fn register_persistent_client(
+    inner: Arc<OAuthInner>,
+    database: &DatabaseHandle,
+    record: NewOAuthClientRecord,
+) -> Result<(), crate::contracts::LabError> {
+    database
+        .call("oauth_register_public_client", move |store| {
+            let grants = &inner.grants;
+            // The storage owner serializes registration. Reserve under a brief grants lock,
+            // release it for SQL, then publish memory only after the durable commit.
+            let eviction = {
+                let mut grants = grants.lock().map_err(|_| {
+                    crate::contracts::LabError::Internal("OAuth grant lock poisoned".into())
+                })?;
+                grants.prune(Instant::now());
+                grants
+                    .reserve_client_eviction(&record.client_id)
+                    .map_err(|()| {
+                        crate::contracts::LabError::ResourceLimit(
+                            "OAuth client registry is at capacity".into(),
+                        )
+                    })?
+            };
+            let registration_order = match store.register_oauth_client(&record, eviction.clone()) {
+                Ok(order) => order,
+                Err(error) => {
+                    if let Ok(mut grants) = grants.lock() {
+                        grants.release_client_eviction(eviction.as_deref());
+                    }
+                    return Err(error);
+                }
+            };
+            let mut grants = grants.lock().map_err(|_| {
+                crate::contracts::LabError::Internal(
+                    "OAuth grant lock poisoned after commit".into(),
+                )
+            })?;
+            let client = Client {
+                redirect_uris: record.redirect_uris,
+                display_name: record.client_name,
+                registration_order,
+                pinned: false,
+            };
+            if grants
+                .apply_client_insert(record.client_id, client, eviction.clone())
+                .is_err()
+            {
+                grants.release_client_eviction(eviction.as_deref());
+                return Err(crate::contracts::LabError::DataCorrupt(
+                    "OAuth memory registry changed during durable client registration".into(),
+                ));
+            }
+            Ok(())
+        })
+        .await
+}
+
 async fn register(State(state): State<OAuthState>, body: String) -> Response {
     let Ok(request) = serde_json::from_str::<RegistrationRequest>(&body) else {
         return oauth_error(StatusCode::BAD_REQUEST, "invalid_client_metadata");
@@ -942,21 +1192,43 @@ async fn register(State(state): State<OAuthState>, body: String) -> Response {
     let name = if request.client_name.trim().is_empty() {
         "MCP client".to_owned()
     } else {
-        request.client_name.chars().take(120).collect()
+        request.client_name.trim().chars().take(120).collect()
     };
-    let client = Client {
-        redirect_uris: request.redirect_uris.clone(),
-        display_name: name.clone(),
-        registered_at: Instant::now(),
-        pinned: false,
+    if name.chars().any(char::is_control) {
+        return oauth_error(StatusCode::BAD_REQUEST, "invalid_client_metadata");
+    }
+    let database = match state.inner.client_database.lock() {
+        Ok(bound) => bound.clone(),
+        Err(_) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
     };
-    {
+    if let Some(database) = database {
+        let record = NewOAuthClientRecord {
+            issuer: state.inner.public_url.clone(),
+            client_id: client_id.clone(),
+            redirect_uris: request.redirect_uris.clone(),
+            client_name: name.clone(),
+            registered_at_utc: crate::contracts::UtcTimestamp::now().to_rfc3339(),
+        };
+        let registered =
+            register_persistent_client(Arc::clone(&state.inner), &database, record).await;
+        if registered.is_err() {
+            return oauth_error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable");
+        }
+    } else {
         let Ok(mut grants) = state.inner.grants.lock() else {
             return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
         };
         grants.prune(Instant::now());
         if grants
-            .insert_client_bounded(client_id.clone(), client)
+            .insert_client_bounded(
+                client_id.clone(),
+                Client {
+                    redirect_uris: request.redirect_uris.clone(),
+                    display_name: name.clone(),
+                    registration_order: 0,
+                    pinned: false,
+                },
+            )
             .is_err()
         {
             return oauth_error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable");
@@ -1014,6 +1286,9 @@ async fn authorize(State(state): State<OAuthState>, RawQuery(query): RawQuery) -
         let Ok(grants) = state.inner.grants.lock() else {
             return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
         };
+        if grants.reserved_client_evictions.contains(client_id) {
+            return oauth_error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable");
+        }
         match grants.clients.get(client_id) {
             Some(client) => (
                 client.display_name.clone(),
@@ -1541,11 +1816,11 @@ fn html_escape(value: &str) -> String {
 mod tests {
     use super::*;
 
-    fn test_client(registered_at: Instant) -> Client {
+    fn test_client(registration_order: u64) -> Client {
         Client {
             redirect_uris: vec!["http://127.0.0.1/callback".into()],
             display_name: "Test client".into(),
-            registered_at,
+            registration_order,
             pinned: false,
         }
     }
@@ -1760,8 +2035,7 @@ mod tests {
                 Client {
                     redirect_uris: vec!["http://127.0.0.1/callback".into()],
                     display_name: format!("Client {index}"),
-                    registered_at: now
-                        + Duration::from_secs(u64::try_from(index).unwrap_or(u64::MAX)),
+                    registration_order: 0,
                     pinned: false,
                 },
             );
@@ -1784,7 +2058,7 @@ mod tests {
                     Client {
                         redirect_uris: vec!["http://127.0.0.1/callback".into()],
                         display_name: "New client".into(),
-                        registered_at: now + Duration::from_hours(2),
+                        registration_order: 0,
                         pinned: false,
                     },
                 )
@@ -1851,7 +2125,7 @@ mod tests {
                 .grants
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            grants.clients.insert("client".into(), test_client(now));
+            grants.clients.insert("client".into(), test_client(0));
             grants.codes.insert(
                 "code".into(),
                 AuthorizationCode {
@@ -1904,7 +2178,7 @@ mod tests {
                 .grants
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            grants.clients.insert("client".into(), test_client(now));
+            grants.clients.insert("client".into(), test_client(0));
             grants.refresh_tokens.insert(
                 "refresh".into(),
                 test_access("client", now + REFRESH_TOKEN_TTL),
@@ -1939,13 +2213,14 @@ mod tests {
             let client_id = format!("client-{index}");
             grants.clients.insert(
                 client_id.clone(),
-                test_client(now + Duration::from_secs(u64::try_from(index).unwrap_or(u64::MAX))),
+                test_client(u64::try_from(index).unwrap_or(u64::MAX)),
             );
             grants.pending.insert(
                 format!("flow-{index}"),
                 test_pending(&client_id, now + APPROVAL_TTL),
             );
         }
+        grants.next_registration_order = u64::try_from(MAX_CLIENTS).unwrap_or(u64::MAX);
         grants.codes.insert(
             "issued-code".into(),
             AuthorizationCode {
@@ -1960,10 +2235,7 @@ mod tests {
 
         assert!(
             grants
-                .insert_client_bounded(
-                    "new-client".into(),
-                    test_client(now + Duration::from_hours(1)),
-                )
+                .insert_client_bounded("new-client".into(), test_client(0))
                 .is_ok()
         );
         assert!(grants.clients.contains_key("client-0"));
@@ -1984,7 +2256,7 @@ mod tests {
                 .grants
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            grants.clients.insert("client".into(), test_client(now));
+            grants.clients.insert("client".into(), test_client(0));
             for index in 0..MAX_PENDING_APPROVALS {
                 grants.pending.insert(
                     format!("flow-{index}"),

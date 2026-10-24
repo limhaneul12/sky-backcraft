@@ -134,6 +134,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let viewMenu = NSMenu(title: "보기")
         viewItem.submenu = viewMenu
         mainMenu.addItem(viewItem)
+        let sidebarToggle = NSMenuItem(
+            title: "사이드바 표시/가리기",
+            action: #selector(DashboardWindowController.toggleSidebar(_:)),
+            keyEquivalent: ""
+        )
+        sidebarToggle.target = dashboard
+        viewMenu.addItem(sidebarToggle)
+        viewMenu.addItem(.separator())
         for (tag, title) in ["시스템 모드", "라이트 모드", "다크 모드"].enumerated() {
             let item = NSMenuItem(title: title, action: #selector(changeAppearance(_:)), keyEquivalent: "")
             item.tag = tag
@@ -168,6 +176,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func apply(_ status: RuntimeStatus) {
         stateItem.title = status.menuTitle
         settings.updateStatus(status)
+        dashboard.updateRuntimeStatus(status)
         if CommandLine.arguments.contains("--gui-review") {
             startItem.isEnabled = false
             stopItem.isEnabled = false

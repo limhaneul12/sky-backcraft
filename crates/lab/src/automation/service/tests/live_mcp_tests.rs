@@ -24,6 +24,11 @@ use crate::upbit::execution::LiveExecutionPolicy;
 use crate::upbit::live_order_control::{
     LiveOrderControlAction, LiveOrderControlRequest, LiveOrderControlService, LiveOrderSendGate,
 };
+use crate::upbit::realtime::{
+    PrivateAccountEvent, PrivateOrderEventIdentity, PrivateOrderObservation, PrivateOrderSide,
+    PrivateOrderState, SessionTiming, private_account_realtime_channels,
+    run_private_account_stream_for_test,
+};
 use rust_decimal::Decimal;
 use std::path::PathBuf;
 use std::sync::{
@@ -83,6 +88,9 @@ struct SyntheticVenueState {
     base_average_price: Decimal,
     submit_count: usize,
     lookup_count: usize,
+    private_not_ready: bool,
+    private_not_ready_count: usize,
+    hide_order_readbacks: bool,
     order: Option<SyntheticOrder>,
 }
 
@@ -94,6 +102,9 @@ impl SyntheticVenueState {
             base_average_price: Decimal::ZERO,
             submit_count: 0,
             lookup_count: 0,
+            private_not_ready: false,
+            private_not_ready_count: 0,
+            hide_order_readbacks: false,
             order: None,
         }
     }
@@ -102,11 +113,19 @@ impl SyntheticVenueState {
 #[derive(Clone)]
 struct SyntheticLiveVenue {
     state: Arc<Mutex<SyntheticVenueState>>,
+    account_identity: String,
 }
 
 impl SyntheticLiveVenue {
     fn new(state: Arc<Mutex<SyntheticVenueState>>) -> Self {
-        Self { state }
+        Self::for_account(state, LIVE_ACCOUNT_ID)
+    }
+
+    fn for_account(state: Arc<Mutex<SyntheticVenueState>>, account_identity: &str) -> Self {
+        Self {
+            state,
+            account_identity: account_identity.to_owned(),
+        }
     }
 }
 
@@ -116,7 +135,7 @@ impl VenueAdapter for SyntheticLiveVenue {
     }
 
     fn account_identity(&self) -> String {
-        LIVE_ACCOUNT_ID.into()
+        self.account_identity.clone()
     }
 
     fn account_balances(&self) -> VenueFuture<'_, Vec<UpbitAccountBalance>> {
@@ -180,6 +199,15 @@ impl VenueAdapter for SyntheticLiveVenue {
         let state = Arc::clone(&self.state);
         let request = request.clone();
         Box::pin(async move {
+            {
+                let mut state = state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if state.private_not_ready {
+                    state.private_not_ready_count += 1;
+                    return Err(ClientError::PrivateAccountNotReady);
+                }
+            }
             let crate::contracts::AutomationOrderKind::MarketBuy { budget } = &request.order else {
                 return Err(ClientError::InvalidParams(
                     "synthetic LIVE journey expects its bounded market-buy intent".into(),
@@ -232,6 +260,10 @@ impl VenueAdapter for SyntheticLiveVenue {
             let mut state = state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.hide_order_readbacks {
+                state.lookup_count += 1;
+                return Ok(None);
+            }
             let Some(mut order) = state.order.take() else {
                 return Ok(None);
             };
@@ -354,6 +386,33 @@ fn live_service(
         "http://127.0.0.1:1",
         LiveExecutionPolicy::OperatorEnabled,
     )?;
+    inner.risk_guard = risk_guard;
+    Ok(service)
+}
+
+fn live_service_with_private_client(
+    database: DatabaseHandle,
+    root: PathBuf,
+    venue_state: Arc<Mutex<SyntheticVenueState>>,
+    risk_guard: crate::upbit::risk::RiskGuard,
+    private_client: UpbitPrivateClient,
+) -> TestResult<JobService> {
+    let account_identity = private_client.account_identity();
+    let mock_venue = crate::automation::PersistentMockVenue::new(database.clone());
+    let adapter: Arc<dyn VenueAdapter> = Arc::new(SyntheticLiveVenue::for_account(
+        venue_state,
+        &account_identity,
+    ));
+    let mut service = make_service_with_live_override(
+        database,
+        crate::market_data::UpbitClient::synthetic_local("http://127.0.0.1:1")?,
+        mock_venue,
+        root,
+        adapter,
+    );
+    let inner = Arc::get_mut(&mut service.inner)
+        .expect("test service remains unique while its private client is installed");
+    inner.automation_live_venue = private_client;
     inner.risk_guard = risk_guard;
     Ok(service)
 }
@@ -515,6 +574,7 @@ fn live_policy_definition() -> PolicyDefinition {
         description: "one deterministic target-weight LIVE fixture".into(),
         program: PolicyProgram::Rules {
             program: RulesProgram {
+                condition_roles: Vec::new(),
                 indicators: vec![PolicyIndicator {
                     id: "close".into(),
                     indicator: PolicyIndicatorKind::Close,
@@ -590,6 +650,15 @@ async fn start_live_session_fixture(
     policy: &FrozenPolicyRevision,
     started_at: UtcTimestamp,
 ) -> TestResult<(AutomationSessionId, AutomationSessionWrite)> {
+    start_live_session_fixture_for_account(database, policy, started_at, LIVE_ACCOUNT_ID).await
+}
+
+async fn start_live_session_fixture_for_account(
+    database: &DatabaseHandle,
+    policy: &FrozenPolicyRevision,
+    started_at: UtcTimestamp,
+    account_identity: &str,
+) -> TestResult<(AutomationSessionId, AutomationSessionWrite)> {
     let start = AutomationSessionWrite::Start {
         request_id: RequestId::new("synthetic-live-session-start")?,
         policy_ref: policy.reference.clone(),
@@ -601,8 +670,8 @@ async fn start_live_session_fixture(
     let start_for_begin = start.clone();
     let start_for_write = start.clone();
     let frozen_policy = policy.clone();
-    let account_for_begin = LIVE_ACCOUNT_ID.to_owned();
-    let account_for_write = LIVE_ACCOUNT_ID.to_owned();
+    let account_for_begin = account_identity.to_owned();
+    let account_for_write = account_identity.to_owned();
     let response = database
         .call("test_start_synthetic_live_session", move |store| {
             store.automation_begin_request(
@@ -670,7 +739,8 @@ async fn seed_causal_live_buy(
     checkpoint.last_observation = Some(observation.clone());
     checkpoint.held_decision_bars = 1;
     let checkpoint_json = serde_json::to_string(&checkpoint)?;
-    let evaluation_json = super::super::evaluation_to_value(&evaluation);
+    let evaluation_json =
+        super::super::evaluation_to_value(&evaluation, Some(position.actual_weight));
     let action = super::super::action_for_target(
         evaluation.constrained_target_weight,
         Weight::new(Decimal::ZERO)?,
@@ -891,12 +961,24 @@ async fn seed_live_session_with_baseline(
     service: &JobService,
     close_time: UtcTimestamp,
 ) -> TestResult<(AutomationSessionId, FrozenPolicyRevision, UtcTimestamp)> {
+    seed_live_session_with_baseline_for_account(database, service, close_time, LIVE_ACCOUNT_ID)
+        .await
+}
+
+async fn seed_live_session_with_baseline_for_account(
+    database: &DatabaseHandle,
+    service: &JobService,
+    close_time: UtcTimestamp,
+    account_identity: &str,
+) -> TestResult<(AutomationSessionId, FrozenPolicyRevision, UtcTimestamp)> {
     let started_at = UtcTimestamp(close_time.0 - chrono::Duration::seconds(30));
     let policy = create_policy(database, started_at).await?;
-    let (session_id, _) = start_live_session_fixture(database, &policy, started_at).await?;
+    let (session_id, _) =
+        start_live_session_fixture_for_account(database, &policy, started_at, account_identity)
+            .await?;
 
     service
-        .refresh_account(AutomationSessionMode::Live, LIVE_ACCOUNT_ID)
+        .refresh_account(AutomationSessionMode::Live, account_identity)
         .await?;
     let view_after_refresh = read_session(service, &session_id).await?;
     let day = UtcTimestamp::now().0.format("%Y-%m-%d").to_string();
@@ -906,7 +988,7 @@ async fn seed_live_session_with_baseline(
         session_id: session_id.clone(),
         expected_sequence: view_after_refresh.sequence,
         baseline: AutomationAccountDayBaselineInput {
-            account_identity: LIVE_ACCOUNT_ID.into(),
+            account_identity: account_identity.into(),
             day_utc: day,
             reference_time_utc: midnight,
             source: AutomationBaselineSource::ExchangeObservedDayStart,
@@ -958,6 +1040,796 @@ async fn assert_intent_rejected_event(
         rejected.is_some(),
         "LIVE intent lacks a durable OFF rejection event"
     );
+    Ok(())
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one actual service-to-Store-to-projection journey proves deferred gate capture and unchanged financial state"
+)]
+async fn pending_intent_records_private_readiness_deferral_without_re_evaluation_or_orders()
+-> TestResult {
+    let root = TestRoot::new()?;
+    let owner = DatabaseOwner::open_with_live_order_control(root.0.clone(), true)?;
+    let database = owner.handle();
+    let risk_guard = crate::upbit::risk::RiskGuard::new(crate::upbit::risk::RiskConfig::default());
+    let control = start_live_control(database.clone(), risk_guard.clone()).await?;
+    let venue_state = Arc::new(Mutex::new(SyntheticVenueState::new()));
+    let service = live_service(
+        database.clone(),
+        root.0.clone(),
+        Arc::clone(&venue_state),
+        risk_guard,
+    )?;
+    let (session_id, intent_id) = seed_pending_live_intent(&database, &service).await?;
+    let id = session_id.clone();
+    let (before, pending) = database
+        .call("read_before_deferred_admission", move |store| {
+            Ok((
+                store.automation_runtime_record_with_policy(
+                    &id,
+                    UtcTimestamp::now(),
+                    LiveExecutionPolicy::OperatorEnabled,
+                )?,
+                store.automation_pending_intents(&id)?,
+            ))
+        })
+        .await?;
+    let intent = pending.first().ok_or("seeded pending intent missing")?;
+    assert_eq!(intent.intent_id, intent_id);
+    let evaluation = intent.evaluation_json.clone();
+    let fence = service
+        .inner
+        .automation_live_venue
+        .private_readiness_fence();
+    fence.invalidate_for_recovery(fence.generation())?;
+    service.admit_pending_intent(&before, intent).await?;
+    service.admit_pending_intent(&before, intent).await?;
+    let id = session_id.clone();
+    let (after, still_pending, events) = database
+        .call("read_after_deferred_admission", move |store| {
+            Ok((
+                store.automation_runtime_record_with_policy(
+                    &id,
+                    UtcTimestamp::now(),
+                    LiveExecutionPolicy::OperatorEnabled,
+                )?,
+                store.automation_pending_intents(&id)?,
+                store.automation_query(
+                    AutomationSessionQuery::Events {
+                        session_id: id,
+                        after_sequence: None,
+                        limit: 100,
+                    },
+                    UtcTimestamp::now(),
+                )?,
+            ))
+        })
+        .await?;
+    assert_eq!(before.checkpoint_json, after.checkpoint_json);
+    assert_eq!(before.view.sequence, after.view.sequence);
+    assert_eq!(still_pending.len(), 1);
+    assert_eq!(still_pending[0].evaluation_json, evaluation);
+    let deferred: Vec<_> = events["items"]
+        .as_array()
+        .ok_or("event page missing")?
+        .iter()
+        .filter(|event| event["kind"] == "DECISION_DEFERRED")
+        .collect();
+    assert_eq!(deferred.len(), 1);
+    assert_eq!(deferred[0]["detail"]["intent_id"], intent_id.as_str());
+    assert_eq!(
+        deferred[0]["detail"]["admission_deferral"]["phase"],
+        "BEFORE_ADMISSION"
+    );
+    assert_eq!(
+        deferred[0]["detail"]["admission_deferral"]["reason"],
+        "PRIVATE_ACCOUNT_RECOVERY_REQUIRED"
+    );
+    let selected_session = session_id.clone();
+    let selected_intent = intent_id.clone();
+    let projected = database
+        .call("read_stored_admission_deferral_projection", move |store| {
+            store.automation_review_detail(&selected_session, &selected_intent)
+        })
+        .await?
+        .recorded_decision
+        .ok_or("stored decision projection missing")?;
+    assert!(projected.reasons.iter().any(|reason| reason.stage
+        == crate::contracts::RecordedDecisionStage::Admission
+        && reason.code == "PRIVATE_ACCOUNT_RECOVERY_REQUIRED"));
+    assert_eq!(
+        projected.execution_state,
+        crate::contracts::RecordedExecutionState::NotCaptured
+    );
+    assert_eq!(
+        projected.strategy_action,
+        crate::contracts::RecordedDecisionAction::Buy
+    );
+    assert_eq!(
+        projected.actual_weight_at_decision,
+        Some(Weight::new(Decimal::ZERO)?)
+    );
+    assert_eq!(
+        projected.condition_trace_capture,
+        crate::contracts::SavedFactCaptureStatus::Captured
+    );
+    let ledger = read_ledger(&service, &session_id).await?;
+    assert_eq!(ledger["orders"].as_array().map(Vec::len), Some(0));
+    assert_eq!(ledger["fills"].as_array().map(Vec::len), Some(0));
+    assert_eq!(venue_state_counts(&venue_state), (0, 0));
+    drop(service);
+    drop(control);
+    drop(database);
+    owner.shutdown()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn private_account_not_ready_releases_claimed_live_order_without_venue_effect() -> TestResult
+{
+    let root = TestRoot::new()?;
+    let owner = DatabaseOwner::open_with_live_order_control(root.0.clone(), true)?;
+    let database = owner.handle();
+    let risk_guard = crate::upbit::risk::RiskGuard::new(crate::upbit::risk::RiskConfig::default());
+    let control = start_live_control(database.clone(), risk_guard.clone()).await?;
+    let send_gate = LiveOrderSendGate::new_disabled();
+    let send_control = LiveOrderControlService::new(
+        database.clone(),
+        LiveExecutionPolicy::OperatorEnabled,
+        Some(send_gate),
+        ExchangeReadMode::Mock,
+    );
+    assert!(
+        set_live_order_sending(
+            &send_control,
+            LiveOrderControlAction::Enable,
+            "enable-private-not-ready-test"
+        )
+        .await?
+        .live_trading_enabled
+    );
+    let venue_state = Arc::new(Mutex::new(SyntheticVenueState::new()));
+    venue_state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .private_not_ready = true;
+    let service = live_service(
+        database.clone(),
+        root.0.clone(),
+        Arc::clone(&venue_state),
+        risk_guard,
+    )?;
+
+    let close_time = first_post_start_close(UtcTimestamp::now()).1;
+    let (session_id, policy, _) =
+        seed_live_session_with_baseline(&database, &service, close_time).await?;
+    seed_causal_live_buy(&database, &policy, &session_id, close_time).await?;
+
+    service
+        .process_due_automation_sessions(UtcTimestamp::now())
+        .await?;
+
+    let ledger = read_ledger(&service, &session_id).await?;
+    assert_eq!(ledger["orders"].as_array().map(Vec::len), Some(1));
+    assert_eq!(ledger["orders"][0]["state"], "REJECTED");
+    assert_eq!(ledger["fills"].as_array().map(Vec::len), Some(0));
+    let intent_id: crate::contracts::AutomationIntentId =
+        serde_json::from_value(ledger["orders"][0]["intent_id"].clone())?;
+    assert_intent_rejected_event(
+        &service,
+        &session_id,
+        &intent_id,
+        "PRIVATE_ACCOUNT_RECOVERY_REQUIRED",
+    )
+    .await?;
+    let projection = service
+        .automation_session_query(AutomationSessionQuery::Get {
+            session_id: session_id.clone(),
+        })
+        .await?;
+    assert_eq!(projection["account_risk"]["risk"]["open_order_count"], 0);
+    let quote_reserved: QuoteAmount = serde_json::from_value(
+        projection["account_risk"]["balance"]["quote_local_reserved"].clone(),
+    )?;
+    assert_eq!(quote_reserved.get(), Decimal::ZERO);
+    let state = venue_state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(state.private_not_ready_count, 1);
+    assert_eq!(state.submit_count, 0);
+    assert_eq!(state.lookup_count, 0);
+    assert!(state.order.is_none());
+    drop(state);
+
+    drop(service);
+    drop(send_control);
+    drop(control);
+    drop(database);
+    owner.shutdown()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn duplicate_private_trade_is_durably_deduplicated_without_creating_manual_intent()
+-> TestResult {
+    let root = TestRoot::new()?;
+    let owner = DatabaseOwner::open(root.0.clone())?;
+    let database = owner.handle();
+    let venue_state = Arc::new(Mutex::new(SyntheticVenueState::new()));
+    let service = live_service(
+        database.clone(),
+        root.0.clone(),
+        Arc::clone(&venue_state),
+        crate::upbit::risk::RiskGuard::new(crate::upbit::risk::RiskConfig::default()),
+    )?;
+    let generation = service
+        .inner
+        .automation_live_venue
+        .private_readiness_fence()
+        .generation();
+    let provider_at = UtcTimestamp::parse_rfc3339("2026-10-17T01:02:03Z")?;
+    let received_at = UtcTimestamp::now();
+    let order = PrivateOrderObservation {
+        generation,
+        stream_sequence: 1,
+        identity: PrivateOrderEventIdentity::Trade {
+            trade_uuid: "manual-provider-trade-duplicate-test".into(),
+        },
+        order_uuid: "manual-provider-order-duplicate-test".into(),
+        client_identifier: Some("provider/manual order id".into()),
+        market: MarketId::parse_upbit(MARKET)?,
+        side: PrivateOrderSide::Bid,
+        order_type: "limit".into(),
+        state: PrivateOrderState::Trade,
+        price: Some(Decimal::from(10_000)),
+        average_price: Some(Decimal::from(10_000)),
+        volume: Some(Decimal::ONE),
+        remaining_volume: Some(Decimal::ZERO),
+        executed_volume: Some(Decimal::ONE),
+        trades_count: Some(1),
+        reserved_fee: Some(Decimal::ZERO),
+        remaining_fee: Some(Decimal::ZERO),
+        paid_fee: Some(Decimal::ZERO),
+        locked: Some(Decimal::ZERO),
+        executed_funds: Some(Decimal::from(10_000)),
+        trade_fee: Some(Decimal::ZERO),
+        is_maker: Some(false),
+        smp_type: None,
+        prevented_volume: None,
+        prevented_locked: None,
+        provider_order_at_utc: provider_at,
+        provider_trade_at_utc: Some(provider_at),
+        provider_at_utc: provider_at,
+        received_at_utc: received_at,
+    };
+    service
+        .consume_private_stream_event(&PrivateAccountEvent::OrderObserved(Box::new(order.clone())))
+        .await?;
+    let duplicate = PrivateAccountEvent::OrderObserved(Box::new(PrivateOrderObservation {
+        stream_sequence: 2,
+        received_at_utc: UtcTimestamp(received_at.0 + chrono::Duration::seconds(1)),
+        ..order
+    }));
+    service.consume_private_stream_event(&duplicate).await?;
+
+    let account_identity = service.inner.automation_live_venue.account_identity();
+    let observations = database
+        .call("test_duplicate_private_trade_journal", {
+            let account_identity = account_identity.clone();
+            move |store| store.private_stream_observations(&account_identity, 0, 100)
+        })
+        .await?;
+    assert_eq!(observations.len(), 1);
+    assert_eq!(observations[0].sequence, 1);
+    assert_eq!(
+        observations[0]
+            .observation
+            .transport
+            .as_ref()
+            .map(|transport| transport.message_sequence),
+        Some(1),
+        "duplicate provider trade keeps its first transport receipt"
+    );
+    let automation_orders = database
+        .call("test_manual_private_trade_no_owned_intent", move |store| {
+            store.automation_account_order_readback_targets(&account_identity)
+        })
+        .await?;
+    assert!(
+        automation_orders.is_empty(),
+        "manual orders do not create intents"
+    );
+    let venue_state = venue_state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(venue_state.submit_count, 0);
+    assert_eq!(venue_state.lookup_count, 0);
+    assert!(venue_state.order.is_none());
+    drop(venue_state);
+
+    drop(service);
+    drop(database);
+    owner.shutdown()?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one loopback private owner journey proves baseline, buffered trade, exact pending readback, bounded history marker, readiness, and idempotent fill"
+)]
+async fn private_bootstrap_exact_reads_pending_orders_and_marks_only_bounded_coverage() -> TestResult
+{
+    use axum::http::{StatusCode, Uri};
+    use futures_util::{SinkExt, StreamExt};
+    use std::sync::atomic::AtomicUsize;
+    use tokio::net::TcpListener;
+    use tokio::sync::{Notify, oneshot};
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_util::sync::CancellationToken;
+
+    let root = TestRoot::new()?;
+    let owner = DatabaseOwner::open_with_live_order_control(root.0.clone(), true)?;
+    let database = owner.handle();
+    let risk_guard = crate::upbit::risk::RiskGuard::new(crate::upbit::risk::RiskConfig::default());
+    let control = start_live_control(database.clone(), risk_guard.clone()).await?;
+    let send_gate = LiveOrderSendGate::new_disabled();
+    let send_control = LiveOrderControlService::new(
+        database.clone(),
+        LiveExecutionPolicy::OperatorEnabled,
+        Some(send_gate),
+        ExchangeReadMode::Mock,
+    );
+    assert!(
+        set_live_order_sending(
+            &send_control,
+            LiveOrderControlAction::Enable,
+            "enable-private-bootstrap-test"
+        )
+        .await?
+        .live_trading_enabled
+    );
+
+    let order_body = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let open_orders_body = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let baseline_account_body = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let account_body = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let frame_body = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let open_reads = Arc::new(AtomicUsize::new(0));
+    let exact_order_reads = Arc::new(AtomicUsize::new(0));
+    let closed_history_reads = Arc::new(AtomicUsize::new(0));
+    let account_reads = Arc::new(AtomicUsize::new(0));
+    let frame_sent = Arc::new(AtomicBool::new(false));
+    let frame_sent_notify = Arc::new(Notify::new());
+    let rest_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let rest_address = rest_listener.local_addr()?;
+    let rest_app = axum::Router::new().fallback({
+        let order_body = Arc::clone(&order_body);
+        let open_orders_body = Arc::clone(&open_orders_body);
+        let baseline_account_body = Arc::clone(&baseline_account_body);
+        let account_body = Arc::clone(&account_body);
+        let open_reads = Arc::clone(&open_reads);
+        let exact_order_reads = Arc::clone(&exact_order_reads);
+        let closed_history_reads = Arc::clone(&closed_history_reads);
+        let account_reads = Arc::clone(&account_reads);
+        let frame_sent = Arc::clone(&frame_sent);
+        let frame_sent_notify = Arc::clone(&frame_sent_notify);
+        move |uri: Uri| {
+            let order_body = Arc::clone(&order_body);
+            let open_orders_body = Arc::clone(&open_orders_body);
+            let baseline_account_body = Arc::clone(&baseline_account_body);
+            let account_body = Arc::clone(&account_body);
+            let open_reads = Arc::clone(&open_reads);
+            let exact_order_reads = Arc::clone(&exact_order_reads);
+            let closed_history_reads = Arc::clone(&closed_history_reads);
+            let account_reads = Arc::clone(&account_reads);
+            let frame_sent = Arc::clone(&frame_sent);
+            let frame_sent_notify = Arc::clone(&frame_sent_notify);
+            let path = uri.path().to_owned();
+            async move {
+                let body = match path.as_str() {
+                    "/v1/accounts" => {
+                        let read_index = account_reads.fetch_add(1, Ordering::SeqCst);
+                        if !frame_sent.load(Ordering::Acquire) {
+                            frame_sent_notify.notified().await;
+                        }
+                        if read_index == 0 {
+                            baseline_account_body
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .clone()
+                        } else {
+                            account_body
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .clone()
+                        }
+                    }
+                    "/v1/orders/open" => {
+                        open_reads.fetch_add(1, Ordering::SeqCst);
+                        open_orders_body
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clone()
+                    }
+                    "/v1/order" => {
+                        exact_order_reads.fetch_add(1, Ordering::SeqCst);
+                        order_body
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clone()
+                    }
+                    "/v1/orders/closed" => {
+                        closed_history_reads.fetch_add(1, Ordering::SeqCst);
+                        b"[]".to_vec()
+                    }
+                    _ => br#"{"error":{"name":"order_not_found"}}"#.to_vec(),
+                };
+                (
+                    StatusCode::OK,
+                    [("Remaining-Req", "group=default; min=1800; sec=59")],
+                    body,
+                )
+            }
+        }
+    });
+    let (rest_stop, rest_stopped) = oneshot::channel();
+    let rest_server = tokio::spawn(async move {
+        axum::serve(rest_listener, rest_app)
+            .with_graceful_shutdown(async {
+                let _ = rest_stopped.await;
+            })
+            .await
+    });
+
+    let ws_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let ws_address = ws_listener.local_addr()?;
+    let ws_endpoint = format!("ws://{ws_address}/websocket/v1/private");
+    let (subscription_tx, subscription_rx) = oneshot::channel();
+    let (ws_closed_tx, ws_closed_rx) = oneshot::channel();
+    let ws_frame_buffer = Arc::clone(&frame_body);
+    let ws_frame_sent = Arc::clone(&frame_sent);
+    let cancellation = CancellationToken::new();
+    let ws_cancellation = cancellation.clone();
+    let ws_server = tokio::spawn(async move {
+        let mut subscription_tx = Some(subscription_tx);
+        let mut ws_closed_tx = Some(ws_closed_tx);
+        for _ in 0..8 {
+            let (stream, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(10), ws_listener.accept())
+                    .await??;
+            let mut socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            let subscription =
+                match tokio::time::timeout(std::time::Duration::from_secs(5), socket.next()).await?
+                {
+                    Some(Ok(Message::Text(text))) => text.to_string(),
+                    _ => {
+                        return Err(std::io::Error::other(
+                            "private subscription request missing",
+                        ));
+                    }
+                };
+            if let Some(sender) = subscription_tx.take() {
+                let _sent = sender.send(subscription);
+            }
+            let frame = ws_frame_buffer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            socket
+                .send(Message::Text(
+                    String::from_utf8(frame)
+                        .map_err(|error| std::io::Error::other(error.to_string()))?
+                        .into(),
+                ))
+                .await
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            ws_frame_sent.store(true, Ordering::Release);
+            frame_sent_notify.notify_one();
+            loop {
+                match socket.next().await {
+                    Some(Ok(Message::Ping(payload))) => {
+                        socket
+                            .send(Message::Pong(payload))
+                            .await
+                            .map_err(|error| std::io::Error::other(error.to_string()))?;
+                    }
+                    Some(Ok(Message::Close(_frame))) => {
+                        socket
+                            .flush()
+                            .await
+                            .map_err(|error| std::io::Error::other(error.to_string()))?;
+                        if ws_cancellation.is_cancelled() {
+                            if let Some(sender) = ws_closed_tx.take() {
+                                let _sent = sender.send(());
+                            }
+                            return Ok::<(), std::io::Error>(());
+                        }
+                        break;
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => return Err(std::io::Error::other(error.to_string())),
+                    None => break,
+                }
+            }
+        }
+        Err(std::io::Error::other(
+            "private WebSocket fixture reconnect bound exhausted",
+        ))
+    });
+
+    let private_client = UpbitPrivateClient::loopback_fixture(
+        &format!("http://{rest_address}"),
+        LiveExecutionPolicy::OperatorEnabled,
+    )?;
+    let account_identity = private_client.account_identity();
+    let venue_state = Arc::new(Mutex::new(SyntheticVenueState::new()));
+    venue_state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .hide_order_readbacks = true;
+    let service = live_service_with_private_client(
+        database.clone(),
+        root.0.clone(),
+        Arc::clone(&venue_state),
+        risk_guard,
+        private_client.clone(),
+    )?;
+    let close_time = first_post_start_close(UtcTimestamp::now()).1;
+    let (session_id, policy, close_time) = seed_live_session_with_baseline_for_account(
+        &database,
+        &service,
+        close_time,
+        &account_identity,
+    )
+    .await?;
+    seed_causal_live_buy(&database, &policy, &session_id, close_time).await?;
+    service
+        .process_due_automation_sessions(UtcTimestamp::now())
+        .await?;
+    let pending_ledger = read_ledger(&service, &session_id).await?;
+    assert_eq!(pending_ledger["orders"][0]["state"], "SUBMITTED_UNKNOWN");
+    let (
+        order_detail_body,
+        open_orders_body_bytes,
+        baseline_account_body_bytes,
+        account_body_bytes,
+        ws_frame_body,
+    ) = {
+        let state = venue_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let order = state
+            .order
+            .as_ref()
+            .ok_or("synthetic order was not prepared")?;
+        let detail = synthetic_order_detail(order, true);
+        let detail_json = serde_json::to_vec(&detail)?;
+        let open_orders_json = serde_json::to_vec(&vec![detail])?;
+        let partial_volume = order.volume / Decimal::from(2);
+        let partial_funds = order.funds / Decimal::from(2);
+        let partial_fee = order.fee / Decimal::from(2);
+        let balances = vec![
+            UpbitAccountBalance {
+                currency: "KRW".into(),
+                balance: Decimal::from(INITIAL_KRW) - order.budget - order.fee,
+                locked: order.budget - partial_funds + order.fee - partial_fee,
+                avg_buy_price: Decimal::ZERO,
+                avg_buy_price_modified: false,
+                unit_currency: "KRW".into(),
+            },
+            UpbitAccountBalance {
+                currency: "BTC".into(),
+                balance: partial_volume,
+                locked: Decimal::ZERO,
+                avg_buy_price: order.mark,
+                avg_buy_price_modified: false,
+                unit_currency: "KRW".into(),
+            },
+        ];
+        let post_order_balances = serde_json::to_vec(&balances)?;
+        let frame_timestamp = UtcTimestamp::now();
+        let frame = serde_json::json!({
+            "type": "myOrder",
+            "code": order.market,
+            "uuid": "synthetic-live-order-1",
+            "ask_bid": "BID",
+            "order_type": "price",
+            "state": "trade",
+            "trade_uuid": "synthetic-live-trade-1",
+            "identifier": order.identifier,
+            "price": order.mark.to_string(),
+            "avg_price": order.mark.to_string(),
+            "volume": order.volume.to_string(),
+            "remaining_volume": "0.5",
+            "executed_volume": partial_volume.to_string(),
+            "trades_count": 1,
+            "reserved_fee": order.fee.to_string(),
+            "remaining_fee": (order.fee - partial_fee).to_string(),
+            "paid_fee": partial_fee.to_string(),
+            "locked": (order.budget - partial_funds + order.fee - partial_fee).to_string(),
+            "executed_funds": partial_funds.to_string(),
+            "trade_fee": partial_fee.to_string(),
+            "is_maker": true,
+            "smp_type": null,
+            "prevented_volume": "0",
+            "prevented_locked": "0",
+            "order_timestamp": order.created_at.0.timestamp_millis(),
+            "trade_timestamp": frame_timestamp.0.timestamp_millis(),
+            "timestamp": frame_timestamp.0.timestamp_millis(),
+            "stream_type": "REALTIME",
+        });
+        (
+            detail_json,
+            open_orders_json,
+            post_order_balances.clone(),
+            post_order_balances,
+            serde_json::to_vec(&frame)?,
+        )
+    };
+    *order_body
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = order_detail_body;
+    *open_orders_body
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = open_orders_body_bytes;
+    *baseline_account_body
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = baseline_account_body_bytes;
+    *account_body
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = account_body_bytes;
+    *frame_body
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = ws_frame_body;
+
+    let (producer, consumer) = private_account_realtime_channels(&private_client);
+    let private_task = tokio::spawn(run_private_account_stream_for_test(
+        private_client.clone(),
+        cancellation.clone(),
+        producer,
+        ws_endpoint,
+        SessionTiming::test(),
+    ));
+    let coordinator_service = service.clone();
+    let coordinator =
+        tokio::spawn(async move { coordinator_service.coordinate(Some(consumer)).await });
+    let _subscription = tokio::time::timeout(std::time::Duration::from_secs(10), subscription_rx)
+        .await
+        .map_err(|error| {
+            std::io::Error::other(format!("private WS subscription timed out: {error}"))
+        })??;
+    let readiness = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            if private_client
+                .private_readiness_fence()
+                .snapshot()
+                .ready_for_decisions
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    if let Err(error) = readiness {
+        let health = private_client.private_readiness_fence().snapshot();
+        service.inner.stop.cancel();
+        cancellation.cancel();
+        let coordinator_result = coordinator.await;
+        let private_result = private_task.await;
+        let websocket_result = ws_server.await;
+        let _sent = rest_stop.send(());
+        let _rest_result = rest_server.await;
+        return Err(std::io::Error::other(format!(
+            "private bootstrap readiness timed out: {error}; health={health:?}; frame_sent={}; account_reads={}, open_reads={}, exact_reads={}, closed_reads={}; task={private_result:?}; websocket={websocket_result:?}; coordinator={coordinator_result:?}",
+            frame_sent.load(Ordering::Acquire),
+            account_reads.load(Ordering::SeqCst),
+            open_reads.load(Ordering::SeqCst),
+            exact_order_reads.load(Ordering::SeqCst),
+            closed_history_reads.load(Ordering::SeqCst),
+        ))
+        .into());
+    }
+
+    assert!(service.realtime_status().private.ready_for_decisions);
+    assert_eq!(exact_order_reads.load(Ordering::SeqCst), 3);
+    assert_eq!(open_reads.load(Ordering::SeqCst), 1);
+    assert_eq!(closed_history_reads.load(Ordering::SeqCst), 1);
+    assert!(account_reads.load(Ordering::SeqCst) >= 2);
+    let observations = database
+        .call("test_private_bootstrap_journal", {
+            let account_identity = account_identity.clone();
+            move |store| store.private_stream_observations(&account_identity, 0, 100)
+        })
+        .await?;
+    let baseline_position = observations
+        .iter()
+        .position(|record| {
+            record.observation.kind == crate::contracts::PrivateStreamObservationKind::Baseline
+        })
+        .ok_or("private baseline journal record missing")?;
+    let stream_order_position = observations
+        .iter()
+        .position(|record| {
+            record.observation.kind == crate::contracts::PrivateStreamObservationKind::OrderObserved
+        })
+        .ok_or("buffered private order journal record missing")?;
+    let stream_order = &observations[stream_order_position].observation;
+    assert_eq!(stream_order.event_key, "trade:synthetic-live-trade-1");
+    assert_eq!(
+        stream_order
+            .transport
+            .as_ref()
+            .map(|transport| transport.message_sequence),
+        Some(1),
+        "the private REST readback is preceded by the buffered WebSocket trade"
+    );
+    let baseline_balances = observations[baseline_position].observation.payload["balances"]
+        .as_array()
+        .ok_or("private baseline journal omitted balances")?;
+    let btc_balance = baseline_balances
+        .iter()
+        .find(|balance| balance["currency"] == "BTC")
+        .and_then(|balance| balance["balance"].as_str())
+        .ok_or("post-fill baseline omitted the BTC balance")?;
+    assert_eq!(Decimal::from_str_exact(btc_balance)?, Decimal::new(5, 1));
+    let reconciliation = observations
+        .iter()
+        .find(|record| {
+            record.observation.kind
+                == crate::contracts::PrivateStreamObservationKind::RestReconciled
+        })
+        .ok_or("bounded closed-order coverage marker missing")?;
+    let complete_position = observations
+        .iter()
+        .position(|record| {
+            record.observation.kind
+                == crate::contracts::PrivateStreamObservationKind::BootstrapComplete
+        })
+        .ok_or("private bootstrap completion marker missing")?;
+    assert!(baseline_position < stream_order_position);
+    assert!(stream_order_position < complete_position);
+    assert!(
+        observations
+            .iter()
+            .position(|record| record.observation.kind
+                == crate::contracts::PrivateStreamObservationKind::RestReconciled)
+            .is_some_and(|position| position < complete_position)
+    );
+    assert_eq!(reconciliation.observation.payload["window_complete"], true);
+    assert_eq!(
+        reconciliation.observation.payload["full_history_complete"],
+        false
+    );
+    assert_eq!(
+        reconciliation.observation.payload["coverage_kind"],
+        "CLOSED_ORDER_CREATED_TIME_RANGE"
+    );
+    assert_eq!(
+        reconciliation.observation.payload["time_basis"],
+        "PROVIDER_ORDER_CREATED_AT"
+    );
+    let ledger = read_ledger(&service, &session_id).await?;
+    assert_eq!(ledger["fills"].as_array().map(Vec::len), Some(1));
+
+    cancellation.cancel();
+    private_task.await??;
+    service.inner.stop.cancel();
+    coordinator.await??;
+    tokio::time::timeout(std::time::Duration::from_secs(2), ws_closed_rx).await??;
+    ws_server.await??;
+    let _sent = rest_stop.send(());
+    rest_server.await??;
+    drop(service);
+    drop(send_control);
+    drop(control);
+    drop(database);
+    owner.shutdown()?;
     Ok(())
 }
 

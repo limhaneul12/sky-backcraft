@@ -15,7 +15,9 @@ pub const RESAMPLE_VERSION: &str = "utc-ohlcv-sum-v1";
 pub const MAX_DATASET_ROWS: usize = 30_000;
 pub const MAX_COLLECTION_CALLS: u32 = 256;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(try_from = "RangeInput")]
 #[schemars(with = "RangeInput")]
 pub struct UtcRange {
@@ -204,6 +206,10 @@ pub struct RawObjectRef {
     pub raw_bytes: u64,
     pub compressed_bytes: u64,
     pub origin: MarketDataOrigin,
+    /// Absent for historical HTTP evidence. For WebSocket evidence `http_status`
+    /// records the actual upgrade response, not a fabricated per-message response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<super::RawWebSocketTransport>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -217,14 +223,18 @@ pub struct CandleObservation {
     pub constituent_ids: Vec<ObservationId>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum DatasetStatus {
     Ready,
     BlockedData,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum QualityKind {
     UnknownSourceGap,
@@ -238,7 +248,9 @@ pub enum QualityKind {
     ZeroVolume,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum QualitySeverity {
     Info,
@@ -263,7 +275,9 @@ pub struct QualityIssue {
 ///
 /// Deliberately excluded from every dataset digest: reuse changes how data was
 /// obtained, never which economic values the snapshot contains.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(deny_unknown_fields)]
 pub struct CollectionReuse {
     /// Observations taken from previously stored collections.

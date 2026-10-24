@@ -255,13 +255,191 @@ fn gzip_bytes(payload: &[u8]) -> Result<Vec<u8>, LabError> {
 }
 
 fn gunzip_bytes(bytes: &[u8]) -> Result<Vec<u8>, LabError> {
+    gunzip_bytes_bounded(bytes, MAX_CHUNK_DECOMPRESSED_BYTES)
+}
+
+fn gunzip_bytes_bounded(
+    bytes: &[u8],
+    maximum_uncompressed_bytes: u64,
+) -> Result<Vec<u8>, LabError> {
+    let read_limit = maximum_uncompressed_bytes
+        .checked_add(1)
+        .ok_or_else(|| LabError::ResourceLimit("sealed chunk size bound overflow".into()))?;
     let decoder = GzDecoder::new(bytes);
     let mut payload = Vec::new();
     decoder
-        .take(MAX_CHUNK_DECOMPRESSED_BYTES)
+        .take(read_limit)
         .read_to_end(&mut payload)
         .map_err(|error| LabError::DataCorrupt(format!("sealed chunk decode: {error}")))?;
+    if u64::try_from(payload.len())
+        .map_err(|_| LabError::ResourceLimit("sealed payload exceeds u64".into()))?
+        > maximum_uncompressed_bytes
+    {
+        return Err(LabError::DataCorrupt(
+            "sealed chunk exceeds size bound".into(),
+        ));
+    }
     Ok(payload)
+}
+
+fn read_bounded_chunk_bytes(reader: impl Read, maximum_bytes: u64) -> Result<Vec<u8>, LabError> {
+    let read_limit = maximum_bytes
+        .checked_add(1)
+        .ok_or_else(|| LabError::ResourceLimit("sealed chunk size bound overflow".into()))?;
+    let mut bytes = Vec::new();
+    reader
+        .take(read_limit)
+        .read_to_end(&mut bytes)
+        .map_err(io_error("read sealed chunk"))?;
+    let byte_count = u64::try_from(bytes.len())
+        .map_err(|_| LabError::ResourceLimit("sealed chunk exceeds u64".into()))?;
+    if byte_count > maximum_bytes {
+        return Err(LabError::DataCorrupt(
+            "sealed chunk exceeds size bound".into(),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn read_verified_compressed_chunk(
+    store: &Store,
+    relative_path: &str,
+    sha256: &str,
+) -> Result<Vec<u8>, LabError> {
+    validate_relative_path(relative_path)?;
+    let path = store.raw_objects().root.join(relative_path);
+    reject_symlink_chain(&store.raw_objects().root, &path)?;
+    let file = fs::File::open(path).map_err(io_error("read sealed chunk"))?;
+    let compressed = read_bounded_chunk_bytes(file, MAX_CHUNK_COMPRESSED_BYTES)?;
+    let actual_sha = ContentHash::of_bytes(&compressed);
+    if actual_sha.as_str() != sha256 {
+        return Err(LabError::InputHashMismatch(
+            "sealed chunk compressed hash mismatch".into(),
+        ));
+    }
+    Ok(compressed)
+}
+
+fn line_is_nonblank(byte_count: u64, last_byte: Option<u8>) -> bool {
+    byte_count > 0 && !(byte_count == 1 && last_byte == Some(b'\r'))
+}
+
+fn parse_streamed_line(
+    line: &mut Vec<u8>,
+    terminated_by_newline: bool,
+    visitor: &mut impl FnMut(LedgerLine),
+) -> Result<(), LabError> {
+    if terminated_by_newline && line.last() == Some(&b'\r') {
+        line.pop();
+    }
+    if line.is_empty() {
+        return Ok(());
+    }
+    let text = std::str::from_utf8(line).map_err(|_| {
+        LabError::DataCorrupt("sealed chunk line read: stream did not contain valid UTF-8".into())
+    })?;
+    visitor(LedgerLine::from_line(text)?);
+    Ok(())
+}
+
+fn visit_decompressed_chunk(
+    compressed: &[u8],
+    event_count: u64,
+    uncompressed_bytes: u64,
+    maximum_uncompressed_bytes: u64,
+    mut visitor: impl FnMut(LedgerLine),
+) -> Result<(), LabError> {
+    let read_limit = maximum_uncompressed_bytes
+        .checked_add(1)
+        .ok_or_else(|| LabError::ResourceLimit("sealed chunk size bound overflow".into()))?;
+    let decoder = GzDecoder::new(compressed);
+    let mut reader = BufReader::new(decoder.take(read_limit));
+    let mut line = Vec::new();
+    let mut line_bytes = 0_u64;
+    let mut line_last_byte = None;
+    let mut decoded_bytes = 0_u64;
+    let mut decoded_lines = 0_u64;
+    let mut first_parse_error = None;
+
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(available) => available,
+            Err(error) => {
+                return Err(LabError::DataCorrupt(format!(
+                    "sealed chunk decode: {error}"
+                )));
+            }
+        };
+        if available.is_empty() {
+            break;
+        }
+
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(available.len(), |index| index + 1);
+        let content_bytes = newline.unwrap_or(consumed);
+        let segment_bytes = u64::try_from(consumed)
+            .map_err(|_| LabError::ResourceLimit("sealed payload exceeds u64".into()))?;
+        let next_decoded_bytes = decoded_bytes.saturating_add(segment_bytes);
+        if next_decoded_bytes > maximum_uncompressed_bytes {
+            return Err(LabError::DataCorrupt(
+                "sealed chunk exceeds size bound".into(),
+            ));
+        }
+        if first_parse_error.is_none() {
+            line.extend_from_slice(&available[..content_bytes]);
+        }
+        line_bytes = line_bytes.saturating_add(
+            u64::try_from(content_bytes)
+                .map_err(|_| LabError::ResourceLimit("sealed line exceeds u64".into()))?,
+        );
+        if let Some(last_byte) = available[..content_bytes].last() {
+            line_last_byte = Some(*last_byte);
+        }
+
+        if newline.is_some() {
+            if line_is_nonblank(line_bytes, line_last_byte) {
+                decoded_lines = decoded_lines.saturating_add(1);
+            }
+            if first_parse_error.is_none()
+                && line_bytes > 0
+                && let Err(error) = parse_streamed_line(&mut line, true, &mut visitor)
+            {
+                first_parse_error = Some(error);
+            }
+            line.clear();
+            line_bytes = 0;
+            line_last_byte = None;
+        }
+
+        reader.consume(consumed);
+        decoded_bytes = next_decoded_bytes;
+    }
+
+    if line_bytes > 0 {
+        if line_is_nonblank(line_bytes, line_last_byte) {
+            decoded_lines = decoded_lines.saturating_add(1);
+        }
+        if first_parse_error.is_none()
+            && let Err(error) = parse_streamed_line(&mut line, false, &mut visitor)
+        {
+            first_parse_error = Some(error);
+        }
+    }
+
+    if decoded_bytes != uncompressed_bytes {
+        return Err(LabError::InputHashMismatch(
+            "sealed chunk decompressed length mismatch".into(),
+        ));
+    }
+    if decoded_lines != event_count {
+        return Err(LabError::InputHashMismatch(
+            "sealed chunk event count mismatch".into(),
+        ));
+    }
+    if let Some(error) = first_parse_error {
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn publish_chunk_file(
@@ -314,23 +492,7 @@ fn read_verified_chunk(
     event_count: u64,
     uncompressed_bytes: u64,
 ) -> Result<Vec<u8>, LabError> {
-    validate_relative_path(relative_path)?;
-    let path = store.raw_objects().root.join(relative_path);
-    reject_symlink_chain(&store.raw_objects().root, &path)?;
-    let compressed = fs::read(&path).map_err(io_error("read sealed chunk"))?;
-    let compressed_bytes = u64::try_from(compressed.len())
-        .map_err(|_| LabError::ResourceLimit("sealed chunk exceeds u64".into()))?;
-    if compressed_bytes > MAX_CHUNK_COMPRESSED_BYTES {
-        return Err(LabError::DataCorrupt(
-            "sealed chunk exceeds size bound".into(),
-        ));
-    }
-    let actual_sha = ContentHash::of_bytes(&compressed);
-    if actual_sha.as_str() != sha256 {
-        return Err(LabError::InputHashMismatch(
-            "sealed chunk compressed hash mismatch".into(),
-        ));
-    }
+    let compressed = read_verified_compressed_chunk(store, relative_path, sha256)?;
     let payload = gunzip_bytes(&compressed)?;
     let payload_bytes = u64::try_from(payload.len())
         .map_err(|_| LabError::ResourceLimit("sealed payload exceeds u64".into()))?;
@@ -691,8 +853,10 @@ impl Store {
 
     /// Visit verified lines from a sealed run without retaining the whole ledger.
     ///
-    /// Returns `false` when the run has no chunk rows. Each chunk is fully
-    /// verified before its lines are parsed and passed to the visitor.
+    /// Returns `false` when the run has no chunk rows. Each compressed chunk
+    /// hash is verified before streaming. The visitor may receive a valid
+    /// prefix before a later decode or line-integrity error is returned, so
+    /// callers must discard provisional results when this method returns `Err`.
     ///
     /// # Errors
     /// Reports corrupt or tampered chunk files.
@@ -714,22 +878,14 @@ impl Store {
             return Ok(false);
         }
         for (relative_path, sha256, event_count, uncompressed_bytes) in rows {
-            let payload = read_verified_chunk(
-                self,
-                &relative_path,
-                &sha256,
+            let compressed = read_verified_compressed_chunk(self, &relative_path, &sha256)?;
+            visit_decompressed_chunk(
+                &compressed,
                 stored_u64(event_count, "sealed event count")?,
                 stored_u64(uncompressed_bytes, "sealed uncompressed byte count")?,
+                MAX_CHUNK_DECOMPRESSED_BYTES,
+                &mut visitor,
             )?;
-            for line in BufReader::new(payload.as_slice()).lines() {
-                let line = line.map_err(|error| {
-                    LabError::DataCorrupt(format!("sealed chunk line read: {error}"))
-                })?;
-                if line.is_empty() {
-                    continue;
-                }
-                visitor(LedgerLine::from_line(&line)?);
-            }
         }
         Ok(true)
     }

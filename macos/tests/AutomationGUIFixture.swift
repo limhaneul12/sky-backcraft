@@ -156,6 +156,15 @@ private enum AutomationGUIFixture {
         path.hasPrefix("/tmp/") || path.hasPrefix("/private/tmp/")
     }
 
+    private static func sidebarRouteRow(named title: String, in sidebar: NSTableView) -> Int? {
+        for row in 0..<sidebar.numberOfRows {
+            guard let cell = sidebar.view(atColumn: 0, row: row, makeIfNecessary: true) as? NSTableCellView,
+                  cell.textField?.stringValue == title else { continue }
+            return row
+        }
+        return nil
+    }
+
     private static func scheduleLifecycleWorkspace(dashboard: NSWindow) {
         let deadline = Date().addingTimeInterval(35)
         Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { timer in
@@ -164,11 +173,15 @@ private enum AutomationGUIFixture {
                 fail("Timed out opening synthetic lifecycle workspace.", status: 1)
             }
             let tables = descendants(of: root).compactMap { $0 as? NSTableView }
-            if let sidebar = tables.first(where: { $0.numberOfRows == 7 && $0.tableColumns.count == 1 }), sidebar.selectedRow != 4 {
-                sidebar.selectRowIndexes(IndexSet(integer: 4), byExtendingSelection: false)
+            if let sidebar = tables.first(where: { $0.identifier?.rawValue == "DashboardNavigationTable" }),
+               let automationRow = sidebarRouteRow(named: "전략 자동화", in: sidebar),
+               sidebar.selectedRow != automationRow {
+                sidebar.selectRowIndexes(IndexSet(integer: automationRow), byExtendingSelection: false)
                 return
             }
-            if tables.contains(where: { $0.tableColumns.first?.identifier.rawValue == "session_id" }) {
+            if tables.contains(where: { table in
+                table.tableColumns.contains(where: { $0.identifier.rawValue == "session_id" })
+            }) {
                 timer.invalidate()
             }
         }
@@ -183,14 +196,15 @@ private enum AutomationGUIFixture {
                 fail("Timed out opening the persisted automation review window.", status: 1)
             }
             let tables = descendants(of: root).compactMap { $0 as? NSTableView }
-            if let sidebar = tables.first(where: { $0.numberOfRows == 7 && $0.tableColumns.count == 1 }),
-               sidebar.selectedRow != 4 {
-                sidebar.selectRowIndexes(IndexSet(integer: 4), byExtendingSelection: false)
+            if let sidebar = tables.first(where: { $0.identifier?.rawValue == "DashboardNavigationTable" }),
+               let automationRow = sidebarRouteRow(named: "전략 자동화", in: sidebar),
+               sidebar.selectedRow != automationRow {
+                sidebar.selectRowIndexes(IndexSet(integer: automationRow), byExtendingSelection: false)
                 dashboard.contentView?.layoutSubtreeIfNeeded()
                 return
             }
             guard let sessionTable = tables.first(where: {
-                $0.tableColumns.first?.identifier.rawValue == "session_id"
+                $0.tableColumns.contains(where: { $0.identifier.rawValue == "session_id" })
             }) else { return }
             guard sessionTable.numberOfRows > 0 else { return }
             if sessionTable.selectedRow != 0 {

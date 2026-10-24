@@ -919,6 +919,7 @@ pub enum AutomationEventKind {
     Resumed,
     Stopped,
     CandleObserved,
+    DecisionDeferred,
     SignalObserved,
     IntentRejected,
     OrderAdmitted,

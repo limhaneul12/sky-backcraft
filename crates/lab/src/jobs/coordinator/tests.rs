@@ -11,11 +11,15 @@ use crate::jobs::JobRuntime;
 use crate::market_data::UpbitClient;
 use axum::extract::State;
 use axum::http::{StatusCode, Uri};
+use futures_util::{SinkExt, StreamExt};
 use rust_decimal::Decimal;
 use std::fs;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use tokio::net::TcpListener;
 use tokio::sync::{Notify, oneshot};
+use tokio_tungstenite::accept_async;
+use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -119,6 +123,777 @@ async fn start_request_aware_fixture(
     start_fixture_with_mode(false, true, temporary_failures).await
 }
 
+#[tokio::test]
+async fn synthetic_job_runtime_does_not_open_the_production_public_feed() -> Result<(), LabError> {
+    use crate::contracts::RealtimeConnectionState;
+
+    let root = TempRoot::new("synthetic-no-production-ws");
+    let owner = DatabaseOwner::open(root.0.clone())?;
+    let runtime = JobRuntime::start(
+        owner.handle(),
+        UpbitClient::synthetic_local("http://127.0.0.1:1")?,
+        root.0.clone(),
+        None,
+    )
+    .await?;
+    let service = runtime.service();
+    assert!(service.inner.public_market_feed.is_none());
+    assert_eq!(
+        service.realtime_status().market.state,
+        RealtimeConnectionState::Unavailable
+    );
+    runtime.shutdown().await?;
+    owner.shutdown()?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one local fixture proves paper and MOCK automation share the joined WebSocket source and causal candle"
+)]
+async fn shared_public_feed_drives_paper_and_mock_from_one_confirmed_candle()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use crate::contracts::{
+        AssetQuantity, AutomationRiskPolicy, AutomationSessionMode, AutomationSessionQuery,
+        AutomationSessionWrite, CandleInterval, CostPolicy, ExecutionPolicy, PaperEventKind,
+        PaperMarketRuleScenario, PaperMarketStart, PaperSessionQuery, PaperSessionWrite,
+        PolicyDefinition, PolicyIndicator, PolicyIndicatorKind, PolicyProgram, PolicyRule,
+        PolicySignalExpiry, PolicyTarget, PolicyWrite, QuoteAmount, RequestId, RulesProgram,
+        TickBand, UtcTimestamp, Weight,
+    };
+    use crate::upbit::execution::LiveExecutionPolicy;
+
+    let root = TempRoot::new("shared-public-feed-paper-mock");
+    let owner = DatabaseOwner::open(root.0.clone())?;
+    let database = owner.handle();
+
+    let now = UtcTimestamp::now();
+    let interval = CandleInterval::M1;
+    let close = crate::scheduling::latest_completed_boundary(now, interval)?;
+    let open = UtcTimestamp(close.0 - interval.duration());
+    let started_at = UtcTimestamp(open.0 + chrono::Duration::seconds(5));
+    let candle_json = |open_at: UtcTimestamp, price: i64| {
+        serde_json::json!({
+            "market": "KRW-BTC",
+            "candle_date_time_utc": open_at.0.naive_utc().format("%Y-%m-%dT%H:%M:%S").to_string(),
+            "opening_price": price,
+            "high_price": price,
+            "low_price": price,
+            "trade_price": price,
+            "candle_acc_trade_volume": 1,
+            "candle_acc_trade_price": price,
+        })
+    };
+    // The joined coordinator bootstraps the same bounded history requested by
+    // paper recovery. Keep this provider fixture honest about that count rather
+    // than relying on an earlier two-row cache to bypass bootstrap validation.
+    let history = (0..crate::paper::MAX_PAPER_RECOVERY_BARS)
+        .map(|offset| {
+            let open_at = UtcTimestamp(open.0 - interval.duration() * i32::try_from(offset)?);
+            Ok(candle_json(
+                open_at,
+                if offset == 0 { 10_000 } else { 9_900 },
+            ))
+        })
+        .collect::<Result<Vec<_>, std::num::TryFromIntError>>()?;
+    let rest_body = serde_json::to_vec(&history)?;
+    let rest_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let rest_address = rest_listener.local_addr()?;
+    let rest_body = Arc::new(rest_body);
+    let app = axum::Router::new().fallback({
+        let rest_body = rest_body.clone();
+        move || {
+            let body = rest_body.as_ref().clone();
+            async move {
+                (
+                    StatusCode::OK,
+                    [("Remaining-Req", "group=candle; min=1800; sec=59")],
+                    body,
+                )
+            }
+        }
+    });
+    let (rest_stop, rest_stopped) = oneshot::channel();
+    let rest_server = tokio::spawn(async move {
+        axum::serve(rest_listener, app)
+            .with_graceful_shutdown(async {
+                let _ = rest_stopped.await;
+            })
+            .await
+    });
+
+    let ws_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let ws_address = ws_listener.local_addr()?;
+    let ws_endpoint = format!("ws://{ws_address}/websocket/v1");
+    let completed_frame = serde_json::json!({
+        "type": "candle.1m",
+        "code": "KRW-BTC",
+        "timestamp": (close.0 - chrono::Duration::milliseconds(1)).timestamp_millis(),
+        "candle_date_time_utc": open.0.naive_utc().format("%Y-%m-%dT%H:%M:%S").to_string(),
+        "opening_price": 10_000,
+        "high_price": 10_000,
+        "low_price": 10_000,
+        "trade_price": 10_000,
+        "candle_acc_trade_volume": 1,
+        "candle_acc_trade_price": 10_000,
+        "stream_type": "REALTIME",
+    })
+    .to_string();
+    let forming_frame = serde_json::json!({
+        "type": "candle.1m",
+        "code": "KRW-BTC",
+        "timestamp": now.0.timestamp_millis(),
+        "candle_date_time_utc": close.0.naive_utc().format("%Y-%m-%dT%H:%M:%S").to_string(),
+        "opening_price": 50_000,
+        "high_price": 50_000,
+        "low_price": 50_000,
+        "trade_price": 50_000,
+        "candle_acc_trade_volume": 1,
+        "candle_acc_trade_price": 50_000,
+        "stream_type": "REALTIME",
+    })
+    .to_string();
+    let frame_diagnostic = format!("completed={completed_frame}; forming={forming_frame}");
+    let (subscription_tx, subscription_rx) = oneshot::channel();
+    let (ws_closed_tx, ws_closed_rx) = oneshot::channel();
+    let ws_server = tokio::spawn(async move {
+        let (stream, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(15), ws_listener.accept())
+                .await??;
+        let mut socket = accept_async(stream)
+            .await
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let subscription =
+            match tokio::time::timeout(std::time::Duration::from_secs(5), socket.next()).await? {
+                Some(Ok(Message::Text(text))) => text.to_string(),
+                _ => return Err(std::io::Error::other("public subscription request missing")),
+            };
+        let _sent = subscription_tx.send(subscription);
+        for frame in [completed_frame, forming_frame] {
+            socket
+                .send(Message::Text(frame.into()))
+                .await
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+        }
+        loop {
+            match socket.next().await {
+                Some(Ok(Message::Ping(payload))) => {
+                    socket
+                        .send(Message::Pong(payload))
+                        .await
+                        .map_err(|error| std::io::Error::other(error.to_string()))?;
+                }
+                Some(Ok(Message::Close(_frame))) => {
+                    socket
+                        .flush()
+                        .await
+                        .map_err(|error| std::io::Error::other(error.to_string()))?;
+                    let _sent = ws_closed_tx.send(());
+                    break;
+                }
+                Some(Ok(_)) => {}
+                Some(Err(error)) => return Err(std::io::Error::other(error.to_string())),
+                None => break,
+            }
+        }
+        Ok::<(), std::io::Error>(())
+    });
+
+    let runtime = JobRuntime::start_with_test_market_feed_config(
+        database.clone(),
+        UpbitClient::synthetic_local(&format!("http://{rest_address}"))?,
+        crate::upbit::client::UpbitPrivateClient::new_mock(),
+        crate::upbit::risk::RiskGuard::new(crate::upbit::risk::RiskConfig::default()),
+        root.0.clone(),
+        Some("shared-feed-test".into()),
+        crate::realtime::PublicMarketFeedConfig::loopback_fixture(&ws_endpoint)?,
+    )
+    .await?;
+    let service = runtime.service();
+
+    let definition = PolicyDefinition {
+        schema_version: "1.0".into(),
+        name: "shared-source-paper-mock-test".into(),
+        description: "SYNTHETIC_TEST_ONLY shared feed decision fixture".into(),
+        program: PolicyProgram::Rules {
+            program: RulesProgram {
+                condition_roles: Vec::new(),
+                indicators: vec![PolicyIndicator {
+                    id: "close".into(),
+                    indicator: PolicyIndicatorKind::Close,
+                    source_interval: None,
+                }],
+                states: Vec::new(),
+                rules: vec![PolicyRule {
+                    id: "buy".into(),
+                    condition: crate::contracts::BoolExpr::Compare {
+                        comparison: crate::contracts::CompareOp::Gt,
+                        left: crate::contracts::NumericExpr::Indicator { id: "close".into() },
+                        right: crate::contracts::NumericExpr::Constant { value: 0.0 },
+                    },
+                    target: PolicyTarget::Weight {
+                        value: crate::contracts::NumericExpr::Constant { value: 0.001 },
+                    },
+                }],
+                fallback: PolicyTarget::Hold,
+                signal_expiry: PolicySignalExpiry::EndOfRange,
+            },
+        },
+    };
+    let policy_write = PolicyWrite::Create {
+        request_id: RequestId::new("shared-feed-test-policy")?,
+        definition,
+    };
+    let policy = database
+        .call("shared_feed_test_policy", move |store| {
+            store.write_policy(&policy_write, started_at)
+        })
+        .await?;
+    let market = MarketId::parse_upbit("KRW-BTC")?;
+    let zero = crate::contracts::BasisPoints::new(Decimal::ZERO)?;
+    let paper_write = PaperSessionWrite::Start {
+        request_id: RequestId::new("shared-feed-test-paper")?,
+        policy_ref: policy.snapshot.reference.clone(),
+        decision_interval: interval,
+        execution_resolution: interval,
+        latency_ms: 0,
+        execution: ExecutionPolicy::NextBarOpen {
+            participation_cap: Weight::new(Decimal::ONE)?,
+        },
+        markets: vec![PaperMarketStart {
+            market: market.clone(),
+            initial_cash: QuoteAmount::new(Decimal::from(1_000_000))?,
+            costs: CostPolicy {
+                buy_fee_bps: zero,
+                sell_fee_bps: zero,
+                maker_fee_bps: zero,
+                half_spread_bps: zero,
+                slippage_bps: zero,
+                impact_bps: zero,
+                assumption_label: "zero synthetic costs".into(),
+                dynamic: None,
+            },
+            market_rules: PaperMarketRuleScenario::SimulatedScenario {
+                min_notional: QuoteAmount::new(Decimal::ONE)?,
+                quantity_step: AssetQuantity::new(Decimal::new(1, 4))?,
+                ticks: vec![TickBand {
+                    lower_bound: QuoteAmount::new(Decimal::ZERO)?,
+                    tick: crate::contracts::PriceKrw::new(Decimal::ONE)?,
+                }],
+                assumption_label: "synthetic test rules".into(),
+            },
+        }],
+    };
+    let paper_policy_ref = policy.snapshot.reference.clone();
+    let paper_response = database
+        .call("shared_feed_test_paper_start", move |store| {
+            if store.load_policy_revision(&paper_policy_ref)?.is_none() {
+                return Err(LabError::DataCorrupt("test policy disappeared".into()));
+            }
+            store.paper_write(&paper_write, started_at)
+        })
+        .await?;
+
+    let automation_write = AutomationSessionWrite::Start {
+        request_id: RequestId::new("shared-feed-test-automation")?,
+        policy_ref: policy.snapshot.reference.clone(),
+        market: market.clone(),
+        decision_interval: interval,
+        mode: AutomationSessionMode::Mock,
+        risk: AutomationRiskPolicy {
+            max_order_notional_krw: QuoteAmount::new(Decimal::from(100_000))?,
+            max_daily_notional_krw: QuoteAmount::new(Decimal::from(1_000_000))?,
+            max_asset_exposure_krw: QuoteAmount::new(Decimal::from(100_000))?,
+            max_daily_loss_krw: QuoteAmount::new(Decimal::from(100_000))?,
+            activation_loss_limit_krw: None,
+            max_open_orders: 1,
+            max_orders_per_interval: 1,
+            max_balance_age_seconds: 3_600,
+            max_feed_age_seconds: 3_600,
+        },
+    };
+    let policy_snapshot = policy.snapshot;
+    let automation_session = database
+        .call("shared_feed_test_mock_start", move |store| {
+            store.automation_begin_request(
+                &automation_write,
+                Some("mock:upbit-default"),
+                started_at,
+            )?;
+            store.automation_write_with_policy(
+                &automation_write,
+                Some(policy_snapshot),
+                Some("mock:upbit-default".into()),
+                started_at,
+                LiveExecutionPolicy::Disabled,
+            )
+        })
+        .await?;
+    let requirements = database
+        .call("shared_feed_test_requirements", |store| {
+            store.active_realtime_market_requirements()
+        })
+        .await?;
+    assert_eq!(requirements.len(), 1, "paper and MOCK share one feed key");
+    assert!(requirements.contains(&(market.clone(), interval)));
+
+    let feed = service
+        .inner
+        .public_market_feed
+        .as_ref()
+        .ok_or("runtime did not retain the injected public feed")?;
+    // This fixture creates sessions through direct Store calls, so explicitly
+    // wake the coordinator as the service admission path does after a write.
+    feed.wake().notify_one();
+    let subscription = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        subscription_rx,
+    )
+    .await
+    .map_err(|error| {
+        std::io::Error::other(format!(
+            "public WS subscription timed out: {error}; health={:?}; status={:?}; server_finished={}; requirements={requirements:?}",
+            feed.health(),
+            service.realtime_status(),
+            ws_server.is_finished(),
+        ))
+    })??;
+    let subscription: serde_json::Value = serde_json::from_str(&subscription)?;
+    assert_eq!(subscription[1]["type"], "candle.1m");
+    let mut health_receiver = feed.subscribe_health();
+    let mut first_feed_error = None;
+    let readiness = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            if feed.ensure_ready(&market, interval).is_ok() {
+                break;
+            }
+            tokio::select! {
+                changed = health_receiver.changed() => {
+                    if changed.is_ok() && first_feed_error.is_none() {
+                        first_feed_error = health_receiver
+                            .borrow_and_update()
+                            .last_error_category
+                            .map(|category| format!("{category:?}"));
+                    }
+                }
+                () = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+            }
+        }
+    })
+    .await;
+    if let Err(error) = readiness {
+        let health = feed.health();
+        let server_finished = ws_server.is_finished();
+        let server_result = if server_finished {
+            format!("{:?}", ws_server.await)
+        } else {
+            "server still running".into()
+        };
+        return Err(std::io::Error::other(format!(
+            "public WS per-key readiness timed out: {error}; first_feed_error={first_feed_error:?}; health={health:?}; status={:?}; server_finished={server_finished}; server_result={server_result}; frame={frame_diagnostic}; requirements={requirements:?}",
+            service.realtime_status(),
+        ))
+        .into());
+    }
+    let count = crate::contracts::ProbeCount::try_from(2_u32)?;
+    let (_, shared_observations) = feed
+        .read_or_bootstrap_observations(&market, interval, count)
+        .await?;
+    let shared_candle = shared_observations
+        .iter()
+        .find(|observation| observation.candle.close_time_utc == close)
+        .ok_or("confirmed feed candle missing")?;
+    let provenance = {
+        let catalog = rusqlite::Connection::open_with_flags(
+            root.0.join("lab.sqlite"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        shared_candle
+            .raw_object_ids
+            .iter()
+            .map(|id| {
+                let json: String = catalog.query_row(
+                    "SELECT object_json FROM raw_objects WHERE id=?1",
+                    [id.as_str()],
+                    |row| row.get(0),
+                )?;
+                Ok::<crate::contracts::RawObjectRef, Box<dyn std::error::Error + Send + Sync>>(
+                    serde_json::from_str(&json)?,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let mut rest_reads = provenance
+        .iter()
+        .filter(|raw| raw.http_status == 200)
+        .collect::<Vec<_>>();
+    rest_reads.sort_by_key(|raw| raw.fetched_at);
+    assert_eq!(rest_reads.len(), 2);
+    assert_ne!(rest_reads[0].id, rest_reads[1].id);
+    assert!(
+        rest_reads[1].fetched_at.0 - rest_reads[0].fetched_at.0 >= chrono::Duration::seconds(1)
+    );
+    assert_eq!(
+        provenance
+            .iter()
+            .filter(|raw| raw.http_status == 101)
+            .count(),
+        1
+    );
+    assert_eq!(provenance.len(), 3);
+    assert!(shared_candle.candle.completed);
+    assert_eq!(
+        shared_candle.candle.close.get(),
+        rust_decimal::Decimal::from(10_000)
+    );
+    assert!(
+        shared_observations
+            .iter()
+            .all(|observation| observation.candle.open_time_utc != close)
+    );
+
+    let paper_session_id = paper_response.session.session_id;
+    let automation_session_id = automation_session.session.session_id;
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let paper_page: crate::contracts::PaperSessionEventPage = serde_json::from_value(
+                service
+                    .paper_session_query(PaperSessionQuery::Events {
+                        session_id: paper_session_id.clone(),
+                        after_sequence: None,
+                        limit: 100,
+                    })
+                    .await?,
+            )?;
+            let mock_ledger: crate::contracts::AutomationLedgerPage = serde_json::from_value(
+                service
+                    .automation_session_query(AutomationSessionQuery::Ledger {
+                        session_id: automation_session_id.clone(),
+                        after_sequence: None,
+                        limit: 100,
+                    })
+                    .await?,
+            )?;
+            let paper_consumed = paper_page.items.iter().any(|event| {
+                event.kind == PaperEventKind::CandleProcessed
+                    && event.finalized_at == Some(close)
+                    && event.candle.as_ref().is_some_and(|candle| {
+                        candle.open_time == open && candle.close_time == close
+                    })
+            });
+            if paper_consumed && !mock_ledger.fills.is_empty() {
+                assert_eq!(
+                    mock_ledger.fills.len(),
+                    1,
+                    "replayed wakes do not double-fill"
+                );
+                break Ok::<(), LabError>(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await??;
+
+    runtime.shutdown().await?;
+    tokio::time::timeout(std::time::Duration::from_secs(2), ws_closed_rx).await??;
+    ws_server.await??;
+    let _sent = rest_stop.send(());
+    rest_server.await??;
+    owner.shutdown()?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one loopback runtime regression reproduces durable-history versus cold-feed-cache readiness"
+)]
+async fn coordinator_bootstraps_cold_mtf_feed_keys_when_durable_candles_are_already_present()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use crate::contracts::{
+        AssetQuantity, BasisPoints, CandleInterval, CostPolicy, ExecutionPolicy, MarketId,
+        PaperMarketRuleScenario, PaperMarketStart, PaperSessionWrite, PolicyDefinition,
+        PolicyIndicator, PolicyIndicatorKind, PolicyRule, PolicySignalExpiry, PolicyTarget,
+        PolicyWrite, ProbeCount, QuoteAmount, RequestId, RulesProgram, TickBand, UtcTimestamp,
+        Weight,
+    };
+    use futures_util::{SinkExt, StreamExt};
+    use rust_decimal::Decimal;
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+    use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+    // Keep the run away from a source-interval boundary so the old durable-due
+    // selector cannot legitimately begin bootstrapping H1/H4 during this fixture.
+    let now = UtcTimestamp::now();
+    let next_h1 = crate::scheduling::latest_completed_boundary(now, CandleInterval::H1)?
+        .0
+        .checked_add_signed(CandleInterval::H1.duration())
+        .ok_or("H1 test boundary overflow")?;
+    let until_boundary = next_h1.signed_duration_since(now.0);
+    if until_boundary >= chrono::Duration::zero() && until_boundary < chrono::Duration::seconds(30)
+    {
+        let wait_ms =
+            u64::try_from((until_boundary + chrono::Duration::seconds(1)).num_milliseconds())?;
+        tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+    }
+
+    let root = TempRoot::new("cold-mtf-feed-cache");
+    let owner = DatabaseOwner::open(root.0.clone())?;
+    let database = owner.handle();
+    let rest_fixture = start_request_aware_fixture(0).await?;
+    let rest_client = UpbitClient::synthetic_local(&rest_fixture.base_url)?;
+    let market = MarketId::parse_upbit("KRW-BTC")?;
+    let preexisting_count = ProbeCount::try_from(199_u32)?;
+    let (raw, observations) = rest_client
+        .poll_paper_observations(&market, CandleInterval::H1, preexisting_count, &database)
+        .await?;
+    database
+        .call("seed_preexisting_h1_candles", move |store| {
+            store.reconcile_running_paper_sessions(&[(raw, observations)], UtcTimestamp::now())
+        })
+        .await?;
+
+    let zero_bps = BasisPoints::new(Decimal::ZERO)?;
+    let definition = PolicyDefinition {
+        schema_version: "1.0".into(),
+        name: "cold-mtf-feed-cache-test".into(),
+        description: "SYNTHETIC_TEST_ONLY M5 policy with persisted H1 source".into(),
+        program: crate::contracts::PolicyProgram::Rules {
+            program: RulesProgram {
+                condition_roles: Vec::new(),
+                indicators: vec![PolicyIndicator {
+                    id: "h1_close".into(),
+                    indicator: PolicyIndicatorKind::Close,
+                    source_interval: Some(CandleInterval::H1),
+                }],
+                states: Vec::new(),
+                rules: vec![PolicyRule {
+                    id: "hold".into(),
+                    condition: crate::contracts::BoolExpr::Compare {
+                        comparison: crate::contracts::CompareOp::Gt,
+                        left: crate::contracts::NumericExpr::Indicator {
+                            id: "h1_close".into(),
+                        },
+                        right: crate::contracts::NumericExpr::Constant { value: 0.0 },
+                    },
+                    target: PolicyTarget::Hold,
+                }],
+                fallback: PolicyTarget::Hold,
+                signal_expiry: PolicySignalExpiry::EndOfRange,
+            },
+        },
+    };
+    let policy_write = PolicyWrite::Create {
+        request_id: RequestId::new("cold-mtf-feed-cache-policy")?,
+        definition,
+    };
+    let started_at = UtcTimestamp::now();
+    let policy = database
+        .call("create_cold_mtf_feed_cache_policy", move |store| {
+            store.write_policy(&policy_write, started_at)
+        })
+        .await?;
+    let paper_write = PaperSessionWrite::Start {
+        request_id: RequestId::new("cold-mtf-feed-cache-paper")?,
+        policy_ref: policy.snapshot.reference,
+        decision_interval: CandleInterval::M5,
+        execution_resolution: CandleInterval::M5,
+        latency_ms: 0,
+        execution: ExecutionPolicy::NextBarOpen {
+            participation_cap: Weight::new(Decimal::ONE)?,
+        },
+        markets: vec![PaperMarketStart {
+            market: market.clone(),
+            initial_cash: QuoteAmount::new(Decimal::from(100_000))?,
+            costs: CostPolicy {
+                buy_fee_bps: zero_bps,
+                sell_fee_bps: zero_bps,
+                maker_fee_bps: zero_bps,
+                half_spread_bps: zero_bps,
+                slippage_bps: zero_bps,
+                impact_bps: zero_bps,
+                assumption_label: "synthetic test costs".into(),
+                dynamic: None,
+            },
+            market_rules: PaperMarketRuleScenario::SimulatedScenario {
+                min_notional: QuoteAmount::new(Decimal::ONE)?,
+                quantity_step: AssetQuantity::new(Decimal::new(1, 8))?,
+                ticks: vec![TickBand {
+                    lower_bound: QuoteAmount::new(Decimal::ZERO)?,
+                    tick: crate::contracts::PriceKrw::new(Decimal::ONE)?,
+                }],
+                assumption_label: "synthetic test rules".into(),
+            },
+        }],
+    };
+    database
+        .call("start_cold_mtf_feed_cache_paper", move |store| {
+            store.paper_write(&paper_write, started_at)
+        })
+        .await?;
+
+    let requirements = database
+        .call("cold_mtf_feed_cache_requirements", |store| {
+            store.active_realtime_market_requirements()
+        })
+        .await?;
+    assert_eq!(requirements.len(), 2);
+    for interval in [CandleInterval::M5, CandleInterval::H1] {
+        assert!(requirements.contains(&(market.clone(), interval)));
+    }
+    let due = database
+        .call("cold_mtf_feed_cache_durable_due", move |store| {
+            store.due_paper_network_polls(UtcTimestamp::now())
+        })
+        .await?;
+    assert!(
+        due.iter()
+            .any(|requirement| requirement.interval == CandleInterval::M5)
+            && due
+                .iter()
+                .all(|requirement| requirement.interval != CandleInterval::H1),
+        "M5 may be due, but persisted H1 history already reaches its source boundary: {due:?}"
+    );
+
+    let ws_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let ws_address = ws_listener.local_addr()?;
+    let ws_endpoint = format!("ws://{ws_address}/websocket/v1");
+    let frame_time = UtcTimestamp::now();
+    let mut frames = Vec::new();
+    for (interval, stream_type) in [
+        (CandleInterval::M5, "candle.5m"),
+        (CandleInterval::H1, "candle.60m"),
+    ] {
+        let open = crate::scheduling::latest_completed_boundary(frame_time, interval)?;
+        frames.push(
+            serde_json::json!({
+                "type": stream_type,
+                "code": market.code(),
+                "timestamp": frame_time.0.timestamp_millis(),
+                "candle_date_time_utc": open.0.naive_utc().format("%Y-%m-%dT%H:%M:%S").to_string(),
+                "opening_price": 100_000,
+                "high_price": 100_001,
+                "low_price": 99_999,
+                "trade_price": 100_000,
+                "candle_acc_trade_volume": 1,
+                "candle_acc_trade_price": 100_000,
+                "stream_type": "SNAPSHOT",
+            })
+            .to_string(),
+        );
+    }
+    let (subscription_tx, subscription_rx) = oneshot::channel();
+    let (frames_sent_tx, frames_sent_rx) = oneshot::channel();
+    let (ws_stop_tx, mut ws_stop_rx) = oneshot::channel();
+    let ws_server = tokio::spawn(async move {
+        let (stream, _) = tokio::select! {
+            _ = &mut ws_stop_rx => return Ok::<(), std::io::Error>(()),
+            result = ws_listener.accept() => result?,
+        };
+        let mut socket = accept_async(stream)
+            .await
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let subscription =
+            match tokio::time::timeout(std::time::Duration::from_secs(5), socket.next()).await {
+                Ok(Some(Ok(Message::Text(text)))) => text.to_string(),
+                _ => return Err(std::io::Error::other("public subscription request missing")),
+            };
+        let _sent = subscription_tx.send(subscription);
+        for frame in frames {
+            socket
+                .send(Message::Text(frame.into()))
+                .await
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+        }
+        let _sent = frames_sent_tx.send(());
+        loop {
+            tokio::select! {
+                _ = &mut ws_stop_rx => break,
+                incoming = socket.next() => {
+                    match incoming {
+                        Some(Ok(Message::Ping(payload))) => {
+                            socket
+                                .send(Message::Pong(payload))
+                                .await
+                                .map_err(|error| std::io::Error::other(error.to_string()))?;
+                        }
+                        Some(Ok(Message::Close(_)) | Err(_)) | None => break,
+                        Some(Ok(_)) => {}
+                    }
+                }
+            }
+        }
+        Ok::<(), std::io::Error>(())
+    });
+
+    let runtime = JobRuntime::start_with_test_market_feed_config(
+        database.clone(),
+        rest_client,
+        crate::upbit::client::UpbitPrivateClient::new_mock(),
+        crate::upbit::risk::RiskGuard::new(crate::upbit::risk::RiskConfig::default()),
+        root.0.clone(),
+        Some("cold-mtf-feed-cache-test".into()),
+        crate::realtime::PublicMarketFeedConfig::loopback_fixture(&ws_endpoint)?,
+    )
+    .await?;
+    let service = runtime.service();
+    let feed = service
+        .inner
+        .public_market_feed
+        .as_ref()
+        .ok_or("runtime did not retain the injected public feed")?;
+    feed.wake().notify_one();
+
+    let subscription = tokio::time::timeout(std::time::Duration::from_secs(10), subscription_rx)
+        .await
+        .ok()
+        .and_then(Result::ok);
+    let frames_sent = if subscription.is_some() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), frames_sent_rx)
+            .await
+            .is_ok_and(|result| result.is_ok())
+    } else {
+        false
+    };
+    let readiness = if frames_sent {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if service.realtime_status().market.ready_for_decisions {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap_or(false)
+    } else {
+        false
+    };
+    let market_status = service.realtime_status().market;
+    runtime.shutdown().await?;
+    let _sent = ws_stop_tx.send(());
+    ws_server.await??;
+    let _sent = rest_fixture.stop.send(());
+    rest_fixture.task.await??;
+    owner.shutdown()?;
+
+    assert!(
+        subscription.is_some(),
+        "runtime did not subscribe to active MTF keys"
+    );
+    assert!(
+        frames_sent,
+        "loopback WebSocket did not send its MTF snapshots"
+    );
+    assert!(
+        readiness,
+        "active M5/H1 keys remained unready after coordinator bootstrap; market_status={market_status:?}"
+    );
+    Ok(())
+}
+
 async fn start_fixture_with_mode(
     block_candles: bool,
     request_aware: bool,
@@ -207,24 +982,35 @@ fn request_aware_wire_candles(uri: &Uri) -> Vec<u8> {
         .and_then(|value| value.parse::<i64>().ok())
         .unwrap_or(2)
         .clamp(1, 200);
-    let anchor = parameters
+    let unit = uri
+        .path()
+        .rsplit('/')
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+        .expect("fixture candle interval");
+    let interval = match unit {
+        1 => crate::contracts::CandleInterval::M1,
+        5 => crate::contracts::CandleInterval::M5,
+        15 => crate::contracts::CandleInterval::M15,
+        60 => crate::contracts::CandleInterval::H1,
+        240 => crate::contracts::CandleInterval::H4,
+        _ => panic!("unsupported fixture candle interval {unit}"),
+    };
+    let step_seconds = interval.duration().num_seconds();
+    let requested_anchor = parameters
         .get("to")
         .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-        .map_or_else(
-            || {
-                let now = chrono::Utc::now();
-                chrono::DateTime::from_timestamp(
-                    now.timestamp() - now.timestamp().rem_euclid(3_600),
-                    0,
-                )
-                .expect("current hourly boundary")
-            },
-            |value| value.with_timezone(&chrono::Utc),
-        );
+        .map_or_else(chrono::Utc::now, |value| value.with_timezone(&chrono::Utc));
+    let anchor_seconds = requested_anchor.timestamp();
+    let anchor = chrono::DateTime::from_timestamp(
+        anchor_seconds - anchor_seconds.rem_euclid(step_seconds),
+        0,
+    )
+    .expect("aligned fixture candle boundary");
     let rows = (0..count)
         .map(|offset| {
             let opened = anchor
-                .checked_sub_signed(chrono::Duration::hours(offset + 1))
+                .checked_sub_signed(chrono::Duration::seconds(step_seconds * (offset + 1)))
                 .expect("fixture candle time");
             serde_json::json!({
                 "market": market,

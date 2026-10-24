@@ -1,5 +1,7 @@
 //! Pure deterministic research-suite geometry and selection decisions.
 
+pub mod counterfactual;
+
 use crate::contracts::{
     ContentHash, CostPolicy, DatasetSnapshot, EligibleEvidence, EvidenceSnapshot, ExperimentSpec,
     FrozenPolicyRevision, FrozenResearchSuite, LabError, MAX_RUN_EVENTS, MAX_SUITE_CELLS,
@@ -706,14 +708,29 @@ pub fn freeze(
 /// Legacy v1/v2 plans retain their existing full-plan input digest unchanged.
 /// # Errors
 /// Rejects non-v3 plans, missing frozen policies, corrupt evidence or conflicting observations.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one audit path binds declared windows and PIT evidence into a single causal identity"
-)]
 pub fn causal_input_digest(
     plan: &ResolvedPlan,
     datasets: &[DatasetSnapshot],
     evidence: Option<&EvidenceSnapshot>,
+) -> Result<ContentHash, LabError> {
+    let cache = crate::policy_engine::PreparedBarCache::prewarm_for_plan(plan, datasets, &|| false);
+    causal_input_digest_with_cache(plan, datasets, evidence, Some(&cache))
+}
+
+/// Hash only the v3 causal observation windows and PIT-eligible evidence inputs,
+/// reusing an optional pre-warmed [`crate::policy_engine::PreparedBarCache`].
+///
+/// # Errors
+/// Has the same failure contract as [`causal_input_digest`].
+#[expect(
+    clippy::too_many_lines,
+    reason = "one audit path binds declared windows and PIT evidence into a single causal identity"
+)]
+pub fn causal_input_digest_with_cache(
+    plan: &ResolvedPlan,
+    datasets: &[DatasetSnapshot],
+    evidence: Option<&EvidenceSnapshot>,
+    bar_cache: Option<&crate::policy_engine::PreparedBarCache>,
 ) -> Result<ContentHash, LabError> {
     if plan.spec.schema_version != "3.0" && plan.spec.causal_execution.is_none() {
         return Ok(plan.input_digest.clone());
@@ -764,7 +781,7 @@ pub fn causal_input_digest(
                     .find(|policy| policy.reference == *reference)
             })
             .is_some_and(|policy| policy.definition.requires_evidence());
-        let decision_bars = crate::policy_engine::prepare_interval_bars(
+        let decision_bars = crate::policy_engine::prepare_interval_bars_cached(
             datasets,
             &admission.market,
             plan.spec.decision_interval,
@@ -772,12 +789,14 @@ pub fn causal_input_digest(
                 decision_range,
                 plan.spec.range.start(),
             ),
+            bar_cache,
         )?;
-        let execution_bars = crate::policy_engine::prepare_interval_bars(
+        let execution_bars = crate::policy_engine::prepare_interval_bars_cached(
             datasets,
             &admission.market,
             plan.spec.execution_resolution,
             execution_range,
+            bar_cache,
         )?;
         insert_causal_observations(&mut observations, &decision_bars, |observation| {
             observation.candle.close_time_utc < plan.spec.range.end()
@@ -790,7 +809,7 @@ pub fn causal_input_digest(
                 source_interval,
                 source_warmup,
             )?;
-            let source_bars = crate::policy_engine::prepare_interval_bars(
+            let source_bars = crate::policy_engine::prepare_interval_bars_cached(
                 datasets,
                 &admission.market,
                 source_interval,
@@ -798,11 +817,12 @@ pub fn causal_input_digest(
                     source_range,
                     plan.spec.range.start(),
                 ),
+                bar_cache,
             )?;
             insert_causal_observations(&mut observations, &source_bars, |_| true)?;
         }
         if requires_evidence {
-            for observation in &decision_bars {
+            for observation in decision_bars.iter() {
                 if observation.candle.close_time_utc < plan.spec.range.end() {
                     evidence_points.insert(
                         (market_code.clone(), observation.candle.close_time_utc),
@@ -816,14 +836,15 @@ pub fn causal_input_digest(
         .iter()
         .map(|(id, content_digest)| CausalObservation { id, content_digest })
         .collect();
-    let versions = evidence
+    let version_digests = evidence
         .map(|snapshot| {
             snapshot
                 .versions
                 .iter()
-                .map(|version| (&version.revision_id, version))
-                .collect::<BTreeMap<_, _>>()
+                .map(|version| Ok((&version.revision_id, ContentHash::of_value(version)?)))
+                .collect::<Result<BTreeMap<_, _>, LabError>>()
         })
+        .transpose()?
         .unwrap_or_default();
     let mut causal_evidence = Vec::with_capacity(evidence_points.len());
     for ((market_code, decision_time), market) in evidence_points {
@@ -832,13 +853,16 @@ pub fn causal_input_digest(
             .eligible
             .into_iter()
             .map(|eligible| {
-                let version = versions.get(&eligible.revision_id).ok_or_else(|| {
-                    LabError::InputHashMismatch(
-                        "eligible evidence revision is absent from frozen snapshot".into(),
-                    )
-                })?;
+                let version_digest = version_digests
+                    .get(&eligible.revision_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        LabError::InputHashMismatch(
+                            "eligible evidence revision is absent from frozen snapshot".into(),
+                        )
+                    })?;
                 Ok(CausalEligibleEvidence {
-                    version_digest: ContentHash::of_value(*version)?,
+                    version_digest,
                     effect: eligible,
                 })
             })

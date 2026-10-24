@@ -162,7 +162,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         super.init(window: window)
         window.delegate = self
         buildUI()
-        populate(.default)
+        populate((try? store.load()) ?? .default)
         updateTradingState(.standby)
         strategyAdmissionExitObserver = NotificationCenter.default.addObserver(
             forName: .nativeMCPOwnedHelperExited, object: nil, queue: .main

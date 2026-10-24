@@ -935,3 +935,203 @@ fn sealed_line_envelope_compatibility_and_multichunk_verification() {
     ));
     bad_byte_guard.restore(&store, &seeded.run_id);
 }
+
+fn legacy_nonblank_line_count(payload: &[u8]) -> u64 {
+    u64::try_from(
+        payload
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.strip_suffix(b"\r").unwrap_or(line).is_empty())
+            .count(),
+    )
+    .expect("test line count fits u64")
+}
+
+fn legacy_buffered_line_signature(payload: &[u8]) -> Result<Vec<String>, String> {
+    let mut lines = Vec::new();
+    for line in BufReader::new(payload).lines() {
+        let line = line.map_err(|error| {
+            format!(
+                "{:?}",
+                LabError::DataCorrupt(format!("sealed chunk line read: {error}"))
+            )
+        })?;
+        if !line.is_empty() {
+            let parsed = LedgerLine::from_line(&line).map_err(|error| format!("{error:?}"))?;
+            lines.push(parsed.to_line().map_err(|error| format!("{error:?}"))?);
+        }
+    }
+    Ok(lines)
+}
+
+fn streaming_line_signature(
+    compressed: &[u8],
+    event_count: u64,
+    uncompressed_bytes: u64,
+    max_uncompressed_bytes: u64,
+) -> Result<Vec<String>, String> {
+    let mut lines = Vec::new();
+    let result = super::visit_decompressed_chunk(
+        compressed,
+        event_count,
+        uncompressed_bytes,
+        max_uncompressed_bytes,
+        |line| lines.push(line.to_line().expect("fixture ledger line re-encodes")),
+    );
+    result.map(|()| lines).map_err(|error| format!("{error:?}"))
+}
+
+#[test]
+fn streaming_ledger_reader_matches_buffered_newline_and_blank_line_semantics() {
+    let first = r#"{"kind":"SIGNAL","model":"model-00","seq":1,"t":1,"r":{}}"#;
+    let second = r#"{"kind":"SIGNAL","model":"model-00","seq":2,"t":2,"r":{}}"#;
+    let long_line = serde_json::json!({
+        "kind": "SIGNAL",
+        "model": "model-00",
+        "seq": 3,
+        "t": 3,
+        "r": "x".repeat(64 * 1024),
+    })
+    .to_string();
+    assert!(
+        long_line.len() > 8 * 1024,
+        "line spans multiple reader buffers"
+    );
+    let payloads = [
+        format!("{first}\r\n\r\n{second}").into_bytes(),
+        format!("{long_line}\r\n{second}").into_bytes(),
+        format!("{first}\n\n").into_bytes(),
+        first.as_bytes().to_vec(),
+        b"\r\n".to_vec(),
+        b"\r".to_vec(),
+        b"\xff\n".to_vec(),
+        b"{not-json\n".to_vec(),
+    ];
+    assert_eq!(legacy_nonblank_line_count(b"\r"), 0);
+
+    for payload in payloads {
+        let compressed = gzip_bytes(&payload).expect("gzip newline fixture");
+        assert_eq!(
+            streaming_line_signature(
+                &compressed,
+                legacy_nonblank_line_count(&payload),
+                u64::try_from(payload.len()).expect("payload length fits u64"),
+                MAX_CHUNK_DECOMPRESSED_BYTES,
+            ),
+            legacy_buffered_line_signature(&payload),
+            "payload {payload:?}"
+        );
+    }
+}
+
+#[test]
+fn streaming_reader_drains_after_parse_error_and_prioritizes_chunk_integrity() {
+    let malformed = b"{not-json\n";
+    let compressed = gzip_bytes(malformed).expect("gzip malformed-line fixture");
+    let length = u64::try_from(malformed.len()).expect("fixture length fits u64");
+
+    let length_mismatch = super::visit_decompressed_chunk(
+        &compressed,
+        1,
+        length + 1,
+        MAX_CHUNK_DECOMPRESSED_BYTES,
+        |_| {},
+    );
+    assert!(matches!(
+        length_mismatch,
+        Err(LabError::InputHashMismatch(message))
+            if message == "sealed chunk decompressed length mismatch"
+    ));
+
+    let line_count_mismatch = super::visit_decompressed_chunk(
+        &compressed,
+        2,
+        length,
+        MAX_CHUNK_DECOMPRESSED_BYTES,
+        |_| {},
+    );
+    assert!(matches!(
+        line_count_mismatch,
+        Err(LabError::InputHashMismatch(message))
+            if message == "sealed chunk event count mismatch"
+    ));
+
+    let valid = r#"{"kind":"SIGNAL","model":"model-00","seq":1,"t":1,"r":{}}"#;
+    let with_later_lines = format!("{valid}\n{{not-json\n{valid}");
+    let compressed = gzip_bytes(with_later_lines.as_bytes()).expect("gzip parse-error fixture");
+    let mut visited = Vec::new();
+    let parse_error = super::visit_decompressed_chunk(
+        &compressed,
+        3,
+        u64::try_from(with_later_lines.len()).expect("fixture length fits u64"),
+        MAX_CHUNK_DECOMPRESSED_BYTES,
+        |line| visited.push(line.event_seq),
+    );
+    assert!(parse_error.is_err());
+    assert_eq!(visited, vec![1], "callbacks stop at the first bad line");
+
+    let mut bad_crc = gzip_bytes(malformed).expect("gzip CRC fixture");
+    let crc_byte = bad_crc.len().checked_sub(8).expect("gzip trailer present");
+    bad_crc[crc_byte] ^= 1;
+    let decode_error =
+        super::visit_decompressed_chunk(&bad_crc, 1, length, MAX_CHUNK_DECOMPRESSED_BYTES, |_| {});
+    assert!(matches!(
+        decode_error,
+        Err(LabError::DataCorrupt(message)) if message.contains("sealed chunk decode")
+    ));
+
+    let mut truncated = gzip_bytes(malformed).expect("gzip truncation fixture");
+    truncated.truncate(truncated.len() - 4);
+    let decode_error = super::visit_decompressed_chunk(
+        &truncated,
+        1,
+        length,
+        MAX_CHUNK_DECOMPRESSED_BYTES,
+        |_| {},
+    );
+    assert!(matches!(
+        decode_error,
+        Err(LabError::DataCorrupt(message)) if message.contains("sealed chunk decode")
+    ));
+}
+
+#[test]
+fn bounded_chunk_reader_stops_at_limit_plus_one_and_streaming_rejects_raw_overflow() {
+    let source = [1_u8, 2, 3, 4, 5, 6];
+    let mut reader = std::io::Cursor::new(source);
+    let error = super::read_bounded_chunk_bytes(&mut reader, 4)
+        .expect_err("compressed cap is detected after reading only its sentinel byte");
+    assert!(
+        matches!(error, LabError::DataCorrupt(message) if message == "sealed chunk exceeds size bound")
+    );
+    assert_eq!(reader.position(), 5);
+
+    let payload = vec![b'x'; 1024 * 1024];
+    let mut compressed = gzip_bytes(&payload).expect("gzip oversized raw-cap fixture");
+    let crc_byte = compressed
+        .len()
+        .checked_sub(8)
+        .expect("gzip trailer present");
+    compressed[crc_byte] ^= 1;
+    let buffered_error = super::gunzip_bytes_bounded(&compressed, 64)
+        .expect_err("buffered decompression also rejects over-cap payloads at its sentinel");
+    assert!(matches!(
+        buffered_error,
+        LabError::DataCorrupt(message) if message == "sealed chunk exceeds size bound"
+    ));
+    let mut visited = 0;
+    let error = super::visit_decompressed_chunk(
+        &compressed,
+        1,
+        u64::try_from(payload.len()).expect("fixture length fits u64"),
+        64,
+        |_| visited += 1,
+    )
+    .expect_err("raw cap overflow must fail before draining the corrupted gzip trailer");
+    assert!(
+        matches!(error, LabError::DataCorrupt(message) if message == "sealed chunk exceeds size bound")
+    );
+    assert_eq!(
+        visited, 0,
+        "an over-cap line is never passed to the visitor"
+    );
+}

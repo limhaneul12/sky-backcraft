@@ -1,15 +1,72 @@
-//! The JobRuntime-owned producer loop never executes engine or network work.
+//! The JobRuntime-owned coordinator schedules bounded producer and realtime work.
 
 mod schedule_recovery;
 
 use super::JobService;
 use crate::contracts::{
-    CollectionScheduleRecord, CollectionScheduleStatus, JobPayload, JobSubmission, LabError,
-    PlanRequest, RequestId, RunRequest, ScheduleFireStatus, ScheduleId, SuiteCase, SuiteCaseStatus,
-    SuiteId, SuitePhase, SuiteRecord, SuiteStatus, UtcTimestamp,
+    CandleInterval, CollectionScheduleRecord, CollectionScheduleStatus, JobPayload, JobSubmission,
+    LabError, MarketId, PlanRequest, RequestId, RunRequest, ScheduleFireStatus, ScheduleId,
+    SuiteCase, SuiteCaseStatus, SuiteId, SuitePhase, SuiteRecord, SuiteStatus, UtcTimestamp,
 };
+use crate::realtime::PublicMarketSubscription;
 use crate::scheduling::ScheduleTick;
+use crate::upbit::realtime::{PrivateAccountEvent, PrivateRealtimeConsumer};
+use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
+
+enum CoordinatorWake {
+    Safety,
+    MarketData,
+    PublicHealth,
+    PrivateHealth,
+    PrivateEvent(Box<PrivateAccountEvent>),
+    PrivateEventClosed,
+    PrivateHealthClosed,
+}
+
+fn private_event_generation(event: &PrivateAccountEvent) -> u64 {
+    match event {
+        PrivateAccountEvent::Baseline { baseline, .. } => baseline.generation,
+        PrivateAccountEvent::OrderObserved(observation) => observation.generation,
+        PrivateAccountEvent::AssetObserved(observation) => observation.generation,
+        PrivateAccountEvent::BootstrapComplete { generation, .. } => *generation,
+    }
+}
+
+fn invalidate_private_generation(
+    readiness: &crate::upbit::realtime::PrivateReadinessFence,
+    generation: u64,
+) -> Result<(), LabError> {
+    match readiness.invalidate_for_recovery(generation) {
+        Ok(_) | Err(crate::upbit::realtime::PrivateRealtimeError::StaleGeneration) => Ok(()),
+        Err(error) => Err(LabError::Internal(format!(
+            "private readiness invalidation failed: {error}"
+        ))),
+    }
+}
+
+fn private_recovery_error_is_transient(error: &LabError) -> bool {
+    matches!(
+        error,
+        LabError::NetworkUnavailable(_)
+            | LabError::RateLimited(_)
+            | LabError::TemporarilyBlocked(_)
+            | LabError::BlockedEvidence(_)
+            | LabError::OutcomeUnknown(_)
+    )
+}
+
+fn disable_private_lane(
+    readiness: &crate::upbit::realtime::PrivateReadinessFence,
+    generation: u64,
+    failure: crate::upbit::realtime::PrivateRealtimeFailure,
+    baseline_sequence: &mut Option<(u64, u64)>,
+    private_events: &mut Option<tokio::sync::mpsc::Receiver<PrivateAccountEvent>>,
+) {
+    readiness.mark_owner_failure(generation, failure);
+    *baseline_sequence = None;
+    *private_events = None;
+}
 
 #[derive(Debug)]
 enum Producer {
@@ -26,25 +83,302 @@ impl Producer {
 }
 
 impl JobService {
-    pub(super) async fn coordinate(self) -> Result<(), LabError> {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "this one wake-select state machine owns the safety cadence and all producer subscriptions"
+    )]
+    pub(super) async fn coordinate(
+        self,
+        private_consumer: Option<PrivateRealtimeConsumer>,
+    ) -> Result<(), LabError> {
         let mut poll = tokio::time::interval(std::time::Duration::from_secs(1));
         poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut tick_counter = 0_u64;
+        let market_wake = self
+            .inner
+            .public_market_feed
+            .as_ref()
+            .map(crate::realtime::PublicMarketFeed::wake);
+        let mut public_health = self
+            .inner
+            .public_market_feed
+            .as_ref()
+            .map(crate::realtime::PublicMarketFeed::subscribe_health);
+        let (mut private_events, mut private_health, private_readiness) =
+            private_consumer.map_or((None, None, None), |consumer| {
+                (
+                    Some(consumer.events),
+                    Some(consumer.health),
+                    Some(consumer.readiness),
+                )
+            });
+        let mut active_subscriptions = BTreeSet::new();
+        let mut private_baseline_sequence = None::<(u64, u64)>;
         loop {
-            tokio::select! {
+            let wake = tokio::select! {
                 () = self.inner.stop.cancelled() => return Ok(()),
-                _ = poll.tick() => {},
-            }
+                _ = poll.tick() => CoordinatorWake::Safety,
+                () = async {
+                    match market_wake.as_ref() {
+                        Some(signal) => signal.notified().await,
+                        None => std::future::pending().await,
+                    }
+                } => CoordinatorWake::MarketData,
+                changed = async {
+                    match public_health.as_mut() {
+                        Some(health) => health.changed().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    changed.map_err(|_| LabError::Internal("public feed health channel closed".into()))?;
+                    CoordinatorWake::PublicHealth
+                },
+                changed = async {
+                    match private_health.as_mut() {
+                        Some(health) => health.changed().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match changed {
+                        Ok(()) => CoordinatorWake::PrivateHealth,
+                        Err(_) => CoordinatorWake::PrivateHealthClosed,
+                    }
+                },
+                event = async {
+                    match private_events.as_mut() {
+                        Some(events) => events.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => match event {
+                    Some(event) => CoordinatorWake::PrivateEvent(Box::new(event)),
+                    None => CoordinatorWake::PrivateEventClosed,
+                },
+            };
             if !self.inner.admitting.load(Ordering::Acquire) {
                 return Ok(());
             }
-            let now = UtcTimestamp::now();
-            self.coordinate_once(now).await?;
-            tick_counter = tick_counter.wrapping_add(1);
-            if tick_counter.is_multiple_of(15) {
-                self.poll_due_paper_markets(now).await;
+            match wake {
+                CoordinatorWake::PublicHealth | CoordinatorWake::PrivateHealth => {
+                    super::realtime_runtime::publish_status_if_changed(&self);
+                }
+                CoordinatorWake::PrivateEventClosed | CoordinatorWake::PrivateHealthClosed => {
+                    if !self.inner.stop.is_cancelled()
+                        && let Some(readiness) = private_readiness.as_ref()
+                    {
+                        let generation = readiness.snapshot().generation;
+                        disable_private_lane(
+                            readiness,
+                            generation,
+                            crate::upbit::realtime::PrivateRealtimeFailure::ConsumerClosed,
+                            &mut private_baseline_sequence,
+                            &mut private_events,
+                        );
+                        private_health = None;
+                        super::realtime_runtime::publish_status_if_changed(&self);
+                    }
+                }
+                CoordinatorWake::MarketData | CoordinatorWake::Safety => {
+                    self.reconcile_active_sessions(&mut active_subscriptions)
+                        .await?;
+                }
+                CoordinatorWake::PrivateEvent(event) => {
+                    let Some(readiness) = private_readiness.as_ref() else {
+                        return Err(LabError::Internal(
+                            "private event arrived without an owned readiness fence".into(),
+                        ));
+                    };
+                    self.handle_private_event(
+                        *event,
+                        readiness,
+                        &mut private_baseline_sequence,
+                        &mut private_events,
+                        &mut active_subscriptions,
+                    )
+                    .await?;
+                }
             }
         }
+    }
+
+    async fn reconcile_active_sessions(
+        &self,
+        active_subscriptions: &mut BTreeSet<(MarketId, CandleInterval)>,
+    ) -> Result<(), LabError> {
+        self.refresh_public_market_subscriptions(active_subscriptions)
+            .await?;
+        if let Some(feed) = &self.inner.public_market_feed {
+            let count =
+                crate::contracts::ProbeCount::try_from(crate::paper::MAX_PAPER_RECOVERY_BARS)?;
+            if let Err(error) = feed
+                .reconcile_one_subscription(count, &self.inner.stop)
+                .await
+            {
+                if self.inner.stop.is_cancelled() {
+                    return Ok(());
+                }
+                if matches!(error, LabError::BlockedEvidence(_)) {
+                    tracing::debug!(
+                        reason = %super::research_control::bounded_note(&error),
+                        "public subscription input reconciliation awaiting evidence"
+                    );
+                } else {
+                    tracing::warn!(
+                        reason = %super::research_control::bounded_note(&error),
+                        "public subscription input reconciliation deferred"
+                    );
+                }
+            }
+        }
+        let now = UtcTimestamp::now();
+        self.coordinate_once(now).await?;
+        self.poll_due_paper_markets(now).await;
+        Ok(())
+    }
+
+    async fn handle_private_event(
+        &self,
+        event: PrivateAccountEvent,
+        readiness: &crate::upbit::realtime::PrivateReadinessFence,
+        baseline_sequence: &mut Option<(u64, u64)>,
+        private_events: &mut Option<tokio::sync::mpsc::Receiver<PrivateAccountEvent>>,
+        active_subscriptions: &mut BTreeSet<(MarketId, CandleInterval)>,
+    ) -> Result<(), LabError> {
+        let generation = private_event_generation(&event);
+        if readiness.snapshot().generation != generation {
+            return Ok(());
+        }
+        match self.consume_private_stream_event(&event).await {
+            Ok(Some(sequence)) => *baseline_sequence = Some((generation, sequence)),
+            Ok(None) => {}
+            Err(error) => {
+                invalidate_private_generation(readiness, generation)?;
+                *baseline_sequence = None;
+                if private_recovery_error_is_transient(&error) {
+                    tracing::warn!(
+                        event = "private_stream_consumer_recovery_required",
+                        error = %error,
+                        readiness = "CLOSED_UNTIL_NEW_GENERATION_BASELINE"
+                    );
+                } else {
+                    disable_private_lane(
+                        readiness,
+                        readiness.snapshot().generation,
+                        crate::upbit::realtime::PrivateRealtimeFailure::Reconciliation,
+                        baseline_sequence,
+                        private_events,
+                    );
+                }
+                super::realtime_runtime::publish_status_if_changed(self);
+                return Ok(());
+            }
+        }
+        if let PrivateAccountEvent::BootstrapComplete {
+            generation,
+            gap_reconciliation_required,
+            known_order_readbacks_required,
+            closed_order_history_complete,
+        } = &event
+            && let Err(error) = self
+                .complete_private_stream_bootstrap_event(
+                    *generation,
+                    *gap_reconciliation_required,
+                    *known_order_readbacks_required,
+                    *closed_order_history_complete,
+                    baseline_sequence,
+                    readiness,
+                )
+                .await
+        {
+            invalidate_private_generation(readiness, *generation)?;
+            *baseline_sequence = None;
+            if private_recovery_error_is_transient(&error) {
+                tracing::warn!(
+                    event = "private_bootstrap_recovery_required",
+                    error = %error,
+                    readiness = "CLOSED_UNTIL_NEW_GENERATION_BASELINE"
+                );
+            } else {
+                disable_private_lane(
+                    readiness,
+                    readiness.snapshot().generation,
+                    crate::upbit::realtime::PrivateRealtimeFailure::Reconciliation,
+                    baseline_sequence,
+                    private_events,
+                );
+            }
+            super::realtime_runtime::publish_status_if_changed(self);
+            return Ok(());
+        }
+        self.reconcile_active_sessions(active_subscriptions).await?;
+        super::realtime_runtime::publish_status_if_changed(self);
+        Ok(())
+    }
+
+    async fn complete_private_stream_bootstrap_event(
+        &self,
+        generation: u64,
+        gap_reconciliation_required: bool,
+        known_order_readbacks_required: bool,
+        closed_order_history_complete: bool,
+        baseline_sequence: &mut Option<(u64, u64)>,
+        readiness: &crate::upbit::realtime::PrivateReadinessFence,
+    ) -> Result<(), LabError> {
+        let Some((baseline_generation, sequence)) = *baseline_sequence else {
+            return Err(LabError::DataCorrupt(
+                "private bootstrap completed without its durable baseline".into(),
+            ));
+        };
+        if baseline_generation != generation {
+            return Err(LabError::DataCorrupt(
+                "private bootstrap generation differs from its baseline".into(),
+            ));
+        }
+        self.complete_private_stream_bootstrap(
+            generation,
+            gap_reconciliation_required,
+            known_order_readbacks_required,
+            closed_order_history_complete,
+        )
+        .await?;
+        self.record_private_bootstrap_complete(
+            generation,
+            sequence,
+            gap_reconciliation_required,
+            known_order_readbacks_required,
+            closed_order_history_complete,
+        )
+        .await?;
+        if !readiness.mark_ready(generation) || !readiness.record_reconciled(generation) {
+            invalidate_private_generation(readiness, generation)?;
+            *baseline_sequence = None;
+        }
+        Ok(())
+    }
+
+    async fn refresh_public_market_subscriptions(
+        &self,
+        active: &mut BTreeSet<(MarketId, CandleInterval)>,
+    ) -> Result<(), LabError> {
+        let Some(feed) = &self.inner.public_market_feed else {
+            return Ok(());
+        };
+        let requirements = self
+            .inner
+            .database
+            .call("active_realtime_market_requirements", |store| {
+                store.active_realtime_market_requirements()
+            })
+            .await?;
+        if requirements == *active {
+            return Ok(());
+        }
+        feed.replace_subscriptions(
+            requirements
+                .iter()
+                .map(|(market, interval)| PublicMarketSubscription::new(market.clone(), *interval)),
+        )?;
+        *active = requirements;
+        super::realtime_runtime::publish_status_if_changed(self);
+        Ok(())
     }
 
     async fn coordinate_once(&self, now: UtcTimestamp) -> Result<(), LabError> {

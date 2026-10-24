@@ -106,7 +106,8 @@ final class PolicyDeletionWorkspace: NSView, NSTableViewDataSource, NSTableViewD
     private let searchField = NSSearchField()
     private let familyPopup = NSPopUpButton()
     private let usagePopup = NSPopUpButton()
-    private let selectionLabel = NSTextField(labelWithString: "")
+    private let selectionLabel = NSTextField(wrappingLabelWithString: "")
+    private let listEmptyLabel = NSTextField(wrappingLabelWithString: "")
     private let pageLabel = NSTextField(labelWithString: "")
     private let capabilityLabel = NSTextField(wrappingLabelWithString: "삭제 가능 여부를 서버에서 확인합니다.")
     private let statusLabel = NSTextField(wrappingLabelWithString: "")
@@ -295,14 +296,15 @@ final class PolicyDeletionWorkspace: NSView, NSTableViewDataSource, NSTableViewD
         outerScroll.setAccessibilityLabel("정책 삭제 내용, 세로로 스크롤 가능")
         addSubview(outerScroll)
 
-        let documentView = PolicyDeletionFlippedDocumentView()
+        let documentView = TerminalFlippedDocumentView()
         documentView.translatesAutoresizingMaskIntoConstraints = false
         outerScroll.documentView = documentView
 
         let title = NSTextField(labelWithString: "정책 삭제")
-        title.font = TerminalTheme.systemFont(ofSize: 18, weight: .bold)
+        title.font = TerminalTheme.screenTitle
+        title.setAccessibilityLabel("사용자 정책 삭제 작업공간")
 
-        let hint = NSTextField(wrappingLabelWithString: "참조 중인 정책은 유지됩니다.")
+        let hint = NSTextField(wrappingLabelWithString: "사용자 정책의 삭제 가능 여부를 서버 미리보기로 확인합니다. 참조 중인 정책은 유지됩니다.")
         hint.font = TerminalTheme.body
         hint.textColor = TerminalTheme.secondaryText
 
@@ -321,12 +323,18 @@ final class PolicyDeletionWorkspace: NSView, NSTableViewDataSource, NSTableViewD
         usagePopup.action = #selector(handleFilterChanged)
 
         let filterRow = NSStackView(views: [searchField, familyPopup, usagePopup])
-        filterRow.orientation = .horizontal
-        filterRow.alignment = .centerY
-        filterRow.spacing = 8
-        searchField.widthAnchor.constraint(greaterThanOrEqualToConstant: 260).isActive = true
-        familyPopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 150).isActive = true
-        usagePopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 170).isActive = true
+        let filterStacksVertically = TerminalTheme.textScale >= 1.5
+        filterRow.orientation = filterStacksVertically ? .vertical : .horizontal
+        filterRow.alignment = filterStacksVertically ? .leading : .centerY
+        filterRow.spacing = filterStacksVertically ? 6 : 8
+        searchField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        if filterStacksVertically {
+            for control in [searchField, familyPopup, usagePopup] {
+                control.widthAnchor.constraint(equalTo: filterRow.widthAnchor).isActive = true
+            }
+        } else {
+            searchField.widthAnchor.constraint(greaterThanOrEqualToConstant: 240).isActive = true
+        }
 
         for (button, action, label) in [
             (selectFilteredButton, #selector(handleSelectFiltered), "현재 필터의 정책 모두 선택"),
@@ -343,19 +351,45 @@ final class PolicyDeletionWorkspace: NSView, NSTableViewDataSource, NSTableViewD
             button.setAccessibilityLabel(label)
         }
         confirmBatchButton.contentTintColor = .systemRed
+        confirmBatchButton.keyEquivalent = ""
+        confirmBatchButton.setAccessibilityLabel("유효한 미리보기와 확인 문구로 정책 삭제 요청")
+        cancelReviewButton.keyEquivalent = "\u{1b}"
+        cancelReviewButton.setAccessibilityLabel("삭제 영향 확인 취소. 삭제 요청을 보내지 않습니다.")
+        previewButton.setAccessibilityLabel("선택한 사용자 정책의 서버 삭제 영향 확인")
+        queryPendingButton.setAccessibilityLabel("저장된 삭제 요청 결과 조회")
+        continueBatchButton.setAccessibilityLabel("다음 사용자 정책 묶음의 삭제 영향 확인")
 
-        let actions = NSStackView(views: [
-            selectFilteredButton, clearSelectionButton, previewButton,
-            queryPendingButton, continueBatchButton
-        ])
-        actions.orientation = .horizontal
-        actions.alignment = .centerY
-        actions.spacing = 8
+        let selectionActions = NSStackView(views: [selectFilteredButton, clearSelectionButton])
+        let selectionActionsStackVertically = TerminalTheme.textScale >= 1.5
+        selectionActions.orientation = selectionActionsStackVertically ? .vertical : .horizontal
+        selectionActions.alignment = selectionActionsStackVertically ? .leading : .centerY
+        selectionActions.spacing = 8
+        if selectionActionsStackVertically {
+            for button in [selectFilteredButton, clearSelectionButton] {
+                button.widthAnchor.constraint(equalTo: selectionActions.widthAnchor).isActive = true
+            }
+        }
+
+        let workflowActions = NSStackView(views: [previewButton, queryPendingButton, continueBatchButton])
+        workflowActions.orientation = TerminalTheme.textScale >= 1.5 ? .vertical : .horizontal
+        workflowActions.alignment = TerminalTheme.textScale >= 1.5 ? .leading : .centerY
+        workflowActions.spacing = 8
+        if TerminalTheme.textScale >= 1.5 {
+            for button in [previewButton, queryPendingButton, continueBatchButton] {
+                button.widthAnchor.constraint(equalTo: workflowActions.widthAnchor).isActive = true
+            }
+        }
 
         selectionLabel.font = TerminalTheme.monospacedFont(ofSize: 12)
         selectionLabel.textColor = TerminalTheme.secondaryText
+        selectionLabel.setAccessibilityLabel("정책 선택 범위와 페이지 상태")
+        listEmptyLabel.font = TerminalTheme.body
+        listEmptyLabel.textColor = TerminalTheme.secondaryText
+        listEmptyLabel.setAccessibilityLabel("사용자 정책 목록 상태")
+        listEmptyLabel.isHidden = true
         pageLabel.font = TerminalTheme.monospacedDigitFont(ofSize: 12)
         pageLabel.textColor = TerminalTheme.secondaryText
+        pageLabel.setAccessibilityLabel("사용자 정책 목록 페이지")
 
         previousPageButton.target = self
         previousPageButton.action = #selector(handlePreviousPage)
@@ -364,39 +398,47 @@ final class PolicyDeletionWorkspace: NSView, NSTableViewDataSource, NSTableViewD
         previousPageButton.setAccessibilityLabel("이전 사용자 정책 페이지")
         nextPageButton.setAccessibilityLabel("다음 사용자 정책 페이지")
         let pageRow = NSStackView(views: [previousPageButton, pageLabel, nextPageButton])
-        pageRow.orientation = .horizontal
-        pageRow.alignment = .centerY
+        let pageRowStackVertically = TerminalTheme.textScale >= 1.5
+        pageRow.orientation = pageRowStackVertically ? .vertical : .horizontal
+        pageRow.alignment = pageRowStackVertically ? .leading : .centerY
         pageRow.spacing = 8
+        if pageRowStackVertically {
+            for control in [previousPageButton, pageLabel, nextPageButton] {
+                control.widthAnchor.constraint(equalTo: pageRow.widthAnchor).isActive = true
+            }
+        }
 
         setupPolicyTable()
         let tableScroll = NSScrollView()
         tableScroll.documentView = table
         tableScroll.hasVerticalScroller = true
         tableScroll.hasHorizontalScroller = true
-        tableScroll.heightAnchor.constraint(equalToConstant: 330).isActive = true
+        tableScroll.autohidesScrollers = true
+        tableScroll.setAccessibilityLabel("사용자 정책 테이블, 가로 및 세로 스크롤 가능")
+        tableScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: max(330, TerminalTheme.tableRowHeight * 7)).isActive = true
 
         capabilityLabel.font = TerminalTheme.body
         capabilityLabel.textColor = TerminalTheme.secondaryText
         capabilityLabel.setAccessibilityLabel("서버 정책 삭제 capability 상태")
+        capabilityLabel.setAccessibilityValue(capabilityLabel.stringValue)
         statusLabel.font = TerminalTheme.body
         statusLabel.textColor = TerminalTheme.secondaryText
         statusLabel.setAccessibilityLabel("정책 삭제 요청 상태")
+        statusLabel.setAccessibilityValue(statusLabel.stringValue)
 
-        let reviewTitle = NSTextField(labelWithString: "삭제 영향 확인")
-        reviewTitle.font = .systemFont(ofSize: 13, weight: .semibold)
+        let inspectorTitle = NSTextField(labelWithString: "선택 정책과 삭제 영향")
+        inspectorTitle.font = TerminalTheme.sectionHeading
+        inspectorTitle.setAccessibilityLabel("정책 선택 및 삭제 영향 검사기")
+        let reviewTitle = NSTextField(labelWithString: "서버 삭제 영향 및 요청 결과")
+        reviewTitle.font = TerminalTheme.sectionHeading
         detailsText.isEditable = false
         detailsText.isSelectable = true
-        detailsText.isVerticallyResizable = true
-        detailsText.autoresizingMask = [.width]
-        detailsText.textContainer?.widthTracksTextView = true
-        detailsText.textContainerInset = NSSize(width: 10, height: 10)
         detailsText.font = TerminalTheme.table
         detailsText.setAccessibilityLabel("선택한 정책의 삭제 영향과 요청 결과")
-        let detailsScroll = NSScrollView()
-        detailsScroll.documentView = detailsText
-        detailsScroll.hasVerticalScroller = true
-        detailsScroll.hasHorizontalScroller = true
-        detailsScroll.heightAnchor.constraint(equalToConstant: 220).isActive = true
+        let detailsScroll = TerminalWrappingTextScrollView()
+        detailsScroll.configureWrapping(textView: detailsText, inset: NSSize(width: 10, height: 10))
+        detailsScroll.setAccessibilityLabel("정책 선택 범위, 서버 삭제 영향, 요청 결과")
+        detailsScroll.heightAnchor.constraint(equalToConstant: max(220, 220 * TerminalTheme.textScale)).isActive = true
 
         confirmationField.placeholderString = "표시된 확인 문구를 입력하세요"
         confirmationField.font = TerminalTheme.table
@@ -404,19 +446,77 @@ final class PolicyDeletionWorkspace: NSView, NSTableViewDataSource, NSTableViewD
         confirmationField.target = self
         confirmationField.action = #selector(handleConfirmationChanged)
 
-        let confirmationRow = NSStackView(views: [confirmationField, confirmBatchButton, cancelReviewButton])
-        confirmationRow.orientation = .horizontal
-        confirmationRow.alignment = .centerY
+        let confirmationRow = NSStackView(views: [confirmationField, cancelReviewButton, confirmBatchButton])
+        confirmationRow.orientation = .vertical
+        confirmationRow.alignment = .leading
         confirmationRow.spacing = 8
+        for control in [confirmationField, cancelReviewButton, confirmBatchButton] {
+            control.widthAnchor.constraint(equalTo: confirmationRow.widthAnchor).isActive = true
+        }
 
-        let mainStack = NSStackView(views: [
-            title, hint, capabilityLabel, filterRow, actions,
-            selectionLabel, tableScroll, pageRow, statusLabel,
+        let listStack = NSStackView(views: [filterRow, selectionActions, selectionLabel, listEmptyLabel, tableScroll, pageRow])
+        listStack.orientation = .vertical
+        listStack.alignment = .leading
+        listStack.spacing = 10
+        let listPanel = TerminalSurfaceView()
+        listPanel.usesPanel = true
+        listPanel.setAccessibilityLabel("사용자 정책 검색, 선택, 페이지 목록")
+        listStack.translatesAutoresizingMaskIntoConstraints = false
+        listPanel.addSubview(listStack)
+        NSLayoutConstraint.activate([
+            listStack.leadingAnchor.constraint(equalTo: listPanel.leadingAnchor, constant: 12),
+            listStack.trailingAnchor.constraint(equalTo: listPanel.trailingAnchor, constant: -12),
+            listStack.topAnchor.constraint(equalTo: listPanel.topAnchor, constant: 12),
+            listStack.bottomAnchor.constraint(equalTo: listPanel.bottomAnchor, constant: -12),
+            filterRow.widthAnchor.constraint(equalTo: listStack.widthAnchor),
+            selectionActions.widthAnchor.constraint(equalTo: listStack.widthAnchor),
+            selectionLabel.widthAnchor.constraint(equalTo: listStack.widthAnchor),
+            listEmptyLabel.widthAnchor.constraint(equalTo: listStack.widthAnchor),
+            tableScroll.widthAnchor.constraint(equalTo: listStack.widthAnchor),
+            pageRow.widthAnchor.constraint(equalTo: listStack.widthAnchor)
+        ])
+
+        let inspectorStack = NSStackView(views: [
+            inspectorTitle, capabilityLabel, statusLabel, workflowActions,
             reviewTitle, detailsScroll, confirmationRow
         ])
+        inspectorStack.orientation = .vertical
+        inspectorStack.alignment = .leading
+        inspectorStack.spacing = 10
+        inspectorStack.translatesAutoresizingMaskIntoConstraints = false
+        let inspectorPanel = TerminalSurfaceView()
+        inspectorPanel.usesPanel = true
+        inspectorPanel.setAccessibilityLabel("선택 정책 삭제 영향과 요청 상태 검사기")
+        inspectorStack.translatesAutoresizingMaskIntoConstraints = false
+        inspectorPanel.addSubview(inspectorStack)
+        NSLayoutConstraint.activate([
+            inspectorStack.leadingAnchor.constraint(equalTo: inspectorPanel.leadingAnchor, constant: 12),
+            inspectorStack.trailingAnchor.constraint(equalTo: inspectorPanel.trailingAnchor, constant: -12),
+            inspectorStack.topAnchor.constraint(equalTo: inspectorPanel.topAnchor, constant: 12),
+            inspectorStack.bottomAnchor.constraint(equalTo: inspectorPanel.bottomAnchor, constant: -12),
+            inspectorTitle.widthAnchor.constraint(equalTo: inspectorStack.widthAnchor),
+            capabilityLabel.widthAnchor.constraint(equalTo: inspectorStack.widthAnchor),
+            statusLabel.widthAnchor.constraint(equalTo: inspectorStack.widthAnchor),
+            workflowActions.widthAnchor.constraint(equalTo: inspectorStack.widthAnchor),
+            reviewTitle.widthAnchor.constraint(equalTo: inspectorStack.widthAnchor),
+            detailsScroll.widthAnchor.constraint(equalTo: inspectorStack.widthAnchor),
+            confirmationRow.widthAnchor.constraint(equalTo: inspectorStack.widthAnchor)
+        ])
+
+        let split = NSSplitView()
+        split.isVertical = true
+        split.dividerStyle = .thin
+        split.setAccessibilityLabel("사용자 정책 목록과 삭제 영향 검사기")
+        split.addArrangedSubview(listPanel)
+        split.addArrangedSubview(inspectorPanel)
+        listPanel.widthAnchor.constraint(greaterThanOrEqualToConstant: 380).isActive = true
+        inspectorPanel.widthAnchor.constraint(greaterThanOrEqualToConstant: 420).isActive = true
+        split.heightAnchor.constraint(greaterThanOrEqualToConstant: max(500, TerminalTheme.tableRowHeight * 10)).isActive = true
+
+        let mainStack = NSStackView(views: [title, hint, split])
         mainStack.orientation = .vertical
         mainStack.alignment = .leading
-        mainStack.spacing = 10
+        mainStack.spacing = 12
         mainStack.translatesAutoresizingMaskIntoConstraints = false
         documentView.addSubview(mainStack)
         NSLayoutConstraint.activate([
@@ -431,28 +531,19 @@ final class PolicyDeletionWorkspace: NSView, NSTableViewDataSource, NSTableViewD
             mainStack.bottomAnchor.constraint(equalTo: documentView.bottomAnchor, constant: -16),
             title.widthAnchor.constraint(equalTo: mainStack.widthAnchor),
             hint.widthAnchor.constraint(equalTo: mainStack.widthAnchor),
-            capabilityLabel.widthAnchor.constraint(equalTo: mainStack.widthAnchor),
-            filterRow.widthAnchor.constraint(equalTo: mainStack.widthAnchor),
-            actions.widthAnchor.constraint(equalTo: mainStack.widthAnchor),
-            selectionLabel.widthAnchor.constraint(equalTo: mainStack.widthAnchor),
-            tableScroll.widthAnchor.constraint(equalTo: mainStack.widthAnchor),
-            pageRow.widthAnchor.constraint(equalTo: mainStack.widthAnchor),
-            statusLabel.widthAnchor.constraint(equalTo: mainStack.widthAnchor),
-            detailsScroll.widthAnchor.constraint(equalTo: mainStack.widthAnchor),
-            confirmationRow.widthAnchor.constraint(equalTo: mainStack.widthAnchor),
-            confirmationField.widthAnchor.constraint(greaterThanOrEqualToConstant: 360)
+            split.widthAnchor.constraint(equalTo: mainStack.widthAnchor)
         ])
         setReviewVisible(false)
     }
 
     private func setupPolicyTable() {
         for (id, title, width) in [
-            ("PolicyDeleteSelect", "선택", 50),
-            ("PolicyDeleteID", "사용자 정책 ID", 290),
-            ("PolicyDeleteName", "정책명", 250),
-            ("PolicyDeleteFamily", "패밀리", 110),
-            ("PolicyDeleteRevisions", "리비전 수", 90),
-            ("PolicyDeleteUsage", "과거 원장 참조", 130)
+            ("PolicyDeleteSelect", "선택", 46),
+            ("PolicyDeleteName", "정책명", 190),
+            ("PolicyDeleteID", "사용자 정책 ID", 190),
+            ("PolicyDeleteFamily", "패밀리", 90),
+            ("PolicyDeleteRevisions", "리비전 수", 80),
+            ("PolicyDeleteUsage", "과거 원장 참조", 120)
         ] {
             let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(id))
             column.title = title
@@ -461,6 +552,8 @@ final class PolicyDeletionWorkspace: NSView, NSTableViewDataSource, NSTableViewD
         }
         table.dataSource = self
         table.delegate = self
+        table.target = self
+        table.action = #selector(handlePolicyTableClick)
         table.setAccessibilityLabel("사용자 정책 단일·필터·선택 삭제 목록")
         TerminalTheme.prepareTable(table)
         table.columnAutoresizingStyle = .noColumnAutoresizing
@@ -503,9 +596,48 @@ final class PolicyDeletionWorkspace: NSView, NSTableViewDataSource, NSTableViewD
         let hidden = selection.hiddenSelectionCount(visiblePolicyIDs: visibleIDs)
         let unavailable = missingSelectedIDs.count
         selectionLabel.stringValue = "필터 \(filteredPolicies.count) · 사용자 정책 \(userPolicies.count) · 선택 \(selection.selectedPolicyIDs.count) · 현재 페이지 \(selection.selectedPolicyIDs.intersection(visibleIDs).count) · 숨김 \(hidden) · 확인 필요 \(unavailable)"
+        selectionLabel.setAccessibilityValue(selectionLabel.stringValue)
+        let emptyMessage = userPolicies.isEmpty
+            ? "사용자 정책이 없습니다."
+            : (filteredPolicies.isEmpty ? "현재 검색·필터와 일치하는 정책이 없습니다." : "")
+        listEmptyLabel.stringValue = emptyMessage
+        listEmptyLabel.setAccessibilityValue(emptyMessage)
+        listEmptyLabel.isHidden = emptyMessage.isEmpty
         let pageCount = max(1, (filteredPolicies.count + pageSize - 1) / pageSize)
         pageLabel.stringValue = "페이지 \(currentPage + 1) / \(pageCount) · 한 번에 \(pageSize)개"
+        pageLabel.setAccessibilityValue(pageLabel.stringValue)
         pageLabel.toolTip = "현재 필터에 일치하는 모든 정책 중 표시 구간입니다. 선택은 policy_id로 유지됩니다."
+        if pendingIntent == nil, pendingReadback == nil, activePreviews.isEmpty {
+            renderSelectionScope()
+        }
+    }
+
+    private func renderSelectionScope() {
+        let selectedIDs = selection.orderedPolicyIDs
+        let batchIDs = batchPlan?.currentBatchIDs ?? Array(selectedIDs.prefix(PolicyDeletionBatchPlan.maximumBatchSize))
+        let entries = batchIDs.map { policyID -> String in
+            guard let policy = userPolicies.first(where: { $0.policyId == policyID }) else {
+                return "policy_id: \(policyID) · 현재 정책 projection에 없음, 목록 새로고침 필요"
+            }
+            return "policy_id: \(policy.policyId)\nname: \(policy.name)\nhead_revision_id: \(policy.headRevisionId)\nrevision_count: \(policy.revisionCount) · historical_run_count: \(policy.historicalRunCount) · usage: \(policy.usageState.rawValue)"
+        }
+        let continuation = selectedIDs.count > batchIDs.count
+            ? "\n\n다음 묶음에서 확인할 정책: \(selectedIDs.count - batchIDs.count)건"
+            : ""
+        detailsText.string = selectedIDs.isEmpty
+            ? """
+              사용자 정책을 선택하면 exact policy_id와 리비전 identity가 여기에 표시됩니다.
+
+              이 목록은 카탈로그 projection입니다. dependents, blockers와 삭제 범위는 ‘삭제 영향 확인’을 눌러 서버 미리보기를 읽은 뒤 표시됩니다.
+              """
+            : """
+              카탈로그 선택 범위 · 전체 선택 \(selectedIDs.count)건 · 현재 묶음 \(batchIDs.count)건
+              이 내용은 카탈로그 projection이며 서버 삭제 scope가 아닙니다. dependents, blockers와 삭제 범위는 서버 미리보기 결과에서 확인하세요.
+
+              \(entries.joined(separator: "\n\n"))\(continuation)
+              """
+        detailsText.toolTip = detailsText.string
+        detailsText.setAccessibilityValue(detailsText.string)
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int {
@@ -557,6 +689,21 @@ final class PolicyDeletionWorkspace: NSView, NSTableViewDataSource, NSTableViewD
         selectionGeneration &+= 1
         invalidatePreviewAfterSelectionChange()
         table.reloadData()
+        updateSummary()
+        updateControlEnablement()
+    }
+
+    @objc private func handlePolicyTableClick() {
+        let row = table.clickedRow
+        let column = table.clickedColumn
+        guard column > 0, pagePolicies.indices.contains(row) else { return }
+        let policyId = pagePolicies[row].policyId
+        let shouldSelect = !selection.selectedPolicyIDs.contains(policyId)
+        selection.setSelected(policyId, selected: shouldSelect)
+        selectionGeneration &+= 1
+        invalidatePreviewAfterSelectionChange()
+        table.reloadData()
+        table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
         updateSummary()
         updateControlEnablement()
     }
@@ -653,6 +800,7 @@ final class PolicyDeletionWorkspace: NSView, NSTableViewDataSource, NSTableViewD
                 self.confirmationField.stringValue = ""
                 self.renderReviewDetails()
                 self.setReviewVisible(true)
+                self.window?.makeFirstResponder(self.cancelReviewButton)
                 if self.locallyEligiblePreviewCount == 0 {
                     self.statusTextValue = "이 묶음에서 삭제할 수 있는 정책이 없습니다. 참조 중인 정책은 유지됩니다."
                 } else if self.locallyEligiblePreviewCount < ids.count {
@@ -998,16 +1146,18 @@ final class PolicyDeletionWorkspace: NSView, NSTableViewDataSource, NSTableViewD
 
             \(readbackText)
             """
+            detailsText.setAccessibilityValue(detailsText.string)
             setReviewVisible(true)
             return
         }
         if let pendingReadback {
             detailsText.string = formatReadback(pendingReadback)
+            detailsText.setAccessibilityValue(detailsText.string)
             setReviewVisible(true)
             return
         }
         guard !activePreviews.isEmpty, let plan = batchPlan else {
-            detailsText.string = ""
+            renderSelectionScope()
             setReviewVisible(phase == .terminal)
             return
         }
@@ -1033,6 +1183,7 @@ final class PolicyDeletionWorkspace: NSView, NSTableViewDataSource, NSTableViewD
         \(activePreviews.map(\.summary).joined(separator: "\n\n────────────────────────\n\n"))
         """
         detailsText.toolTip = detailsText.string
+        detailsText.setAccessibilityValue(detailsText.string)
         setReviewVisible(phase == .reviewing || phase == .submitting || phase == .terminal)
     }
 
@@ -1051,7 +1202,9 @@ final class PolicyDeletionWorkspace: NSView, NSTableViewDataSource, NSTableViewD
     }
 
     private func setReviewVisible(_ visible: Bool) {
-        detailsText.enclosingScrollView?.isHidden = !visible
+        if !visible, pendingIntent == nil, pendingReadback == nil, activePreviews.isEmpty {
+            renderSelectionScope()
+        }
         confirmationField.isHidden = !(visible && phase == .reviewing)
         confirmBatchButton.isHidden = !(visible && phase == .reviewing)
         cancelReviewButton.isHidden = !(visible && phase == .reviewing)
@@ -1061,6 +1214,7 @@ final class PolicyDeletionWorkspace: NSView, NSTableViewDataSource, NSTableViewD
         capabilityLabel.stringValue = capability?.permitsPolicyOnlyDelete == true
             ? "삭제 요청을 사용할 수 있습니다. 참조 중인 정책은 유지됩니다."
             : "삭제 요청을 사용할 수 없습니다. 영향 확인만 가능합니다."
+        capabilityLabel.setAccessibilityValue(capabilityLabel.stringValue)
         capabilityLabel.toolTip = capability?.permitsPolicyOnlyDelete == true
             ? "POLICY_ONLY_CONFIRMED · max_items \(capability?.max_items ?? 100) · archive unavailable · request readback available"
             : "policy deletion capability unavailable; preview only"
@@ -1068,6 +1222,7 @@ final class PolicyDeletionWorkspace: NSView, NSTableViewDataSource, NSTableViewD
         statusLabel.toolTip = statusTextValue
         statusLabel.textColor = pendingIntent == nil ? TerminalTheme.secondaryText : .systemOrange
         statusLabel.setAccessibilityLabel(statusTextValue)
+        statusLabel.setAccessibilityValue(statusTextValue)
     }
 
     private func schedulePreviewExpiryCheck() {
@@ -1120,9 +1275,5 @@ final class PolicyDeletionWorkspace: NSView, NSTableViewDataSource, NSTableViewD
             && locallyEligiblePreviewCount > 0
             && confirmationOptions.contains(confirmationField.stringValue)
     }
-}
-
-private final class PolicyDeletionFlippedDocumentView: NSView {
-    override var isFlipped: Bool { true }
 }
 

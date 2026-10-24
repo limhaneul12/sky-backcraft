@@ -523,6 +523,7 @@ fn export_review_wire_fixture() {
     let snapshot = fixture();
     let manifest = export_manifest(&snapshot).expect("manifest");
     let detail = AutomationDecisionDetail {
+        recorded_decision: None,
         session: snapshot.session.clone(),
         frozen_policy: snapshot.frozen_policy.clone(),
         decision: snapshot.decisions[0].clone(),

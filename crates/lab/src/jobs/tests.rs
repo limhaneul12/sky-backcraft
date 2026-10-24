@@ -10,6 +10,188 @@ use crate::storage::RawObjectInput;
 use rust_decimal::Decimal;
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one isolated runtime journey verifies shared capacity and passive saved-state reads"
+)]
+fn saved_paper_review_job_path_is_passive_and_shares_bounded_capacity()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::contracts::{PaperReviewQuery, PaperReviewSelection};
+    let (root, _guard) = temp_root("saved-paper-review-job");
+    let owner = DatabaseOwner::open(root.clone())?;
+    let database = owner.handle();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(async {
+        let now = UtcTimestamp::now();
+        let session_id =
+            start_paper_test_session(&database, "saved-review-job", StrategyKind::BuyAndHold, now)
+                .await?;
+        let sid = session_id.clone();
+        database
+            .call("pause_review_fixture", move |store| {
+                store.paper_write(
+                    &PaperSessionWrite::Pause {
+                        request_id: RequestId::new("saved-review-pause")?,
+                        session_id: sid,
+                        expected_sequence: 0,
+                    },
+                    now,
+                )?;
+                Ok(())
+            })
+            .await?;
+        let jobs = JobRuntime::start(
+            database.clone(),
+            UpbitClient::synthetic_local("http://127.0.0.1:9")?,
+            root,
+            None,
+        )
+        .await?;
+        let service = jobs.service();
+        let snapshot = |sid: crate::contracts::PaperSessionId| {
+            move |store: &mut crate::storage::Store| {
+                Ok((
+                    store.paper_stored_view_json_for_test(&sid)?,
+                    store.paper_checkpoint_digests_for_test(&sid)?,
+                    serde_json::to_value(store.paper_review_events(&sid, None, Some(1), 1)?)?,
+                ))
+            }
+        };
+        let before = database
+            .call("review_before", snapshot(session_id.clone()))
+            .await?;
+        let selection = PaperReviewSelection {
+            session_id: session_id.clone(),
+            event_sequence: 1,
+            as_of_sequence: 1,
+            signal_id: None,
+        };
+        for query in [
+            PaperReviewQuery::Decision {
+                selection: selection.clone(),
+            },
+            PaperReviewQuery::AuditRules {
+                selection: selection.clone(),
+            },
+            PaperReviewQuery::AuditIndicators {
+                selection: selection.clone(),
+                max_source_bars: 32,
+            },
+        ] {
+            let value = service.paper_review_query(query).await?;
+            if value.get("report").is_some() {
+                assert_eq!(
+                    value.pointer("/report/status"),
+                    Some(&serde_json::json!("INSUFFICIENT_EVIDENCE"))
+                );
+            }
+        }
+        let permits = service
+            .inner
+            .automation_review_budget
+            .clone()
+            .acquire_many_owned(2)
+            .await?;
+        assert!(matches!(
+            service
+                .paper_review_query(PaperReviewQuery::Decision {
+                    selection: selection.clone()
+                })
+                .await,
+            Err(LabError::ResourceLimit(_))
+        ));
+        drop(permits);
+        assert!(
+            service
+                .paper_review_query(PaperReviewQuery::Decision {
+                    selection: selection.clone()
+                })
+                .await
+                .is_ok()
+        );
+        let after = database.call("review_after", snapshot(session_id)).await?;
+        assert_eq!(before, after);
+        jobs.shutdown().await?;
+        assert!(matches!(
+            service
+                .paper_review_query(PaperReviewQuery::Decision { selection })
+                .await,
+            Err(LabError::Cancelled(_))
+        ));
+        Ok::<(), Box<dyn std::error::Error>>(())
+    });
+    owner.shutdown()?;
+    result
+}
+
+#[test]
+fn paper_review_query_does_not_drive_a_stopped_runtime() -> Result<(), Box<dyn std::error::Error>> {
+    let (root, _guard) = temp_root("paper-read-only-review");
+    let owner = DatabaseOwner::open(root.clone())?;
+    let database = owner.handle();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(async {
+        let jobs = JobRuntime::start(
+            database.clone(),
+            UpbitClient::synthetic_local("http://127.0.0.1:9")?,
+            root,
+            None,
+        )
+        .await?;
+        let service = jobs.service();
+        jobs.shutdown().await?;
+        // Keep a RUNNING fixture after the producer has stopped. A query must not
+        // reconcile it just because its logical candle boundary is in the past.
+        let now = paper_test_time("2025-01-02T00:00:00Z");
+        let session_id = start_paper_test_session(
+            &database,
+            "query-only-review",
+            StrategyKind::BuyAndHold,
+            now,
+        )
+        .await?;
+        let id = session_id.clone();
+        let before = database
+            .call("review_before", move |store| {
+                Ok((
+                    serde_json::to_value(store.paper_get_session(&id, now)?)?,
+                    store.paper_checkpoint_digests_for_test(&id)?,
+                ))
+            })
+            .await?;
+        for _ in 0..2 {
+            let value = service
+                .paper_session_query(crate::contracts::PaperSessionQuery::ReviewEvents {
+                    session_id: session_id.clone(),
+                    after_sequence: None,
+                    as_of_sequence: None,
+                    limit: 1,
+                })
+                .await?;
+            let page: crate::contracts::PaperSessionReviewPage = serde_json::from_value(value)?;
+            assert_eq!(page.as_of_sequence, 0);
+            assert!(page.page.items.is_empty());
+        }
+        let after = database
+            .call("review_after", move |store| {
+                Ok((
+                    serde_json::to_value(store.paper_get_session(&session_id, now)?)?,
+                    store.paper_checkpoint_digests_for_test(&session_id)?,
+                ))
+            })
+            .await?;
+        assert_eq!(before, after);
+        Ok::<(), Box<dyn std::error::Error>>(())
+    });
+    owner.shutdown()?;
+    result
+}
+
+#[test]
 fn failed_execution_owner_closes_admission_and_is_joined() -> Result<(), Box<dyn std::error::Error>>
 {
     let root = std::env::temp_dir().join(format!("spot-lab-runner-failure-{}", std::process::id()));
@@ -64,19 +246,18 @@ fn durable_queue_is_polled_when_submission_notification_is_lost()
         .enable_all()
         .build()?;
     let result = runtime.block_on(async {
-        let jobs =
-            JobRuntime::start(database.clone(), UpbitClient::new()?, root.clone(), None).await?;
+        let jobs = JobRuntime::start(
+            database.clone(),
+            UpbitClient::synthetic_local("http://127.0.0.1:9")?,
+            root.clone(),
+            None,
+        )
+        .await?;
         let service = jobs.service();
         // Let the initial empty claim and interval tick settle. The committed
         // mutation below deliberately bypasses the caller's Notify continuation.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let submission = JobSubmission {
-            request_id: crate::contracts::RequestId::new("lost-notification")?,
-            payload: JobPayload::Export {
-                run_id: RunId::new("missing-run")?,
-                market: None,
-            },
-        };
+        let submission = queue_test_submission("lost-notification")?;
         let admitted = database
             .call("submit_without_wake", move |store| {
                 store.submit_job(&submission, UtcTimestamp::now())
@@ -108,6 +289,28 @@ fn durable_queue_is_polled_when_submission_notification_is_lost()
     result?;
     closed?;
     Ok(())
+}
+
+// Real input-free collection requests exercise queue ownership; the worker uses
+// a closed loopback client and fails deterministically without provider access.
+fn queue_test_submission(id: &str) -> Result<JobSubmission, LabError> {
+    let request_id = RequestId::new(id)?;
+    Ok(JobSubmission {
+        request_id: request_id.clone(),
+        payload: JobPayload::Collect {
+            request: crate::contracts::CollectRequest {
+                request_id,
+                markets: vec![MarketId::parse_upbit("KRW-BTC")?],
+                range: crate::contracts::UtcRange::new(
+                    paper_test_time("2024-01-01T00:00:00Z"),
+                    paper_test_time("2024-01-01T01:00:00Z"),
+                )?,
+                data_resolution: CandleInterval::H1,
+                warmup_bars: 0,
+                completed_only: true,
+            },
+        },
+    })
 }
 
 fn paper_test_time(value: &str) -> UtcTimestamp {
@@ -448,18 +651,17 @@ fn queued_job_cancellation_and_recovery() -> Result<(), Box<dyn std::error::Erro
         .enable_all()
         .build()?;
     let result = runtime.block_on(async {
-        let jobs =
-            JobRuntime::start(database.clone(), UpbitClient::new()?, root.clone(), None).await?;
+        let jobs = JobRuntime::start(
+            database.clone(),
+            UpbitClient::synthetic_local("http://127.0.0.1:9")?,
+            root.clone(),
+            None,
+        )
+        .await?;
         let service = jobs.service();
 
         // 1. Occupy the single running slot with a blocker claimed attempt
-        let blocker_sub = JobSubmission {
-            request_id: crate::contracts::RequestId::new("blocker-job-1")?,
-            payload: JobPayload::Export {
-                run_id: RunId::new("missing-run-blocker-1")?,
-                market: None,
-            },
-        };
+        let blocker_sub = queue_test_submission("blocker-job-1")?;
         let blocker = database
             .call("submit_blocker", move |store| {
                 let job = store.submit_job(&blocker_sub, UtcTimestamp::now())?;
@@ -470,13 +672,7 @@ fn queued_job_cancellation_and_recovery() -> Result<(), Box<dyn std::error::Erro
             .await?;
 
         // 2. Submit the target job - it must stay Queued because running == 1
-        let submission = JobSubmission {
-            request_id: crate::contracts::RequestId::new("queued-job-1")?,
-            payload: JobPayload::Export {
-                run_id: RunId::new("missing-run-1")?,
-                market: None,
-            },
-        };
+        let submission = queue_test_submission("queued-job-1")?;
         let admitted = database
             .call("submit_queued", move |store| {
                 store.submit_job(&submission, UtcTimestamp::now())
@@ -523,13 +719,7 @@ fn queued_job_cancellation_and_recovery() -> Result<(), Box<dyn std::error::Erro
         assert_eq!(status.running_attempts, 0);
 
         // 6. Submit a new job through service and verify normal processing
-        let next_submission = JobSubmission {
-            request_id: crate::contracts::RequestId::new("next-job-after-cancel")?,
-            payload: JobPayload::Export {
-                run_id: RunId::new("missing-run-2")?,
-                market: None,
-            },
-        };
+        let next_submission = queue_test_submission("next-job-after-cancel")?;
         let next_job = service.submit(next_submission).await?;
         let observed = wait_terminal_attempt(&service, next_job.id, 1).await?;
         assert!(matches!(
@@ -608,13 +798,7 @@ fn restart_recovers_interrupted_attempts() -> Result<(), Box<dyn std::error::Err
         .build()?;
 
     // 1. Submit a job and claim it directly to put it into Running state in SQLite
-    let submission = JobSubmission {
-        request_id: crate::contracts::RequestId::new("unrecovered-job")?,
-        payload: JobPayload::Export {
-            run_id: RunId::new("missing-run-recovery")?,
-            market: None,
-        },
-    };
+    let submission = queue_test_submission("unrecovered-job")?;
     let unrecovered_id = runtime.block_on(async {
         let job = database
             .call("submit_unrecovered", move |store| {
@@ -632,8 +816,13 @@ fn restart_recovers_interrupted_attempts() -> Result<(), Box<dyn std::error::Err
 
     // 2. Start a fresh JobRuntime - this must recover interrupted attempts
     let result = runtime.block_on(async {
-        let jobs =
-            JobRuntime::start(database.clone(), UpbitClient::new()?, root.clone(), None).await?;
+        let jobs = JobRuntime::start(
+            database.clone(),
+            UpbitClient::synthetic_local("http://127.0.0.1:9")?,
+            root.clone(),
+            None,
+        )
+        .await?;
         let service = jobs.service();
 
         let status = service.status().await?;
@@ -662,18 +851,17 @@ fn cancelled_job_can_be_retried_and_processed() -> Result<(), Box<dyn std::error
         .enable_all()
         .build()?;
     let result = runtime.block_on(async {
-        let jobs =
-            JobRuntime::start(database.clone(), UpbitClient::new()?, root.clone(), None).await?;
+        let jobs = JobRuntime::start(
+            database.clone(),
+            UpbitClient::synthetic_local("http://127.0.0.1:9")?,
+            root.clone(),
+            None,
+        )
+        .await?;
         let service = jobs.service();
 
         // 1. Blocker in running state
-        let blocker_sub = JobSubmission {
-            request_id: crate::contracts::RequestId::new("blocker-retry-job")?,
-            payload: JobPayload::Export {
-                run_id: RunId::new("missing-run-blocker-retry")?,
-                market: None,
-            },
-        };
+        let blocker_sub = queue_test_submission("blocker-retry-job")?;
         let blocker = database
             .call("submit_blocker_retry", move |store| {
                 let job = store.submit_job(&blocker_sub, UtcTimestamp::now())?;
@@ -684,13 +872,7 @@ fn cancelled_job_can_be_retried_and_processed() -> Result<(), Box<dyn std::error
             .await?;
 
         // 2. Target job submitted (queued)
-        let submission = JobSubmission {
-            request_id: crate::contracts::RequestId::new("retry-target-job")?,
-            payload: JobPayload::Export {
-                run_id: RunId::new("missing-run-retry")?,
-                market: None,
-            },
-        };
+        let submission = queue_test_submission("retry-target-job")?;
         let job = database
             .call("submit_for_cancel", move |store| {
                 store.submit_job(&submission, UtcTimestamp::now())

@@ -1186,6 +1186,37 @@ impl Store {
         self.automation_get_session_with_policy(session_id, now, LiveExecutionPolicy::Disabled)
     }
 
+    /// Fence a session's new intents when its frozen cross-source coverage is incomplete.
+    /// Existing orders and reservations remain available for ordinary reconciliation.
+    /// # Errors
+    /// Rejects a changed session sequence or persistence failure.
+    pub(crate) fn automation_hold_source_gap(
+        &mut self,
+        session_id: &crate::contracts::AutomationSessionId,
+        expected_sequence: u64,
+        reason: &str,
+        now: UtcTimestamp,
+    ) -> Result<(), LabError> {
+        let tx = self.connection.transaction().map_err(sql_error)?;
+        let (state, sequence, prior_reason): (String, i64, Option<String>) = tx.query_row(
+            "SELECT state,sequence,recovery_reason FROM automation_sessions WHERE session_id=?1",
+            [session_id.as_str()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).map_err(sql_error)?;
+        if from_sql_u64(sequence)? != expected_sequence {
+            return Err(LabError::Conflict(
+                "automation source-gap sequence changed".into(),
+            ));
+        }
+        if state == "RUNNING"
+            || (state == "NEEDS_RECONCILIATION"
+                && prior_reason.as_deref()
+                    == Some("PROCESS_RESTART_REQUIRES_ACCOUNT_AND_ORDER_READBACK"))
+        {
+            set_automation_recovery(&tx, session_id, reason, now)?;
+        }
+        tx.commit().map_err(sql_error)
+    }
+
     pub(crate) fn automation_get_session_with_policy(
         &self,
         session_id: &crate::contracts::AutomationSessionId,
@@ -2424,6 +2455,28 @@ impl Store {
         .map(|observation| observation.candle.close.get())
     }
 
+    /// Persist a preparation fact without creating a candle, intent or cursor.
+    pub(crate) fn automation_record_preparation(
+        &mut self,
+        session_id: &crate::contracts::AutomationSessionId,
+        preparation: &crate::contracts::DecisionPreparation,
+        now: UtcTimestamp,
+    ) -> Result<bool, LabError> {
+        decision_preparation::record(self, session_id, preparation, now)
+    }
+
+    /// Persist an original gate deferral without changing intent, order, or session state.
+    pub(crate) fn automation_record_admission_deferral(
+        &mut self,
+        session_id: &crate::contracts::AutomationSessionId,
+        target: &crate::contracts::AdmissionDeferredTarget,
+        reason: crate::contracts::AdmissionDeferredReason,
+        reason_detail: Option<&str>,
+        now: UtcTimestamp,
+    ) -> Result<bool, LabError> {
+        admission_deferred::record(self, session_id, target, reason, reason_detail, now)
+    }
+
     /// Persist one causal completed candle and its evaluator checkpoint atomically.
     /// Identical replay is a no-op; conflicting identity or a gap blocks the session.
     #[allow(clippy::too_many_lines)] // Candle identity, checkpoint, cursor and event commit in one SQLite transaction.
@@ -2434,6 +2487,34 @@ impl Store {
         checkpoint_json: &str,
         received_at: UtcTimestamp,
     ) -> Result<bool, LabError> {
+        self.automation_record_candle_with_preparation(
+            session_id,
+            observation,
+            checkpoint_json,
+            received_at,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_lines)] // The preparation is frozen with the same original candle.
+    pub(crate) fn automation_record_candle_with_preparation(
+        &mut self,
+        session_id: &crate::contracts::AutomationSessionId,
+        observation: &CandleObservation,
+        checkpoint_json: &str,
+        received_at: UtcTimestamp,
+        preparation: Option<&crate::contracts::DecisionPreparation>,
+    ) -> Result<bool, LabError> {
+        if preparation.is_some_and(|fact| {
+            fact.observation_id != observation.id
+                || fact.market.code() != observation.candle.market
+                || fact.interval != observation.candle.interval
+                || fact.decision_time != observation.candle.close_time_utc
+        }) {
+            return Err(LabError::DataCorrupt(
+                "warmup preparation differs from its candle".into(),
+            ));
+        }
         if checkpoint_json.len() > 2_000_000 {
             return Err(LabError::ResourceLimit(
                 "automation evaluator checkpoint exceeds 2 MiB".into(),
@@ -2586,17 +2667,21 @@ impl Store {
                 ],
             )
             .map_err(sql_error)?;
+        let mut candle_detail = serde_json::json!({
+            "observation_id": observation.id,
+            "close_time_utc": observation.candle.close_time_utc,
+            "content_digest": observation.content_digest
+        });
+        if let Some(preparation) = preparation {
+            candle_detail["preparation"] = serde_json::to_value(preparation)?;
+        }
         insert_event(
             &transaction,
             session_id,
             next_event_sequence(&transaction, session_id)?,
             AutomationEventKind::CandleObserved,
             received_at,
-            serde_json::json!({
-                "observation_id":observation.id,
-                "close_time_utc":observation.candle.close_time_utc,
-                "content_digest":observation.content_digest
-            }),
+            candle_detail,
         )?;
         transaction.commit().map_err(sql_error)?;
         Ok(true)
@@ -3155,6 +3240,99 @@ impl Store {
         load_order_view(&self.connection, identifier)
     }
 
+    /// Resolve a streamed identifier against durable local account/session scope
+    /// before the runtime is permitted to issue an exact private REST readback.
+    /// Terminal orders remain resolvable for duplicate and late provider events.
+    pub(crate) fn automation_order_readback_target(
+        &self,
+        identifier: &AutomationOrderIdentifier,
+    ) -> Result<Option<AutomationPendingOrder>, LabError> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT session_id,account_identity,state,order_request_json,decision_mark_krw \
+             FROM automation_orders WHERE client_identifier=?1",
+                [identifier.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(sql_error)?;
+        row.map(|(session, account, state, request, mark)| {
+            let request: AutomationOrderRequest =
+                serde_json::from_str(&request).map_err(json_error)?;
+            if &request.client_identifier != identifier {
+                return Err(LabError::DataCorrupt(
+                    "durable order identifier mismatch".into(),
+                ));
+            }
+            Ok(AutomationPendingOrder {
+                session_id: crate::contracts::AutomationSessionId::new(session)?,
+                account_identity: account,
+                state: parse_order_state(&state)?,
+                request,
+                decision_mark: crate::contracts::PriceKrw::new(parse_decimal(&mark)?)?,
+            })
+        })
+        .transpose()
+    }
+
+    /// Bounded account recovery targets include uncertain orders in every session.
+    /// RESERVED intents have no provider effect and remain on the admission path.
+    pub(crate) fn automation_account_order_readback_targets(
+        &self,
+        account_identity: &str,
+    ) -> Result<Vec<AutomationPendingOrder>, LabError> {
+        const LIMIT: usize = 1_000;
+        if account_identity.is_empty() || account_identity.len() > 256 {
+            return Err(LabError::InvalidConfig(
+                "invalid private order recovery account".into(),
+            ));
+        }
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT client_identifier FROM automation_orders WHERE account_identity=?1 \
+             AND state IN ('SUBMITTED_UNKNOWN','OPEN','PARTIALLY_FILLED','NEEDS_RECONCILIATION') \
+             ORDER BY client_identifier LIMIT 1001",
+            )
+            .map_err(sql_error)?;
+        let identifiers = statement
+            .query_map([account_identity], |row| row.get::<_, String>(0))
+            .map_err(sql_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sql_error)?;
+        if identifiers.len() > LIMIT {
+            return Err(LabError::ResourceLimit(
+                "private order recovery target limit exceeded".into(),
+            ));
+        }
+        identifiers
+            .into_iter()
+            .map(|raw| {
+                let identifier = AutomationOrderIdentifier::new(raw)?;
+                let target = self
+                    .automation_order_readback_target(&identifier)?
+                    .ok_or_else(|| {
+                        LabError::DataCorrupt("private order recovery target disappeared".into())
+                    })?;
+                if target.account_identity != account_identity {
+                    return Err(LabError::DataCorrupt(
+                        "private order recovery account mismatch".into(),
+                    ));
+                }
+                Ok(target)
+            })
+            .collect()
+    }
+
     /// Release a reservation only after a definitive pre-send denial. A durable
     /// send claim changes the state to `SUBMITTED_UNKNOWN`, which this CAS refuses.
     pub(crate) fn automation_reject_reserved_order(
@@ -3207,12 +3385,21 @@ impl Store {
         Ok(view)
     }
 
-    /// Release a send claim only when the final runtime gate proves no HTTP request started.
-    pub(crate) fn automation_reject_claimed_order_before_send(
+    /// Release a claim only for one of the definitive local pre-send gates.
+    pub(crate) fn automation_reject_claimed_order_before_send_with_reason(
         &mut self,
         identifier: &AutomationOrderIdentifier,
         now: UtcTimestamp,
+        reason: &str,
     ) -> Result<(), LabError> {
+        if !matches!(
+            reason,
+            "LIVE_ORDER_SENDING_DISABLED" | "PRIVATE_ACCOUNT_RECOVERY_REQUIRED"
+        ) {
+            return Err(LabError::InvalidConfig(
+                "invalid pre-send rejection reason".into(),
+            ));
+        }
         let transaction = self.connection.transaction().map_err(sql_error)?;
         let row = transaction
             .query_row(
@@ -3237,7 +3424,7 @@ impl Store {
         }
         let session_id = crate::contracts::AutomationSessionId::new(row.0)?;
         let detail_json = serde_json::to_string(&serde_json::json!({
-            "reason": "LIVE_ORDER_SENDING_DISABLED",
+            "reason": reason,
             "pre_send": true,
         }))
         .map_err(json_error)?;
@@ -3285,7 +3472,7 @@ impl Store {
             serde_json::json!({
                 "intent_id": row.1,
                 "client_identifier": identifier,
-                "reason": "LIVE_ORDER_SENDING_DISABLED",
+                "reason": reason,
                 "pre_send": true,
             }),
         )?;
@@ -5405,6 +5592,7 @@ fn event_name(kind: AutomationEventKind) -> &'static str {
         AutomationEventKind::Resumed => "RESUMED",
         AutomationEventKind::Stopped => "STOPPED",
         AutomationEventKind::CandleObserved => "CANDLE_OBSERVED",
+        AutomationEventKind::DecisionDeferred => "DECISION_DEFERRED",
         AutomationEventKind::SignalObserved => "SIGNAL_OBSERVED",
         AutomationEventKind::IntentRejected => "INTENT_REJECTED",
         AutomationEventKind::OrderAdmitted => "ORDER_ADMITTED",
@@ -5427,6 +5615,7 @@ fn parse_event_kind(value: &str) -> Result<AutomationEventKind, LabError> {
         "RESUMED" => Ok(AutomationEventKind::Resumed),
         "STOPPED" => Ok(AutomationEventKind::Stopped),
         "CANDLE_OBSERVED" => Ok(AutomationEventKind::CandleObserved),
+        "DECISION_DEFERRED" => Ok(AutomationEventKind::DecisionDeferred),
         "SIGNAL_OBSERVED" => Ok(AutomationEventKind::SignalObserved),
         "INTENT_REJECTED" => Ok(AutomationEventKind::IntentRejected),
         "ORDER_ADMITTED" => Ok(AutomationEventKind::OrderAdmitted),
@@ -7859,6 +8048,11 @@ fn parse_decimal(value: &str) -> Result<Decimal, LabError> {
     })
 }
 
+mod admission_deferred;
+#[cfg(test)]
+mod admission_deferred_tests;
+mod decision_preparation;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7866,6 +8060,234 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn preparation_is_deduplicated_without_advancing_candle_or_intent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!(
+            "sky-backcraft-preparation-{}-{}",
+            std::process::id(),
+            TEST_ROOT_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        ));
+        fs::create_dir(&root)?;
+        let result = (|| -> Result<(), LabError> {
+            let mut store = Store::open(&root)?;
+            let now = UtcTimestamp::parse_rfc3339("2025-01-02T02:01:00Z")?;
+            let session = seed_running_automation_session(
+                &mut store,
+                "preparation-session",
+                "KRW-BTC",
+                "mock:upbit-default",
+                &baseline_test_risk_policy()?,
+                now,
+            )?;
+            let observation =
+                completed_test_observation("2025-01-02T02:00:00Z", "2025-01-02T03:00:00Z")?;
+            let preparation = crate::contracts::DecisionPreparation {
+                status: crate::contracts::DecisionPreparationStatus::PrivateReadinessBlocked,
+                market: MarketId::parse_upbit("KRW-BTC")?,
+                interval: crate::contracts::CandleInterval::H1,
+                observation_id: observation.id.clone(),
+                decision_time: observation.candle.close_time_utc,
+                completed_bars_seen: 7,
+                required_bars: 10,
+            };
+            let snapshot = |store: &Store| -> Result<(String, Option<String>, i64), LabError> {
+                store.connection.query_row(
+                    "SELECT checkpoint_json,last_finalized_candle_at_utc,sequence FROM automation_sessions WHERE session_id=?1",
+                    [session.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+                ).map_err(sql_error)
+            };
+            let before = snapshot(&store)?;
+            let received = UtcTimestamp::parse_rfc3339("2025-01-02T03:00:01Z")?;
+            assert!(store.automation_record_preparation(&session, &preparation, received)?);
+            assert!(!store.automation_record_preparation(&session, &preparation, received)?);
+            assert_eq!(snapshot(&store)?, before);
+            let counts: (i64, i64, i64) = store
+                .connection
+                .query_row(
+                    "SELECT (SELECT count(*) FROM automation_candles), \
+                 (SELECT count(*) FROM automation_intents), \
+                 (SELECT count(*) FROM automation_session_events WHERE kind='DECISION_DEFERRED')",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .map_err(sql_error)?;
+            assert_eq!(counts, (0, 0, 1));
+            let mut changed = preparation.clone();
+            changed.status = crate::contracts::DecisionPreparationStatus::AwaitingPolicySources;
+            assert!(store.automation_record_preparation(&session, &changed, received)?);
+            assert!(store.automation_record_preparation(&session, &preparation, received)?);
+            assert!(!store.automation_record_preparation(&session, &preparation, received)?);
+            assert_eq!(snapshot(&store)?, before);
+            store.automation_record_decision(
+                &session,
+                &observation,
+                "{}",
+                &AutomationIntentId::from_seed("ready-after-preparation"),
+                "HOLD",
+                &serde_json::json!({"original_test_decision":true}),
+                received,
+            )?;
+            assert!(!store.automation_record_preparation(&session, &preparation, received)?);
+            assert_eq!(
+                snapshot(&store)?.1,
+                Some(observation.candle.close_time_utc.to_rfc3339())
+            );
+            store.close()?;
+            Ok(())
+        })();
+        fs::remove_dir_all(&root)?;
+        result?;
+        Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one held-session fixture proves CAS, frozen-policy retention, existing reservation reconciliation, admission fence and restart"
+    )]
+    fn source_coverage_hold_is_durable_idempotent_and_fences_new_reservations()
+    -> Result<(), LabError> {
+        let root = std::env::temp_dir().join(format!(
+            "sky-backcraft-source-hold-{}-{}",
+            std::process::id(),
+            TEST_ROOT_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        ));
+        fs::create_dir(&root).expect("isolated source-hold store");
+        let result = (|| {
+            let mut store = Store::open(&root)?;
+            let now = UtcTimestamp::parse_rfc3339("2025-01-02T02:01:00Z")?;
+            let market = MarketId::parse_upbit("KRW-BTC")?;
+            let id = seed_running_automation_session(
+                &mut store,
+                "source-hold-session",
+                "KRW-BTC",
+                "mock:upbit-default",
+                &baseline_test_risk_policy()?,
+                now,
+            )?;
+            assert!(matches!(
+                store.automation_hold_source_gap(&id, 2, "SOURCE_COVERAGE_GAP", now),
+                Err(LabError::Conflict(_))
+            ));
+            let policy_before: String = store
+                .connection
+                .query_row(
+                    "SELECT frozen_policy_json FROM automation_sessions WHERE session_id=?1",
+                    [id.as_str()],
+                    |r| r.get(0),
+                )
+                .map_err(sql_error)?;
+            let existing_order =
+                seed_reserved_test_order(&mut store, &id, "before-source-gap", now)?;
+            let reservation_snapshot =
+                |store: &Store| -> Result<(String, String, String, String), LabError> {
+                    store.connection.query_row(
+                    "SELECT o.order_request_json,o.state,r.quote_reserved_krw,r.state \
+                     FROM automation_orders o JOIN automation_risk_reservations r USING(client_identifier) \
+                     WHERE o.client_identifier=?1", [existing_order.as_str()],
+                    |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+                ).map_err(sql_error)
+                };
+            let reserved_before = reservation_snapshot(&store)?;
+            store.automation_hold_source_gap(&id, 1, "SOURCE_COVERAGE_GAP", now)?;
+            store.automation_hold_source_gap(&id, 1, "SOURCE_COVERAGE_GAP", now)?;
+            let (state, reason, policy_after): (String, String, String) = store.connection.query_row(
+                "SELECT state,recovery_reason,frozen_policy_json FROM automation_sessions WHERE session_id=?1", [id.as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            ).map_err(sql_error)?;
+            assert_eq!(state, "NEEDS_RECONCILIATION");
+            assert_eq!(reason, "SOURCE_COVERAGE_GAP");
+            assert_eq!(policy_before, policy_after);
+            assert_eq!(reservation_snapshot(&store)?, reserved_before);
+            let events: i64 = store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM automation_session_events WHERE session_id=?1",
+                    [id.as_str()],
+                    |r| r.get(0),
+                )
+                .map_err(sql_error)?;
+            assert_eq!(events, 1);
+            let intent = AutomationIntentId::from_seed("source-hold-intent");
+            let notional = QuoteAmount::new(Decimal::from(9000))?;
+            let rules = VerifiedMarketRules {
+                market: market.code(),
+                source_mode: AutomationSessionMode::Mock,
+                observed_at_utc: now,
+                state: "active".into(),
+                bid_types: vec!["price".into()],
+                ask_types: vec!["market".into()],
+                bid_fee: Decimal::new(5, 4),
+                ask_fee: Decimal::new(5, 4),
+                bid_min_total: Decimal::from(5000),
+                ask_min_total: Decimal::from(5000),
+                max_total: Decimal::from(1_000_000_000),
+                bid_price_unit: None,
+                ask_price_unit: None,
+            };
+            let denied = store.automation_admit_order(
+                AutomationOrderAdmission {
+                    session_id: id.clone(),
+                    intent_id: intent.clone(),
+                    request: AutomationOrderRequest {
+                        client_identifier: AutomationOrderIdentifier::from_intent(&intent),
+                        market,
+                        side: crate::contracts::AutomationSide::Bid,
+                        order: AutomationOrderKind::MarketBuy { budget: notional },
+                    },
+                    decision_mark: crate::contracts::PriceKrw::new(Decimal::from(10000))?,
+                    decision_time: now,
+                    requested_notional: notional,
+                    quote_reserve: QuoteAmount::new(Decimal::new(90045, 1))?,
+                    asset_currency: "BTC".into(),
+                    asset_reserve: AssetQuantity::new(Decimal::ZERO)?,
+                    fee_reserve: QuoteAmount::new(Decimal::new(45, 1))?,
+                    rules,
+                    evaluation_json: serde_json::json!({}),
+                },
+                now,
+            );
+            assert!(
+                matches!(denied, Err(LabError::Conflict(reason)) if reason.contains("session is not running"))
+            );
+            let reservations: i64 = store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM automation_risk_reservations",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(sql_error)?;
+            assert_eq!(reservations, 1);
+            // The hold preserves pre-existing reservations for ordinary reconciliation.
+            // This is an isolated mock venue; no provider request or real order occurs.
+            store.automation_seed_mock_venue(now)?;
+            let request: AutomationOrderRequest =
+                serde_json::from_str(&reserved_before.0).map_err(json_error)?;
+            let detail = store.automation_mock_submit_order(
+                &request,
+                crate::contracts::PriceKrw::new(Decimal::from(100))?,
+                now,
+            )?;
+            let reconciled = store.automation_reconcile_order(&detail, now)?;
+            assert_eq!(reconciled.client_identifier, existing_order);
+            assert_eq!(
+                store.automation_get_session(&id, now)?.state,
+                AutomationSessionState::NeedsReconciliation
+            );
+            drop(store);
+            let reopened = Store::open(&root)?;
+            assert_eq!(
+                reopened.automation_get_session(&id, now)?.state,
+                AutomationSessionState::NeedsReconciliation
+            );
+            Ok(())
+        })();
+        let _ = fs::remove_dir_all(&root);
+        result
+    }
 
     #[test]
     fn daily_loss_boundary_blocks_at_and_above_the_cap() -> Result<(), LabError> {
@@ -10727,7 +11149,7 @@ mod tests {
         transaction.commit().map_err(sql_error)
     }
 
-    fn completed_test_observation(
+    pub(super) fn completed_test_observation(
         open_at: &str,
         close_at: &str,
     ) -> Result<CandleObservation, LabError> {
@@ -11125,7 +11547,7 @@ mod tests {
         result.expect("Pause/Stop must release only unclaimed reservations atomically");
     }
 
-    fn seed_reserved_test_order(
+    pub(super) fn seed_reserved_test_order(
         store: &mut Store,
         session_id: &crate::contracts::AutomationSessionId,
         suffix: &str,
@@ -11209,7 +11631,7 @@ mod tests {
         Ok(identifier)
     }
 
-    fn seed_running_automation_session(
+    pub(super) fn seed_running_automation_session(
         store: &mut Store,
         raw_session_id: &str,
         raw_market: &str,
@@ -11243,7 +11665,7 @@ mod tests {
         Ok(session_id)
     }
 
-    fn baseline_test_risk_policy() -> Result<AutomationRiskPolicy, LabError> {
+    pub(super) fn baseline_test_risk_policy() -> Result<AutomationRiskPolicy, LabError> {
         Ok(AutomationRiskPolicy {
             max_order_notional_krw: QuoteAmount::new(Decimal::from(100_000))?,
             max_daily_notional_krw: QuoteAmount::new(Decimal::from(1_000_000))?,

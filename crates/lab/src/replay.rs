@@ -123,11 +123,16 @@ fn replay_models(
     source: &RunBundle,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<Vec<ModelLedger>, LabError> {
+    let bar_cache = crate::policy_engine::PreparedBarCache::prewarm_for_plan(
+        &source.plan,
+        &source.datasets,
+        &|| false,
+    );
     let mut models = Vec::with_capacity(source.plan.admissions.len());
     let mut next_sequence = 1_u64;
     for admission in &source.plan.admissions {
         check_cancelled(cancelled)?;
-        let model = crate::engine::run_model(
+        let model = crate::engine::run_model_with_cache(
             &source.plan,
             &source.datasets,
             source.evidence.as_ref(),
@@ -135,6 +140,7 @@ fn replay_models(
             admission,
             next_sequence,
             cancelled,
+            Some(&bar_cache),
         )?;
         next_sequence = model
             .last_event_seq

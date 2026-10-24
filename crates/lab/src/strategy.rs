@@ -6,9 +6,11 @@
 pub(crate) mod indicators;
 
 use crate::contracts::{
-    AssetQuantity, CandleInterval, CandleObservation, EvidenceDecisionEffect, INDICATOR_VERSION,
-    IndicatorSnapshot, LabError, MarketId, PositionState, PriceKrw, ReasonCode, StateParameters,
-    StrategySpec, UtcTimestamp, Weight,
+    AssetQuantity, CandleInterval, CandleObservation, CompareOp, EvidenceDecisionEffect,
+    FinitePolicyNumber, INDICATOR_VERSION, IndicatorSnapshot, LabError, MarketId,
+    PolicyConditionEvidence, PolicyConditionOutcome, PolicyConditionReason, PolicyConditionRole,
+    PolicyConditionScope, PolicyConditionTrace, PositionState, PriceKrw, ReasonCode,
+    StateParameters, StrategyKind, StrategySpec, UtcTimestamp, VerifiedProviderCoverage, Weight,
 };
 use crate::evidence::EvidenceEvaluator;
 use indicators::{Ema, RollingExtreme, RollingVol, Rsi, finite, finite_positive};
@@ -77,6 +79,9 @@ pub struct StrategyEvaluation {
     pub evidence_effect: Option<EvidenceDecisionEffect>,
     pub policy_ref: Option<crate::contracts::PolicyRevisionRef>,
     pub policy_trace: Option<crate::contracts::PolicyTrace>,
+    /// Actual branch-local conditions evaluated by builtin strategies.
+    /// Rules policies continue to use `policy_trace.condition_trace`.
+    pub(crate) decision_trace: Option<Vec<PolicyConditionTrace>>,
     pub(crate) base_state_before: Option<PositionState>,
     pub(crate) base_state_after: Option<PositionState>,
 }
@@ -178,7 +183,30 @@ impl StrategyEvaluator {
         position: PositionView,
         evidence: Option<&EvidenceEvaluator>,
     ) -> Result<Option<StrategyEvaluation>, LabError> {
-        self.validate_observation(observation)?;
+        self.observe_with_provider_coverage(
+            observation,
+            position,
+            evidence,
+            &VerifiedProviderCoverage::empty(),
+        )
+    }
+
+    /// Admit one actual completed bar when verified provider coverage accounts
+    /// for any missing open times since the prior actual bar.
+    ///
+    /// Coverage exempts only the continuity check. Indicators and counters
+    /// still advance once, using this actual observation only.
+    ///
+    /// # Errors
+    /// Preserves all existing bar, market, OHLC, evidence and position guards.
+    pub(crate) fn observe_with_provider_coverage(
+        &mut self,
+        observation: &CandleObservation,
+        position: PositionView,
+        evidence: Option<&EvidenceEvaluator>,
+        coverage: &VerifiedProviderCoverage,
+    ) -> Result<Option<StrategyEvaluation>, LabError> {
+        self.validate_observation(observation, coverage)?;
         let candle = &observation.candle;
         let close = decimal_f64(candle.close.get(), "close")?;
         let high = decimal_f64(candle.high.get(), "high")?;
@@ -262,27 +290,26 @@ impl StrategyEvaluator {
     ) -> Result<StrategyEvaluation, LabError> {
         let base_before = self.base_signal_state;
         let mut decision_state_before = actual_state;
+        let strategy_kind = self.spec.kind();
+        let mut decision_trace = BuiltinConditionRecorder::new(strategy_kind);
         let (state_after, raw_target, constrained_target, mut reasons) = match &self.spec {
             StrategySpec::S1 { state } => {
                 decision_state_before = base_before;
-                let decision = state_decision(close, base_before, state, indicators)?;
+                let decision =
+                    state_decision(close, base_before, state, indicators, &mut decision_trace)?;
                 self.base_signal_state = decision.0;
                 decision
             }
-            StrategySpec::S2 { .. } => donchian_decision(close, actual_state, indicators)?,
-            StrategySpec::S3 {
-                entry_threshold,
-                exit_threshold,
-                max_holding_bars,
-                ..
-            } => trend_pullback_decision(
+            StrategySpec::S2 { .. } => {
+                donchian_decision(close, actual_state, indicators, &mut decision_trace)?
+            }
+            StrategySpec::S3 { .. } => trend_pullback_decision(
                 close,
                 actual_state,
                 position,
                 indicators,
-                *entry_threshold,
-                *exit_threshold,
-                *max_holding_bars,
+                &self.spec,
+                &mut decision_trace,
             )?,
             StrategySpec::S4 {
                 state,
@@ -291,7 +318,7 @@ impl StrategyEvaluator {
                 rebalance_band,
             } => {
                 let (state_after, _, _, reasons) =
-                    state_decision(close, base_before, state, indicators)?;
+                    state_decision(close, base_before, state, indicators, &mut decision_trace)?;
                 decision_state_before = base_before;
                 self.base_signal_state = state_after;
                 let annual_vol = indicators.annual_vol.ok_or_else(missing_indicator)?;
@@ -301,7 +328,16 @@ impl StrategyEvaluator {
                     weight_from_f64((target_annual_vol / annual_vol.max(*vol_floor)).min(1.0))?
                 };
                 let difference = (target.get() - position.actual_weight.get()).abs();
-                if difference <= rebalance_band.get() {
+                let rebalance_allowed = difference <= rebalance_band.get();
+                decision_trace.weight_band(
+                    "builtin:rebalance:target_distance_within_band",
+                    target,
+                    position.actual_weight,
+                    Weight::new(difference)?,
+                    *rebalance_band,
+                    rebalance_allowed,
+                );
+                if rebalance_allowed {
                     let mut reasons = reasons;
                     reasons.push(ReasonCode::RebalanceBand);
                     reasons.push(ReasonCode::NoAction);
@@ -313,7 +349,7 @@ impl StrategyEvaluator {
             StrategySpec::S5 { state } | StrategySpec::S1CoverageControl { state } => {
                 decision_state_before = base_before;
                 let (base_state_after, base_target, _, mut reasons) =
-                    state_decision(close, base_before, state, indicators)?;
+                    state_decision(close, base_before, state, indicators, &mut decision_trace)?;
                 self.base_signal_state = base_state_after;
                 let evaluator = evidence.ok_or_else(|| {
                     LabError::BlockedEvidence("S5 evaluation requires an EvidenceEvaluator".into())
@@ -338,22 +374,40 @@ impl StrategyEvaluator {
                     evidence_effect: Some(effect),
                     policy_ref: None,
                     policy_trace: None,
+                    decision_trace: Some(decision_trace.into_rows()),
                     base_state_before: Some(base_before),
                     base_state_after: Some(base_state_after),
                 });
             }
-            StrategySpec::BuyAndHold => (
-                PositionState::Long,
-                one_weight()?,
-                one_weight()?,
-                if actual_state == PositionState::Cash {
-                    vec![ReasonCode::StartFromCash]
-                } else {
-                    Vec::new()
-                },
-            ),
+            StrategySpec::BuyAndHold => {
+                let starts_from_cash = actual_state == PositionState::Cash;
+                decision_trace.position(
+                    "builtin:entry:starts_from_cash",
+                    PositionState::Cash,
+                    actual_state,
+                    starts_from_cash,
+                );
+                (
+                    PositionState::Long,
+                    one_weight()?,
+                    one_weight()?,
+                    if starts_from_cash {
+                        vec![ReasonCode::StartFromCash]
+                    } else {
+                        Vec::new()
+                    },
+                )
+            }
         };
-        if constrained_target == position.actual_weight && reasons.is_empty() {
+        let target_matches_position = constrained_target == position.actual_weight;
+        decision_trace.weight_comparison(
+            "builtin:action:target_equals_actual_weight",
+            constrained_target,
+            CompareOp::Eq,
+            position.actual_weight,
+            target_matches_position,
+        );
+        if target_matches_position && reasons.is_empty() {
             reasons.extend([ReasonCode::HoldState, ReasonCode::NoAction]);
         }
         Ok(StrategyEvaluation {
@@ -367,6 +421,7 @@ impl StrategyEvaluator {
             evidence_effect: None,
             policy_ref: None,
             policy_trace: None,
+            decision_trace: Some(decision_trace.into_rows()),
             base_state_before: matches!(
                 self.spec,
                 StrategySpec::S1 { .. } | StrategySpec::S4 { .. }
@@ -389,7 +444,11 @@ impl StrategyEvaluator {
         }
     }
 
-    fn validate_observation(&self, observation: &CandleObservation) -> Result<(), LabError> {
+    fn validate_observation(
+        &self,
+        observation: &CandleObservation,
+        coverage: &VerifiedProviderCoverage,
+    ) -> Result<(), LabError> {
         let candle = &observation.candle;
         if candle.market != self.market.code() || candle.interval != self.interval {
             return Err(LabError::InvalidConfig(
@@ -410,10 +469,9 @@ impl StrategyEvaluator {
                 "strategy requires one complete aligned candle".into(),
             ));
         }
-        if self
-            .last_close_time
-            .is_some_and(|previous| previous != candle.open_time_utc)
-        {
+        if self.last_close_time.is_some_and(|previous| {
+            !coverage.covers(&self.market, self.interval, previous, candle.open_time_utc)
+        }) {
             return Err(LabError::DataGap(
                 "strategy candle sequence is not contiguous".into(),
             ));
@@ -448,6 +506,7 @@ fn state_decision(
     state_before: PositionState,
     parameters: &StateParameters,
     indicators: &IndicatorSnapshot,
+    trace: &mut BuiltinConditionRecorder,
 ) -> Result<(PositionState, Weight, Weight, Vec<ReasonCode>), LabError> {
     let ema = indicators.ema.ok_or_else(missing_indicator)?;
     let sigma = indicators.bar_sigma.ok_or_else(missing_indicator)?;
@@ -456,9 +515,36 @@ fn state_decision(
     finite(upper, "upper state band")?;
     finite(lower, "lower state band")?;
     let (state_after, reasons) = match state_before {
-        PositionState::Cash if close > upper => (PositionState::Long, vec![ReasonCode::BandEntry]),
-        PositionState::Long if close < lower => (PositionState::Cash, vec![ReasonCode::BandExit]),
-        _ => (state_before, Vec::new()),
+        PositionState::Cash => {
+            let entered = close > upper;
+            trace.comparison(
+                "builtin:entry:close_gt_upper_band",
+                close,
+                CompareOp::Gt,
+                upper,
+                entered,
+            )?;
+            if entered {
+                (PositionState::Long, vec![ReasonCode::BandEntry])
+            } else {
+                (PositionState::Cash, Vec::new())
+            }
+        }
+        PositionState::Long => {
+            let exited = close < lower;
+            trace.comparison(
+                "builtin:exit:close_lt_lower_band",
+                close,
+                CompareOp::Lt,
+                lower,
+                exited,
+            )?;
+            if exited {
+                (PositionState::Cash, vec![ReasonCode::BandExit])
+            } else {
+                (PositionState::Long, Vec::new())
+            }
+        }
     };
     let target = weight_for_state(state_after)?;
     Ok((state_after, target, target, reasons))
@@ -468,6 +554,7 @@ fn donchian_decision(
     close: f64,
     state_before: PositionState,
     indicators: &IndicatorSnapshot,
+    trace: &mut BuiltinConditionRecorder,
 ) -> Result<(PositionState, Weight, Weight, Vec<ReasonCode>), LabError> {
     let entry = decimal_f64(
         indicators.entry_high.ok_or_else(missing_indicator)?.get(),
@@ -478,9 +565,36 @@ fn donchian_decision(
         "exit low",
     )?;
     let (state_after, reasons) = match state_before {
-        PositionState::Cash if close > entry => (PositionState::Long, vec![ReasonCode::Breakout]),
-        PositionState::Long if close < exit => (PositionState::Cash, vec![ReasonCode::Breakdown]),
-        _ => (state_before, Vec::new()),
+        PositionState::Cash => {
+            let breakout = close > entry;
+            trace.comparison(
+                "builtin:entry:close_gt_prior_entry_high",
+                close,
+                CompareOp::Gt,
+                entry,
+                breakout,
+            )?;
+            if breakout {
+                (PositionState::Long, vec![ReasonCode::Breakout])
+            } else {
+                (PositionState::Cash, Vec::new())
+            }
+        }
+        PositionState::Long => {
+            let breakdown = close < exit;
+            trace.comparison(
+                "builtin:exit:close_lt_prior_exit_low",
+                close,
+                CompareOp::Lt,
+                exit,
+                breakdown,
+            )?;
+            if breakdown {
+                (PositionState::Cash, vec![ReasonCode::Breakdown])
+            } else {
+                (PositionState::Long, Vec::new())
+            }
+        }
     };
     let target = weight_for_state(state_after)?;
     Ok((state_after, target, target, reasons))
@@ -491,30 +605,93 @@ fn trend_pullback_decision(
     state_before: PositionState,
     position: PositionView,
     indicators: &IndicatorSnapshot,
-    entry_threshold: f64,
-    exit_threshold: f64,
-    max_holding_bars: usize,
+    strategy_spec: &StrategySpec,
+    trace: &mut BuiltinConditionRecorder,
 ) -> Result<(PositionState, Weight, Weight, Vec<ReasonCode>), LabError> {
+    let StrategySpec::S3 {
+        entry_threshold,
+        exit_threshold,
+        max_holding_bars,
+        ..
+    } = strategy_spec
+    else {
+        return Err(LabError::Internal(
+            "trend-pullback decision requires its frozen S3 specification".into(),
+        ));
+    };
     let ema = indicators.ema.ok_or_else(missing_indicator)?;
     let rsi = indicators.rsi.ok_or_else(missing_indicator)?;
     let mut reasons = Vec::new();
     let state_after = match state_before {
-        PositionState::Cash if close > ema && rsi < entry_threshold => {
-            reasons.push(ReasonCode::TrendPullbackEntry);
-            PositionState::Long
+        PositionState::Cash => {
+            let trend_confirmed = close > ema;
+            trace.comparison(
+                "builtin:entry:close_gt_ema",
+                close,
+                CompareOp::Gt,
+                ema,
+                trend_confirmed,
+            )?;
+            let pullback_confirmed = if trend_confirmed {
+                let confirmed = rsi < *entry_threshold;
+                trace.comparison(
+                    "builtin:entry:rsi_lt_entry_threshold",
+                    rsi,
+                    CompareOp::Lt,
+                    *entry_threshold,
+                    confirmed,
+                )?;
+                confirmed
+            } else {
+                trace.not_evaluated(
+                    "builtin:entry:rsi_lt_entry_threshold",
+                    PolicyConditionReason::AndShortCircuit,
+                );
+                false
+            };
+            if trend_confirmed && pullback_confirmed {
+                reasons.push(ReasonCode::TrendPullbackEntry);
+                PositionState::Long
+            } else {
+                PositionState::Cash
+            }
         }
-        PositionState::Cash => PositionState::Cash,
         PositionState::Long => {
-            if close < ema {
+            let trend_invalidated = close < ema;
+            trace.comparison(
+                "builtin:exit:close_lt_ema",
+                close,
+                CompareOp::Lt,
+                ema,
+                trend_invalidated,
+            )?;
+            if trend_invalidated {
                 reasons.push(ReasonCode::TrendInvalidated);
             }
-            if rsi > exit_threshold {
+            let rsi_recovered = rsi > *exit_threshold;
+            trace.comparison(
+                "builtin:exit:rsi_gt_exit_threshold",
+                rsi,
+                CompareOp::Gt,
+                *exit_threshold,
+                rsi_recovered,
+            )?;
+            if rsi_recovered {
                 reasons.push(ReasonCode::RsiRecovery);
             }
-            if position
-                .held_decision_bars
-                .is_some_and(|bars| bars >= max_holding_bars as u64)
-            {
+            let holding_timed_out = position.held_decision_bars.is_some_and(|bars| {
+                let limit = *max_holding_bars as u64;
+                let timed_out = bars >= limit;
+                trace.count_comparison(
+                    "builtin:exit:held_bars_gte_maximum",
+                    bars,
+                    CompareOp::Gte,
+                    limit,
+                    timed_out,
+                );
+                timed_out
+            });
+            if holding_timed_out {
                 reasons.push(ReasonCode::HoldingTimeout);
             }
             if reasons.is_empty() {
@@ -526,6 +703,155 @@ fn trend_pullback_decision(
     };
     let target = weight_for_state(state_after)?;
     Ok((state_after, target, target, reasons))
+}
+
+fn builtin_condition_trace(
+    strategy: StrategyKind,
+    path: &str,
+    result: bool,
+    evidence: PolicyConditionEvidence,
+) -> PolicyConditionTrace {
+    PolicyConditionTrace {
+        scope: PolicyConditionScope::BuiltinStrategy { strategy },
+        ast_path: path.into(),
+        role: PolicyConditionRole::Unspecified,
+        outcome: if result {
+            PolicyConditionOutcome::True
+        } else {
+            PolicyConditionOutcome::False
+        },
+        engine_result: Some(result),
+        evidence: Some(evidence),
+    }
+}
+
+struct BuiltinConditionRecorder {
+    strategy: StrategyKind,
+    rows: Vec<PolicyConditionTrace>,
+}
+
+impl BuiltinConditionRecorder {
+    fn new(strategy: StrategyKind) -> Self {
+        Self {
+            strategy,
+            rows: Vec::new(),
+        }
+    }
+
+    fn into_rows(self) -> Vec<PolicyConditionTrace> {
+        self.rows
+    }
+
+    fn comparison(
+        &mut self,
+        path: &str,
+        left: f64,
+        comparison: CompareOp,
+        right: f64,
+        result: bool,
+    ) -> Result<(), LabError> {
+        self.rows.push(builtin_condition_trace(
+            self.strategy,
+            path,
+            result,
+            PolicyConditionEvidence::Comparison {
+                left: FinitePolicyNumber::new(left)?,
+                comparison,
+                right: FinitePolicyNumber::new(right)?,
+            },
+        ));
+        Ok(())
+    }
+
+    fn count_comparison(
+        &mut self,
+        path: &str,
+        left: u64,
+        comparison: CompareOp,
+        right: u64,
+        result: bool,
+    ) {
+        self.rows.push(builtin_condition_trace(
+            self.strategy,
+            path,
+            result,
+            PolicyConditionEvidence::CountComparison {
+                left,
+                comparison,
+                right,
+            },
+        ));
+    }
+
+    fn position(
+        &mut self,
+        path: &str,
+        expected: PositionState,
+        actual: PositionState,
+        result: bool,
+    ) {
+        self.rows.push(builtin_condition_trace(
+            self.strategy,
+            path,
+            result,
+            PolicyConditionEvidence::Position { expected, actual },
+        ));
+    }
+
+    fn weight_band(
+        &mut self,
+        path: &str,
+        target: Weight,
+        actual: Weight,
+        difference: Weight,
+        band: Weight,
+        result: bool,
+    ) {
+        self.rows.push(builtin_condition_trace(
+            self.strategy,
+            path,
+            result,
+            PolicyConditionEvidence::WeightBand {
+                target,
+                actual,
+                difference,
+                band,
+            },
+        ));
+    }
+
+    fn weight_comparison(
+        &mut self,
+        path: &str,
+        left: Weight,
+        comparison: CompareOp,
+        right: Weight,
+        result: bool,
+    ) {
+        self.rows.push(builtin_condition_trace(
+            self.strategy,
+            path,
+            result,
+            PolicyConditionEvidence::WeightComparison {
+                left,
+                comparison,
+                right,
+            },
+        ));
+    }
+
+    fn not_evaluated(&mut self, path: &str, reason: PolicyConditionReason) {
+        self.rows.push(PolicyConditionTrace {
+            scope: PolicyConditionScope::BuiltinStrategy {
+                strategy: self.strategy,
+            },
+            ast_path: path.into(),
+            role: PolicyConditionRole::Unspecified,
+            outcome: PolicyConditionOutcome::NotEvaluated(reason),
+            engine_result: None,
+            evidence: None,
+        });
+    }
 }
 
 fn missing_indicator() -> LabError {

@@ -395,7 +395,7 @@ fn verify_cargo_baseline(root: &Path, policy: &HarnessPolicy) -> Result<(), Stri
 fn cargo_metadata(root: &Path, policy: &ToolchainPolicy) -> Result<serde_json::Value, String> {
     let mut command = policy.command("cargo");
     command
-        .args(["metadata", "--format-version", "1", "--no-deps"])
+        .args(["metadata", "--locked", "--format-version", "1", "--no-deps"])
         .current_dir(root);
     let output = command
         .output()
@@ -526,13 +526,13 @@ fn check() -> Result<(), String> {
     let root = workspace_root()?;
     let mut command = cargo_command(&root)?;
     command
-        .args(["check", "--workspace", "--all-targets"])
+        .args(["check", "--locked", "--workspace", "--all-targets"])
         .current_dir(&root);
     status(&mut command, "cargo check")?;
 
     let mut command = cargo_command(&root)?;
     command
-        .args(["clippy", "--workspace", "--all-targets"])
+        .args(["clippy", "--locked", "--workspace", "--all-targets"])
         .current_dir(&root);
     status(&mut command, "cargo clippy")
 }
@@ -541,7 +541,7 @@ fn test() -> Result<(), String> {
     let root = workspace_root()?;
     let mut command = cargo_command(&root)?;
     command
-        .args(["test", "--workspace", "--all-targets"])
+        .args(["test", "--locked", "--workspace", "--all-targets"])
         .current_dir(&root);
     status(&mut command, "cargo test")
 }

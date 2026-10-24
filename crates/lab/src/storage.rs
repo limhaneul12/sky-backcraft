@@ -11,15 +11,19 @@ mod delete_store;
 mod equity_chart;
 mod evidence_store;
 mod history_store;
+mod job_inputs;
 mod job_store;
 mod ledger_seal;
 mod maintenance_store;
 mod migrations;
+mod oauth_client_store;
 mod paper_store;
 mod plan_store;
 mod policy_store;
 mod portfolio_store;
+mod public_feed_recovery;
 mod query_read;
+mod realtime_store;
 mod research_store;
 mod run_store;
 mod schedule_store;
@@ -31,8 +35,12 @@ pub(crate) use delete_store::PolicyDeleteAdmission;
 pub use equity_chart::EquityChartProjection;
 pub use job_store::AttemptPublication;
 pub use ledger_seal::RunLedgerSealStats;
+pub(crate) use oauth_client_store::{NewOAuthClientRecord, StoredOAuthClientRecord};
 pub use paper_store::PaperPollRequirement;
 pub use plan_store::StoredPlan;
+pub(crate) use public_feed_recovery::{
+    MAX_PROVIDER_RECOVERY_ROWS, PersistedProviderRecoveryPage, ProviderFeedRecoveryCursor,
+};
 pub use query_read::{
     JobQueueStatus, ModelCostSummary, ModelResultSummary, RunResultSummary, ValidationResultSummary,
 };
@@ -41,7 +49,8 @@ pub use run_store::{ModelFactBatch, ResultPage};
 use crate::contracts::{
     CandleObservation, CollectRequest, CollectionPage, ContentHash, DatasetId, DatasetSnapshot,
     DatasetStatus, LabError, MAX_COLLECTION_CALLS, MAX_DATASET_ROWS, MarketDataOrigin, MarketId,
-    ObservationId, QualitySeverity, RawObjectId, RawObjectRef, RequestId, UtcTimestamp,
+    ObservationId, QualitySeverity, RawObjectId, RawObjectRef, RawWebSocketTransport, RequestId,
+    UtcTimestamp,
 };
 use flate2::{Compression, GzBuilder};
 use rusqlite::{Connection, MAIN_DB, OptionalExtension, Transaction, params};
@@ -282,6 +291,8 @@ struct BackupArtifact {
 pub struct Store {
     connection: Connection,
     raw: RawObjectStore,
+    active_job_input_holds:
+        std::collections::HashMap<crate::contracts::AttemptId, job_inputs::ActiveJobInputHold>,
 }
 
 impl RawObjectStore {
@@ -305,6 +316,14 @@ impl RawObjectStore {
 
     /// Publish bounded source bytes by durable same-filesystem directory rename.
     fn publish(&self, input: RawObjectInput) -> Result<PublishedRaw, LabError> {
+        self.publish_with_transport(input, None)
+    }
+
+    fn publish_with_transport(
+        &self,
+        input: RawObjectInput,
+        transport: Option<RawWebSocketTransport>,
+    ) -> Result<PublishedRaw, LabError> {
         if input.source_url.is_empty()
             || input.source_url.len() > 2_048
             || input
@@ -317,12 +336,7 @@ impl RawObjectStore {
                 "raw response metadata exceeds bounds or has invalid HTTP status".into(),
             ));
         }
-        if input.body.len() > MAX_RAW_OBJECT_BYTES {
-            return Err(LabError::ResourceLimit(format!(
-                "raw response is {} bytes; limit is {MAX_RAW_OBJECT_BYTES}",
-                input.body.len()
-            )));
-        }
+        validate_raw_input(&input, transport.as_ref())?;
         let raw_sha256 = ContentHash::of_bytes(&input.body);
         let compressed = deterministic_gzip(&input.body)?;
         let compressed_sha256 = ContentHash::of_bytes(&compressed);
@@ -336,6 +350,13 @@ impl RawObjectStore {
             input.origin,
         ))
         .map_err(json_error)?;
+        // Preserve every historical HTTP raw identity and serialized shape.
+        // New socket evidence also binds the connection/message receipt metadata.
+        let seed = if let Some(metadata) = &transport {
+            serde_json::to_string(&(seed, metadata)).map_err(json_error)?
+        } else {
+            seed
+        };
         let id = RawObjectId::from_seed(&seed);
         let shard = &raw_sha256.as_str()[..2];
         let relative_path = format!("{RAW_DIR}/{shard}/{id}");
@@ -358,6 +379,7 @@ impl RawObjectStore {
             raw_bytes: input.body.len() as u64,
             compressed_bytes: compressed.len() as u64,
             origin: input.origin,
+            transport,
         };
 
         if destination.exists() {
@@ -407,11 +429,43 @@ impl RawObjectStore {
         Ok(())
     }
 
+    /// Inspect one already path-validated input without treating absence as a storage fault.
+    /// # Errors
+    /// Reports missing inputs as invalid configuration, unsafe symlinks as corrupt data, and
+    /// other filesystem failures as storage errors.
+    pub(super) fn inspect_job_input_path(
+        &self,
+        path: &Path,
+        label: &str,
+    ) -> Result<fs::Metadata, LabError> {
+        if !path.starts_with(&self.root) {
+            return Err(LabError::InvalidConfig(
+                "job input path escapes the store root".into(),
+            ));
+        }
+        reject_symlink_chain_with(&self.root, path, |error| job_input_io_error(label, error))?;
+        let metadata =
+            fs::symlink_metadata(path).map_err(|error| job_input_io_error(label, error))?;
+        if metadata.file_type().is_symlink() {
+            return Err(LabError::DataCorrupt(format!("{label} is a symlink")));
+        }
+        Ok(metadata)
+    }
+
     /// Read raw bytes only after path, length, compressed hash, and raw hash verification.
     ///
     /// # Errors
     /// Returns an error for unsafe paths, missing/corrupt content, or invalid metadata.
     pub fn read_verified(&self, object: &RawObjectRef) -> Result<Vec<u8>, LabError> {
+        if let Some(metadata) = &object.transport {
+            validate_websocket_raw_metadata(
+                &object.source_url,
+                object.http_status,
+                object.fetched_at,
+                metadata,
+            )
+            .map_err(|_| LabError::DataCorrupt("invalid WebSocket raw provenance".into()))?;
+        }
         validate_object_path(object)?;
         let directory = self.root.join(&object.relative_path);
         reject_symlink_chain(&self.root, &directory)?;
@@ -477,7 +531,11 @@ impl Store {
         migrations::apply(&mut connection)?;
         delete_store::recover_pending_file_removals(&mut connection, &root)?;
         delete_store::recover_interrupted_policy_deletes(&mut connection)?;
-        Ok(Self { connection, raw })
+        Ok(Self {
+            connection,
+            raw,
+            active_job_input_holds: std::collections::HashMap::new(),
+        })
     }
 
     /// Persist one bounded raw response before any database reference is created.
@@ -486,6 +544,18 @@ impl Store {
     /// Returns an error for capacity, path, compression, or durable publication failure.
     pub fn publish_raw(&self, input: RawObjectInput) -> Result<PublishedRaw, LabError> {
         self.raw.publish(input)
+    }
+
+    /// Publish an actual socket message before cataloging or financial decisions.
+    /// The caller supplies the observed successful upgrade status in `input`.
+    /// # Errors
+    /// Rejects secret-bearing URLs, invalid receipt coordinates or unsafe storage.
+    pub fn publish_websocket_raw(
+        &self,
+        input: RawObjectInput,
+        transport: RawWebSocketTransport,
+    ) -> Result<PublishedRaw, LabError> {
+        self.raw.publish_with_transport(input, Some(transport))
     }
 
     /// Reserve worst-case bytes for an out-of-owner export until its files are catalogued.
@@ -1522,6 +1592,7 @@ impl Store {
                     reservations: Arc::new(Mutex::new(ReservationState::default())),
                 },
             },
+            active_job_input_holds: std::collections::HashMap::new(),
         };
         verified.verify_backup_contents(&manifest)?;
         let mut file =
@@ -2194,6 +2265,7 @@ pub(super) fn insert_observation(
     observation: &CandleObservation,
 ) -> Result<(), LabError> {
     validate_observation_identity(observation)?;
+    public_feed_recovery::record_observation_absence_conflicts(transaction, observation)?;
     let json = serde_json::to_string(observation).map_err(json_error)?;
     let existing = transaction
         .query_row(
@@ -2252,7 +2324,9 @@ fn insert_observation_links(
         .iter()
         .map(ToString::to_string)
         .collect();
-    if !constituents.is_empty() && constituents != requested {
+    // Direct exchange observations add independent raw evidence to the same
+    // economic identity; an absent derivation must not erase an existing one.
+    if !constituents.is_empty() && !requested.is_empty() && constituents != requested {
         return Err(LabError::Conflict(
             "observation identity has different constituents".into(),
         ));
@@ -2455,6 +2529,14 @@ fn reject_symlink(path: &Path) -> Result<(), LabError> {
 }
 
 fn reject_symlink_chain(root: &Path, path: &Path) -> Result<(), LabError> {
+    reject_symlink_chain_with(root, path, |error| io_error("inspect path")(error))
+}
+
+fn reject_symlink_chain_with(
+    root: &Path,
+    path: &Path,
+    mut map_error: impl FnMut(std::io::Error) -> LabError,
+) -> Result<(), LabError> {
     let relative = path
         .strip_prefix(root)
         .map_err(|_| LabError::InvalidConfig("path escapes data root".into()))?;
@@ -2463,10 +2545,26 @@ fn reject_symlink_chain(root: &Path, path: &Path) -> Result<(), LabError> {
     for component in relative.components() {
         cursor.push(component);
         if cursor.exists() {
-            reject_symlink(&cursor)?;
+            let metadata = fs::symlink_metadata(&cursor).map_err(&mut map_error)?;
+            if metadata.file_type().is_symlink() {
+                return Err(LabError::InvalidConfig(format!(
+                    "symlink path is not allowed: {}",
+                    cursor.display()
+                )));
+            }
         }
     }
     Ok(())
+}
+
+fn job_input_io_error(label: &str, error: std::io::Error) -> LabError {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => LabError::InvalidConfig(format!("{label} is missing")),
+        std::io::ErrorKind::NotADirectory => {
+            LabError::DataCorrupt(format!("{label} has a non-directory parent"))
+        }
+        _ => io_error("inspect job input")(error),
+    }
 }
 
 fn validate_object_path(object: &RawObjectRef) -> Result<(), LabError> {
@@ -2733,6 +2831,64 @@ fn write_synced(path: &Path, bytes: &[u8]) -> Result<(), LabError> {
         .map_err(io_error("create file"))?;
     file.write_all(bytes).map_err(io_error("write file"))?;
     file.sync_all().map_err(io_error("sync file"))
+}
+
+fn validate_raw_input(
+    input: &RawObjectInput,
+    transport: Option<&RawWebSocketTransport>,
+) -> Result<(), LabError> {
+    if input.body.len() > MAX_RAW_OBJECT_BYTES {
+        return Err(LabError::ResourceLimit(format!(
+            "raw response is {} bytes; limit is {MAX_RAW_OBJECT_BYTES}",
+            input.body.len()
+        )));
+    }
+    if let Some(metadata) = transport {
+        validate_websocket_raw_metadata(
+            &input.source_url,
+            input.http_status,
+            input.fetched_at,
+            metadata,
+        )?;
+    } else if reqwest::Url::parse(&input.source_url)
+        .is_ok_and(|url| matches!(url.scheme(), "wss" | "ws"))
+    {
+        return Err(LabError::InvalidConfig(
+            "WebSocket evidence requires explicit transport provenance".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_websocket_raw_metadata(
+    source_url: &str,
+    handshake_status: u16,
+    fetched_at: UtcTimestamp,
+    transport: &RawWebSocketTransport,
+) -> Result<(), LabError> {
+    let url = reqwest::Url::parse(source_url)
+        .map_err(|_| LabError::InvalidConfig("invalid WebSocket evidence URL".into()))?;
+    let loopback = url.host_str().is_some_and(|host| {
+        host == "localhost"
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    });
+    if !(url.scheme() == "wss" || (url.scheme() == "ws" && loopback))
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || handshake_status != 101
+        || transport.connection_epoch == 0
+        || transport.message_sequence == 0
+        || transport.received_at != fetched_at
+    {
+        return Err(LabError::InvalidConfig(
+            "invalid WebSocket evidence transport metadata".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn sync_directory(path: &Path) -> Result<(), LabError> {

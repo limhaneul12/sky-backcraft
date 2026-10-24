@@ -13,9 +13,15 @@ COPY crates crates
 COPY xtask xtask
 
 FROM source AS ci
-RUN rustup component add --toolchain 1.98.0 rustfmt clippy \
+COPY Makefile ./
+COPY scripts scripts
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends python3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && rustup component add --toolchain 1.98.0 rustfmt clippy \
+    && command -v flock \
     && cargo fetch --locked
-CMD ["cargo", "xtask", "ci"]
+CMD ["sh", "scripts/shell/ci.sh"]
 
 FROM source AS builder
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
@@ -32,7 +38,7 @@ RUN apt-get update \
     && install --directory --owner spotlab --group spotlab /var/lib/spot-lab
 
 COPY --from=builder /workspace/target/release/spot-lab /usr/local/bin/spot-lab
-COPY --chmod=755 scripts/container-entrypoint.sh /usr/local/bin/spot-lab-entrypoint
+COPY --chmod=755 scripts/shell/container-entrypoint.sh /usr/local/bin/spot-lab-entrypoint
 
 USER 10001:10001
 WORKDIR /var/lib/spot-lab

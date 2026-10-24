@@ -6,24 +6,35 @@ use super::{
 };
 use crate::contracts::{
     CandleInterval, CandleObservation, ContentHash, ENGINE_VERSION, LabError, MarketId,
-    PaperCommandOutcome, PaperControlEvent, PaperEventCursor, PaperEventKind, PaperMarketStart,
-    PaperRecoveryCause, PaperSessionCommandAction, PaperSessionCommandResponse, PaperSessionCursor,
-    PaperSessionEvent, PaperSessionEventPage, PaperSessionGetResponse, PaperSessionId,
-    PaperSessionMode, PaperSessionPage, PaperSessionReceipt, PaperSessionRequestReadback,
-    PaperSessionStartOptions, PaperSessionState, PaperSessionView, PaperSessionWrite, PolicyId,
-    PolicyRevisionId, PolicyRevisionRef, RawObjectRef, RequestId, SCHEMA_VERSION, UtcTimestamp,
+    ObservationId, PaperCandleReference, PaperCommandOutcome, PaperControlEvent, PaperEventKind,
+    PaperMarketStart, PaperRecoveryCause, PaperSessionCommandAction, PaperSessionCommandResponse,
+    PaperSessionCursor, PaperSessionEvent, PaperSessionEventPage, PaperSessionGetResponse,
+    PaperSessionId, PaperSessionMode, PaperSessionPage, PaperSessionReceipt,
+    PaperSessionRequestReadback, PaperSessionStartOptions, PaperSessionState, PaperSessionView,
+    PaperSessionWrite, PaperVerification, PaperVerificationStatus, PolicyId, PolicyRevisionId,
+    PolicyRevisionRef, RawObjectRef, RequestId, SCHEMA_VERSION, UtcTimestamp,
 };
 use crate::paper::{
     MAX_ACTIVE_PAPER_SESSIONS, MAX_PAPER_MARKETS_PER_SESSION, MAX_PAPER_RECOVERY_BARS,
-    PAPER_CHECKPOINT_SCHEMA_VERSION, PaperMarketCheckpoint, PaperStepOutcome,
-    PreparedPaperSourceFrame, default_start_options, materialize_candle_event,
-    policy_option_from_revision, request_payload_digest, semantic_digest,
+    MAX_PAPER_SESSION_VERIFICATION_EVENT_BYTES, MAX_PAPER_SESSION_VERIFICATION_EVENTS,
+    MAX_PAPER_SESSION_VERIFICATION_JSON_BYTES, MAX_PAPER_SESSION_VERIFICATION_OBSERVATION_BYTES,
+    MAX_PAPER_SESSION_VERIFICATION_OBSERVATIONS, PAPER_CHECKPOINT_SCHEMA_VERSION,
+    PaperMarketCheckpoint, PaperStepOutcome, PreparedPaperSourceFrame, StoredCheckpointRow,
+    StoredEventRow, default_start_options, materialize_candle_event, policy_option_from_revision,
+    request_payload_digest, semantic_digest, verify_paper_session,
 };
-use rusqlite::{OptionalExtension, Transaction, params};
+use rusqlite::{OptionalExtension, Transaction, params, params_from_iter};
 use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_SESSION_LIST_LIMIT: u32 = 50;
 const MAX_EVENT_LIST_LIMIT: u32 = 100;
+
+mod decision_preparation;
+mod provider_recovery;
+mod review;
+mod review_audit;
+mod review_counterfactual;
+mod review_decision;
 
 /// Market/interval polling requirement for an active `RUNNING` paper session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,6 +157,7 @@ impl Store {
             let mut view: PaperSessionView =
                 serde_json::from_str(&view_json).map_err(json_error)?;
             refresh_view_freshness(&mut view, now);
+            self.project_paper_verification(&mut view)?;
             items.push(view);
         }
         let limit_usize = usize::try_from(limit)
@@ -184,7 +196,165 @@ impl Store {
             LabError::InvalidConfig(format!("unknown paper session: {}", session_id.as_str()))
         })?;
         refresh_view_freshness(&mut session, now);
+        self.project_paper_verification(&mut session)?;
         Ok(PaperSessionGetResponse { session })
+    }
+
+    /// Derive bounded, read-only accounting/event verification for the public session projection.
+    /// The durable `view_json` remains the persisted source; this method only replaces the
+    /// response's verification field.
+    #[allow(clippy::too_many_lines)]
+    fn project_paper_verification(&self, session: &mut PaperSessionView) -> Result<(), LabError> {
+        let session_row = self
+            .connection
+            .query_row(
+                "SELECT sequence, event_count FROM paper_sessions WHERE session_id=?1",
+                [session.session_id.as_str()],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        let Some(session_row) = session_row else {
+            set_failed_paper_verification(session, "SESSION_ROW_MISSING");
+            return Ok(());
+        };
+
+        let (event_count, event_bytes): (i64, i64) = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(length(CAST(event_json AS BLOB))), 0) \
+                 FROM paper_session_events WHERE session_id=?1",
+                [session.session_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(sql_error)?;
+        let event_count = usize::try_from(event_count)
+            .map_err(|_| LabError::DataCorrupt("negative paper event row count".into()))?;
+        let event_bytes = usize::try_from(event_bytes)
+            .map_err(|_| LabError::DataCorrupt("negative paper event byte count".into()))?;
+        if event_count > MAX_PAPER_SESSION_VERIFICATION_EVENTS {
+            set_unavailable_paper_verification(session, "EVENT_HISTORY_OVER_20000");
+            return Ok(());
+        }
+        if event_bytes > MAX_PAPER_SESSION_VERIFICATION_EVENT_BYTES {
+            set_unavailable_paper_verification(session, "EVENT_JSON_OVER_64MIB");
+            return Ok(());
+        }
+        let event_rows = match load_session_event_rows(&self.connection, &session.session_id) {
+            Ok(rows) => rows,
+            Err(LabError::DataCorrupt(_)) => {
+                set_failed_paper_verification(session, "EVENT_JSON_CORRUPT");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+
+        let (checkpoint_count, checkpoint_bytes): (i64, i64) = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(length(CAST(checkpoint_json AS BLOB))), 0) \
+                 FROM paper_market_checkpoints WHERE session_id=?1",
+                [session.session_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(sql_error)?;
+        if checkpoint_count < 0 || checkpoint_count > i64::from(MAX_PAPER_MARKETS_PER_SESSION) {
+            set_failed_paper_verification(session, "CHECKPOINT_ROW_COUNT");
+            return Ok(());
+        }
+        let checkpoint_bytes = usize::try_from(checkpoint_bytes)
+            .map_err(|_| LabError::DataCorrupt("negative paper checkpoint byte count".into()))?;
+        if checkpoint_bytes > MAX_PAPER_SESSION_VERIFICATION_EVENT_BYTES
+            || event_bytes
+                .checked_add(checkpoint_bytes)
+                .is_none_or(|total| total > MAX_PAPER_SESSION_VERIFICATION_JSON_BYTES)
+        {
+            set_unavailable_paper_verification(session, "CHECKPOINT_JSON_OVER_64MIB");
+            return Ok(());
+        }
+        let checkpoint_rows =
+            match load_session_checkpoint_rows(&self.connection, &session.session_id) {
+                Ok(rows) => rows,
+                Err(LabError::DataCorrupt(_)) => {
+                    set_failed_paper_verification(session, "CHECKPOINT_ROW_CORRUPT");
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
+        let checkpoints = checkpoint_rows
+            .iter()
+            .map(|(_, _, checkpoint)| checkpoint.clone())
+            .collect::<Vec<_>>();
+        if let Err(error) =
+            verify_recovery_checkpoint_identity(&self.connection, session, &checkpoints)
+        {
+            if matches!(error, LabError::DataCorrupt(_)) {
+                set_failed_paper_verification(session, "FROZEN_CHECKPOINT_IDENTITY");
+                return Ok(());
+            }
+            return Err(error);
+        }
+
+        let observation_ids =
+            crate::paper::verification_observation_ids(&event_rows, &checkpoint_rows);
+        if observation_ids.len() > MAX_PAPER_SESSION_VERIFICATION_OBSERVATIONS {
+            set_unavailable_paper_verification(session, "OBSERVATION_REFERENCES_OVER_40000");
+            return Ok(());
+        }
+        let observation_sizes = load_observation_sizes(&self.connection, &observation_ids)?;
+        let observation_bytes = observation_sizes
+            .iter()
+            .try_fold(0_usize, |total, (_, bytes)| total.checked_add(*bytes));
+        let Some(observation_bytes) = observation_bytes else {
+            set_unavailable_paper_verification(session, "OBSERVATION_JSON_SIZE_OVERFLOW");
+            return Ok(());
+        };
+        if observation_bytes > MAX_PAPER_SESSION_VERIFICATION_OBSERVATION_BYTES
+            || event_bytes
+                .checked_add(checkpoint_bytes)
+                .and_then(|total| total.checked_add(observation_bytes))
+                .is_none_or(|total| total > MAX_PAPER_SESSION_VERIFICATION_JSON_BYTES)
+        {
+            set_unavailable_paper_verification(session, "OBSERVATION_JSON_OVER_64MIB");
+            return Ok(());
+        }
+        let observations =
+            match load_verification_observations(&self.connection, &observation_sizes) {
+                Ok(rows) => rows,
+                Err(LabError::DataCorrupt(_)) => {
+                    set_failed_paper_verification(session, "OBSERVATION_JSON_CORRUPT");
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
+        let proof_ids = event_rows
+            .iter()
+            .filter_map(|row| row.event.provider_recovery.as_ref())
+            .flat_map(|meta| meta.proof_ids.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        let coverage =
+            match provider_recovery::named_coverage(&self.connection, &self.raw, &proof_ids) {
+                Ok(coverage) => coverage,
+                Err(
+                    LabError::DataCorrupt(_)
+                    | LabError::Conflict(_)
+                    | LabError::InputHashMismatch(_),
+                ) => {
+                    set_failed_paper_verification(session, "PROVIDER_RECOVERY_PROOF_INVALID");
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
+        let projected = verify_paper_session(
+            session,
+            session_row,
+            &event_rows,
+            &checkpoint_rows,
+            &observations,
+            &coverage,
+        );
+        set_paper_verification(session, &projected);
+        Ok(())
     }
 
     #[cfg(test)]
@@ -196,6 +366,202 @@ impl Store {
             .iter()
             .map(PaperMarketCheckpoint::checkpoint_digest)
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn paper_tamper_market_cash_total_for_test(
+        &self,
+        session_id: &PaperSessionId,
+        market: &MarketId,
+    ) -> Result<(), LabError> {
+        let mut view = load_session_view(&self.connection, session_id)?.ok_or_else(|| {
+            LabError::InvalidConfig(format!("unknown paper session: {}", session_id.as_str()))
+        })?;
+        let snapshot = view
+            .markets
+            .iter_mut()
+            .find(|snapshot| &snapshot.market == market)
+            .ok_or_else(|| LabError::InvalidConfig(format!("unknown market: {}", market.code())))?;
+        let changed = snapshot
+            .cash_total
+            .get()
+            .checked_add(rust_decimal::Decimal::ONE)
+            .ok_or_else(|| LabError::ResourceLimit("test cash tamper overflow".into()))?;
+        snapshot.cash_total = crate::contracts::QuoteAmount::new(changed)?;
+        let json = serde_json::to_string(&view).map_err(json_error)?;
+        self.connection
+            .execute(
+                "UPDATE paper_sessions SET view_json=?1 WHERE session_id=?2",
+                params![json, session_id.as_str()],
+            )
+            .map_err(sql_error)?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn paper_stored_view_json_for_test(
+        &self,
+        session_id: &PaperSessionId,
+    ) -> Result<String, LabError> {
+        self.connection
+            .query_row(
+                "SELECT view_json FROM paper_sessions WHERE session_id=?1",
+                [session_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn paper_restore_session_view_for_test(
+        &self,
+        session_id: &PaperSessionId,
+        view: &PaperSessionView,
+    ) -> Result<(), LabError> {
+        let mut view = view.clone();
+        for market in &mut view.markets {
+            market.verification = crate::paper::default_paper_verification();
+        }
+        let json = serde_json::to_string(&view).map_err(json_error)?;
+        self.connection
+            .execute(
+                "UPDATE paper_sessions SET view_json=?1 WHERE session_id=?2",
+                params![json, session_id.as_str()],
+            )
+            .map_err(sql_error)?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn paper_restore_events_for_test(
+        &self,
+        session_id: &PaperSessionId,
+        events: &[PaperSessionEvent],
+    ) -> Result<(), LabError> {
+        for event in events {
+            let json = serde_json::to_string(event).map_err(json_error)?;
+            let changed = self
+                .connection
+                .execute(
+                    "UPDATE paper_session_events SET event_json=?1 \
+                     WHERE session_id=?2 AND sequence=?3",
+                    params![json, session_id.as_str(), u64_to_i64(event.sequence)?],
+                )
+                .map_err(sql_error)?;
+            if changed != 1 {
+                return Err(LabError::DataCorrupt(
+                    "test event restore did not find exactly one SQL row".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn paper_tamper_first_fill_fee_for_test(
+        &self,
+        session_id: &PaperSessionId,
+    ) -> Result<MarketId, LabError> {
+        let event = self.mutate_first_event_for_test(session_id, |event| {
+            let Some(fill) = event.fills.first_mut() else {
+                return Ok(false);
+            };
+            let changed = fill
+                .fee
+                .get()
+                .checked_add(rust_decimal::Decimal::ONE)
+                .ok_or_else(|| LabError::ResourceLimit("test fee tamper overflow".into()))?;
+            fill.fee = crate::contracts::QuoteAmount::new(changed)?;
+            Ok(true)
+        })?;
+        event
+            .fills
+            .first()
+            .map(|fill| fill.context.market.clone())
+            .ok_or_else(|| LabError::DataCorrupt("fee tamper did not alter a fill".into()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn paper_tamper_first_fill_source_for_test(
+        &self,
+        session_id: &PaperSessionId,
+    ) -> Result<MarketId, LabError> {
+        let event = self.mutate_first_event_for_test(session_id, |event| {
+            let Some(fill) = event.fills.first_mut() else {
+                return Ok(false);
+            };
+            fill.liquidity_source_bar_id = ObservationId::new("obs-missing-from-test-db")?;
+            Ok(true)
+        })?;
+        event
+            .fills
+            .first()
+            .map(|fill| fill.context.market.clone())
+            .ok_or_else(|| LabError::DataCorrupt("source tamper did not alter a fill".into()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn paper_tamper_first_event_sequence_for_test(
+        &self,
+        session_id: &PaperSessionId,
+    ) -> Result<(), LabError> {
+        self.mutate_first_event_for_test(session_id, |event| {
+            event.sequence = event
+                .sequence
+                .checked_add(1_000_000)
+                .ok_or_else(|| LabError::ResourceLimit("test sequence tamper overflow".into()))?;
+            Ok(true)
+        })?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn mutate_first_event_for_test(
+        &self,
+        session_id: &PaperSessionId,
+        mut mutate: impl FnMut(&mut PaperSessionEvent) -> Result<bool, LabError>,
+    ) -> Result<PaperSessionEvent, LabError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT sequence, event_json FROM paper_session_events \
+                 WHERE session_id=?1 ORDER BY sequence ASC",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map([session_id.as_str()], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(sql_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sql_error)?;
+        drop(statement);
+        for (sql_sequence, json) in rows {
+            let mut event: PaperSessionEvent = serde_json::from_str(&json).map_err(|error| {
+                LabError::DataCorrupt(format!("test event JSON is invalid: {error}"))
+            })?;
+            if !mutate(&mut event)? {
+                continue;
+            }
+            let json = serde_json::to_string(&event).map_err(json_error)?;
+            let changed = self
+                .connection
+                .execute(
+                    "UPDATE paper_session_events SET event_json=?1 \
+                     WHERE session_id=?2 AND sequence=?3",
+                    params![json, session_id.as_str(), sql_sequence],
+                )
+                .map_err(sql_error)?;
+            if changed != 1 {
+                return Err(LabError::DataCorrupt(
+                    "test event mutation did not find exactly one SQL row".into(),
+                ));
+            }
+            return Ok(event);
+        }
+        Err(LabError::DataCorrupt(
+            "test fixture has no event matching requested mutation".into(),
+        ))
     }
 
     #[cfg(test)]
@@ -253,68 +619,14 @@ impl Store {
                 session_id.as_str()
             )));
         }
-        if !(1..=MAX_EVENT_LIST_LIMIT).contains(&limit) {
-            return Err(LabError::InvalidConfig(format!(
-                "paper event list limit must be 1..={MAX_EVENT_LIST_LIMIT}"
-            )));
-        }
-        let after_seq_i64 = u64_to_i64(after_sequence.unwrap_or(0))?;
-
-        let total_i64: i64 = self
-            .connection
-            .query_row(
-                "SELECT COUNT(*) FROM paper_session_events WHERE session_id = ?1",
-                [session_id.as_str()],
-                |row| row.get(0),
-            )
-            .map_err(sql_error)?;
-        let total_count = u64::try_from(total_i64)
-            .map_err(|_| LabError::DataCorrupt("negative paper event count".into()))?;
-
-        let mut statement = self
-            .connection
-            .prepare(
-                "SELECT event_json FROM paper_session_events \
-                 WHERE session_id = ?1 AND sequence > ?2 \
-                 ORDER BY sequence ASC \
-                 LIMIT ?3",
-            )
-            .map_err(sql_error)?;
-        let rows = statement
-            .query_map(
-                params![session_id.as_str(), after_seq_i64, i64::from(limit) + 1],
-                |row| row.get::<_, String>(0),
-            )
-            .map_err(sql_error)?;
-
-        let mut items = Vec::new();
-        for row in rows {
-            let event_json = row.map_err(sql_error)?;
-            let event: PaperSessionEvent = serde_json::from_str(&event_json).map_err(json_error)?;
-            items.push(event);
-        }
-        let limit_usize = usize::try_from(limit)
-            .map_err(|_| LabError::ResourceLimit("limit exceeds usize".into()))?;
-        let has_more = items.len() > limit_usize;
-        if has_more {
-            items.truncate(limit_usize);
-        }
-        let next_cursor = if has_more {
-            items.last().map(|event| PaperEventCursor {
-                sequence: event.sequence,
-            })
-        } else {
-            None
-        };
-        let returned_count = u64::try_from(items.len())
-            .map_err(|_| LabError::ResourceLimit("returned_count overflow".into()))?;
-        Ok(PaperSessionEventPage {
-            session_id: session_id.clone(),
-            items,
-            returned_count,
-            total_count,
-            next_cursor,
-        })
+        review::load_event_page(
+            &self.connection,
+            session_id,
+            after_sequence,
+            i64::MAX,
+            limit,
+            usize::MAX,
+        )
     }
 
     /// Read back the durable outcome of a prior `paper_session_write` request by `request_id`.
@@ -352,6 +664,7 @@ impl Store {
         let mut session = load_session_view(&self.connection, &session_id)?;
         if let Some(view) = &mut session {
             refresh_view_freshness(view, now);
+            self.project_paper_verification(view)?;
         }
         Ok(PaperSessionRequestReadback {
             request_id: request_id.clone(),
@@ -417,43 +730,46 @@ impl Store {
         let request_id = write.request_id();
         let payload_digest = request_payload_digest(&action_label, request_id, write)?;
 
-        if let Some(response) =
+        let response = if let Some(response) =
             self.replay_paper_write_if_present(request_id, &action_label, &payload_digest, now)?
         {
-            return Ok(response);
-        }
-
-        match write {
-            PaperSessionWrite::Start {
-                request_id,
-                policy_ref,
-                decision_interval,
-                execution_resolution,
-                latency_ms,
-                execution,
-                markets,
-            } => self.paper_start_session(
-                request_id,
-                &payload_digest,
-                policy_ref,
-                *decision_interval,
-                *execution_resolution,
-                *latency_ms,
-                execution,
-                markets,
-                now,
-            ),
-            PaperSessionWrite::Pause { .. } | PaperSessionWrite::Stop { .. } => {
-                self.paper_transition_session(write, &payload_digest, None, &[], now)
+            response
+        } else {
+            match write {
+                PaperSessionWrite::Start {
+                    request_id,
+                    policy_ref,
+                    decision_interval,
+                    execution_resolution,
+                    latency_ms,
+                    execution,
+                    markets,
+                } => self.paper_start_session(
+                    request_id,
+                    &payload_digest,
+                    policy_ref,
+                    *decision_interval,
+                    *execution_resolution,
+                    *latency_ms,
+                    execution,
+                    markets,
+                    now,
+                )?,
+                PaperSessionWrite::Pause { .. } | PaperSessionWrite::Stop { .. } => {
+                    self.paper_transition_session(write, &payload_digest, None, &[], now)?
+                }
+                PaperSessionWrite::Resume { .. } => self.paper_transition_session(
+                    write,
+                    &payload_digest,
+                    expected_requirements,
+                    fetched_batches,
+                    now,
+                )?,
             }
-            PaperSessionWrite::Resume { .. } => self.paper_transition_session(
-                write,
-                &payload_digest,
-                expected_requirements,
-                fetched_batches,
-                now,
-            ),
-        }
+        };
+        let mut response = response;
+        self.project_paper_verification(&mut response.session)?;
+        Ok(response)
     }
 
     fn replay_paper_write_if_present(
@@ -626,6 +942,7 @@ impl Store {
             event_count: 0,
             markets: market_snapshots,
             recovery_cause: None,
+            recovery_detail: None,
         };
         let receipt = PaperSessionReceipt {
             request_id: request_id.clone(),
@@ -936,6 +1253,7 @@ impl Store {
             .ok_or_else(|| LabError::ResourceLimit("paper session sequence overflow".into()))?;
         session_view.sequence = next_sequence;
         session_view.state = resulting_state;
+        session_view.recovery_detail.clone_from(&recovery_failure);
         session_view.event_count = session_view
             .event_count
             .saturating_add(u64::try_from(catch_up_records.len()).unwrap_or(u64::MAX))
@@ -950,12 +1268,14 @@ impl Store {
         session_view.markets = snapshots;
 
         let event = PaperSessionEvent {
+            preparation: None,
             sequence: next_sequence,
             kind: event_kind,
             market: None,
             candle: None,
             source_event_at: None,
             finalized_at: None,
+            provider_recovery: None,
             control: Some(PaperControlEvent {
                 action,
                 cancelled_pending_orders: cancelled_order_events.clone(),
@@ -1003,6 +1323,12 @@ impl Store {
     /// # Errors
     /// Returns an error if SQLite queries or checkpoint deserialization fail.
     pub fn active_running_paper_polls(&self) -> Result<Vec<PaperPollRequirement>, LabError> {
+        let session_ids = self.active_running_paper_session_ids()?;
+        Ok(self.active_running_paper_polls_for_ids(&session_ids, &BTreeSet::new()))
+    }
+
+    /// Parse every ordered RUNNING SQL identity before checkpoint loading.
+    pub(super) fn active_running_paper_session_ids(&self) -> Result<Vec<PaperSessionId>, LabError> {
         let mut statement = self
             .connection
             .prepare(
@@ -1014,33 +1340,42 @@ impl Store {
             .map_err(sql_error)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(sql_error)?;
+        session_ids.into_iter().map(PaperSessionId::new).collect()
+    }
 
+    /// Load tolerant poll requirements for IDs not covered by the strict observer scan.
+    pub(super) fn active_running_paper_polls_for_ids(
+        &self,
+        session_ids: &[PaperSessionId],
+        strict_loaded_ids: &BTreeSet<PaperSessionId>,
+    ) -> Vec<PaperPollRequirement> {
         let mut requirements: BTreeMap<(MarketId, CandleInterval), Option<UtcTimestamp>> =
             BTreeMap::new();
-        for session_id_str in session_ids {
-            let session_id = PaperSessionId::new(session_id_str)?;
-            let Ok(checkpoints) = load_session_checkpoints(&self.connection, &session_id) else {
+        for session_id in session_ids {
+            if strict_loaded_ids.contains(session_id) {
+                continue;
+            }
+            let Ok(checkpoints) = load_session_checkpoints(&self.connection, session_id) else {
                 continue;
             };
-            for cp in checkpoints {
-                let decision_interval = cp.plan.spec.decision_interval;
+            for checkpoint in checkpoints {
                 merge_poll_cursor(
                     &mut requirements,
-                    cp.market.clone(),
-                    decision_interval,
-                    cp.last_finalized_candle_at,
+                    checkpoint.market.clone(),
+                    checkpoint.plan.spec.decision_interval,
+                    checkpoint.last_finalized_candle_at,
                 );
-                for (&source_interval, cursor) in &cp.source_cursors {
+                for (&source_interval, cursor) in &checkpoint.source_cursors {
                     merge_poll_cursor(
                         &mut requirements,
-                        cp.market.clone(),
+                        checkpoint.market.clone(),
                         source_interval,
                         cursor.last_bar_close_utc,
                     );
                 }
             }
         }
-        Ok(requirements
+        requirements
             .into_iter()
             .map(
                 |((market, interval), last_bar_close_utc)| PaperPollRequirement {
@@ -1049,7 +1384,7 @@ impl Store {
                     last_bar_close_utc,
                 },
             )
-            .collect())
+            .collect()
     }
 
     /// Return `(market, interval)` pairs required by `RUNNING` paper sessions whose
@@ -1159,7 +1494,9 @@ impl Store {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT session_id FROM paper_sessions WHERE state = 'RUNNING' ORDER BY created_at_utc ASC, session_id ASC",
+                "SELECT session_id FROM paper_sessions WHERE state = 'RUNNING' \
+                 OR (state = 'RECOVERY_REQUIRED' AND json_extract(view_json, '$.recovery_cause') IN ('FEED_GAP','PROVIDER_GAP')) \
+                 ORDER BY created_at_utc ASC, session_id ASC",
             )
             .map_err(sql_error)?;
         let running_ids = statement
@@ -1231,14 +1568,16 @@ impl Store {
         let mut checkpoints = match load_session_checkpoints(&transaction, session_id) {
             Ok(cps) => cps,
             Err(err) => {
-                return mark_session_recovery_required(
+                let mut recovery_view = mark_session_recovery_required(
                     transaction,
                     session_view,
                     expected_sequence,
                     None,
                     &format!("checkpoint integrity failure: {err}"),
                     now,
-                );
+                )?;
+                self.project_paper_verification(&mut recovery_view)?;
+                return Ok(recovery_view);
             }
         };
         let cp_index = checkpoints
@@ -1309,6 +1648,27 @@ impl Store {
                         None,
                         now,
                     )?;
+                    if let Some(preparation) = outcome.preparation.as_ref()
+                        && let Some(event) = decision_preparation::deferred_event(
+                            &transaction,
+                            session_id,
+                            bar,
+                            preparation,
+                            now,
+                        )?
+                    {
+                        pending_events.push(event);
+                    }
+                    if !outcome.did_advance
+                        && outcome.recovery_required.is_none()
+                        && checkpoint
+                            .last_finalized_candle_at
+                            .is_none_or(|last| bar.candle.close_time_utc > last)
+                    {
+                        // The new row remains durable and unprocessed. Trying
+                        // its successor now would fabricate a decision gap.
+                        break;
+                    }
                     if outcome.did_advance {
                         pending_events.extend(outcome.events);
                     }
@@ -1323,8 +1683,15 @@ impl Store {
 
         if pending_events.is_empty() && recovery_reason.is_none() {
             refresh_view_freshness(&mut session_view, now);
+            drop(transaction);
+            self.project_paper_verification(&mut session_view)?;
             return Ok(session_view);
         }
+
+        let checkpoint_progress = recovery_reason.is_some()
+            || pending_events
+                .iter()
+                .any(|event| event.kind != PaperEventKind::DecisionDeferred);
 
         let mut next_sequence = session_view.sequence;
         let mut materialized_events = Vec::with_capacity(pending_events.len());
@@ -1340,19 +1707,33 @@ impl Store {
         session_view.event_count = session_view
             .event_count
             .saturating_add(u64::try_from(materialized_events.len()).unwrap_or(0));
-        session_view.last_evaluated_at = Some(now);
+        if checkpoint_progress {
+            session_view.last_evaluated_at = Some(now);
+        }
         if recovery_reason.is_some() {
             session_view.state = PaperSessionState::RecoveryRequired;
             session_view.recovery_cause = recovery_cause;
+            session_view.recovery_detail.clone_from(&recovery_reason);
         }
 
-        let mut snapshots = Vec::with_capacity(checkpoints.len());
-        for (order, cp) in checkpoints.iter_mut().enumerate() {
-            cp.refresh_freshness(now);
-            snapshots.push(cp.to_market_snapshot()?);
-            upsert_checkpoint_row(&transaction, order, next_sequence, now, cp)?;
+        if checkpoint_progress {
+            let mut snapshots = Vec::with_capacity(checkpoints.len());
+            for (order, cp) in checkpoints.iter_mut().enumerate() {
+                cp.refresh_freshness(now);
+                snapshots.push(cp.to_market_snapshot()?);
+                upsert_checkpoint_row(&transaction, order, next_sequence, now, cp)?;
+            }
+            session_view.markets = snapshots;
+        } else {
+            // Preparation is observable, but a failed source check must not
+            // commit its staged evaluator/source cursors or account state.
+            transaction
+                .execute(
+                    "UPDATE paper_market_checkpoints SET sequence=?1 WHERE session_id=?2",
+                    params![u64_to_i64(next_sequence)?, session_id.as_str()],
+                )
+                .map_err(sql_error)?;
         }
-        session_view.markets = snapshots;
 
         update_session_row(
             &transaction,
@@ -1364,6 +1745,7 @@ impl Store {
             insert_event_row(&transaction, session_id, event, now)?;
         }
         transaction.commit().map_err(sql_error)?;
+        self.project_paper_verification(&mut session_view)?;
         Ok(session_view)
     }
 
@@ -1377,7 +1759,13 @@ impl Store {
         let Some(mut session_view) = load_session_view(&transaction, session_id)? else {
             return Ok(false);
         };
-        if session_view.state != PaperSessionState::Running {
+        let running = session_view.state == PaperSessionState::Running;
+        let awaiting_gap_evidence = session_view.state == PaperSessionState::RecoveryRequired
+            && matches!(
+                session_view.recovery_cause,
+                Some(PaperRecoveryCause::FeedGap | PaperRecoveryCause::ProviderGap)
+            );
+        if !running && !awaiting_gap_evidence {
             return Ok(false);
         }
         let expected_sequence = session_view.sequence;
@@ -1395,6 +1783,47 @@ impl Store {
                 return Ok(true);
             }
         };
+
+        let coverage = match provider_recovery::session_coverage(
+            &transaction,
+            &self.raw,
+            &session_view,
+            &checkpoints,
+            now,
+        ) {
+            Ok(coverage) => coverage,
+            Err(LabError::Conflict(reason)) => {
+                let detail = format!("PROVIDER_RECOVERY_PROOF_CONFLICT: {reason}");
+                if session_view.state == PaperSessionState::RecoveryRequired
+                    && session_view.recovery_detail.as_ref() == Some(&detail)
+                {
+                    return Ok(false);
+                }
+                mark_session_recovery_required(
+                    transaction,
+                    session_view,
+                    expected_sequence,
+                    Some(PaperRecoveryCause::ProviderGap),
+                    &detail,
+                    now,
+                )?;
+                return Ok(true);
+            }
+            Err(error) => return Err(error),
+        };
+        if provider_recovery::needs_recovery(&session_view, &checkpoints, &coverage) {
+            return provider_recovery::recover(
+                transaction,
+                session_view,
+                checkpoints,
+                &coverage,
+                now,
+            );
+        }
+
+        if !running {
+            return Ok(false);
+        }
 
         let mut pending_events = Vec::new();
         let mut recovery_reason: Option<String> = None;
@@ -1429,14 +1858,14 @@ impl Store {
                     )?;
                     pre_sources.insert(source_interval, bars);
                 }
-                let before = checkpoint.warmup_completed_bars;
+                let before = checkpoint.checkpoint_digest()?;
                 checkpoint.warm_up_pre_start(
                     &pre_decision,
                     &pre_sources,
                     None,
                     session_view.started_at,
                 )?;
-                if checkpoint.warmup_completed_bars != before {
+                if checkpoint.checkpoint_digest()? != before {
                     warmup_changed = true;
                 }
             }
@@ -1445,6 +1874,14 @@ impl Store {
             if checkpoint.last_finalized_candle_at.is_none()
                 && checkpoint.warmup_completed_bars < required_pre_start_bars
             {
+                checkpoint.refresh_freshness(now);
+                continue;
+            }
+            if checkpoint.last_finalized_candle_at.is_none()
+                && !checkpoint.pre_start_source_history_ready(session_view.started_at)?
+            {
+                tracing::debug!(market = %checkpoint.market.code(), sources = ?checkpoint.source_cursors,
+                    "paper first decision waiting for causal source warmup");
                 checkpoint.refresh_freshness(now);
                 continue;
             }
@@ -1483,10 +1920,30 @@ impl Store {
                 &checkpoint.evaluator,
                 &checkpoint.market,
                 &source_bars,
-            );
+            )
+            .with_provider_coverage(&coverage);
             for bar in &decision_bars {
                 let outcome =
                     checkpoint.step_bar_with_prepared_sources(bar, &mut source_frame, None, now)?;
+                if let Some(preparation) = outcome.preparation.as_ref()
+                    && let Some(event) = decision_preparation::deferred_event(
+                        &transaction,
+                        session_id,
+                        bar,
+                        preparation,
+                        now,
+                    )?
+                {
+                    pending_events.push(event);
+                }
+                if !outcome.did_advance
+                    && outcome.recovery_required.is_none()
+                    && checkpoint
+                        .last_finalized_candle_at
+                        .is_none_or(|last| bar.candle.close_time_utc > last)
+                {
+                    break;
+                }
                 if outcome.did_advance {
                     pending_events.extend(outcome.events);
                 }
@@ -1505,6 +1962,12 @@ impl Store {
             return Ok(false);
         }
 
+        let checkpoint_progress = warmup_changed
+            || recovery_reason.is_some()
+            || pending_events
+                .iter()
+                .any(|event| event.kind != PaperEventKind::DecisionDeferred);
+
         let mut next_sequence = session_view.sequence;
         let mut materialized_events = Vec::with_capacity(pending_events.len());
         for pending in pending_events {
@@ -1519,19 +1982,33 @@ impl Store {
         session_view.event_count = session_view
             .event_count
             .saturating_add(u64::try_from(materialized_events.len()).unwrap_or(0));
-        session_view.last_evaluated_at = Some(now);
+        if checkpoint_progress {
+            session_view.last_evaluated_at = Some(now);
+        }
         if recovery_reason.is_some() {
             session_view.state = PaperSessionState::RecoveryRequired;
             session_view.recovery_cause = recovery_cause;
+            session_view.recovery_detail.clone_from(&recovery_reason);
         }
 
-        let mut snapshots = Vec::with_capacity(checkpoints.len());
-        for (order, cp) in checkpoints.iter_mut().enumerate() {
-            cp.refresh_freshness(now);
-            snapshots.push(cp.to_market_snapshot()?);
-            upsert_checkpoint_row(&transaction, order, next_sequence, now, cp)?;
+        if checkpoint_progress {
+            let mut snapshots = Vec::with_capacity(checkpoints.len());
+            for (order, cp) in checkpoints.iter_mut().enumerate() {
+                cp.refresh_freshness(now);
+                snapshots.push(cp.to_market_snapshot()?);
+                upsert_checkpoint_row(&transaction, order, next_sequence, now, cp)?;
+            }
+            session_view.markets = snapshots;
+        } else {
+            // Preparation is observable, but a failed source check must not
+            // commit its staged evaluator/source cursors or account state.
+            transaction
+                .execute(
+                    "UPDATE paper_market_checkpoints SET sequence=?1 WHERE session_id=?2",
+                    params![u64_to_i64(next_sequence)?, session_id.as_str()],
+                )
+                .map_err(sql_error)?;
         }
-        session_view.markets = snapshots;
 
         update_session_row(
             &transaction,
@@ -1636,19 +2113,28 @@ fn verify_recovery_checkpoint_identity(
             "paper recovery checkpoint count does not match session markets".into(),
         ));
     }
-    let stored_policy_digest: Option<String> = connection
+    let stored_policy: Option<(String, String)> = connection
         .query_row(
-            "SELECT definition_digest FROM policy_revisions \
+            "SELECT definition_digest, definition_json FROM policy_revisions \
              WHERE policy_id=?1 AND revision_id=?2",
             params![
                 session_view.policy_ref.policy_id.as_str(),
                 session_view.policy_ref.revision_id.as_str()
             ],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
         .map_err(sql_error)?;
-    if stored_policy_digest.as_deref() != Some(session_view.policy_ref.definition_digest.as_str()) {
+    let Some((stored_digest, definition_json)) = stored_policy else {
+        return Err(LabError::DataCorrupt(
+            "stored paper policy revision is missing".into(),
+        ));
+    };
+    let definition: crate::contracts::PolicyDefinition =
+        serde_json::from_str(&definition_json).map_err(json_error)?;
+    if stored_digest != session_view.policy_ref.definition_digest.as_str()
+        || ContentHash::of_value(&definition)? != session_view.policy_ref.definition_digest
+    {
         return Err(LabError::DataCorrupt(
             "stored paper policy revision is missing or has a changed digest".into(),
         ));
@@ -1782,6 +2268,201 @@ fn load_session_view(
     view_json
         .map(|json| serde_json::from_str::<PaperSessionView>(&json).map_err(json_error))
         .transpose()
+}
+
+fn set_paper_verification(
+    session: &mut PaperSessionView,
+    results: &BTreeMap<MarketId, PaperVerification>,
+) {
+    for market in &mut session.markets {
+        market.verification =
+            results
+                .get(&market.market)
+                .cloned()
+                .unwrap_or_else(|| PaperVerification {
+                    status: PaperVerificationStatus::Fail,
+                    reason: "PAPER_INDEPENDENT_VERIFICATION_FAIL[MARKET_RESULT_MISSING]".into(),
+                });
+    }
+}
+
+fn set_failed_paper_verification(session: &mut PaperSessionView, code: &'static str) {
+    let results = crate::paper::failed_paper_verification(session, code);
+    set_paper_verification(session, &results);
+}
+
+fn set_unavailable_paper_verification(session: &mut PaperSessionView, code: &'static str) {
+    let results = crate::paper::unavailable_paper_verification(session, code);
+    set_paper_verification(session, &results);
+}
+
+fn load_session_event_rows(
+    connection: &rusqlite::Connection,
+    session_id: &PaperSessionId,
+) -> Result<Vec<StoredEventRow>, LabError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT sequence, market, kind, event_json FROM paper_session_events \
+             WHERE session_id=?1 ORDER BY sequence ASC",
+        )
+        .map_err(sql_error)?;
+    let rows = statement
+        .query_map([session_id.as_str()], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(sql_error)?;
+    let mut events = Vec::new();
+    for row in rows {
+        let (sql_sequence, sql_market, sql_kind, json) = row.map_err(sql_error)?;
+        let event = serde_json::from_str(&json).map_err(|error| {
+            LabError::DataCorrupt(format!("paper event JSON is not a valid event: {error}"))
+        })?;
+        events.push(StoredEventRow {
+            sql_sequence,
+            sql_market,
+            sql_kind,
+            event,
+        });
+    }
+    Ok(events)
+}
+
+fn load_observation_sizes(
+    connection: &rusqlite::Connection,
+    ids: &BTreeSet<ObservationId>,
+) -> Result<Vec<(ObservationId, usize)>, LabError> {
+    let ids = ids.iter().cloned().collect::<Vec<_>>();
+    let mut sizes = Vec::new();
+    for chunk in ids.chunks(400) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let values = chunk
+            .iter()
+            .map(|id| id.as_str().to_owned())
+            .collect::<Vec<_>>();
+        let placeholders = (1..=values.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT id, length(CAST(observation_json AS BLOB)) FROM candle_observations \
+             WHERE id IN ({placeholders})"
+        );
+        let mut statement = connection.prepare(&sql).map_err(sql_error)?;
+        let rows = statement
+            .query_map(params_from_iter(values.iter()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(sql_error)?;
+        for row in rows {
+            let (id, size) = row.map_err(sql_error)?;
+            let id = ObservationId::new(id)?;
+            let size = usize::try_from(size)
+                .map_err(|_| LabError::DataCorrupt("negative observation JSON length".into()))?;
+            sizes.push((id, size));
+        }
+    }
+    Ok(sizes)
+}
+
+fn load_verification_observations(
+    connection: &rusqlite::Connection,
+    sizes: &[(ObservationId, usize)],
+) -> Result<BTreeMap<ObservationId, CandleObservation>, LabError> {
+    let ids = sizes.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>();
+    let mut observations = BTreeMap::new();
+    for chunk in ids.chunks(400) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let values = chunk
+            .iter()
+            .map(|id| id.as_str().to_owned())
+            .collect::<Vec<_>>();
+        let placeholders = (1..=values.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT id, observation_json FROM candle_observations \
+             WHERE id IN ({placeholders})"
+        );
+        let mut statement = connection.prepare(&sql).map_err(sql_error)?;
+        let rows = statement
+            .query_map(params_from_iter(values.iter()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(sql_error)?;
+        for row in rows {
+            let (id, json) = row.map_err(sql_error)?;
+            let id = ObservationId::new(id)?;
+            let observation = serde_json::from_str(&json).map_err(|error| {
+                LabError::DataCorrupt(format!("paper source observation JSON is invalid: {error}"))
+            })?;
+            observations.insert(id, observation);
+        }
+    }
+    Ok(observations)
+}
+
+fn load_session_checkpoint_rows(
+    connection: &rusqlite::Connection,
+    session_id: &PaperSessionId,
+) -> Result<Vec<StoredCheckpointRow>, LabError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT market, sequence, schema_version, engine_version, checkpoint_digest, checkpoint_json \
+             FROM paper_market_checkpoints WHERE session_id=?1 ORDER BY market_order ASC",
+        )
+        .map_err(sql_error)?;
+    let rows = statement
+        .query_map([session_id.as_str()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })
+        .map_err(sql_error)?;
+    let mut checkpoints = Vec::new();
+    for row in rows {
+        let (market, sequence, schema_version, engine_version, expected_digest, json) =
+            row.map_err(sql_error)?;
+        if schema_version != PAPER_CHECKPOINT_SCHEMA_VERSION {
+            return Err(LabError::DataCorrupt(format!(
+                "unsupported paper checkpoint schema version: {schema_version}"
+            )));
+        }
+        if engine_version != ENGINE_VERSION {
+            return Err(LabError::DataCorrupt(format!(
+                "paper checkpoint engine version mismatch: expected {ENGINE_VERSION}, found {engine_version}"
+            )));
+        }
+        if ContentHash::of_bytes(json.as_bytes()).as_str() != expected_digest {
+            return Err(LabError::DataCorrupt(
+                "paper market checkpoint digest mismatch".into(),
+            ));
+        }
+        let checkpoint = serde_json::from_str(&json).map_err(|error| {
+            LabError::DataCorrupt(format!("paper checkpoint JSON is invalid: {error}"))
+        })?;
+        checkpoints.push((market, sequence, checkpoint));
+    }
+    if checkpoints.is_empty() {
+        return Err(LabError::DataCorrupt(
+            "paper session has no market checkpoints".into(),
+        ));
+    }
+    Ok(checkpoints)
 }
 
 fn load_session_checkpoints(
@@ -1965,33 +2646,42 @@ fn upsert_checkpoint_row(
     Ok(())
 }
 
-fn insert_event_row(
-    transaction: &Transaction<'_>,
+const PAPER_SESSION_EVENT_INSERT_SQL: &str = "INSERT INTO paper_session_events( \
+    session_id, sequence, market, kind, occurred_at_utc, event_json \
+ ) VALUES (?1,?2,?3,?4,?5,?6)";
+
+fn execute_paper_session_event_row(
     session_id: &PaperSessionId,
     event: &PaperSessionEvent,
     default_now: UtcTimestamp,
+    execute: impl FnOnce(&[&dyn rusqlite::ToSql]) -> rusqlite::Result<usize>,
 ) -> Result<(), LabError> {
     let event_json = serde_json::to_string(event).map_err(json_error)?;
     let occurred_at = event
         .finalized_at
         .or(event.source_event_at)
         .unwrap_or(default_now);
-    transaction
-        .execute(
-            "INSERT INTO paper_session_events( \
-                session_id, sequence, market, kind, occurred_at_utc, event_json \
-             ) VALUES (?1,?2,?3,?4,?5,?6)",
-            params![
-                session_id.as_str(),
-                u64_to_i64(event.sequence)?,
-                event.market.as_ref().map(MarketId::code),
-                enum_text(&event.kind)?,
-                occurred_at.to_string(),
-                event_json,
-            ],
-        )
-        .map_err(sql_error)?;
+    execute(params![
+        session_id.as_str(),
+        u64_to_i64(event.sequence)?,
+        event.market.as_ref().map(MarketId::code),
+        enum_text(&event.kind)?,
+        occurred_at.to_string(),
+        event_json,
+    ])
+    .map_err(sql_error)?;
     Ok(())
+}
+
+fn insert_event_row(
+    transaction: &Transaction<'_>,
+    session_id: &PaperSessionId,
+    event: &PaperSessionEvent,
+    default_now: UtcTimestamp,
+) -> Result<(), LabError> {
+    execute_paper_session_event_row(session_id, event, default_now, |parameters| {
+        transaction.execute(PAPER_SESSION_EVENT_INSERT_SQL, parameters)
+    })
 }
 
 fn insert_receipt_row(
@@ -2034,12 +2724,14 @@ fn mark_session_recovery_required(
     session_view.sequence = next_sequence;
     session_view.state = PaperSessionState::RecoveryRequired;
     session_view.recovery_cause = recovery_cause;
+    session_view.recovery_detail = Some(reason.to_owned());
     session_view.event_count = session_view.event_count.saturating_add(1);
     session_view.last_evaluated_at = Some(now);
     for market in &mut session_view.markets {
         market.freshness = crate::contracts::PaperFreshness::Offline;
     }
     let event = PaperSessionEvent {
+        preparation: None,
         sequence: next_sequence,
         kind: PaperEventKind::RecoveryRequired,
         market: None,
@@ -2047,6 +2739,7 @@ fn mark_session_recovery_required(
         source_event_at: Some(now),
         finalized_at: None,
         control: None,
+        provider_recovery: None,
         signals: Vec::new(),
         orders: Vec::new(),
         order_events: Vec::new(),
@@ -2054,6 +2747,12 @@ fn mark_session_recovery_required(
         account_marks: Vec::new(),
         episodes: Vec::new(),
     };
+    transaction
+        .execute(
+            "UPDATE paper_market_checkpoints SET sequence=?1 WHERE session_id=?2",
+            params![u64_to_i64(next_sequence)?, session_view.session_id.as_str()],
+        )
+        .map_err(sql_error)?;
     update_session_row(&transaction, expected_sequence, Some(reason), &session_view)?;
     insert_event_row(&transaction, &session_view.session_id, &event, now)?;
     transaction.commit().map_err(sql_error)?;

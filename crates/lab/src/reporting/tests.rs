@@ -1094,6 +1094,8 @@ fn fixture() -> RunBundle {
     };
     let signals = vec![
         SignalRecord {
+            decision_trace: None,
+            actual_weight_at_decision: None,
             context: context(3, "2024-01-01T01:00:00Z"),
             signal_id: buy_signal.clone(),
             strategy: StrategyKind::BuyAndHold,
@@ -1115,6 +1117,8 @@ fn fixture() -> RunBundle {
             outcome: SignalOutcome::Executed,
         },
         SignalRecord {
+            decision_trace: None,
+            actual_weight_at_decision: None,
             context: context(10, "2024-01-01T03:00:00Z"),
             signal_id: sell_signal.clone(),
             strategy: StrategyKind::BuyAndHold,
@@ -1503,6 +1507,8 @@ pub(crate) fn policy_fixture() -> RunBundle {
         signal.strategy = StrategyKind::S1;
         signal.policy_ref = Some(reference.clone());
         signal.policy_trace = Some(PolicyTrace {
+            condition_trace: None,
+            source_provenance: None,
             matched_rule_id: None,
             state_before: Vec::new(),
             state_after: Vec::new(),
@@ -1547,6 +1553,8 @@ fn passive_fixture() -> RunBundle {
         }
     };
     let signal = SignalRecord {
+        decision_trace: None,
+        actual_weight_at_decision: None,
         context: context(6, "2024-01-01T04:00:00Z"),
         signal_id: signal_id.clone(),
         strategy: StrategyKind::BuyAndHold,
@@ -2166,6 +2174,7 @@ fn fixture_raw_object(seed: &str) -> RawObjectRef {
         raw_bytes: 1,
         compressed_bytes: 1,
         origin: MarketDataOrigin::SyntheticTestOnly,
+        transport: None,
     }
 }
 

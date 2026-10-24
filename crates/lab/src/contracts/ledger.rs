@@ -106,6 +106,13 @@ pub struct SignalRecord {
     pub policy_ref: Option<super::PolicyRevisionRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_trace: Option<super::PolicyTrace>,
+    /// Actual guards captured by an unbound or policy-bound built-in evaluator.
+    /// Rules retain their guards in `policy_trace.condition_trace`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_trace: Option<Vec<super::PolicyConditionTrace>>,
+    /// Position input supplied to this decision, not a later account mark.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_weight_at_decision: Option<Weight>,
     pub source_bar_ids: Vec<ObservationId>,
     pub signal_time: UtcTimestamp,
     pub decision_available_at: UtcTimestamp,

@@ -107,6 +107,31 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "0021_live_order_control",
         include_str!("migrations/0021_live_order_control.sql"),
     ),
+    (
+        22,
+        "0022_private_stream_observations",
+        include_str!("migrations/0022_private_stream_observations.sql"),
+    ),
+    (
+        23,
+        "0023_oauth_public_clients",
+        include_str!("migrations/0023_oauth_public_clients.sql"),
+    ),
+    (
+        24,
+        "0024_public_feed_recovery",
+        include_str!("migrations/0024_public_feed_recovery.sql"),
+    ),
+    (
+        25,
+        "0025_paper_provider_proofs_index",
+        include_str!("migrations/0025_paper_provider_proofs_index.sql"),
+    ),
+    (
+        26,
+        "0026_decision_deferred_automation_events",
+        include_str!("migrations/0026_decision_deferred_automation_events.sql"),
+    ),
 ];
 
 pub(super) fn apply(connection: &mut Connection) -> Result<(), LabError> {
@@ -299,3 +324,7 @@ mod tests {
             .expect("insert baseline events after 0018");
     }
 }
+
+#[cfg(test)]
+#[path = "migrations/decision_deferred_tests.rs"]
+mod decision_deferred_tests;

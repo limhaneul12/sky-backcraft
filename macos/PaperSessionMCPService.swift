@@ -1,11 +1,14 @@
 import Foundation
 
 enum PaperSessionServiceError: LocalizedError {
+    case invalidInput(String)
     case invalidResponse(String)
     case unknownMutationOutcome(requestId: String, message: String)
 
     var errorDescription: String? {
         switch self {
+        case .invalidInput(let detail):
+            return "지속 모의 세션 조회 요청 형식이 유효하지 않습니다: \(detail)"
         case .invalidResponse(let detail):
             return "지속 모의 세션 응답 형식이 유효하지 않습니다: \(detail)"
         case .unknownMutationOutcome(let requestId, let message):
@@ -220,6 +223,7 @@ struct PaperSessionView: Codable, Equatable {
     let event_count: UInt64
     let markets: [PaperMarketSnapshot]
     let recovery_cause: String?
+    var recovery_detail: String? = nil
 
     var canOfferFeedGapRecoveryResume: Bool {
         state == "RECOVERY_REQUIRED" && recovery_cause == "FEED_GAP"
@@ -327,6 +331,22 @@ struct PaperControlEvent: Codable, Equatable {
     let cancelled_pending_orders: [PaperOrderRecord]
 }
 
+struct PaperCheckpointTransition: Codable, Equatable {
+    let market: String
+    let before_digest: String
+    let after_digest: String
+    let from_close: String?
+    let to_close: String?
+}
+
+struct PaperProviderRecovery: Codable, Equatable {
+    let phase: String
+    let processed_at: String
+    let target_completed_at: String
+    let proof_ids: [String]
+    let checkpoint_transitions: [PaperCheckpointTransition]
+}
+
 struct PaperSessionEvent: Codable, Equatable {
     let sequence: UInt64
     let kind: String
@@ -335,6 +355,8 @@ struct PaperSessionEvent: Codable, Equatable {
     let source_event_at: String?
     let finalized_at: String?
     let control: PaperControlEvent?
+    let preparation: AutomationJSONValue?
+    var provider_recovery: PaperProviderRecovery? = nil
     let signals: [PaperSignalRecord]
     let orders: [PaperOrderRecord]
     let order_events: [PaperOrderRecord]
@@ -343,7 +365,15 @@ struct PaperSessionEvent: Codable, Equatable {
 
     var kindDisplay: String {
         switch kind {
-        case "CANDLE_PROCESSED": return "확정 봉 처리"
+        case "CANDLE_PROCESSED":
+            return provider_recovery?.phase == "CATCH_UP" ? "복구 상태 동기화 · 판단/주문 없음" : "확정 봉 처리"
+        case "PROVIDER_RECOVERY":
+            switch provider_recovery?.phase {
+            case "STARTED": return "공백 복구 시작"
+            case "PROGRESS": return "실제 봉 상태 동기화 중"
+            case "COMPLETED": return "같은 세션 복구 완료"
+            default: return "공급자 공백 복구"
+            }
         case "PAUSE": return "일시정지"
         case "RESUME": return "재개"
         case "STOP": return "세션 종료"
@@ -402,6 +432,9 @@ struct PaperSessionEvent: Codable, Equatable {
             let ordText = order_events.map { "\($0.side) \($0.status)(\($0.reason))" }.joined(separator: ",")
             parts.append("가상주문 \(ordText)")
         }
+        if let recovery = provider_recovery {
+            parts.append("복구 \(recovery.phase) · 공백 근거 \(recovery.proof_ids.count)개 · 처리 \(recovery.processed_at)")
+        }
         if let control {
             parts.append("제어 \(control.action) (취소 주문 \(control.cancelled_pending_orders.count)건)")
         }
@@ -419,6 +452,55 @@ struct PaperSessionEventPage: Codable, Equatable {
     let returned_count: UInt64
     let total_count: UInt64
     let next_cursor: PaperEventCursor?
+}
+
+enum PaperSessionReviewMode: String, Codable, Equatable {
+    case simulated = "SIMULATED"
+}
+
+struct PaperSessionReviewConfiguration: Codable, Equatable {
+    let request_id: String
+    let policy_ref: PaperPolicyRevisionReference
+    let decision_interval: String
+    let execution_resolution: String
+    let latency_ms: UInt64
+    let execution: PaperExecutionPolicy
+    let markets: [PaperMarketStartInput]
+}
+
+struct PaperSessionReviewResponse: Codable, Equatable {
+    let schema_version: String
+    let mode: PaperSessionReviewMode
+    let configuration: PaperSessionReviewConfiguration
+    let as_of_sequence: UInt64
+    let after_sequence: UInt64
+    let page: PaperSessionEventPage
+}
+
+struct PaperDecisionReviewSelection: Codable, Equatable {
+    let session_id: String
+    let event_sequence: UInt64
+    let as_of_sequence: UInt64
+    let signal_id: String?
+}
+
+struct PaperDecisionReviewConfigurationIdentity: Codable, Equatable {
+    let policy_ref: PaperPolicyRevisionReference
+}
+
+struct PaperDecisionReviewPolicyIdentity: Codable, Equatable {
+    let reference: PaperPolicyRevisionReference
+}
+
+struct PaperDecisionReviewResponse: Codable, Equatable {
+    let schema_version: String
+    let selection: PaperDecisionReviewSelection
+    let configuration: PaperDecisionReviewConfigurationIdentity
+    let event: PaperSessionEvent
+    let original_event_digest: String
+    let policy: PaperDecisionReviewPolicyIdentity
+    let selected_signal_id: String?
+    let recorded_decision: AutomationJSONValue?
 }
 
 struct PaperSessionReceipt: Codable, Equatable {
@@ -446,11 +528,18 @@ struct PaperSessionRequestReadback: Codable, Equatable {
     let session: PaperSessionView?
 }
 
-struct PaperMarketStartInput: Equatable {
+struct PaperMarketStartInput: Codable, Equatable {
     let market: String
     let initialCash: String
     let costs: PaperCostPolicy
     let marketRules: PaperMarketRuleScenario
+
+    private enum CodingKeys: String, CodingKey {
+        case market
+        case initialCash = "initial_cash"
+        case costs
+        case marketRules = "market_rules"
+    }
 
     var arguments: [String: Any] {
         [
@@ -463,6 +552,7 @@ struct PaperMarketStartInput: Equatable {
 }
 
 final class PaperSessionMCPService {
+    private static let maximumReviewPageAttempts = 7
     private let client: NativeMCPClient
     private let decoder = JSONDecoder()
 
@@ -560,6 +650,306 @@ final class PaperSessionMCPService {
                     return .failure(error)
                 }
             })
+        }
+    }
+
+    @discardableResult
+    func reviewEvents(
+        sessionId: String,
+        asOfSequence: UInt64,
+        afterSequence: UInt64? = nil,
+        limit: Int = 50,
+        completion: @escaping (Result<PaperSessionReviewResponse, Error>) -> Void
+    ) -> NativeMCPRequest {
+        do {
+            try Self.validateReviewRequest(
+                sessionId: sessionId,
+                afterSequence: afterSequence,
+                asOfSequence: asOfSequence,
+                limit: limit
+            )
+        } catch {
+            completion(.failure(error))
+            return .alreadyFinished()
+        }
+
+        let requestOwner = NativeMCPRequest()
+        let expectedTransportContext = client.currentTransportContext()
+        let client = self.client
+        let decoder = self.decoder
+        var attempts = 0
+
+        func requestPage(limit: Int) {
+            guard requestOwner.isPending else { return }
+            attempts += 1
+            let attempt = attempts
+            let arguments: [String: Any] = [
+                "action": "review_events",
+                "session_id": sessionId,
+                "after_sequence": afterSequence ?? NSNull(),
+                "as_of_sequence": asOfSequence,
+                "limit": limit
+            ]
+            let request = client.call(
+                "paper_session_query",
+                arguments: arguments,
+                expectedTransportContext: expectedTransportContext
+            ) { result in
+                guard requestOwner.isPending, attempts == attempt else { return }
+                if case .failure(let error as NativeMCPError) = result,
+                   case .paperEventPageByteBudgetExceeded = error {
+                    guard limit > 1, attempt < Self.maximumReviewPageAttempts else {
+                        guard requestOwner.complete() else { return }
+                        completion(.failure(error))
+                        return
+                    }
+                    guard let expectedTransportContext,
+                          client.currentTransportContext() == expectedTransportContext else {
+                        guard requestOwner.complete() else { return }
+                        completion(.failure(NativeMCPError.transportContextChanged))
+                        return
+                    }
+                    requestPage(limit: max(1, limit / 2))
+                    return
+                }
+
+                let validatedResult = result.flatMap { data in
+                    do {
+                        let response = try decoder.decode(PaperSessionReviewResponse.self, from: data)
+                        try Self.validateReviewResponse(
+                            response,
+                            sessionId: sessionId,
+                            afterSequence: afterSequence,
+                            asOfSequence: asOfSequence,
+                            limit: limit
+                        )
+                        return .success(response)
+                    } catch {
+                        return .failure(error)
+                    }
+                }
+                guard requestOwner.complete() else { return }
+                completion(validatedResult)
+            }
+
+            guard requestOwner.isPending, attempts == attempt else {
+                request.cancel()
+                return
+            }
+            guard request.isPending else { return }
+            guard requestOwner.replaceSingleChild(with: request) else {
+                guard requestOwner.complete() else { return }
+                completion(.failure(NativeMCPError.protocolError))
+                return
+            }
+        }
+
+        requestPage(limit: limit)
+        return requestOwner
+    }
+
+    @discardableResult
+    func reviewDecision(
+        sessionId: String,
+        eventSequence: UInt64,
+        asOfSequence: UInt64,
+        signalID: String?,
+        expectedPolicyReference: PaperPolicyRevisionReference,
+        completion: @escaping (Result<PaperDecisionReviewResponse, Error>) -> Void
+    ) -> NativeMCPRequest {
+        let arguments: [String: Any]
+        do {
+            arguments = try Self.decisionReviewArguments(
+                sessionId: sessionId,
+                eventSequence: eventSequence,
+                asOfSequence: asOfSequence,
+                signalID: signalID,
+                expectedPolicyReference: expectedPolicyReference
+            )
+        } catch {
+            completion(.failure(error))
+            return .alreadyFinished()
+        }
+
+        return client.call("paper_review_query", arguments: arguments) { [decoder] result in
+            completion(result.flatMap { data in
+                do {
+                    let response = try decoder.decode(PaperDecisionReviewResponse.self, from: data)
+                    try Self.validateDecisionReviewResponse(
+                        response,
+                        sessionId: sessionId,
+                        eventSequence: eventSequence,
+                        asOfSequence: asOfSequence,
+                        signalID: signalID,
+                        expectedPolicyReference: expectedPolicyReference
+                    )
+                    return .success(response)
+                } catch {
+                    return .failure(error)
+                }
+            })
+        }
+    }
+
+    static func decisionReviewArguments(
+        sessionId: String,
+        eventSequence: UInt64,
+        asOfSequence: UInt64,
+        signalID: String?,
+        expectedPolicyReference: PaperPolicyRevisionReference
+    ) throws -> [String: Any] {
+        guard isReviewIdentifier(sessionId), eventSequence > 0, eventSequence <= asOfSequence,
+              signalID.map(isReviewIdentifier) ?? true,
+              isReviewIdentifier(expectedPolicyReference.policy_id),
+              isReviewIdentifier(expectedPolicyReference.revision_id),
+              isLowerHexSHA256(expectedPolicyReference.definition_digest) else {
+            throw PaperSessionServiceError.invalidInput("saved decision identity, fixed cutoff, or policy reference")
+        }
+        var selection: [String: Any] = [
+            "session_id": sessionId,
+            "event_sequence": eventSequence,
+            "as_of_sequence": asOfSequence
+        ]
+        if let signalID { selection["signal_id"] = signalID }
+        return ["action": "decision", "selection": selection]
+    }
+
+    private static func validateDecisionReviewResponse(
+        _ response: PaperDecisionReviewResponse,
+        sessionId: String,
+        eventSequence: UInt64,
+        asOfSequence: UInt64,
+        signalID: String?,
+        expectedPolicyReference: PaperPolicyRevisionReference
+    ) throws {
+        guard response.schema_version == "1.0",
+              response.selection.session_id == sessionId,
+              response.selection.event_sequence == eventSequence,
+              response.selection.as_of_sequence == asOfSequence,
+              response.selection.signal_id == signalID,
+              response.event.sequence == eventSequence,
+              eventSequence <= asOfSequence,
+              response.configuration.policy_ref == expectedPolicyReference,
+              response.policy.reference == expectedPolicyReference,
+              isLowerHexSHA256(response.original_event_digest),
+              response.selected_signal_id == signalID else {
+            throw PaperSessionServiceError.invalidResponse("saved decision, event, cutoff, signal, or policy identity")
+        }
+
+        let signalIDs = response.event.signals.map(\.signal_id)
+        guard Set(signalIDs).count == signalIDs.count,
+              signalID.map({ signalIDs.contains($0) }) ?? signalIDs.isEmpty else {
+            throw PaperSessionServiceError.invalidResponse("selected signal does not match the saved event")
+        }
+        try validateRecordedDecisionPolicy(
+            response.recorded_decision,
+            expectedPolicyReference: expectedPolicyReference
+        )
+    }
+
+    private static func validateRecordedDecisionPolicy(
+        _ value: AutomationJSONValue?,
+        expectedPolicyReference: PaperPolicyRevisionReference
+    ) throws {
+        guard let value, value != .null else { return }
+        guard case .object(let fields) = value,
+              let policyValue = fields["policy_ref"], policyValue != .null else { return }
+        guard case .object(let reference) = policyValue,
+              case .string(let policyID)? = reference["policy_id"],
+              case .string(let revisionID)? = reference["revision_id"],
+              case .string(let digest)? = reference["definition_digest"],
+              policyID == expectedPolicyReference.policy_id,
+              revisionID == expectedPolicyReference.revision_id,
+              digest == expectedPolicyReference.definition_digest else {
+            throw PaperSessionServiceError.invalidResponse("recorded decision policy reference mismatch")
+        }
+    }
+
+    private static func validateReviewRequest(
+        sessionId: String,
+        afterSequence: UInt64?,
+        asOfSequence: UInt64,
+        limit: Int
+    ) throws {
+        guard isReviewIdentifier(sessionId), (1...100).contains(limit) else {
+            throw PaperSessionServiceError.invalidInput("session_id 또는 limit")
+        }
+        if (afterSequence ?? 0) > asOfSequence {
+            throw PaperSessionServiceError.invalidInput("after_sequence exceeds as_of_sequence")
+        }
+    }
+
+    private static func validateReviewResponse(
+        _ response: PaperSessionReviewResponse,
+        sessionId: String,
+        afterSequence: UInt64?,
+        asOfSequence: UInt64,
+        limit: Int
+    ) throws {
+        let expectedAfter = afterSequence ?? 0
+        guard response.schema_version == "1.0",
+              response.mode == .simulated,
+              response.after_sequence == expectedAfter,
+              response.as_of_sequence == asOfSequence,
+              response.as_of_sequence >= expectedAfter,
+              response.page.session_id == sessionId else {
+            throw PaperSessionServiceError.invalidResponse("review schema/mode/session/cutoff identity")
+        }
+
+        let configuration = response.configuration
+        let marketIDs = configuration.markets.map(\.market)
+        guard isReviewIdentifier(configuration.request_id),
+              isReviewIdentifier(configuration.policy_ref.policy_id),
+              isReviewIdentifier(configuration.policy_ref.revision_id),
+              isLowerHexSHA256(configuration.policy_ref.definition_digest),
+              !configuration.decision_interval.isEmpty,
+              !configuration.execution_resolution.isEmpty,
+              !configuration.execution.kind.isEmpty,
+              !configuration.execution.participation_cap.isEmpty,
+              !configuration.markets.isEmpty,
+              marketIDs.allSatisfy(isReviewIdentifier),
+              Set(marketIDs).count == marketIDs.count,
+              configuration.markets.allSatisfy({ !$0.initialCash.isEmpty }) else {
+            throw PaperSessionServiceError.invalidResponse("review immutable configuration identity")
+        }
+
+        let items = response.page.items
+        let sequences = items.map(\.sequence)
+        guard response.page.returned_count == UInt64(items.count),
+              items.count <= limit,
+              response.page.total_count == response.as_of_sequence,
+              sequences.allSatisfy({ $0 > expectedAfter && $0 <= response.as_of_sequence }) else {
+            throw PaperSessionServiceError.invalidResponse("review page count or sequence bounds")
+        }
+        for pair in zip(sequences, sequences.dropFirst()) where pair.0 >= pair.1 {
+            throw PaperSessionServiceError.invalidResponse("review event sequence ordering")
+        }
+
+        if let cursor = response.page.next_cursor {
+            guard items.count == limit,
+                  let lastSequence = sequences.last,
+                  cursor.sequence == lastSequence,
+                  cursor.sequence < response.as_of_sequence else {
+                throw PaperSessionServiceError.invalidResponse("review next cursor does not match the returned page")
+            }
+        } else if expectedAfter < response.as_of_sequence,
+                  sequences.last != response.as_of_sequence {
+            throw PaperSessionServiceError.invalidResponse("review page omitted events before the fixed cutoff")
+        }
+    }
+
+    private static func isReviewIdentifier(_ value: String) -> Bool {
+        let bytes = Array(value.utf8)
+        return (1...96).contains(bytes.count) && bytes.allSatisfy {
+            (48...57).contains($0) || (65...90).contains($0)
+                || (97...122).contains($0) || $0 == 45 || $0 == 95
+        }
+    }
+
+    private static func isLowerHexSHA256(_ value: String) -> Bool {
+        let bytes = Array(value.utf8)
+        return bytes.count == 64 && bytes.allSatisfy {
+            (48...57).contains($0) || (97...102).contains($0)
         }
     }
 

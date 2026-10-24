@@ -17,13 +17,21 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 const MAX_CREDENTIAL_FILE_BYTES: u64 = 64 * 1024;
-#[cfg(target_os = "linux")]
+// Linux arm64 uses a different fcntl ABI from the generic Linux definition.
+// https://github.com/torvalds/linux/blob/master/arch/arm64/include/uapi/asm/fcntl.h
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const O_NOFOLLOW_FLAG: i32 = 1 << 15;
+#[cfg(all(target_os = "linux", not(target_arch = "aarch64")))]
 const O_NOFOLLOW_FLAG: i32 = 0o400_000;
 #[cfg(not(target_os = "linux"))]
 const O_NOFOLLOW_FLAG: i32 = 0x100;
 
 /// Fixed production Upbit API base URL.
 pub const UPBIT_PRODUCTION_HOST: &str = "https://api.upbit.com";
+
+/// Fixed production Upbit private WebSocket endpoint.
+pub(crate) const UPBIT_PRIVATE_WEBSOCKET_ENDPOINT: &str =
+    "wss://api.upbit.com/websocket/v1/private";
 
 /// Authentication errors.
 #[derive(Debug, thiserror::Error)]
@@ -67,6 +75,12 @@ impl UpbitCredentials {
     #[must_use]
     pub fn secret_key_bytes(&self) -> &[u8] {
         self.secret_key.as_bytes()
+    }
+
+    /// Generate isolated credentials for a local authentication fixture.
+    #[cfg(test)]
+    pub(crate) fn generated_for_test() -> Result<Self, AuthError> {
+        Ok(Self::new(generate_nonce()?, generate_nonce()?))
     }
 
     /// Attempt to load credentials from process environment or `.env` files.
@@ -318,6 +332,21 @@ pub fn verify_host_allowlist(url: &str) -> Result<(), AuthError> {
     Err(AuthError::DisallowedHost(
         url.to_string(),
         UPBIT_PRODUCTION_HOST.to_string(),
+    ))
+}
+
+/// Verify that a private WebSocket target is the fixed production endpoint.
+///
+/// # Errors
+/// Returns `AuthError::DisallowedHost` for every endpoint except Upbit's exact
+/// production private WebSocket URL.
+pub(crate) fn verify_private_websocket_endpoint(url: &str) -> Result<(), AuthError> {
+    if url == UPBIT_PRIVATE_WEBSOCKET_ENDPOINT {
+        return Ok(());
+    }
+    Err(AuthError::DisallowedHost(
+        "private WebSocket endpoint rejected".to_owned(),
+        UPBIT_PRIVATE_WEBSOCKET_ENDPOINT.to_owned(),
     ))
 }
 

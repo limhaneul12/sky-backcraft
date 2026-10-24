@@ -1,6 +1,6 @@
 ---
 name: backcraft-research
-description: Sky Backcraft에서 파라미터 스윕으로 정책 후보를 일괄 생성하고, 리서치 스위트(walk-forward/batch)를 사전 계획·실행하며, 공유자본 포트폴리오와 regime 게이팅 연구를 수행한다. 견고성·regime 연구 요청에 사용한다. 단순 백테스트 실행은 backcraft-experiment를, 결과 다운로드는 backcraft-results를 사용한다.
+description: Sky Backcraft의 정책 스윕을 생성 전 preflight하고 워크포워드·batch·공유자본·regime 비교 연구를 계획·실행한다. 단순 정책·수집·백테스트는 backcraft-experiment, 기존 결과 분석·파일 수신은 backcraft-results를 사용한다.
 ---
 
 # Backcraft 리서치 스위트
@@ -13,21 +13,42 @@ description: Sky Backcraft에서 파라미터 스윕으로 정책 후보를 일�
 
 - 연결된 MCP에서 실제 도구 이름을 확인하고 `lab_status`로 한도를 읽는다.
   임시 터널 주소, 과거 run/dataset/policy ID를 지어내지 않는다.
+- 현재 서버의 schema/action과 빌드 identity를 확인한다. 과거 CI의 VERIFIED를 현재 서버에 옮겨 붙이지 않는다. 제공되지 않는 action은 문서에 있다는 이유로 실행하지 않는다.
 - research suite는 **v3 템플릿**(`schema_version: "3.0"`, `strategies: []`,
-  `policy_selections: [정확한 참조들]`, STRICT_PIT, 선언된 정책 warmup)만 받는다.
+  `policy_selections: [정확한 참조들]`, `pit_policy:"STRICT_PIT"`,
+  `causal_execution:"DECLARED_POLICY_WARMUP"`)만 받는다.
   금액·비중·bps는 decimal 문자열로 넣는다.
 
-## 1. 파라미터 스윕 (정책 후보 일괄 생성)
+## 1. 파라미터 스윕 — 생성 전 preflight
 
-1. `policy_write`에 `action: "sweep"`으로 `request_id`, `family`(예: S2),
-   `template`(StrategySpec), `mode`를 넣는다.
-   - tuples: `[{entry_length: 20, exit_length: 10}, ...]` — 명시 나열(권장)
-   - grid: `{entry_length: [20,40,55], exit_length: [10,20]}` — 최대 32 후보
-2. 반환된 `PolicySweepResult`에서 `revisions[].reference`
+1. 먼저 `policy_write(action="preflight")`에 request_id/family/template/mode를 넣는다. 이 호출은 정책 revision을 만들지 않는다. 계획만 요청받았으면 여기서 결과를 전달한다.
+2. 아래는 S2 예제이며 사용자 파라미터로 바꾼다. SweepValue는 bare 숫자가 아니라 `{"integer":20}` 또는 `{"float":0.5}`다. 지원 parameter/type은 schema와 검증 결과를 따른다.
+
+```json
+{
+  "action": "preflight",
+  "request_id": "example-s2-preflight",
+  "family": "S2",
+  "template": {"kind": "S2", "entry_length": 20, "exit_length": 10},
+  "mode": {
+    "kind": "grid",
+    "axes": {
+      "entry_length": [{"integer": 20}, {"integer": 55}],
+      "exit_length": [{"integer": 10}, {"integer": 20}]
+    }
+  }
+}
+```
+
+tuples의 wire 형식은 `{"kind":"tuples","tuples":[{"entry_length":{"integer":20},"exit_length":{"integer":10}}]}`다.
+
+3. joint 연구 규모까지 확인하려면 선택적 `research:{experiment,design,cost_sweep}`를 넣는다. 기존 유효 v3 experiment와 suite geometry를 사용한다. context 없는 숫자를 실제 요청의 전체 fold/market/cost 예산으로 해석하지 않는다.
+4. candidate_count/exact_tuple_count/market_count/fold_count/cost_scenario_count/estimated_model_count/estimated_event_count/resource_admissible/reject_reason을 읽는다. `candidate_count_exact:false`는 unique candidate 수의 상한이며 `estimates_saturated`/notes도 전달한다. 거대한 grid는 전개 전에 거절되므로 DB에 먼저 후보를 만들어 확인하지 않는다.
+5. 생성도 요청받았고 admissible이면 같은 내용으로 `action:"sweep"`을 호출한다. action이 바뀌므로 별도의 request_id를 사용한다. 현재 materialization 한도는 32 후보이며 최종 서버 admission이 기준이다.
+6. 반환된 `PolicySweepResult`에서 `revisions[].reference`
    (`{policy_id, revision_id, definition_digest}`) 전체를 보관한다. 이것이
    스위트 템플릿의 `policy_selections`가 된다.
-3. 동일 파라미터셋은 기존 정책을 재사용하고 중복 tuple은 억제된다
-   (`duplicates_suppressed`). 사용자 정의 파라미터는 익명으로 실행하지 않는다.
+7. 완전히 적용된 immutable 정의가 같은 후보는 재사용한다. 중복 수는 `plan.duplicates_suppressed`에서 읽는다. 일부 parameter assignment만 같다는 이유로 다른 template을 같은 정책으로 간주하지 않는다.
 
 ## 2. 리서치 스위트 — 반드시 plan 먼저
 
@@ -39,9 +60,9 @@ description: Sky Backcraft에서 파라미터 스윕으로 정책 후보를 일�
 2. `admission: rejected`면 숫자로 초과 이유를 사용자에게 보여주고
    `suggestions`를 따라 분할을 제안한다. **마켓 분할은 선택 의미가
    보존**되지만, candidate 분할·시나리오 축소는 selection 집계가 바뀌므로
-   warning을 그대로 전달하고 사용자 승인을 받는다. 자동으로 연구 의미를
+   warning을 그대로 전달하고 이미 승인된 조정 범위가 없으면 선택을 묻는다. 자동으로 연구 의미를
    바꾸지 않는다.
-3. 승인되면 같은 요청으로 `action: "create"`를 실행한다. 템플릿에 dynamic
+3. 실행도 요청받았고 admission이 허용되면 같은 요청으로 `action: "create"`를 실행한다. 템플릿에 dynamic
    cost model(`costs.dynamic`)이 있으면 cost sweep과 조합할 수 없다(create가
    거절한다) — 고정 모델로 스윕하거나 스윕을 생략한다.
 4. 진행 조회: `get`(요약: status/completed_runs/selected_folds), `cases`,
@@ -52,10 +73,10 @@ description: Sky Backcraft에서 파라미터 스윕으로 정책 후보를 일�
 
 ## 3. 공유자본 포트폴리오 (하나의 현금 풀)
 
-1. 먼저 `plan_backtest`로 평가 범위를 포함한 plan을 freeze한다. 포트폴리오는
+1. experiment에 `capital_mode:"SHARED_PORTFOLIO"`를 명시하고 `plan_backtest`로 평가 범위를 포함한 plan을 freeze한다. 기존 독립 모드 plan을 이 경로에 그대로 제출하지 않는다. 포트폴리오는
    **마켓당 정확히 하나의 admitted 전략**을 요구하므로 plan의 markets와
    포트폴리오 assets를 일치시킨다.
-2. `portfolio_backtest`에 `action: "create"`로 넣는다:
+2. `portfolio_backtest`에 `{action:"create",request:{...}}`로 넣는다:
    - `request_id`, `plan_id`, `input_digest`(plan 반환값 그대로)
    - `portfolio`: `initial_cash`, `assets[].market/max_weight`, 
      `risk{max_gross_exposure, min_cash_weight, drawdown_stop}`,
@@ -64,14 +85,16 @@ description: Sky Backcraft에서 파라미터 스윕으로 정책 후보를 일�
 3. 선택으로 `regime` 게이트를 넣는다: `classifier`(revision 문자열,
    sma_long/sma_mid/sma_short, slope/vol/atr lookback, 선택적
    high/low_vol_annualized)와 `rules`(trend_up/trend_down/chop/unknown 각각
-   Enabled | Disabled | ReducedExposure). warmup 미완 구간은 unknown 규칙이
+   `{kind:"ENABLED"}` | `{kind:"DISABLED"}` | `{kind:"REDUCED_EXPOSURE",max_weight:"..."}`). warmup 미완 구간은 UNKNOWN 규칙이
    적용된다. 게이트는 전략 on/off와 exposure cap만 하고 임의 주문을 만들지
-   않는다.
-4. 결과 조회: `get`(요약: status, totals — terminal_equity/total_return/
+   않는다. 안전 cash를 원하면 unknown에 DISABLED를 지정하며 사용자가 동결한 gate를 임의로 바꾸지 않는다. classifier parameters 전체가 identity에 포함되므로 revision 문자열만 같다고 같은 분류라고 보지 않는다.
+4. 제출된 job은 `job_control(get)`의 해당 attempt terminal output을 확인해 portfolio run_id를 얻는다. 응답 손실은 같은 request_id/job의 durable readback으로 확인한다. 관찰 만료만으로 재제출하거나 취소하지 않는다.
+5. 기존 조회: `get`(요약: status, totals — terminal_equity/total_return/
    max_drawdown/turnover/total_fees/price_cost_drag/exposure_seconds/
    rejected_signals/rejection_reasons — 과 benchmarks: CASH, 자산별
    B&H, static allocation), `facts`(kind: intent/fill/rejection/mark,
    offset/limit 페이지), `list`.
+6. 공개 `result_query`의 `portfolio_summary`, `portfolio_equity`, `portfolio_allocations`, `portfolio_rebalances`, `portfolio_contributions`, `regime_timeline`, `regime_summary`로 연구용 projection을 읽는다. 페이지의 next_offset을 따른다. AVAILABLE의 data와 UNAVAILABLE의 reason을 구분하고, 기존 projection 누락이나 regime 미설정을 0 손익으로 해석하지 않는다. 세부 회계와 파일 수신은 [backcraft-results](../backcraft-results/SKILL.md)를 따른다.
 
 ## 4. 해석 수칙
 
@@ -80,7 +103,7 @@ description: Sky Backcraft에서 파라미터 스윕으로 정책 후보를 일�
 - 거절된 신호는 실패가 아니라 자본 제약의 기록이다. `rejection` facts의
   이유(INSUFFICIENT_CASH, GROSS_EXPOSURE_CAP 등)로 자본 배분 병목을 읽는다.
 - regime 게이팅 비교는 always-on vs 게이팅을 같은 기간·비용으로 나란히
-  실행해 return/MDD/turnover를 나란히 제시한다.
+  실행해 return/MDD/turnover를 나란히 제시한다. 예를 들어 S2 always-on과 TREND_UP-only를 같은 frozen plan/portfolio 가정으로 비교하고 UNKNOWN 구간과 label별 trade/fee/transition도 보여준다. regime 조건을 engine에 임의로 하드코딩하거나 분류기를 교체하지 않는다.
 - 시장규칙이 EXPLICIT_SCENARIO면 결과 해석 전에 미검증 가정임을 밝힌다.
   모든 결과는 SIMULATED_ONLY 모의 실행이다.
 
@@ -93,3 +116,10 @@ description: Sky Backcraft에서 파라미터 스윕으로 정책 후보를 일�
   입력(범위·마켓·정책 참조·자본·제약)만 묻는다.
 - 요청 범위 밖의 기능(L2 orderbook, short, 실제 주문, ML 분류기)을 임의로
   추가하지 않는다.
+
+## 필요한 자료만 읽기
+
+- 후보 요청과 preflight: [policy-write](../../docs/schema/policy-write.json), [preflight report](../../docs/schema/sweep-preflight-report.json).
+- suite 계획·실행: [action](../../docs/schema/research-suite-action.json), [request](../../docs/schema/research-suite-request.json).
+- 공유 결과: [result-query](../../docs/schema/mcp-result-query.json), [summary](../../docs/schema/portfolio-result-summary.json), [regime summary](../../docs/schema/portfolio-regime-summary.json).
+- MTF 데이터와 warmup은 [backcraft-experiment](../backcraft-experiment/SKILL.md)를 따른다. 저장소 밖에서는 실제 MCP 계약을 읽고 없는 상대 문서를 가정하지 않는다.

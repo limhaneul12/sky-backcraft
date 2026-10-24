@@ -87,6 +87,8 @@ pub struct AutomationDecisionDetail {
     pub context_candles: Vec<CandleObservation>,
     pub orders: Vec<AutomationOrderView>,
     pub events: Vec<AutomationEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_decision: Option<super::RecordedDecisionExplanation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

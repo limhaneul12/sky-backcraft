@@ -77,6 +77,110 @@ fn target_weight_sizes_a_hand_computed_sell_from_actual_quantity() {
 }
 
 #[test]
+fn initialized_cross_source_must_reach_each_decisions_completed_boundary()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::contracts::{
+        CandleObservation, CandleRecord, ContentHash, FrozenPolicyRevision, MarketId,
+        ObservationId, PolicyOrigin, StrategyKind, UtcTimestamp, observation_digest,
+    };
+    use std::collections::BTreeMap;
+
+    let definition = PolicyDefinition {
+        schema_version: "1.0".into(),
+        name: "source-coverage-fixture".into(),
+        description: "SYNTHETIC_TEST_ONLY source coverage".into(),
+        program: PolicyProgram::Rules {
+            program: RulesProgram {
+                condition_roles: Vec::new(),
+                indicators: vec![PolicyIndicator {
+                    id: "h1-close".into(),
+                    indicator: PolicyIndicatorKind::Close,
+                    source_interval: Some(CandleInterval::H1),
+                }],
+                states: Vec::new(),
+                rules: Vec::new(),
+                fallback: PolicyTarget::Weight {
+                    value: NumericExpr::Constant { value: 1.0 },
+                },
+                signal_expiry: PolicySignalExpiry::EndOfRange,
+            },
+        },
+    };
+    let revision = FrozenPolicyRevision {
+        reference: PolicyRevisionRef {
+            policy_id: PolicyId::new("policy-source-coverage")?,
+            revision_id: PolicyRevisionId::new("revision-source-coverage")?,
+            definition_digest: ContentHash::of_value(&definition)?,
+        },
+        revision_number: 1,
+        parent_revision_id: None,
+        family: StrategyKind::Other,
+        origin: PolicyOrigin::User,
+        definition,
+    };
+    let market = MarketId::parse_upbit("KRW-BTC")?;
+    let at = |value: &str| UtcTimestamp::parse_rfc3339(value).expect("fixed fixture time");
+    let make_source = |open_at: &str| -> Result<CandleObservation, crate::contracts::LabError> {
+        let open_time = at(open_at);
+        let price = PriceKrw::new(Decimal::from(100))?;
+        let candle = CandleRecord {
+            market: market.code(),
+            interval: CandleInterval::H1,
+            open_time_utc: open_time,
+            close_time_utc: UtcTimestamp(open_time.0 + chrono::Duration::hours(1)),
+            open: price,
+            high: price,
+            low: price,
+            close: price,
+            volume: AssetQuantity::new(Decimal::ONE)?,
+            quote_turnover: QuoteAmount::new(Decimal::from(100))?,
+            completed: true,
+        };
+        let content_digest = observation_digest(&candle)?;
+        Ok(CandleObservation {
+            id: ObservationId::from_seed(content_digest.as_str()),
+            candle,
+            content_digest,
+            raw_object_ids: Vec::new(),
+            constituent_ids: Vec::new(),
+        })
+    };
+    let first = make_source("2025-01-02T00:00:00Z")?;
+    let next = make_source("2025-01-02T01:00:00Z")?;
+    let mut checkpoint = crate::automation::AutomationCheckpoint::compile(
+        &revision,
+        market.clone(),
+        CandleInterval::M1,
+    )?;
+    checkpoint.evaluator.observe_source("h1-close", &first)?;
+    let prefix = serde_json::to_value(&checkpoint)?;
+    for missing in [
+        BTreeMap::new(),
+        BTreeMap::from([(CandleInterval::H1, Vec::new())]),
+    ] {
+        assert!(matches!(
+            super::feed_causal_sources(&mut checkpoint, &missing, at("2025-01-02T02:01:00Z")),
+            Err(crate::contracts::LabError::BlockedEvidence(_))
+        ));
+        assert_eq!(serde_json::to_value(&checkpoint)?, prefix);
+    }
+    super::feed_causal_sources(
+        &mut checkpoint,
+        &BTreeMap::new(),
+        at("2025-01-02T01:10:00Z"),
+    )?;
+    let with_future = BTreeMap::from([(CandleInterval::H1, vec![next])]);
+    super::feed_causal_sources(&mut checkpoint, &with_future, at("2025-01-02T01:10:00Z"))?;
+    assert_eq!(serde_json::to_value(&checkpoint)?, prefix);
+    super::feed_causal_sources(&mut checkpoint, &with_future, at("2025-01-02T02:01:00Z"))?;
+    assert_eq!(
+        checkpoint.evaluator.cross_last_close()["h1-close"],
+        at("2025-01-02T02:00:00Z")
+    );
+    Ok(())
+}
+
+#[test]
 #[expect(
     clippy::too_many_lines,
     reason = "one local-only journey verifies frozen policy, durable fill and restart recovery"
@@ -173,6 +277,7 @@ fn frozen_policy_fills_through_mock_venue_and_restart_does_not_duplicate_it()
             description: "fixed 0.001 target for deterministic mock execution".into(),
             program: PolicyProgram::Rules {
                 program: RulesProgram {
+                    condition_roles: Vec::new(),
                     indicators: vec![PolicyIndicator {
                         id: "close".into(),
                         indicator: PolicyIndicatorKind::Close,
@@ -727,7 +832,7 @@ fn queued_owner_claim_observes_fast_emergency_latch_before_store_claim()
     let outcome = runtime.block_on(async {
         let database = owner.handle();
         let (owner_entered_tx, owner_entered_rx) = tokio::sync::oneshot::channel();
-        let (release_owner_tx, release_owner_rx) = std::sync::mpsc::channel();
+        let (release_owner_tx, release_owner_rx) = std::sync::mpsc::sync_channel(1);
         let blocking_database = database.clone();
         let blocker = tokio::spawn(async move {
             blocking_database
@@ -846,6 +951,7 @@ fn make_service_with_venue_overrides(
         inner: Arc::new(Inner {
             database,
             upbit,
+            public_market_feed: None,
             automation_live_venue: UpbitPrivateClient::new_mock(),
             automation_mock_venue,
             risk_guard,
@@ -855,6 +961,7 @@ fn make_service_with_venue_overrides(
             root,
             revision: None,
             wake: Notify::new(),
+            realtime_status: crate::jobs::new_realtime_status_channel(),
             stop: CancellationToken::new(),
             admitting: AtomicBool::new(true),
             admission_gate: Arc::new(tokio::sync::Mutex::new(())),

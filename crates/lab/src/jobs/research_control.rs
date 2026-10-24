@@ -10,7 +10,7 @@ use crate::contracts::{
 };
 use crate::storage::Store;
 use serde_json::Value;
-use std::sync::{Arc, atomic::Ordering};
+use std::sync::atomic::Ordering;
 
 impl JobService {
     /// The single admission gate protects producer writes and ordinary job submission.
@@ -750,6 +750,24 @@ impl JobService {
                     })
                     .await
             }
+            PaperSessionQuery::ReviewEvents {
+                session_id,
+                after_sequence,
+                as_of_sequence,
+                limit,
+            } => {
+                self.inner
+                    .database
+                    .call("paper_review_events", move |store| {
+                        Ok(serde_json::to_value(store.paper_review_events(
+                            &session_id,
+                            after_sequence,
+                            as_of_sequence,
+                            limit,
+                        )?)?)
+                    })
+                    .await
+            }
             PaperSessionQuery::Request { request_id } => {
                 self.inner
                     .database
@@ -842,41 +860,12 @@ impl JobService {
             + Send
             + 'static,
     {
-        if self.inner.stop.is_cancelled() {
-            return Err(LabError::Cancelled(
-                "automation review stopped before snapshot admission".into(),
-            ));
-        }
-        let permit = self
-            .inner
-            .automation_review_budget
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| {
-                LabError::ResourceLimit("automation review compute capacity is full".into())
-            })?;
-        let permit = Arc::new(permit);
-        let storage_permit = Arc::clone(&permit);
-        let snapshot = self
-            .inner
-            .database
-            .call(operation, move |store| {
-                let _permit = storage_permit;
-                store.automation_review_snapshot(&session_id)
-            })
-            .await?;
-        if self.inner.stop.is_cancelled() {
-            return Err(LabError::Cancelled(
-                "automation review stopped before calculation".into(),
-            ));
-        }
-        let calculate_permit = permit;
-        tokio::task::spawn_blocking(move || {
-            let _permit = calculate_permit;
-            calculate(snapshot)
-        })
+        self.bounded_saved_review(
+            operation,
+            move |store| store.automation_review_snapshot(&session_id),
+            calculate,
+        )
         .await
-        .map_err(|_| LabError::Internal("automation review worker panicked".into()))?
     }
 
     /// Apply a durable strategy-automation lifecycle command or owned MOCK cancellation.
@@ -892,7 +881,7 @@ impl JobService {
     /// Best-effort completed-candle poll for `RUNNING` paper sessions whose latest boundary
     /// is not yet present in `candle_observations`.
     pub(super) async fn poll_due_paper_markets(&self, now: UtcTimestamp) {
-        let Ok(due) = self
+        let due = match self
             .inner
             .database
             .call("due_paper_network_polls", move |store| {
@@ -900,8 +889,12 @@ impl JobService {
                 store.due_paper_network_polls(now)
             })
             .await
-        else {
-            return;
+        {
+            Ok(due) => due,
+            Err(error) => {
+                tracing::warn!(reason = %bounded_note(&error), "paper completed-candle polling could not inspect durable state");
+                return;
+            }
         };
         if due.is_empty() {
             return;
@@ -914,23 +907,48 @@ impl JobService {
             if self.inner.stop.is_cancelled() {
                 return;
             }
-            if let Ok(batch) = self
-                .inner
-                .upbit
-                .poll_paper_observations(&req.market, req.interval, count, &self.inner.database)
-                .await
-            {
+            let batch = if let Some(feed) = &self.inner.public_market_feed {
+                match feed
+                    .read_or_bootstrap_observations(&req.market, req.interval, count)
+                    .await
+                {
+                    Ok(batch) => match feed.ensure_ready(&req.market, req.interval) {
+                        Ok(()) => Some(batch),
+                        Err(error) => {
+                            tracing::debug!(market = %req.market.code(), interval = ?req.interval, reason = %bounded_note(&error), "paper completed-candle input awaiting feed readiness");
+                            None
+                        }
+                    },
+                    Err(error @ LabError::BlockedEvidence(_)) => {
+                        tracing::debug!(market = %req.market.code(), interval = ?req.interval, reason = %bounded_note(&error), "paper completed-candle input awaiting recovery evidence");
+                        None
+                    }
+                    Err(error) => {
+                        tracing::warn!(market = %req.market.code(), interval = ?req.interval, reason = %bounded_note(&error), "paper completed-candle input recovery failed");
+                        None
+                    }
+                }
+            } else {
+                self.inner
+                    .upbit
+                    .poll_paper_observations(&req.market, req.interval, count, &self.inner.database)
+                    .await
+                    .ok()
+            };
+            if let Some(batch) = batch {
                 batches.push(batch);
             }
         }
-        if !batches.is_empty() {
-            let _ = self
+        if !batches.is_empty()
+            && let Err(error) = self
                 .inner
                 .database
                 .call("reconcile_running_paper_sessions", move |store| {
                     store.reconcile_running_paper_sessions(&batches, now)
                 })
-                .await;
+                .await
+        {
+            tracing::warn!(reason = %bounded_note(&error), "paper completed-candle persistence or policy evaluation failed");
         }
     }
 }
@@ -958,6 +976,6 @@ fn mutation_receipt(
 }
 
 /// Bounded single-line error note for probe diagnostics.
-fn bounded_note(error: &LabError) -> String {
+pub(super) fn bounded_note(error: &LabError) -> String {
     error.to_string().chars().take(200).collect()
 }

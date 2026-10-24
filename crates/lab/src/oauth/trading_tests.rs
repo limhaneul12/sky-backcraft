@@ -63,12 +63,14 @@ fn add_test_client(state: &OAuthState, client_id: &str) {
         .grants
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let registration_order = grants.next_registration_order;
+    grants.next_registration_order = registration_order.saturating_add(1);
     grants.clients.insert(
         client_id.into(),
         Client {
             redirect_uris: vec![REDIRECT_URI.into()],
             display_name: "OAuth scope test".into(),
-            registered_at: std::time::Instant::now(),
+            registration_order,
             pinned: false,
         },
     );
@@ -400,6 +402,198 @@ async fn operator_registered_client_survives_restart_without_persisting_grants()
     Ok(())
 }
 
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one OAuth restart journey verifies durable DCR identity and ephemeral consent state"
+)]
+async fn dynamically_registered_client_survives_database_owner_restart() -> TestResult {
+    let root = OAuthTempRoot::new()?;
+    let first_owner = crate::database::DatabaseOwner::open(root.0.clone())?;
+    let first_state = enabled_state()?
+        .with_persistent_clients(first_owner.handle())
+        .await?;
+    let registration = register(
+        axum::extract::State(first_state.clone()),
+        serde_json::json!({
+            "redirect_uris": [CHATGPT_CALLBACK],
+            "client_name": format!("{}Reconnect test client", " ".repeat(120))
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(registration.status(), axum::http::StatusCode::CREATED);
+    let registration = response_json(registration).await?;
+    let client_id = response_string(&registration, "client_id")?.to_owned();
+    assert_eq!(
+        registration
+            .get("redirect_uris")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|uris| uris.first())
+            .and_then(serde_json::Value::as_str),
+        Some(CHATGPT_CALLBACK)
+    );
+
+    let first_consent = authorize(
+        axum::extract::State(first_state.clone()),
+        axum::extract::RawQuery(Some(authorization_query_with_redirect(
+            &client_id,
+            CHATGPT_CALLBACK,
+            "before-restart-flow",
+            encoded_scope(OAuthPermissions::Research),
+        ))),
+    )
+    .await;
+    assert_eq!(first_consent.status(), axum::http::StatusCode::OK);
+    assert!(
+        response_text(first_consent)
+            .await?
+            .contains("Reconnect test client")
+    );
+    {
+        let mut grants = first_state
+            .inner
+            .grants
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let expires_at = std::time::Instant::now() + TOKEN_TTL;
+        grants.codes.insert(
+            "ephemeral-code-before-restart".into(),
+            AuthorizationCode {
+                permissions: OAuthPermissions::Research,
+                client_id: client_id.clone(),
+                redirect_uri: CHATGPT_CALLBACK.into(),
+                resource: first_state.inner.resource.clone(),
+                code_challenge: PKCE_CHALLENGE.into(),
+                expires_at,
+            },
+        );
+        grants.tokens.insert(
+            "ephemeral-access-before-restart".into(),
+            AccessToken {
+                permissions: OAuthPermissions::Research,
+                client_id: client_id.clone(),
+                resource: first_state.inner.resource.clone(),
+                expires_at,
+            },
+        );
+        grants.refresh_tokens.insert(
+            "ephemeral-refresh-before-restart".into(),
+            AccessToken {
+                permissions: OAuthPermissions::Research,
+                client_id: client_id.clone(),
+                resource: first_state.inner.resource.clone(),
+                expires_at: std::time::Instant::now() + REFRESH_TOKEN_TTL,
+            },
+        );
+    }
+
+    drop(first_state);
+    first_owner.shutdown()?;
+
+    let second_owner = crate::database::DatabaseOwner::open(root.0.clone())?;
+    let restarted = enabled_state()?
+        .with_persistent_clients(second_owner.handle())
+        .await?;
+    {
+        let grants = restarted
+            .inner
+            .grants
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let client = grants
+            .clients
+            .get(&client_id)
+            .ok_or_else(|| test_error("DCR client survived database owner restart"))?;
+        assert_eq!(client.redirect_uris, [CHATGPT_CALLBACK]);
+        assert_eq!(client.display_name, "Reconnect test client");
+        assert!(!client.pinned);
+        assert!(grants.pending.is_empty());
+        assert!(grants.codes.is_empty());
+        assert!(grants.tokens.is_empty());
+        assert!(grants.refresh_tokens.is_empty());
+    }
+
+    let mut fresh_flow_ids = std::collections::HashSet::new();
+    for state_param in ["after-restart-flow-1", "after-restart-flow-2"] {
+        let consent = authorize(
+            axum::extract::State(restarted.clone()),
+            axum::extract::RawQuery(Some(authorization_query_with_redirect(
+                &client_id,
+                CHATGPT_CALLBACK,
+                state_param,
+                encoded_scope(OAuthPermissions::Research),
+            ))),
+        )
+        .await;
+        assert_eq!(consent.status(), axum::http::StatusCode::OK);
+        assert!(response_text(consent).await?.contains(CHATGPT_CALLBACK));
+        let grants = restarted
+            .inner
+            .grants
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (flow_id, pending) = grants
+            .pending
+            .iter()
+            .find(|(_, pending)| pending.state == state_param)
+            .ok_or_else(|| test_error("reconnected client created a fresh consent flow"))?;
+        assert!(fresh_flow_ids.insert(flow_id.clone()));
+        assert_eq!(pending.client_id, client_id);
+        assert_eq!(pending.redirect_uri, CHATGPT_CALLBACK);
+    }
+
+    let unknown = authorize(
+        axum::extract::State(restarted.clone()),
+        axum::extract::RawQuery(Some(authorization_query_with_redirect(
+            "unknown-dcr-client",
+            CHATGPT_CALLBACK,
+            "unknown-after-restart",
+            encoded_scope(OAuthPermissions::Research),
+        ))),
+    )
+    .await;
+    assert_eq!(unknown.status(), axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_string(&response_json(unknown).await?, "error")?,
+        "unauthorized_client"
+    );
+
+    let wrong_callback = authorize(
+        axum::extract::State(restarted.clone()),
+        axum::extract::RawQuery(Some(authorization_query_with_redirect(
+            &client_id,
+            "https://chatgpt.com/changed-callback",
+            "wrong-callback-after-restart",
+            encoded_scope(OAuthPermissions::Research),
+        ))),
+    )
+    .await;
+    assert_eq!(wrong_callback.status(), axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_string(&response_json(wrong_callback).await?, "error")?,
+        "invalid_request"
+    );
+
+    let bad_pkce = authorization_query_with_redirect(
+        &client_id,
+        CHATGPT_CALLBACK,
+        "bad-pkce-after-restart",
+        encoded_scope(OAuthPermissions::Research),
+    )
+    .replace(PKCE_CHALLENGE, "short");
+    let rejected_pkce = authorize(
+        axum::extract::State(restarted.clone()),
+        axum::extract::RawQuery(Some(bad_pkce)),
+    )
+    .await;
+    assert_eq!(rejected_pkce.status(), axum::http::StatusCode::BAD_REQUEST);
+
+    drop(restarted);
+    second_owner.shutdown()?;
+    Ok(())
+}
+
 #[test]
 fn operator_client_registry_rejects_malformed_documents_and_issuer_mismatches() -> TestResult {
     assert!(serde_json::from_str::<OAuthClientRegistryConfig>("{").is_err());
@@ -486,7 +680,6 @@ fn operator_client_registry_rejects_invalid_and_colliding_clients() -> TestResul
             .is_err()
     );
 
-    let now = std::time::Instant::now();
     let mut grants = Grants::default();
     assert!(
         grants
@@ -495,7 +688,7 @@ fn operator_client_registry_rejects_invalid_and_colliding_clients() -> TestResul
                 Client {
                     redirect_uris: vec![REDIRECT_URI.into()],
                     display_name: "Original client".into(),
-                    registered_at: now,
+                    registration_order: 0,
                     pinned: false,
                 },
             )
@@ -508,7 +701,7 @@ fn operator_client_registry_rejects_invalid_and_colliding_clients() -> TestResul
                 Client {
                     redirect_uris: vec![CHATGPT_CALLBACK.into()],
                     display_name: "Conflicting client".into(),
-                    registered_at: now,
+                    registration_order: 0,
                     pinned: false,
                 },
             )
@@ -526,7 +719,6 @@ fn operator_registered_clients_are_pinned_under_dynamic_registration_pressure() 
     let state = enabled_state()?
         .with_pre_registered_clients(chatgpt_client_registry(PUBLIC_URL))
         .map_err(test_error)?;
-    let now = std::time::Instant::now();
     let mut grants = state
         .inner
         .grants
@@ -538,7 +730,7 @@ fn operator_registered_clients_are_pinned_under_dynamic_registration_pressure() 
             Client {
                 redirect_uris: vec![REDIRECT_URI.into()],
                 display_name: format!("Dynamic {index}"),
-                registered_at: now + Duration::from_secs(u64::try_from(index).unwrap_or(u64::MAX)),
+                registration_order: 0,
                 pinned: false,
             },
         );
@@ -552,7 +744,7 @@ fn operator_registered_clients_are_pinned_under_dynamic_registration_pressure() 
                 Client {
                     redirect_uris: vec![REDIRECT_URI.into()],
                     display_name: "Dynamic replacement".into(),
-                    registered_at: now + Duration::from_hours(2),
+                    registration_order: 0,
                     pinned: false,
                 },
             )
@@ -1433,5 +1625,88 @@ fn bearer_permission_lookup_requires_resource_match_and_unexpired_token() -> Tes
     assert_eq!(state.permissions_for_headers(&wrong_resource_headers), None);
     let expired_headers = bearer_headers("expired")?;
     assert_eq!(state.permissions_for_headers(&expired_headers), None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn realtime_sse_oauth_expiry_releases_admission_without_body_reads() -> TestResult {
+    use crate::contracts::{RealtimeFeedStatus, RealtimeStatus, UtcTimestamp};
+    use crate::realtime_events::{RealtimeEventAuthorization, RealtimeEventTasks, RealtimeEvents};
+    let owner = random_token(32).map_err(|()| test_error("isolated owner entropy"))?;
+    let token = random_token(32).map_err(|()| test_error("isolated access entropy"))?;
+    let state = OAuthState::new_with_trading_scopes(PUBLIC_URL, owner).map_err(test_error)?;
+    state
+        .inner
+        .grants
+        .lock()
+        .map_err(|_| test_error("grant lock"))?
+        .tokens
+        .insert(
+            token.clone(),
+            AccessToken {
+                permissions: OAuthPermissions::TradingRead,
+                client_id: "isolated-sse-client".into(),
+                resource: state.inner.resource.clone(),
+                expires_at: Instant::now() + TOKEN_TTL,
+            },
+        );
+    let status = RealtimeStatus {
+        observed_at_utc: UtcTimestamp::now(),
+        market: RealtimeFeedStatus::unavailable(),
+        private: RealtimeFeedStatus::unavailable(),
+    };
+    let (_sender, receiver) = tokio::sync::watch::channel(status);
+    let stop = tokio_util::sync::CancellationToken::new();
+    let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+    let tasks = RealtimeEventTasks::default();
+    let app = RealtimeEvents::new(
+        receiver,
+        RealtimeEventAuthorization::OAuth(state.clone()),
+        stop.clone(),
+        budget.clone(),
+        tasks.clone(),
+    )
+    .router("/events");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("http://{}/events", listener.local_addr()?);
+    let shutdown = stop.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown.cancelled_owned())
+            .await
+    });
+    let client = reqwest::Client::new();
+    let response = client.get(&endpoint).bearer_auth(&token).send().await?;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(budget.available_permits(), 0);
+    state
+        .inner
+        .grants
+        .lock()
+        .map_err(|_| test_error("grant lock"))?
+        .tokens
+        .get_mut(&token)
+        .ok_or_else(|| test_error("admitted grant"))?
+        .expires_at = Instant::now();
+    // The client deliberately does not pull any body frame after revocation.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while budget.available_permits() == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    assert_eq!(
+        client
+            .get(&endpoint)
+            .bearer_auth(&token)
+            .send()
+            .await?
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    stop.cancel();
+    tasks.shutdown().await?;
+    drop(response);
+    tokio::time::timeout(Duration::from_secs(2), server).await???;
     Ok(())
 }

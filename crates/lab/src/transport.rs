@@ -6,7 +6,7 @@
 
 use axum::{
     Router,
-    body::{Body, to_bytes},
+    body::{Body, BodyDataStream, Bytes, to_bytes},
     extract::{Request, State},
     http::{HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
@@ -44,7 +44,6 @@ pub const REQUEST_DEADLINE: Duration = Duration::from_secs(20);
 pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(30);
 
 const REQUEST_ID_HEADER: header::HeaderName = header::HeaderName::from_static("x-request-id");
-const ROUTE_TEMPLATE: &str = "/mcp";
 const LOG_EVENTS_PER_SECOND: u64 = 20;
 
 /// Fixed public transport ceilings. Public requests cannot raise these limits.
@@ -130,6 +129,7 @@ pub struct TransportState {
     limits: TransportLimits,
     connection_slots: Arc<Semaphore>,
     request_slots: Arc<Semaphore>,
+    status_stream_slots: Arc<Semaphore>,
     request_rate: Mutex<WindowCounter>,
     log_budget: Mutex<WindowCounter>,
     connection_shutdown: CancellationToken,
@@ -153,6 +153,10 @@ impl TransportState {
             limits,
             connection_slots: Arc::new(Semaphore::new(limits.max_open_connections)),
             request_slots: Arc::new(Semaphore::new(limits.max_inflight_requests)),
+            // Long-lived status observers must leave one slot for ordinary RPC.
+            status_stream_slots: Arc::new(Semaphore::new(
+                limits.max_inflight_requests.saturating_sub(1),
+            )),
             request_rate: Mutex::new(WindowCounter::new()),
             log_budget: Mutex::new(WindowCounter::new()),
             connection_shutdown: CancellationToken::new(),
@@ -333,6 +337,31 @@ impl Drop for RequestPermit {
     }
 }
 
+/// Server-only proof that the realtime owner already bounds messages and clients.
+#[derive(Clone, Copy)]
+struct BoundedStatusStream;
+
+pub(crate) fn mark_bounded_status_stream(response: &mut Response) {
+    response.extensions_mut().insert(BoundedStatusStream);
+}
+
+struct StreamingRequestBody {
+    inner: BodyDataStream,
+    permits: Option<(RequestPermit, OwnedSemaphorePermit)>,
+}
+
+impl futures_util::Stream for StreamingRequestBody {
+    type Item = Result<Bytes, axum::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let next = Pin::new(&mut self.inner).poll_next(context);
+        if matches!(next, Poll::Ready(None | Some(Err(_)))) {
+            self.permits.take();
+        }
+        next
+    }
+}
+
 /// Process-local diagnostic correlation only; this is never authentication.
 #[derive(Debug, Clone)]
 pub struct RequestCorrelationId(pub Arc<str>);
@@ -376,7 +405,7 @@ async fn request_limits(
 ) -> Response {
     let correlation_id = state.next_correlation_id();
     request.extensions_mut().insert(correlation_id.clone());
-    let route = ROUTE_TEMPLATE;
+    let route_category = route_category(request.uri().path());
     let method = method_category(request.method());
     let started_at = Instant::now();
 
@@ -395,7 +424,7 @@ async fn request_limits(
                 RequestObservation {
                     event: "request_rejected",
                     correlation_id: &correlation_id,
-                    route,
+                    route_category,
                     method,
                     status: response.status(),
                     elapsed: started_at.elapsed(),
@@ -442,14 +471,20 @@ async fn request_limits(
                 )
             }
         };
-    drop(permit);
+    let initial_status = response.status();
+    response = attach_status_stream_permits(response, permit, &state, &correlation_id);
+    let (event, error_category) = if response.status() == initial_status {
+        (event, error_category)
+    } else {
+        ("request_rejected", "inflight_limit")
+    };
     add_request_id_header(&mut response, &correlation_id);
     record_request(
         &state,
         RequestObservation {
             event,
             correlation_id: &correlation_id,
-            route,
+            route_category,
             method,
             status: response.status(),
             elapsed: started_at.elapsed(),
@@ -457,6 +492,39 @@ async fn request_limits(
         },
     );
     response
+}
+
+fn attach_status_stream_permits(
+    mut response: Response,
+    permit: RequestPermit,
+    state: &TransportState,
+    correlation: &RequestCorrelationId,
+) -> Response {
+    if response
+        .extensions_mut()
+        .remove::<BoundedStatusStream>()
+        .is_none()
+    {
+        drop(permit);
+        return response;
+    }
+    let Ok(stream_permit) = state.status_stream_slots.clone().try_acquire_owned() else {
+        state.rejected_requests.fetch_add(1, Ordering::Relaxed);
+        return sanitized_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "RESOURCE_LIMIT",
+            "status stream capacity reserved for ordinary requests",
+            correlation,
+        );
+    };
+    let (parts, body) = response.into_parts();
+    Response::from_parts(
+        parts,
+        Body::from_stream(StreamingRequestBody {
+            inner: body.into_data_stream(),
+            permits: Some((permit, stream_permit)),
+        }),
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -469,7 +537,11 @@ async fn execute_bounded_response(
     next: Next,
     state: &TransportState,
 ) -> Result<Response, ResponseFailure> {
-    collect_bounded_response(next.run(request).await, state.limits.max_response_bytes).await
+    let response = next.run(request).await;
+    if response.extensions().get::<BoundedStatusStream>().is_some() {
+        return Ok(response);
+    }
+    collect_bounded_response(response, state.limits.max_response_bytes).await
 }
 
 async fn collect_bounded_response(
@@ -535,6 +607,20 @@ fn status_class(status: StatusCode) -> &'static str {
     }
 }
 
+fn route_category(path: &str) -> &'static str {
+    match path {
+        "/mcp" | "/public/mcp" => "mcp",
+        "/token" => "oauth_token",
+        "/register" => "oauth_register",
+        "/authorize" | "/authorize/approve" => "oauth_authorize",
+        "/.well-known/oauth-protected-resource" | "/.well-known/oauth-protected-resource/mcp" => {
+            "protected_resource"
+        }
+        "/.well-known/oauth-authorization-server" => "oauth_server",
+        _ => "other",
+    }
+}
+
 fn response_error_category(status: StatusCode) -> &'static str {
     match status.as_u16() / 100 {
         4 => "client_error",
@@ -547,7 +633,7 @@ fn response_error_category(status: StatusCode) -> &'static str {
 struct RequestObservation<'observation> {
     event: &'static str,
     correlation_id: &'observation RequestCorrelationId,
-    route: &'static str,
+    route_category: &'static str,
     method: &'static str,
     status: StatusCode,
     elapsed: Duration,
@@ -561,9 +647,10 @@ fn record_request(state: &TransportState, observation: RequestObservation<'_>) {
         target: "spot_lab::transport",
         event = observation.event,
         request_id = %observation.correlation_id.0,
-        route = observation.route,
+        route_category = observation.route_category,
         method = observation.method,
         status_class = status_class(observation.status),
+        status_code = observation.status.as_u16(),
         elapsed_ms,
         error_category = observation.error_category,
         active_connections = snapshot.active_connections,

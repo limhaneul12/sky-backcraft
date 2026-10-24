@@ -13,3 +13,5 @@ data
 **/.DS_Store
 **/*.tmp
 **/*.bak
+
+**/__pycache__

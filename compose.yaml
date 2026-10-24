@@ -42,6 +42,10 @@ services:
     network_mode: none
     environment:
       CARGO_NET_OFFLINE: "true"
+      CARGO_BUILD_JOBS: "1"
+      CARGO_INCREMENTAL: "0"
+    volumes:
+      - ci-target:/ci-cache
 
   # Public exposure is operator-managed: route your own Cloudflare Named
   # Tunnel (or equivalent) to 127.0.0.1:${SPOT_LAB_HOST_PORT:-8130} and set
@@ -53,3 +57,4 @@ networks:
 
 volumes:
   spot-lab-data:
+  ci-target:

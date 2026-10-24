@@ -279,7 +279,7 @@ impl Store {
             request_id: request.request_id.clone(),
             payload: JobPayload::Collect { request },
         };
-        let pin = super::job_store::insert_job_tx(&transaction, &submission, now)?;
+        let pin = super::job_store::insert_job_tx(&transaction, &submission, now, &self.raw)?;
         transaction
             .execute(
                 "INSERT INTO schedule_fires(\
@@ -381,7 +381,7 @@ impl Store {
             .job_id
             .as_ref()
             .ok_or_else(|| LabError::DataCorrupt("retryable schedule fire has no job".into()))?;
-        let attempt_id = super::job_store::retry_job_tx(&transaction, job_id, now)?;
+        let attempt_id = super::job_store::retry_job_tx(&transaction, job_id, now, &self.raw)?;
         let changed = transaction
             .execute(
                 "UPDATE schedule_fires SET status='queued',attempt_id=?1,retry_at_ms=NULL \
@@ -485,7 +485,8 @@ impl Store {
             return Ok(schedule);
         }
         enforce_active_capacity(&transaction)?;
-        let recovery_owned = recovery::resume_recovery_tx(&transaction, schedule_id, now)?;
+        let recovery_owned =
+            recovery::resume_recovery_tx(&transaction, schedule_id, now, &self.raw)?;
         let latest = load_latest_fire(&transaction, schedule_id)?;
         if !recovery_owned && let Some(fire) = latest {
             match fire.status {
@@ -501,7 +502,8 @@ impl Store {
                     let job_id = fire.job_id.as_ref().ok_or_else(|| {
                         LabError::DataCorrupt("terminal schedule fire has no job".into())
                     })?;
-                    let attempt_id = super::job_store::retry_job_tx(&transaction, job_id, now)?;
+                    let attempt_id =
+                        super::job_store::retry_job_tx(&transaction, job_id, now, &self.raw)?;
                     transaction
                         .execute(
                             "UPDATE schedule_fires SET status='queued',attempt_id=?1,\

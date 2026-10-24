@@ -53,6 +53,32 @@ pub fn run_model(
     seq_start: u64,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<ModelLedger, LabError> {
+    run_model_with_cache(
+        plan, datasets, evidence, run_id, admission, seq_start, cancelled, None,
+    )
+}
+
+/// Execute one admitted model against immutable inputs with an optional
+/// pre-warmed [`crate::policy_engine::PreparedBarCache`] to eliminate redundant
+/// dataset scanning and MTF resampling across admissions.
+///
+/// # Errors
+/// Has the same failure contract as [`run_model`].
+#[allow(
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "the causal execution-grid loop is one ordered state-machine phase"
+)]
+pub fn run_model_with_cache(
+    plan: &ResolvedPlan,
+    datasets: &[DatasetSnapshot],
+    evidence: Option<&EvidenceSnapshot>,
+    run_id: &RunId,
+    admission: &ModelAdmission,
+    seq_start: u64,
+    cancelled: &dyn Fn() -> bool,
+    bar_cache: Option<&crate::policy_engine::PreparedBarCache>,
+) -> Result<ModelLedger, LabError> {
     plan.spec.validate()?;
     if plan.spec.capital_mode == Some(crate::contracts::CapitalMode::SharedPortfolio) {
         return Err(LabError::InvalidConfig(
@@ -95,7 +121,7 @@ pub fn run_model(
                 .range
                 .with_warmup(1, plan.spec.execution_resolution)?;
             prepared_rows = (
-                crate::policy_engine::prepare_interval_bars(
+                crate::policy_engine::prepare_interval_bars_cached(
                     datasets,
                     &admission.market,
                     plan.spec.decision_interval,
@@ -103,12 +129,14 @@ pub fn run_model(
                         decision_range,
                         plan.spec.range.start(),
                     ),
+                    bar_cache,
                 )?,
-                crate::policy_engine::prepare_interval_bars(
+                crate::policy_engine::prepare_interval_bars_cached(
                     datasets,
                     &admission.market,
                     plan.spec.execution_resolution,
                     execution_range,
+                    bar_cache,
                 )?,
             );
             (
@@ -163,8 +191,13 @@ pub fn run_model(
     }
     // Cross-interval source bars: one bounded causal stream per declared
     // source interval, fed incrementally (never a full reaggregation).
-    let mut source_feed =
-        CrossIntervalFeed::new(&evaluator, datasets, &admission.market, plan.spec.range)?;
+    let mut source_feed = CrossIntervalFeed::new_with_cache(
+        &evaluator,
+        datasets,
+        &admission.market,
+        plan.spec.range,
+        bar_cache,
+    )?;
     let mut decision_index = 0usize;
     while decision_bars
         .get(decision_index)
@@ -410,7 +443,25 @@ pub fn run_model(
         terminal_bar.candle.close,
         terminal_bar.candle.close_time_utc,
     )?;
-    Ok(state.into_ledger())
+    let mut ledger = state.into_ledger();
+    if matches!(plan.spec.schema_version.as_str(), "1.0" | "2.0") {
+        // Historical model-ledger serialization is pinned by replay. Paper uses
+        // EngineState directly and v3 retains the new observational fields.
+        for signal in &mut ledger.signals {
+            signal.actual_weight_at_decision = None;
+            signal.decision_trace = None;
+            if let Some(trace) = signal
+                .policy_trace
+                .as_mut()
+                .and_then(|trace| trace.condition_trace.as_mut())
+            {
+                for condition in trace {
+                    condition.evidence = None;
+                }
+            }
+        }
+    }
+    Ok(ledger)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -529,6 +580,8 @@ impl EngineState {
             strategy_version: STRATEGY_VERSION.into(),
             policy_ref: evaluation.policy_ref.clone(),
             policy_trace: evaluation.policy_trace.clone(),
+            decision_trace: evaluation.decision_trace.clone(),
+            actual_weight_at_decision: Some(actual_weight),
             source_bar_ids: vec![bar.id.clone()],
             signal_time: evaluation.decision_time,
             decision_available_at: evaluation.decision_time,
@@ -928,6 +981,8 @@ impl EngineState {
             strategy_version: STRATEGY_VERSION.into(),
             policy_ref: self.strategy.policy_ref().cloned(),
             policy_trace,
+            decision_trace: None,
+            actual_weight_at_decision: None,
             source_bar_ids: vec![bar.id.clone()],
             signal_time: bar.candle.close_time_utc,
             decision_available_at: bar.candle.close_time_utc,

@@ -77,6 +77,10 @@ pub struct RulesProgram {
     pub rules: Vec<PolicyRule>,
     pub fallback: PolicyTarget,
     pub signal_expiry: PolicySignalExpiry,
+    /// Explicit semantic roles for rule-condition nodes. Empty preserves the
+    /// original policy definition bytes and leaves observed roles unspecified.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub condition_roles: Vec<PolicyConditionRoleDeclaration>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -223,6 +227,26 @@ pub struct PolicyRule {
     pub target: PolicyTarget,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PolicyConditionRole {
+    /// No explicit role metadata was supplied for this AST node.
+    Unspecified,
+    Entry,
+    Filter,
+    Exit,
+    Classification,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyConditionRoleDeclaration {
+    /// Stable evaluator AST path, rooted at `rule:{id}:when`.
+    pub ast_path: String,
+    /// Role labels are metadata only; the evaluator never branches on them.
+    pub role: PolicyConditionRole,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
 pub enum PolicyTarget {
@@ -263,6 +287,184 @@ pub struct PolicyTrace {
     pub state_before: Vec<NamedPolicyValue>,
     pub state_after: Vec<NamedPolicyValue>,
     pub evidence: Option<PolicyEvidenceTrace>,
+    /// Actual Boolean guards visited by a new Rules evaluation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition_trace: Option<Vec<PolicyConditionTrace>>,
+    /// Bounded provenance for the actual indicator source observations supplied
+    /// to this evaluator. A missing value means it was not captured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_provenance: Option<Vec<PolicyIndicatorSourceTrace>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(
+    tag = "status",
+    content = "reason",
+    rename_all = "SCREAMING_SNAKE_CASE",
+    deny_unknown_fields
+)]
+pub enum PolicyConditionOutcome {
+    True,
+    False,
+    Unknown(PolicyConditionReason),
+    NotEvaluated(PolicyConditionReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PolicyConditionReason {
+    CrossHistoryUnavailable,
+    AndShortCircuit,
+    OrShortCircuit,
+    IfBranchNotSelected,
+    PriorRuleMatched,
+    RuleNotMatched,
+}
+
+/// Rules AST or builtin strategy context in which an evaluator guard ran.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub enum PolicyConditionScope {
+    RuleCondition { rule_id: String },
+    StateTransition { state_id: String },
+    RuleTarget { rule_id: String },
+    FallbackTarget,
+    BuiltinStrategy { strategy: StrategyKind },
+}
+
+/// Finite evaluator float preserved as a JSON number.
+///
+/// This is a statistical/evaluator value, not an economic decimal or a unit
+/// declaration. The immutable policy expression at `ast_path` defines meaning.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
+#[serde(transparent)]
+#[schemars(transparent)]
+pub struct FinitePolicyNumber(#[serde(deserialize_with = "finite_statistic")] f64);
+
+impl FinitePolicyNumber {
+    /// Construct from an evaluator value after verifying the finite invariant.
+    /// # Errors
+    /// Returns `INTERNAL` when a nonfinite value crosses the capture boundary.
+    pub(crate) fn new(value: f64) -> Result<Self, LabError> {
+        if value.is_finite() {
+            Ok(Self(value))
+        } else {
+            Err(LabError::Internal(
+                "nonfinite policy condition evidence".into(),
+            ))
+        }
+    }
+
+    /// Return the exact finite float represented by this captured value.
+    #[must_use]
+    pub const fn get(self) -> f64 {
+        self.0
+    }
+}
+
+impl PartialEq for FinitePolicyNumber {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_bits() == other.0.to_bits()
+    }
+}
+
+impl Eq for FinitePolicyNumber {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyOperandPair {
+    pub left: FinitePolicyNumber,
+    pub right: FinitePolicyNumber,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub enum PolicyConditionEvidence {
+    Comparison {
+        left: FinitePolicyNumber,
+        comparison: CompareOp,
+        right: FinitePolicyNumber,
+    },
+    /// Captures the cached crossing sample used by the evaluator. `previous`
+    /// is absent only when cross history was unavailable for this evaluation.
+    Crossing {
+        previous: Option<PolicyOperandPair>,
+        current: PolicyOperandPair,
+    },
+    Position {
+        expected: PositionState,
+        actual: PositionState,
+    },
+    CountComparison {
+        left: u64,
+        comparison: CompareOp,
+        right: u64,
+    },
+    WeightBand {
+        target: Weight,
+        actual: Weight,
+        difference: Weight,
+        band: Weight,
+    },
+    WeightComparison {
+        left: Weight,
+        comparison: CompareOp,
+        right: Weight,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyConditionTrace {
+    pub scope: PolicyConditionScope,
+    /// Stable Rules AST path or builtin guard path.
+    pub ast_path: String,
+    /// Rule-condition declarations are metadata; all other scopes are UNSPECIFIED.
+    pub role: PolicyConditionRole,
+    pub outcome: PolicyConditionOutcome,
+    /// Exact boolean returned by the legacy evaluator for evaluated nodes.
+    /// `UNKNOWN` retains its legacy boolean here; skipped nodes have no result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_result: Option<bool>,
+    /// Evidence read from the actual evaluated primitive guard. Definitions
+    /// remain in the frozen policy and skipped expressions carry no evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<PolicyConditionEvidence>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PolicySourceCaptureOrigin {
+    CapturedFromEvaluatorStart,
+    /// A resumed legacy evaluator did not retain its earlier source capture.
+    NotCaptured,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PolicySourceObservationRef {
+    pub observation_id: super::ObservationId,
+    pub content_digest: super::ContentHash,
+    pub open_time: super::UtcTimestamp,
+    pub close_time: super::UtcTimestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyIndicatorSourceTrace {
+    pub indicator_id: String,
+    pub source_interval: super::CandleInterval,
+    pub required_warmup_bars: u64,
+    pub capture_origin: PolicySourceCaptureOrigin,
+    /// First observation captured by this evaluator state. With `NOT_CAPTURED`
+    /// this anchors only the captured suffix, not the prior checkpoint history.
+    pub capture_anchor: Option<PolicySourceObservationRef>,
+    /// Number of actual source observations included in this capture segment.
+    pub captured_count: u64,
+    /// Up to the latest eight actual observations, in source order.
+    pub recent_refs: Vec<PolicySourceObservationRef>,
+    /// Rolling digest over the captured segment, not an uncaptured checkpoint prefix.
+    pub rolling_digest: Option<super::ContentHash>,
 }
 
 impl PolicyDefinition {
@@ -426,7 +628,8 @@ impl RulesProgram {
                 .validate(&indicator_ids, &state_ids, &mut limits, 1)?;
         }
         self.fallback
-            .validate(&indicator_ids, &state_ids, &mut limits, 1)
+            .validate(&indicator_ids, &state_ids, &mut limits, 1)?;
+        validate_condition_roles(self)
     }
 
     fn warmup_bars(&self) -> Result<usize, LabError> {
@@ -499,6 +702,114 @@ impl RulesProgram {
                 .iter()
                 .any(|rule| rule.condition.requires_evidence() || rule.target.requires_evidence())
             || self.fallback.requires_evidence()
+    }
+}
+
+fn validate_condition_roles(program: &RulesProgram) -> Result<(), LabError> {
+    if program.condition_roles.len() > MAX_AST_NODES {
+        return Err(LabError::ResourceLimit(
+            "policy condition role declarations exceed 128 entries".into(),
+        ));
+    }
+
+    let mut valid_paths = BTreeSet::new();
+    for rule in &program.rules {
+        collect_condition_paths(
+            &rule.condition,
+            &format!("rule:{}:when", rule.id),
+            &mut valid_paths,
+        );
+    }
+
+    let mut declared_paths = BTreeSet::new();
+    for declaration in &program.condition_roles {
+        if declaration.ast_path.len() > 512 {
+            return Err(LabError::ResourceLimit(
+                "policy condition role AST path exceeds 512 bytes".into(),
+            ));
+        }
+        if declaration.role == PolicyConditionRole::Unspecified {
+            return Err(LabError::InvalidConfig(
+                "UNSPECIFIED is implicit and cannot be declared as a policy condition role".into(),
+            ));
+        }
+        if !declared_paths.insert(declaration.ast_path.as_str()) {
+            return Err(LabError::InvalidConfig(format!(
+                "duplicate policy condition role path: {}",
+                declaration.ast_path
+            )));
+        }
+        if !valid_paths.contains(declaration.ast_path.as_str()) {
+            return Err(LabError::InvalidConfig(format!(
+                "policy condition role path does not identify a rule condition: {}",
+                declaration.ast_path
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn collect_condition_paths(expr: &BoolExpr, path: &str, output: &mut BTreeSet<String>) {
+    output.insert(path.to_owned());
+    match expr {
+        BoolExpr::Compare { left, right, .. }
+        | BoolExpr::CrossesAbove { left, right }
+        | BoolExpr::CrossesBelow { left, right } => {
+            collect_numeric_condition_paths(left, &format!("{path}:left"), output);
+            collect_numeric_condition_paths(right, &format!("{path}:right"), output);
+        }
+        BoolExpr::And { conditions } => {
+            for (index, condition) in conditions.iter().enumerate() {
+                collect_condition_paths(condition, &format!("{path}:and:{index}"), output);
+            }
+        }
+        BoolExpr::Or { conditions } => {
+            for (index, condition) in conditions.iter().enumerate() {
+                collect_condition_paths(condition, &format!("{path}:or:{index}"), output);
+            }
+        }
+        BoolExpr::Not { condition } => {
+            collect_condition_paths(condition, &format!("{path}:not"), output);
+        }
+        BoolExpr::PositionIs { .. } => {}
+    }
+}
+
+fn collect_numeric_condition_paths(expr: &NumericExpr, path: &str, output: &mut BTreeSet<String>) {
+    match expr {
+        NumericExpr::Add { left, right }
+        | NumericExpr::Sub { left, right }
+        | NumericExpr::Mul { left, right }
+        | NumericExpr::Div { left, right }
+        | NumericExpr::Min { left, right }
+        | NumericExpr::Max { left, right } => {
+            collect_numeric_condition_paths(left, &format!("{path}:left"), output);
+            collect_numeric_condition_paths(right, &format!("{path}:right"), output);
+        }
+        NumericExpr::Abs { value } => {
+            collect_numeric_condition_paths(value, &format!("{path}:value"), output);
+        }
+        NumericExpr::Clamp { value, min, max } => {
+            collect_numeric_condition_paths(value, &format!("{path}:value"), output);
+            collect_numeric_condition_paths(min, &format!("{path}:min"), output);
+            collect_numeric_condition_paths(max, &format!("{path}:max"), output);
+        }
+        NumericExpr::If {
+            condition,
+            then_value,
+            else_value,
+        } => {
+            collect_condition_paths(condition, &format!("{path}:if"), output);
+            collect_numeric_condition_paths(then_value, &format!("{path}:then"), output);
+            collect_numeric_condition_paths(else_value, &format!("{path}:else"), output);
+        }
+        NumericExpr::Constant { .. }
+        | NumericExpr::Indicator { .. }
+        | NumericExpr::State { .. }
+        | NumericExpr::ActualWeight
+        | NumericExpr::HeldBars
+        | NumericExpr::EvidenceMultiplier
+        | NumericExpr::EvidenceCoverage => {}
     }
 }
 
@@ -818,6 +1129,7 @@ mod tests {
             }],
             fallback: PolicyTarget::Hold,
             signal_expiry: PolicySignalExpiry::DecisionBars { bars: 1 },
+            condition_roles: Vec::new(),
         }
     }
 

@@ -8,6 +8,9 @@ use super::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// Raw event bytes per review page; leaves room for JSON transport and settings.
+pub const MAX_PAPER_REVIEW_EVENT_BYTES: usize = 128 * 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PaperSessionWrite {
@@ -73,6 +76,13 @@ pub enum PaperSessionQuery {
         after_sequence: Option<u64>,
         limit: u32,
     },
+    /// Saved facts only: no feed polling, reconciliation or policy evaluation.
+    ReviewEvents {
+        session_id: super::PaperSessionId,
+        after_sequence: Option<u64>,
+        as_of_sequence: Option<u64>,
+        limit: u32,
+    },
     Request {
         request_id: RequestId,
     },
@@ -91,6 +101,8 @@ pub enum PaperSessionState {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum PaperRecoveryCause {
     FeedGap,
+    /// Provider omission needs proof-authorized state catch-up before live decisions resume.
+    ProviderGap,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -111,6 +123,8 @@ pub enum PaperFreshness {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum PaperVerificationStatus {
+    Pass,
+    Fail,
     NotAvailable,
 }
 
@@ -133,10 +147,43 @@ pub enum PaperBenchmarkKind {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum PaperEventKind {
     CandleProcessed,
+    DecisionDeferred,
     Pause,
     Resume,
     Stop,
     RecoveryRequired,
+    ProviderRecovery,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PaperProviderRecoveryPhase {
+    Started,
+    CatchUp,
+    Progress,
+    Completed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PaperCheckpointTransition {
+    pub market: MarketId,
+    pub before_digest: super::ContentHash,
+    pub after_digest: super::ContentHash,
+    pub from_close: Option<UtcTimestamp>,
+    pub to_close: Option<UtcTimestamp>,
+}
+
+/// Append-only evidence for non-trading state restoration in the existing session.
+/// Proofs refer to verified raw provider omissions; missing slots are never bars.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PaperProviderRecovery {
+    pub phase: PaperProviderRecoveryPhase,
+    pub processed_at: UtcTimestamp,
+    pub target_completed_at: UtcTimestamp,
+    pub proof_ids: Vec<super::ContentHash>,
+    pub checkpoint_transitions: Vec<PaperCheckpointTransition>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -280,6 +327,8 @@ pub struct PaperSessionView {
     pub markets: Vec<PaperMarketSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_cause: Option<PaperRecoveryCause>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -320,6 +369,10 @@ pub struct PaperSessionEvent {
     pub source_event_at: Option<UtcTimestamp>,
     pub finalized_at: Option<UtcTimestamp>,
     pub control: Option<PaperControlEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_recovery: Option<PaperProviderRecovery>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation: Option<super::DecisionPreparation>,
     pub signals: Vec<SignalRecord>,
     pub orders: Vec<OrderRecord>,
     pub order_events: Vec<OrderRecord>,
@@ -342,6 +395,19 @@ pub struct PaperSessionEventPage {
     pub returned_count: u64,
     pub total_count: u64,
     pub next_cursor: Option<PaperEventCursor>,
+}
+
+/// A fixed event prefix and the session's original immutable execution settings.
+/// Resolve `configuration.policy_ref` through `policy_query`; no AST is duplicated.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PaperSessionReviewPage {
+    pub schema_version: String,
+    pub mode: PaperSessionMode,
+    pub configuration: PaperSessionStartRequest,
+    pub as_of_sequence: u64,
+    pub after_sequence: u64,
+    pub page: PaperSessionEventPage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

@@ -154,7 +154,7 @@ impl Store {
         let job_id = recovery.backfill_job_id.clone().ok_or_else(|| {
             LabError::DataCorrupt("recovery backfill wait has no pinned job".into())
         })?;
-        continue_backfill_tx(&transaction, &schedule, &recovery, &job_id, now)?;
+        continue_backfill_tx(&transaction, &self.raw, &schedule, &recovery, &job_id, now)?;
         transaction.commit().map_err(sql_error)?;
         required_schedule(&self.connection, schedule_id)
     }
@@ -253,6 +253,7 @@ impl Store {
             Some(range) => {
                 admit_chunk_tx(
                     &transaction,
+                    &self.raw,
                     &schedule,
                     RecoveryChunkAdmission {
                         target,
@@ -284,7 +285,7 @@ impl Store {
         let schedule = required_schedule(&transaction, schedule_id)?;
         match schedule.recovery_state {
             ScheduleRecoveryState::Backfilling => {
-                reconcile_backfill_tx(&transaction, &schedule, now)?;
+                reconcile_backfill_tx(&transaction, &self.raw, &schedule, now)?;
             }
             ScheduleRecoveryState::VerifyingFreshness => {
                 verify_freshness_tx(&transaction, &schedule, now)?;
@@ -515,6 +516,7 @@ pub(super) fn resume_recovery_tx(
     transaction: &Transaction<'_>,
     schedule_id: &ScheduleId,
     now: UtcTimestamp,
+    raw: &super::super::RawObjectStore,
 ) -> Result<bool, LabError> {
     let recovery = load_recovery(transaction, schedule_id)?;
     match recovery.state {
@@ -529,13 +531,13 @@ pub(super) fn resume_recovery_tx(
                 return Ok(true);
             };
             let schedule = required_schedule(transaction, schedule_id)?;
-            continue_backfill_tx(transaction, &schedule, &recovery, &job_id, now)?;
+            continue_backfill_tx(transaction, raw, &schedule, &recovery, &job_id, now)?;
             Ok(true)
         }
         ScheduleRecoveryState::RecoveryWait => {
             if let Some(job_id) = recovery.backfill_job_id.clone() {
                 let schedule = required_schedule(transaction, schedule_id)?;
-                continue_backfill_tx(transaction, &schedule, &recovery, &job_id, now)?;
+                continue_backfill_tx(transaction, raw, &schedule, &recovery, &job_id, now)?;
             } else {
                 move_to_wait_tx(transaction, schedule_id, now)?;
             }
@@ -552,6 +554,7 @@ pub(super) fn resume_recovery_tx(
 
 fn admit_chunk_tx(
     transaction: &Transaction<'_>,
+    raw: &super::super::RawObjectStore,
     schedule: &CollectionScheduleRecord,
     chunk: RecoveryChunkAdmission,
     now: UtcTimestamp,
@@ -570,7 +573,7 @@ fn admit_chunk_tx(
             request: request.clone(),
         },
     };
-    let pin = super::super::job_store::insert_job_tx(transaction, &submission, now)?;
+    let pin = super::super::job_store::insert_job_tx(transaction, &submission, now, raw)?;
     transaction
         .execute(
             "INSERT INTO schedule_recovery_chunks(\
@@ -614,6 +617,7 @@ fn admit_chunk_tx(
 
 fn reconcile_backfill_tx(
     transaction: &Transaction<'_>,
+    raw: &super::super::RawObjectStore,
     schedule: &CollectionScheduleRecord,
     now: UtcTimestamp,
 ) -> Result<(), LabError> {
@@ -638,6 +642,7 @@ fn reconcile_backfill_tx(
             };
             reconcile_completed_backfill_tx(
                 transaction,
+                raw,
                 schedule,
                 &recovery,
                 &job_id,
@@ -683,14 +688,19 @@ fn reconcile_backfill_tx(
             if schedule.status == CollectionScheduleStatus::Paused {
                 return pause_wait_tx(transaction, &schedule.id, now);
             }
-            continue_backfill_tx(transaction, schedule, &recovery, &job_id, now)?;
+            continue_backfill_tx(transaction, raw, schedule, &recovery, &job_id, now)?;
             Ok(())
         }
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one SQLite transaction reconciles the pinned completed chunk and admits its successor"
+)]
 fn reconcile_completed_backfill_tx(
     transaction: &Transaction<'_>,
+    raw: &super::super::RawObjectStore,
     schedule: &CollectionScheduleRecord,
     recovery: &StoredRecovery,
     job_id: &JobId,
@@ -722,6 +732,7 @@ fn reconcile_completed_backfill_tx(
             .map_err(sql_error)?;
         admit_chunk_tx(
             transaction,
+            raw,
             schedule,
             RecoveryChunkAdmission {
                 target: gap.end(),
@@ -911,11 +922,12 @@ fn backfill_retry_wait_tx(
 
 fn repin_backfill_tx(
     transaction: &Transaction<'_>,
+    raw: &super::super::RawObjectStore,
     schedule_id: &ScheduleId,
     job_id: &JobId,
     now: UtcTimestamp,
 ) -> Result<(), LabError> {
-    let attempt_id = super::super::job_store::retry_job_tx(transaction, job_id, now)?;
+    let attempt_id = super::super::job_store::retry_job_tx(transaction, job_id, now, raw)?;
     transaction
         .execute(
             "UPDATE schedule_recovery_chunks SET status='queued',attempt_id=?1,\
@@ -936,6 +948,7 @@ fn repin_backfill_tx(
 
 fn continue_backfill_tx(
     transaction: &Transaction<'_>,
+    raw: &super::super::RawObjectStore,
     schedule: &CollectionScheduleRecord,
     recovery: &StoredRecovery,
     job_id: &JobId,
@@ -949,14 +962,15 @@ fn continue_backfill_tx(
         )
         .map_err(sql_error)?;
     if attempt_number >= super::super::job_store::MAX_JOB_ATTEMPTS {
-        rotate_backfill_job_tx(transaction, schedule, recovery, job_id, now)
+        rotate_backfill_job_tx(transaction, raw, schedule, recovery, job_id, now)
     } else {
-        repin_backfill_tx(transaction, &schedule.id, job_id, now)
+        repin_backfill_tx(transaction, raw, &schedule.id, job_id, now)
     }
 }
 
 fn rotate_backfill_job_tx(
     transaction: &Transaction<'_>,
+    raw: &super::super::RawObjectStore,
     schedule: &CollectionScheduleRecord,
     recovery: &StoredRecovery,
     exhausted_job_id: &JobId,
@@ -978,6 +992,7 @@ fn rotate_backfill_job_tx(
         .ok_or_else(|| LabError::ResourceLimit("recovery generation overflow".into()))?;
     admit_chunk_tx(
         transaction,
+        raw,
         schedule,
         RecoveryChunkAdmission {
             target: timestamp_from_ms(target_ms)?,

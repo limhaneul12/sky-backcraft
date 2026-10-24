@@ -242,6 +242,10 @@ fn buy_and_hold_runs_from_cash_at_next_eligible_open_with_bounded_unique_events(
     assert_eq!(ledger.fills[0].side, Side::Buy);
     assert_eq!(ledger.fills[0].price.get(), decimal("100"));
     assert_eq!(ledger.fills[0].qty.get(), decimal("10"));
+    let recorded_decision = serde_json::to_value(&ledger.signals[0])
+        .expect("engine decision serializes from its saved facts");
+    assert!(recorded_decision.get("actual_weight_at_decision").is_none());
+    assert!(recorded_decision.get("decision_trace").is_none());
     assert_eq!(
         match ledger.fills[0].timing {
             crate::contracts::FillTiming::Exact { at } => at,
@@ -358,6 +362,7 @@ fn frozen_custom_rule_policy_runs_and_records_exact_trace() {
         description: "SYNTHETIC_TEST_ONLY".into(),
         program: PolicyProgram::Rules {
             program: RulesProgram {
+                condition_roles: Vec::new(),
                 indicators: vec![PolicyIndicator {
                     id: "close".into(),
                     indicator: PolicyIndicatorKind::Close,
@@ -431,6 +436,14 @@ fn causal_execution_ignores_a_gapped_future_suffix() {
         &|| false,
     )
     .expect("bounded causal fixture executes");
+    let saved = expected.signals.first().expect("v3 strategy decision");
+    assert!(saved.actual_weight_at_decision.is_some());
+    assert!(
+        saved
+            .decision_trace
+            .as_ref()
+            .is_some_and(|trace| trace.iter().any(|condition| condition.evidence.is_some()))
+    );
     let mut with_future_gap = baseline;
     with_future_gap.observations.push(observation(
         "irrelevant-future",
@@ -1657,6 +1670,7 @@ fn mtf_definition(reverse_declarations: bool) -> PolicyDefinition {
         description: "SYNTHETIC_TEST_ONLY".into(),
         program: PolicyProgram::Rules {
             program: RulesProgram {
+                condition_roles: Vec::new(),
                 indicators,
                 states: Vec::new(),
                 rules: vec![PolicyRule {

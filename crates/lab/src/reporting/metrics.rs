@@ -238,11 +238,10 @@ pub struct ReviewPayload {
 /// # Errors
 /// Returns an accounting error if exact daily or aggregate deltas violate ledger invariants.
 pub fn build_review(bundle: &RunBundle) -> Result<ReviewPayload, LabError> {
-    let models = bundle
-        .models
-        .iter()
-        .map(|model| model_review(bundle, model))
-        .collect::<Result<_, _>>()?;
+    let models =
+        crate::policy_engine::ordered_parallel_try_map(&bundle.models, &|| false, |model| {
+            model_review(bundle, model)
+        })?;
     Ok(ReviewPayload {
         schema_version: REVIEW_SCHEMA_VERSION.into(),
         run_id: bundle.manifest.run_id.clone(),
@@ -632,24 +631,34 @@ enum CalendarKind {
 }
 
 fn calendar_returns(model: &ModelLedger, kind: CalendarKind) -> Vec<CalendarReturn> {
-    let mut groups: BTreeMap<String, Vec<&crate::contracts::AccountMark>> = BTreeMap::new();
+    let mut groups: BTreeMap<
+        (i32, u32),
+        (
+            &crate::contracts::AccountMark,
+            &crate::contracts::AccountMark,
+        ),
+    > = BTreeMap::new();
     for mark in &model.account_marks {
         let date = mark.context.accounting_event_time.0;
         let key = match kind {
-            CalendarKind::Month => date.format("%Y-%m").to_string(),
-            CalendarKind::Quarter => {
-                format!("{}-Q{}", date.format("%Y"), date.month0() / 3 + 1)
-            }
-            CalendarKind::Year => date.format("%Y").to_string(),
+            CalendarKind::Month => (date.year(), date.month()),
+            CalendarKind::Quarter => (date.year(), date.month0() / 3 + 1),
+            CalendarKind::Year => (date.year(), 0),
         };
-        groups.entry(key).or_default().push(mark);
+        groups
+            .entry(key)
+            .and_modify(|(_, last)| *last = mark)
+            .or_insert((mark, mark));
     }
     groups
         .into_iter()
-        .filter_map(|(period, marks)| {
-            let first = marks.first()?;
-            let last = marks.last()?;
-            Some(CalendarReturn {
+        .map(|((year, unit), (first, last))| {
+            let period = match kind {
+                CalendarKind::Month => format!("{year:04}-{unit:02}"),
+                CalendarKind::Quarter => format!("{year:04}-Q{unit}"),
+                CalendarKind::Year => format!("{year:04}"),
+            };
+            CalendarReturn {
                 period,
                 opening_equity: first.equity,
                 closing_equity: last.equity,
@@ -657,34 +666,31 @@ fn calendar_returns(model: &ModelLedger, kind: CalendarKind) -> Vec<CalendarRetu
                     last.equity.get() - first.equity.get(),
                     first.equity.get(),
                 ),
-            })
+            }
         })
         .collect()
 }
 
 fn daily_slices(model: &ModelLedger) -> Result<Vec<DailySlice>, LabError> {
-    let mut groups: BTreeMap<String, Vec<&crate::contracts::AccountMark>> = BTreeMap::new();
+    let mut groups: BTreeMap<
+        (i32, u32, u32),
+        (
+            &crate::contracts::AccountMark,
+            &crate::contracts::AccountMark,
+        ),
+    > = BTreeMap::new();
     for mark in &model.account_marks {
+        let date = mark.context.accounting_event_time.0;
+        let key = (date.year(), date.month(), date.day());
         groups
-            .entry(
-                mark.context
-                    .accounting_event_time
-                    .0
-                    .format("%Y-%m-%d")
-                    .to_string(),
-            )
-            .or_default()
-            .push(mark);
+            .entry(key)
+            .and_modify(|(_, last)| *last = mark)
+            .or_insert((mark, mark));
     }
     groups
         .into_iter()
-        .map(|(utc_date, marks)| {
-            let first = marks
-                .first()
-                .ok_or_else(|| LabError::Internal("empty daily mark group".into()))?;
-            let last = marks
-                .last()
-                .ok_or_else(|| LabError::Internal("empty daily mark group".into()))?;
+        .map(|((year, month, day), (first, last))| {
+            let utc_date = format!("{year:04}-{month:02}-{day:02}");
             let fees_delta = last
                 .state
                 .cumulative_fees

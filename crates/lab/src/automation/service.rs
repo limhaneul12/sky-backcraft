@@ -16,22 +16,68 @@ use crate::contracts::{
     AutomationRequestReadbackState, AutomationSessionCommandResponse, AutomationSessionMode,
     AutomationSessionRequestReadback, AutomationSessionState, AutomationSessionWrite,
     AutomationSide, CandleInterval, CandleObservation, ContentHash, LabError, PriceKrw,
-    QuoteAmount, RequestId, UtcTimestamp, Weight,
+    PrivateStreamObservation, PrivateStreamObservationKind, QuoteAmount, RawWebSocketTransport,
+    RequestId, UtcTimestamp, Weight,
 };
 use crate::strategy::StrategyEvaluation;
-use crate::upbit::client::ClientError;
+use crate::upbit::client::{ClientError, UpbitOrderDetail};
+use crate::upbit::realtime::{
+    PrivateAccountBaseline, PrivateAccountEvent, PrivateAssetObservation,
+    PrivateOrderEventIdentity, PrivateOrderHistoryScope, PrivateOrderObservation,
+};
 use rust_decimal::Decimal;
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 const AUTOMATION_DUE_LIMIT: u32 = 4;
 const AUTOMATION_CATCHUP_LIMIT: usize = 32;
 const AUTOMATION_MAX_CANDLES: u32 = 199;
 const AUTOMATION_RECOVERY_LIMIT: u32 = 100;
 const AUTOMATION_RECOVERY_MAX_WORK: usize = 10_000;
+const PRIVATE_CLOSED_ORDER_LIMIT: u32 = 1_000;
+const PRIVATE_CLOSED_ORDER_REQUEST_BUDGET: usize = 32;
+const PRIVATE_CLOSED_ORDER_RECORD_BUDGET: usize = 10_000;
+const PRIVATE_CLOSED_ORDER_MAX_WINDOW_DAYS: i64 = 7;
 const AUTOMATION_RECONCILIATION_REASON: &str =
     "PROCESS_RESTART_REQUIRES_ACCOUNT_AND_ORDER_READBACK";
 const AUTOMATION_LIVE_DISABLED_REASON: &str = "LIVE_TRADING_DISABLED";
+
+fn private_closed_order_windows(
+    covered_from: UtcTimestamp,
+    now: UtcTimestamp,
+) -> Result<VecDeque<(UtcTimestamp, UtcTimestamp)>, LabError> {
+    if covered_from > now {
+        return Err(LabError::DataCorrupt(
+            "private REST coverage range is reversed".into(),
+        ));
+    }
+    let maximum_window = chrono::Duration::days(PRIVATE_CLOSED_ORDER_MAX_WINDOW_DAYS);
+    let span_millis = now
+        .0
+        .signed_duration_since(covered_from.0)
+        .num_milliseconds();
+    let max_window_millis = maximum_window.num_milliseconds();
+    let whole_windows = span_millis.div_euclid(max_window_millis);
+    let partial_window = i64::from(span_millis % max_window_millis != 0);
+    let base_windows = whole_windows
+        .checked_add(partial_window)
+        .ok_or_else(|| LabError::ResourceLimit("private order coverage window overflow".into()))?;
+    let base_windows = usize::try_from(base_windows)
+        .map_err(|_| LabError::ResourceLimit("private order coverage span overflow".into()))?;
+    if base_windows > PRIVATE_CLOSED_ORDER_REQUEST_BUDGET {
+        return Err(LabError::ResourceLimit(
+            "private order coverage exceeds its bounded REST request window".into(),
+        ));
+    }
+    let mut windows = VecDeque::with_capacity(base_windows);
+    let mut window_start = covered_from;
+    while window_start < now {
+        let window_end = UtcTimestamp((window_start.0 + maximum_window).min(now.0));
+        windows.push_back((window_start, window_end));
+        window_start = window_end;
+    }
+    Ok(windows)
+}
 
 fn automation_mode_enabled(
     mode: AutomationSessionMode,
@@ -241,6 +287,11 @@ impl JobService {
                 if matches!(error, LabError::Cancelled(_)) && self.inner.stop.is_cancelled() {
                     return Ok(());
                 }
+                if matches!(error, LabError::BlockedEvidence(_)) {
+                    tracing::debug!(session_id = %record.view.session_id, %error,
+                        "automation awaiting source or reconciliation evidence");
+                    continue;
+                }
                 tracing::warn!(
                     event = "automation_session_cycle_blocked",
                     session_id = %record.view.session_id,
@@ -250,6 +301,677 @@ impl JobService {
             }
         }
         Ok(())
+    }
+
+    pub(super) async fn consume_private_stream_event(
+        &self,
+        event: &PrivateAccountEvent,
+    ) -> Result<Option<u64>, LabError> {
+        if !self.inner.automation_live_venue.is_live() {
+            return Err(LabError::BlockedEvidence(
+                "private stream event arrived without a configured LIVE account".into(),
+            ));
+        }
+        ensure_private_stream_generation(
+            &self.inner.automation_live_venue,
+            private_account_event_generation(event),
+        )?;
+        let account_identity = self.inner.automation_live_venue.account_identity();
+        match event {
+            PrivateAccountEvent::Baseline {
+                baseline,
+                history_scope,
+            } => {
+                let observation =
+                    private_baseline_observation(&account_identity, baseline, *history_scope)?;
+                let sequence = self.record_private_stream_observation(observation).await?;
+                for order in &baseline.open_orders {
+                    ensure_private_stream_generation(
+                        &self.inner.automation_live_venue,
+                        baseline.generation,
+                    )?;
+                    if let Some(identifier) = order.identifier.as_deref() {
+                        self.readback_known_private_order(
+                            identifier,
+                            &account_identity,
+                            baseline.generation,
+                            false,
+                        )
+                        .await?;
+                    }
+                }
+                Ok(Some(sequence))
+            }
+            PrivateAccountEvent::OrderObserved(observation) => {
+                self.record_private_stream_observation(private_order_stream_observation(
+                    &account_identity,
+                    observation,
+                )?)
+                .await?;
+                if let Some(identifier) = observation.client_identifier.as_deref() {
+                    self.readback_known_private_order(
+                        identifier,
+                        &account_identity,
+                        observation.generation,
+                        self.inner
+                            .automation_live_venue
+                            .private_readiness_fence()
+                            .is_ready(),
+                    )
+                    .await?;
+                }
+                self.record_live_private_reconciliation(observation.generation)?;
+                Ok(None)
+            }
+            PrivateAccountEvent::AssetObserved(observation) => {
+                self.record_private_stream_observation(private_asset_stream_observation(
+                    &account_identity,
+                    observation,
+                ))
+                .await?;
+                // myAsset is a change signal. The account projection comes from
+                // a fresh REST snapshot, never from stream balances. During
+                // bootstrap, defer projection publication until known-order
+                // readbacks and bounded history reconciliation finish.
+                if self
+                    .inner
+                    .automation_live_venue
+                    .private_readiness_fence()
+                    .is_ready()
+                {
+                    self.refresh_private_account_snapshot(&account_identity)
+                        .await?;
+                }
+                self.record_live_private_reconciliation(observation.generation)?;
+                Ok(None)
+            }
+            PrivateAccountEvent::BootstrapComplete { .. } => Ok(None),
+        }
+    }
+
+    pub(super) async fn record_private_bootstrap_complete(
+        &self,
+        generation: u64,
+        baseline_sequence: u64,
+        gap_reconciliation_required: bool,
+        known_order_readbacks_required: bool,
+        closed_order_history_complete: bool,
+    ) -> Result<(), LabError> {
+        let account_identity = self.inner.automation_live_venue.account_identity();
+        let observation = PrivateStreamObservation {
+            account_identity,
+            generation,
+            kind: PrivateStreamObservationKind::BootstrapComplete,
+            event_key: format!("bootstrap:{baseline_sequence}:{generation}"),
+            provider_at_utc: None,
+            received_at_utc: UtcTimestamp::now(),
+            transport: None,
+            payload: serde_json::json!({
+                "gap_reconciliation_required": gap_reconciliation_required,
+                "known_order_readbacks_required": known_order_readbacks_required,
+                "closed_order_history_complete": closed_order_history_complete,
+                "bounded_closed_order_history_reconciled": true,
+            }),
+        };
+        self.record_private_stream_observation(observation).await?;
+        Ok(())
+    }
+
+    pub(super) async fn complete_private_stream_bootstrap(
+        &self,
+        generation: u64,
+        _gap_reconciliation_required: bool,
+        _known_order_readbacks_required: bool,
+        _closed_order_history_complete: bool,
+    ) -> Result<(), LabError> {
+        ensure_private_stream_generation(&self.inner.automation_live_venue, generation)?;
+        let account_identity = self.inner.automation_live_venue.account_identity();
+        self.readback_all_pending_private_orders(&account_identity, generation)
+            .await?;
+        self.reconcile_private_closed_order_history(generation)
+            .await?;
+        self.refresh_private_account_snapshot(&account_identity)
+            .await?;
+        ensure_private_stream_generation(&self.inner.automation_live_venue, generation)?;
+        Ok(())
+    }
+
+    async fn readback_all_pending_private_orders(
+        &self,
+        expected_account_identity: &str,
+        generation: u64,
+    ) -> Result<(), LabError> {
+        let account = expected_account_identity.to_owned();
+        let pending = self
+            .inner
+            .database
+            .call("automation_account_order_readback_targets", move |store| {
+                store.automation_account_order_readback_targets(&account)
+            })
+            .await?;
+        for order in pending {
+            ensure_private_stream_generation(&self.inner.automation_live_venue, generation)?;
+            if order.account_identity != expected_account_identity {
+                return Err(LabError::DataCorrupt(
+                    "account-scoped private readback returned another account".into(),
+                ));
+            }
+            let identifier = order.request.client_identifier.clone();
+            match self
+                .inner
+                .automation_live_venue
+                .automation_order_by_identifier(&identifier)
+                .await
+            {
+                Ok(Some(detail)) => {
+                    self.reconcile_private_venue_detail(
+                        &identifier,
+                        detail,
+                        expected_account_identity,
+                        false,
+                    )
+                    .await?;
+                }
+                Ok(None) => {
+                    self.mark_order_needs_reconciliation(
+                        &identifier,
+                        "VENUE_IDENTIFIER_NOT_FOUND_OUTCOME_REMAINS_UNKNOWN",
+                    )
+                    .await?;
+                    return Err(LabError::BlockedEvidence(
+                        "known LIVE order is not yet exactly readable; private readiness remains closed".into(),
+                    ));
+                }
+                Err(error) => {
+                    self.mark_order_needs_reconciliation(
+                        &identifier,
+                        &bounded_reason(&error.to_string()),
+                    )
+                    .await?;
+                    return Err(client_error(error));
+                }
+            }
+        }
+        ensure_private_stream_generation(&self.inner.automation_live_venue, generation)?;
+        Ok(())
+    }
+
+    async fn reconcile_private_closed_order_history(
+        &self,
+        generation: u64,
+    ) -> Result<(), LabError> {
+        let account_identity = self.inner.automation_live_venue.account_identity();
+        let now = UtcTimestamp::now();
+        let covered_from = self
+            .private_closed_order_coverage_start(&account_identity, now)
+            .await?;
+        if covered_from == now {
+            return Ok(());
+        }
+        let mut windows = private_closed_order_windows(covered_from, now)?;
+        let (request_count, order_count) = self
+            .scan_private_closed_order_windows(&account_identity, generation, &mut windows)
+            .await?;
+
+        ensure_private_stream_generation(&self.inner.automation_live_venue, generation)?;
+        let payload = serde_json::json!({
+            "coverage_kind": "CLOSED_ORDER_CREATED_TIME_RANGE",
+            "time_basis": "PROVIDER_ORDER_CREATED_AT",
+            "covered_from_utc": covered_from,
+            "covered_through_utc": now,
+            "window_complete": true,
+            "full_history_complete": false,
+            "rest_request_count": request_count,
+            "order_count": order_count,
+        });
+        let digest = ContentHash::of_value(&payload)?;
+        let marker = PrivateStreamObservation {
+            account_identity,
+            generation,
+            kind: PrivateStreamObservationKind::RestReconciled,
+            event_key: format!(
+                "rest-reconciled:{}:{}:{}",
+                covered_from.0.timestamp_millis(),
+                now.0.timestamp_millis(),
+                digest.as_str()
+            ),
+            provider_at_utc: None,
+            received_at_utc: now,
+            transport: None,
+            payload,
+        };
+        self.record_private_stream_observation(marker).await?;
+        Ok(())
+    }
+
+    async fn private_closed_order_coverage_start(
+        &self,
+        account_identity: &str,
+        now: UtcTimestamp,
+    ) -> Result<UtcTimestamp, LabError> {
+        let account_for_lookup = account_identity.to_owned();
+        let latest = self
+            .inner
+            .database
+            .call("private_stream_latest_reconciliation", move |store| {
+                store.private_stream_latest_reconciliation(&account_for_lookup)
+            })
+            .await?;
+        let Some(record) = latest else {
+            return Ok(UtcTimestamp(
+                now.0 - chrono::Duration::days(PRIVATE_CLOSED_ORDER_MAX_WINDOW_DAYS),
+            ));
+        };
+        let through = record
+            .observation
+            .payload
+            .get("covered_through_utc")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                LabError::DataCorrupt(
+                    "private REST coverage marker omitted covered_through_utc".into(),
+                )
+            })?;
+        let through = UtcTimestamp::parse_rfc3339(through)?;
+        if through > now {
+            return Err(LabError::DataCorrupt(
+                "private REST coverage watermark is in the future".into(),
+            ));
+        }
+        Ok(through)
+    }
+
+    async fn scan_private_closed_order_windows(
+        &self,
+        account_identity: &str,
+        generation: u64,
+        windows: &mut VecDeque<(UtcTimestamp, UtcTimestamp)>,
+    ) -> Result<(usize, usize), LabError> {
+        let mut request_count = 0_usize;
+        let mut order_count = 0_usize;
+        let mut observed_order_facts = BTreeMap::<String, ContentHash>::new();
+        while let Some((start, end)) = windows.pop_front() {
+            if request_count >= PRIVATE_CLOSED_ORDER_REQUEST_BUDGET {
+                return Err(LabError::ResourceLimit(
+                    "private closed-order reconciliation exhausted its REST request budget".into(),
+                ));
+            }
+            ensure_private_stream_generation(&self.inner.automation_live_venue, generation)?;
+            let start_text = start.0.timestamp_millis().to_string();
+            let end_text = end.0.timestamp_millis().to_string();
+            let orders = self
+                .inner
+                .automation_live_venue
+                .get_closed_orders(
+                    None,
+                    Some(&start_text),
+                    Some(&end_text),
+                    Some(PRIVATE_CLOSED_ORDER_LIMIT),
+                )
+                .await
+                .map_err(client_error)?;
+            request_count = request_count.saturating_add(1);
+            if Self::split_private_closed_order_window(start, end, orders.len(), windows)? {
+                continue;
+            }
+            order_count = order_count.checked_add(orders.len()).ok_or_else(|| {
+                LabError::ResourceLimit("private closed-order count overflow".into())
+            })?;
+            if order_count > PRIVATE_CLOSED_ORDER_RECORD_BUDGET {
+                return Err(LabError::ResourceLimit(
+                    "private closed-order reconciliation exceeded its record budget".into(),
+                ));
+            }
+            for order in orders {
+                self.record_unique_rest_closed_order(
+                    account_identity,
+                    generation,
+                    order,
+                    &mut observed_order_facts,
+                )
+                .await?;
+            }
+        }
+        Ok((request_count, order_count))
+    }
+
+    fn split_private_closed_order_window(
+        start: UtcTimestamp,
+        end: UtcTimestamp,
+        order_count: usize,
+        windows: &mut VecDeque<(UtcTimestamp, UtcTimestamp)>,
+    ) -> Result<bool, LabError> {
+        if order_count < PRIVATE_CLOSED_ORDER_LIMIT as usize {
+            return Ok(false);
+        }
+        let width = end.0.signed_duration_since(start.0);
+        if width <= chrono::Duration::minutes(1) {
+            return Err(LabError::ResourceLimit(
+                "closed-order history is too dense for bounded exact coverage".into(),
+            ));
+        }
+        let midpoint = UtcTimestamp(start.0 + width / 2);
+        windows.push_front((midpoint, end));
+        windows.push_front((start, midpoint));
+        Ok(true)
+    }
+
+    async fn record_unique_rest_closed_order(
+        &self,
+        account_identity: &str,
+        generation: u64,
+        order: UpbitOrderDetail,
+        seen: &mut BTreeMap<String, ContentHash>,
+    ) -> Result<(), LabError> {
+        let payload = upbit_order_payload(&order);
+        let digest = ContentHash::of_value(&payload)?;
+        if let Some(previous) = seen.get(&order.uuid) {
+            if previous != &digest {
+                return Err(LabError::DataCorrupt(
+                    "closed-order provider facts changed within one reconciliation".into(),
+                ));
+            }
+            return Ok(());
+        }
+        seen.insert(order.uuid.clone(), digest);
+        self.record_rest_closed_order(account_identity, generation, &order)
+            .await
+    }
+
+    async fn record_rest_closed_order(
+        &self,
+        account_identity: &str,
+        generation: u64,
+        detail: &UpbitOrderDetail,
+    ) -> Result<(), LabError> {
+        if detail.uuid.is_empty() || detail.uuid.len() > 128 {
+            return Err(LabError::DataCorrupt(
+                "closed-order REST response contains an invalid UUID".into(),
+            ));
+        }
+        let provider_at = UtcTimestamp::parse_rfc3339(&detail.created_at)?;
+        let payload = upbit_order_payload(detail);
+        let digest = ContentHash::of_value(&payload)?;
+        let event_key = format!("rest-order:{}:{}", detail.uuid, digest.as_str());
+        self.record_private_stream_observation(PrivateStreamObservation {
+            account_identity: account_identity.to_owned(),
+            generation,
+            kind: PrivateStreamObservationKind::RestOrderObserved,
+            event_key,
+            provider_at_utc: Some(provider_at),
+            received_at_utc: UtcTimestamp::now(),
+            transport: None,
+            payload,
+        })
+        .await?;
+        if let Some(identifier) = detail.identifier.as_deref() {
+            let identifier = AutomationOrderIdentifier::new(identifier.to_owned())?;
+            let target_id = identifier.clone();
+            let target = self
+                .inner
+                .database
+                .call("automation_closed_order_readback_target", move |store| {
+                    store.automation_order_readback_target(&target_id)
+                })
+                .await?;
+            if target
+                .as_ref()
+                .is_some_and(|target| target.account_identity == account_identity)
+            {
+                self.reconcile_private_venue_detail(
+                    &identifier,
+                    detail.clone(),
+                    account_identity,
+                    false,
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn readback_known_private_order(
+        &self,
+        raw_identifier: &str,
+        expected_account_identity: &str,
+        generation: u64,
+        refresh_account_after_terminal: bool,
+    ) -> Result<(), LabError> {
+        ensure_private_stream_generation(&self.inner.automation_live_venue, generation)?;
+        let Ok(identifier) = AutomationOrderIdentifier::new(raw_identifier.to_owned()) else {
+            // Provider identifiers outside the local automation namespace are
+            // journal-only manual-order facts; they cannot resolve to a local
+            // intent and must not take down private readiness.
+            return Ok(());
+        };
+        let key = identifier.clone();
+        let Some(target) = self
+            .inner
+            .database
+            .call("automation_private_order_readback_target", move |store| {
+                store.automation_order_readback_target(&key)
+            })
+            .await?
+        else {
+            // Manual provider orders stay in the private observation projection.
+            return Ok(());
+        };
+        if target.account_identity != expected_account_identity {
+            // The identifier belongs to another durable account scope. It is not
+            // an owned order for this configured private connection.
+            return Ok(());
+        }
+        match self
+            .inner
+            .automation_live_venue
+            .automation_order_by_identifier(&identifier)
+            .await
+        {
+            Ok(Some(detail)) => {
+                self.reconcile_private_venue_detail(
+                    &identifier,
+                    detail,
+                    expected_account_identity,
+                    refresh_account_after_terminal,
+                )
+                .await
+            }
+            Ok(None) => {
+                self.mark_order_needs_reconciliation(
+                    &identifier,
+                    "VENUE_IDENTIFIER_NOT_FOUND_OUTCOME_REMAINS_UNKNOWN",
+                )
+                .await?;
+                Err(LabError::BlockedEvidence(
+                    "known LIVE order is not yet exactly readable; private readiness remains closed".into(),
+                ))
+            }
+            Err(error) => {
+                self.mark_order_needs_reconciliation(
+                    &identifier,
+                    &bounded_reason(&error.to_string()),
+                )
+                .await?;
+                Err(client_error(error))
+            }
+        }
+    }
+
+    async fn reconcile_private_venue_detail(
+        &self,
+        identifier: &AutomationOrderIdentifier,
+        detail: UpbitOrderDetail,
+        expected_account_identity: &str,
+        refresh_account_after_terminal: bool,
+    ) -> Result<(), LabError> {
+        if detail.identifier.as_deref() != Some(identifier.as_str()) {
+            return Err(LabError::DataCorrupt(
+                "private REST order readback returned a different identifier".into(),
+            ));
+        }
+        if self.inner.automation_live_venue.account_identity() != expected_account_identity {
+            return Err(LabError::Conflict(
+                "private order readback adapter differs from the configured account scope".into(),
+            ));
+        }
+        let id = identifier.clone();
+        let now = UtcTimestamp::now();
+        let result = self
+            .inner
+            .database
+            .call("automation_private_order_reconcile", move |store| {
+                store.automation_reconcile_order(&detail, now)
+            })
+            .await;
+        let view = match result {
+            Ok(view) => view,
+            Err(error @ LabError::OutcomeUnknown(_)) => {
+                let Some(view) = self.read_order_view(&id).await? else {
+                    return Err(error);
+                };
+                view
+            }
+            Err(error) => return Err(error),
+        };
+        if refresh_account_after_terminal
+            && matches!(
+                view.state,
+                AutomationOrderState::Filled
+                    | AutomationOrderState::Cancelled
+                    | AutomationOrderState::Rejected
+            )
+        {
+            self.refresh_private_account_snapshot(expected_account_identity)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn refresh_private_account_snapshot(
+        &self,
+        expected_account_identity: &str,
+    ) -> Result<(), LabError> {
+        let identity = self.inner.automation_live_venue.account_identity();
+        if identity != expected_account_identity {
+            return Err(LabError::Conflict(
+                "private account refresh differs from the configured account scope".into(),
+            ));
+        }
+        let balances = self
+            .inner
+            .automation_live_venue
+            .get_accounts()
+            .await
+            .map_err(client_error)?;
+        let observed_at = UtcTimestamp::now();
+        self.persist_private_account_snapshot(&identity, observed_at, balances)
+            .await
+    }
+
+    fn record_live_private_reconciliation(&self, generation: u64) -> Result<(), LabError> {
+        let client = &self.inner.automation_live_venue;
+        ensure_private_stream_generation(client, generation)?;
+        let readiness = client.private_readiness_fence();
+        if readiness.is_ready() && !readiness.record_reconciled(generation) {
+            return Err(LabError::BlockedEvidence(
+                "private stream reconciliation raced a recovery fence".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn persist_private_account_snapshot(
+        &self,
+        account_identity: &str,
+        observed_at: UtcTimestamp,
+        balances: Vec<crate::upbit::client::UpbitAccountBalance>,
+    ) -> Result<(), LabError> {
+        let identity = account_identity.to_owned();
+        let received_at = UtcTimestamp::now();
+        let live_execution_policy = self.live_execution_policy();
+        self.inner
+            .database
+            .call("automation_private_account_snapshot", move |store| {
+                store.automation_record_account_snapshot_with_policy(
+                    &identity,
+                    AutomationSessionMode::Live,
+                    observed_at,
+                    received_at,
+                    &balances,
+                    live_execution_policy,
+                )
+            })
+            .await
+    }
+
+    async fn record_private_stream_observation(
+        &self,
+        observation: PrivateStreamObservation,
+    ) -> Result<u64, LabError> {
+        let expected = observation.clone();
+        let retry_observation = observation.clone();
+        match self
+            .record_private_stream_observation_once(observation)
+            .await
+        {
+            Err(LabError::OutcomeUnknown(_)) => {
+                if let Some(sequence) = self.read_private_stream_observation(&expected).await? {
+                    return Ok(sequence);
+                }
+                // The exact key was absent, so one idempotent retry is safe.
+                match self
+                    .record_private_stream_observation_once(retry_observation)
+                    .await
+                {
+                    Ok(sequence) => Ok(sequence),
+                    Err(retry_error @ LabError::OutcomeUnknown(_)) => self
+                        .read_private_stream_observation(&expected)
+                        .await?
+                        .ok_or(retry_error),
+                    Err(retry_error) => Err(retry_error),
+                }
+            }
+            result => result,
+        }
+    }
+
+    async fn record_private_stream_observation_once(
+        &self,
+        observation: PrivateStreamObservation,
+    ) -> Result<u64, LabError> {
+        self.inner
+            .database
+            .call("record_private_stream_observation", move |store| {
+                store.record_private_stream_observation(&observation)
+            })
+            .await
+    }
+
+    async fn read_private_stream_observation(
+        &self,
+        expected: &PrivateStreamObservation,
+    ) -> Result<Option<u64>, LabError> {
+        let account_identity = expected.account_identity.clone();
+        let event_key = expected.event_key.clone();
+        let stored = self
+            .inner
+            .database
+            .call("private_stream_observation_readback", move |store| {
+                store.private_stream_observation_by_key(&account_identity, &event_key)
+            })
+            .await?;
+        let Some(stored) = stored else {
+            return Ok(None);
+        };
+        if stored.observation.kind != expected.kind
+            || stored.observation.provider_at_utc != expected.provider_at_utc
+            || stored.observation.payload != expected.payload
+        {
+            return Err(LabError::DataCorrupt(
+                "private stream readback differs from the exact provider event".into(),
+            ));
+        }
+        Ok(Some(stored.sequence))
     }
 
     pub(super) async fn write_automation_session(
@@ -311,6 +1033,24 @@ impl JobService {
 
         if matches!(&write, AutomationSessionWrite::CancelOrder { .. }) {
             return self.cancel_automation_order(write).await;
+        }
+
+        if matches!(
+            &write,
+            AutomationSessionWrite::Start {
+                mode: AutomationSessionMode::Live,
+                ..
+            }
+        ) && automation_mode_enabled(AutomationSessionMode::Live, self.live_execution_policy())
+            && !super::realtime_runtime::live_private_readiness_is_open(
+                self,
+                AutomationSessionMode::Live,
+            )
+        {
+            let error = LabError::BlockedEvidence("PRIVATE_ACCOUNT_RECOVERY_REQUIRED".into());
+            self.reject_pending_lifecycle_request(&write, &error)
+                .await?;
+            return Err(error);
         }
 
         let frozen_policy_result = match &write {
@@ -961,11 +1701,27 @@ impl JobService {
                 }
             }
 
-            feed_causal_sources(
+            if let Err(error) = feed_causal_sources(
                 &mut checkpoint,
                 &source_bars,
                 observation.candle.close_time_utc,
-            )?;
+            ) {
+                self.record_preparation(
+                    record,
+                    &observation,
+                    &checkpoint,
+                    crate::contracts::DecisionPreparationStatus::AwaitingPolicySources,
+                )
+                .await?;
+                if matches!(error, LabError::DataGap(_)) {
+                    self.hold_automation_source_gap(record, &error).await?;
+                    *record = self
+                        .load_runtime_record(&record.view.session_id, UtcTimestamp::now())
+                        .await?;
+                    return Ok(());
+                }
+                return Err(error);
+            }
             let pre_start = observation.candle.close_time_utc <= record.view.created_at_utc;
             if pre_start || !is_current_eligible {
                 let cash = cash_position()?;
@@ -996,6 +1752,17 @@ impl JobService {
                 }
                 record.view.last_finalized_candle_at = Some(observation.candle.close_time_utc);
                 continue;
+            }
+
+            if !super::realtime_runtime::live_private_readiness_is_open(self, record.view.mode) {
+                self.record_preparation(
+                    record,
+                    &observation,
+                    &checkpoint,
+                    crate::contracts::DecisionPreparationStatus::PrivateReadinessBlocked,
+                )
+                .await?;
+                return Ok(());
             }
 
             self.refresh_account(record.view.mode, &record.account_identity)
@@ -1029,7 +1796,8 @@ impl JobService {
                 }
                 let action =
                     action_for_target(evaluation.constrained_target_weight, position.actual_weight);
-                let evaluation_json = evaluation_to_value(&evaluation);
+                let evaluation_json =
+                    evaluation_to_value(&evaluation, Some(position.actual_weight));
                 let intent_id = AutomationIntentId::from_seed(&format!(
                     "{}:{}",
                     record.view.session_id.as_str(),
@@ -1171,6 +1939,20 @@ impl JobService {
                     UtcTimestamp::now(),
                 )
                 .await;
+        }
+        if !super::realtime_runtime::live_private_readiness_is_open(self, mode) {
+            self.record_admission_deferral(
+                &record.view.session_id,
+                crate::contracts::AdmissionDeferredTarget::PendingIntent(intent.intent_id.clone()),
+                crate::contracts::AdmissionDeferredReason::PrivateAccountRecoveryRequired,
+                None,
+            )
+            .await?;
+            return Ok(());
+        }
+        // Keep the restored source-checkpoint future out of the order-admission frame.
+        if !Box::pin(self.pending_intent_sources_ready(record)).await? {
+            return Ok(());
         }
         let admission_gate = (mode == AutomationSessionMode::Live)
             .then(|| self.inner.automation_live_venue.live_order_send_gate())
@@ -1508,6 +2290,20 @@ impl JobService {
                 AUTOMATION_LIVE_DISABLED_REASON.into(),
             ));
         }
+        if !super::realtime_runtime::live_private_readiness_is_open(self, mode) {
+            self.record_admission_deferral(
+                &order.session_id,
+                crate::contracts::AdmissionDeferredTarget::ReservedOrder(
+                    order.request.client_identifier.clone(),
+                ),
+                crate::contracts::AdmissionDeferredReason::PrivateAccountRecoveryRequired,
+                None,
+            )
+            .await?;
+            return Err(LabError::BlockedEvidence(
+                "PRIVATE_ACCOUNT_RECOVERY_REQUIRED".into(),
+            ));
+        }
         let send_generation = if mode == AutomationSessionMode::Live {
             self.inner
                 .automation_live_venue
@@ -1532,10 +2328,21 @@ impl JobService {
         let now = UtcTimestamp::now();
         let risk_guard = self.inner.risk_guard.clone();
         let live_execution_policy = self.live_execution_policy();
+        let private_readiness =
+            super::realtime_runtime::live_private_readiness_required(self, mode)
+                .then(|| self.inner.automation_live_venue.private_readiness_fence());
         let claimed = self
             .inner
             .database
             .call("automation_claim_order_for_send", move |store| {
+                if private_readiness
+                    .as_ref()
+                    .is_some_and(|readiness| !readiness.is_ready())
+                {
+                    return Err(LabError::BlockedEvidence(
+                        "PRIVATE_ACCOUNT_RECOVERY_REQUIRED".into(),
+                    ));
+                }
                 if mode == AutomationSessionMode::Mock {
                     risk_guard.with_mock_order_admission(|| {
                         store.automation_claim_order_for_send_with_policy(
@@ -1567,6 +2374,17 @@ impl JobService {
                     return Err(error);
                 };
                 if current.state == AutomationOrderState::Reserved {
+                    if matches!(
+                        &error,
+                        LabError::BlockedEvidence(reason)
+                            if reason == "PRIVATE_ACCOUNT_RECOVERY_REQUIRED"
+                    ) {
+                        // A transient private recovery fence is not evidence
+                        // that the intent is invalid. Keep the unclaimed
+                        // reservation durable for the next ready coordinator
+                        // pass; there has been no provider effect.
+                        return Err(error);
+                    }
                     // The exact readback proves no send claim committed. A
                     // terminal rejection releases only this still-RESERVED
                     // order; if the claim raced, its CAS refuses and we
@@ -1659,12 +2477,29 @@ impl JobService {
                 "claimed order is scoped to a different venue account".into(),
             ));
         }
+        if !super::realtime_runtime::live_private_readiness_is_open(self, mode) {
+            self.reject_claimed_order_before_send(
+                &dispatch.request.client_identifier,
+                "PRIVATE_ACCOUNT_RECOVERY_REQUIRED",
+            )
+            .await?;
+            return Ok(());
+        }
         let effect_authorization = if mode == AutomationSessionMode::Mock {
             self.inner.risk_guard.with_mock_order_admission(|| Ok(()))
         } else {
             self.inner.risk_guard.authorize_order_effect()
         };
         if let Err(error) = effect_authorization {
+            self.record_admission_deferral(
+                &order.session_id,
+                crate::contracts::AdmissionDeferredTarget::ClaimedOrder(
+                    order.request.client_identifier.clone(),
+                ),
+                crate::contracts::AdmissionDeferredReason::EffectAuthorizationBlocked,
+                Some(error.to_string().chars().take(512).collect()),
+            )
+            .await?;
             tracing::warn!(
                 event = "automation_order_effect_blocked_after_claim",
                 client_identifier = %dispatch.request.client_identifier,
@@ -1694,18 +2529,18 @@ impl JobService {
                 self.readback_pending_order(order, mode).await.map(|_| ())
             }
             Err(ClientError::LiveOrderControlDenied) => {
-                let identifier = dispatch.request.client_identifier.clone();
-                let now = UtcTimestamp::now();
-                self.inner
-                    .database
-                    .call(
-                        "automation_reject_order_before_runtime_send",
-                        move |store| {
-                            store.automation_reject_claimed_order_before_send(&identifier, now)
-                        },
-                    )
-                    .await?;
-                Ok(())
+                self.reject_claimed_order_before_send(
+                    &dispatch.request.client_identifier,
+                    "LIVE_ORDER_SENDING_DISABLED",
+                )
+                .await
+            }
+            Err(ClientError::PrivateAccountNotReady) => {
+                self.reject_claimed_order_before_send(
+                    &dispatch.request.client_identifier,
+                    "PRIVATE_ACCOUNT_RECOVERY_REQUIRED",
+                )
+                .await
             }
             Err(error) => {
                 tracing::warn!(
@@ -1720,6 +2555,44 @@ impl JobService {
                 // identifier before any later admission. No submit retry.
                 Ok(())
             }
+        }
+    }
+
+    async fn reject_claimed_order_before_send(
+        &self,
+        identifier: &AutomationOrderIdentifier,
+        reason: &str,
+    ) -> Result<(), LabError> {
+        let readback_identifier = identifier.clone();
+        let identifier = identifier.clone();
+        let reason = bounded_reason(reason);
+        let now = UtcTimestamp::now();
+        match self
+            .inner
+            .database
+            .call(
+                "automation_reject_claimed_order_before_send",
+                move |store| {
+                    store.automation_reject_claimed_order_before_send_with_reason(
+                        &identifier,
+                        now,
+                        &reason,
+                    )
+                },
+            )
+            .await
+        {
+            Err(error @ LabError::OutcomeUnknown(_)) => {
+                let Some(order) = self.read_order_view(&readback_identifier).await? else {
+                    return Err(error);
+                };
+                if order.state == AutomationOrderState::Rejected {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            }
+            result => result,
         }
     }
 
@@ -1887,6 +2760,69 @@ impl JobService {
         self.dispatch_reserved_order(&order, mode).await
     }
 
+    async fn record_admission_deferral(
+        &self,
+        session_id: &crate::contracts::AutomationSessionId,
+        target: crate::contracts::AdmissionDeferredTarget,
+        reason: crate::contracts::AdmissionDeferredReason,
+        detail: Option<String>,
+    ) -> Result<(), LabError> {
+        let id = session_id.clone();
+        let observed_at = UtcTimestamp::now();
+        self.inner
+            .database
+            .call("automation_record_admission_deferral", move |store| {
+                store
+                    .automation_record_admission_deferral(
+                        &id,
+                        &target,
+                        reason,
+                        detail.as_deref(),
+                        observed_at,
+                    )
+                    .map(|_| ())
+            })
+            .await
+    }
+
+    fn preparation_fact(
+        record: &AutomationRuntimeRecord,
+        observation: &CandleObservation,
+        checkpoint: &AutomationCheckpoint,
+        status: crate::contracts::DecisionPreparationStatus,
+    ) -> Result<crate::contracts::DecisionPreparation, LabError> {
+        Ok(crate::contracts::DecisionPreparation {
+            status,
+            market: record.view.market.clone(),
+            interval: record.view.decision_interval,
+            observation_id: observation.id.clone(),
+            decision_time: observation.candle.close_time_utc,
+            completed_bars_seen: checkpoint.evaluator.completed_bars_seen(),
+            required_bars: u64::try_from(checkpoint.evaluator.decision_warmup_bars().max(1))
+                .map_err(|_| {
+                    LabError::ResourceLimit("decision preparation warmup overflow".into())
+                })?,
+        })
+    }
+
+    async fn record_preparation(
+        &self,
+        record: &AutomationRuntimeRecord,
+        observation: &CandleObservation,
+        checkpoint: &AutomationCheckpoint,
+        status: crate::contracts::DecisionPreparationStatus,
+    ) -> Result<(), LabError> {
+        let preparation = Self::preparation_fact(record, observation, checkpoint, status)?;
+        let session_id = record.view.session_id.clone();
+        self.inner
+            .database
+            .call("automation_record_preparation", move |store| {
+                store.automation_record_preparation(&session_id, &preparation, UtcTimestamp::now())
+            })
+            .await?;
+        Ok(())
+    }
+
     async fn persist_catchup_decision(
         &self,
         record: &AutomationRuntimeRecord,
@@ -1900,7 +2836,7 @@ impl JobService {
             record.view.session_id.as_str(),
             observation.id.as_str()
         ));
-        let policy_evaluation = evaluation.map(evaluation_to_value);
+        let policy_evaluation = evaluation.map(|evaluation| evaluation_to_value(evaluation, None));
         let evaluation_json = serde_json::json!({
             "recovery_disposition": reason,
             "decision_time_utc": observation.candle.close_time_utc,
@@ -1977,11 +2913,18 @@ impl JobService {
         checkpoint: &AutomationCheckpoint,
         restart_replay: bool,
     ) -> Result<(), LabError> {
+        let preparation = Self::preparation_fact(
+            record,
+            observation,
+            checkpoint,
+            crate::contracts::DecisionPreparationStatus::PolicyWarmup,
+        )?;
         if restart_replay {
             let evaluation = serde_json::json!({
                 "phase": "POLICY_WARMUP",
                 "decision_time": observation.candle.close_time_utc,
                 "completed_bars_seen": checkpoint.evaluator.completed_bars_seen(),
+                "preparation": preparation,
             });
             let id = AutomationIntentId::from_seed(&format!(
                 "{}:{}",
@@ -2011,11 +2954,12 @@ impl JobService {
             .inner
             .database
             .call("automation_record_warmup_candle", move |store| {
-                store.automation_record_candle(
+                store.automation_record_candle_with_preparation(
                     &session_id,
                     &observation,
                     &checkpoint_json,
                     received,
+                    Some(&preparation),
                 )
             })
             .await;
@@ -2256,6 +3200,73 @@ impl JobService {
             .await
     }
 
+    async fn hold_automation_source_gap(
+        &self,
+        record: &AutomationRuntimeRecord,
+        error: &LabError,
+    ) -> Result<(), LabError> {
+        let id = record.view.session_id.clone();
+        let expected = record.view.sequence;
+        let reason = format!("SOURCE_COVERAGE_GAP: {error}")
+            .chars()
+            .take(1024)
+            .collect::<String>();
+        let now = UtcTimestamp::now();
+        self.inner
+            .database
+            .call("automation_hold_source_gap", move |store| {
+                store.automation_hold_source_gap(&id, expected, &reason, now)
+            })
+            .await
+    }
+
+    async fn pending_intent_sources_ready(
+        &self,
+        record: &AutomationRuntimeRecord,
+    ) -> Result<bool, LabError> {
+        if !record
+            .frozen_policy
+            .definition
+            .declared_source_intervals()
+            .iter()
+            .any(|interval| *interval != record.view.decision_interval)
+        {
+            return Ok(true);
+        }
+        let now = UtcTimestamp::now();
+        let current = self
+            .load_runtime_record(&record.view.session_id, now)
+            .await?;
+        if current.view.state != AutomationSessionState::Running {
+            return Ok(false);
+        }
+        let mut checkpoint = restore_checkpoint(&current)?;
+        let checked = async {
+            let sources = self
+                .load_cross_interval_bars(&checkpoint, &current.view.market, now)
+                .await?;
+            feed_causal_sources(&mut checkpoint, &sources, now)?;
+            let cursors = checkpoint.evaluator.cross_last_close();
+            Ok::<bool, LabError>(
+                checkpoint
+                    .evaluator
+                    .source_indicators()
+                    .iter()
+                    .all(|(id, _, _)| cursors.contains_key(id)),
+            )
+        }
+        .await;
+        match checked {
+            Ok(ready) => Ok(ready),
+            Err(LabError::BlockedEvidence(_)) => Ok(false),
+            Err(error @ LabError::DataGap(_)) => {
+                self.hold_automation_source_gap(&current, &error).await?;
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     async fn refresh_account(
         &self,
         mode: AutomationSessionMode,
@@ -2357,6 +3368,13 @@ impl JobService {
         count: u32,
     ) -> Result<Vec<CandleObservation>, LabError> {
         let count = crate::contracts::ProbeCount::try_from(count)?;
+        if let Some(feed) = &self.inner.public_market_feed {
+            let (_, observations) = feed
+                .read_or_bootstrap_observations(market, interval, count)
+                .await?;
+            feed.ensure_ready(market, interval)?;
+            return Ok(observations);
+        }
         let (_, observations) = self
             .inner
             .upbit
@@ -2437,8 +3455,208 @@ impl JobService {
     }
 }
 
-fn evaluation_to_value(evaluation: &StrategyEvaluation) -> Value {
+fn private_account_event_generation(event: &PrivateAccountEvent) -> u64 {
+    match event {
+        PrivateAccountEvent::Baseline { baseline, .. } => baseline.generation,
+        PrivateAccountEvent::OrderObserved(observation) => observation.generation,
+        PrivateAccountEvent::AssetObserved(observation) => observation.generation,
+        PrivateAccountEvent::BootstrapComplete { generation, .. } => *generation,
+    }
+}
+
+fn ensure_private_stream_generation(
+    client: &crate::upbit::client::UpbitPrivateClient,
+    generation: u64,
+) -> Result<(), LabError> {
+    if client.private_readiness_fence().generation() == generation {
+        Ok(())
+    } else {
+        Err(LabError::BlockedEvidence(
+            "PRIVATE_STREAM_GENERATION_STALE".into(),
+        ))
+    }
+}
+
+fn private_baseline_observation(
+    account_identity: &str,
+    baseline: &PrivateAccountBaseline,
+    history_scope: PrivateOrderHistoryScope,
+) -> Result<PrivateStreamObservation, LabError> {
+    let payload = serde_json::json!({
+        "history_scope": match history_scope {
+            PrivateOrderHistoryScope::OpenOrdersOnly => "OPEN_ORDERS_ONLY",
+        },
+        "open_orders_complete": baseline.open_orders_complete,
+        "closed_order_history_complete": baseline.closed_order_history_complete,
+        "gap_reconciliation_required": baseline.gap_reconciliation_required,
+        "balances": baseline.balances.iter().map(account_balance_payload).collect::<Vec<_>>(),
+        "open_orders": baseline.open_orders.iter().map(upbit_order_payload).collect::<Vec<_>>(),
+    });
+    let digest = ContentHash::of_value(&payload)?;
+    let observed = baseline.observed_at_utc.0;
+    let observed_nanos = observed.timestamp_subsec_nanos();
+    Ok(PrivateStreamObservation {
+        account_identity: account_identity.to_owned(),
+        generation: baseline.generation,
+        kind: PrivateStreamObservationKind::Baseline,
+        event_key: format!(
+            "baseline:{}:{}:{observed_nanos}:{}",
+            baseline.generation,
+            observed.timestamp(),
+            digest.as_str()
+        ),
+        provider_at_utc: None,
+        received_at_utc: baseline.observed_at_utc,
+        transport: None,
+        payload,
+    })
+}
+
+fn private_order_stream_observation(
+    account_identity: &str,
+    value: &PrivateOrderObservation,
+) -> Result<PrivateStreamObservation, LabError> {
+    let event_key = match &value.identity {
+        PrivateOrderEventIdentity::Trade { trade_uuid } => format!("trade:{trade_uuid}"),
+        PrivateOrderEventIdentity::OrderState {
+            order_uuid,
+            state,
+            provider_timestamp_ms,
+            event_payload_hash,
+        } => format!(
+            "order:{order_uuid}:{}:{provider_timestamp_ms}:{event_payload_hash}",
+            private_order_state_name(*state)
+        ),
+    };
+    let payload = serde_json::json!({
+        "identity": serde_json::to_value(&value.identity)?,
+        "order_uuid": value.order_uuid,
+        "client_identifier": value.client_identifier,
+        "market": value.market.code(),
+        "side": match value.side {
+            crate::upbit::realtime::PrivateOrderSide::Bid => "BID",
+            crate::upbit::realtime::PrivateOrderSide::Ask => "ASK",
+        },
+        "order_type": value.order_type,
+        "state": private_order_state_name(value.state),
+        "price": decimal_value(value.price),
+        "average_price": decimal_value(value.average_price),
+        "volume": decimal_value(value.volume),
+        "remaining_volume": decimal_value(value.remaining_volume),
+        "executed_volume": decimal_value(value.executed_volume),
+        "trades_count": value.trades_count,
+        "reserved_fee": decimal_value(value.reserved_fee),
+        "remaining_fee": decimal_value(value.remaining_fee),
+        "paid_fee": decimal_value(value.paid_fee),
+        "locked": decimal_value(value.locked),
+        "executed_funds": decimal_value(value.executed_funds),
+        "trade_fee": decimal_value(value.trade_fee),
+        "is_maker": value.is_maker,
+        "smp_type": value.smp_type,
+        "prevented_volume": decimal_value(value.prevented_volume),
+        "prevented_locked": decimal_value(value.prevented_locked),
+        "provider_order_at_utc": value.provider_order_at_utc,
+        "provider_trade_at_utc": value.provider_trade_at_utc,
+    });
+    Ok(PrivateStreamObservation {
+        account_identity: account_identity.to_owned(),
+        generation: value.generation,
+        kind: PrivateStreamObservationKind::OrderObserved,
+        event_key,
+        provider_at_utc: Some(value.provider_at_utc),
+        received_at_utc: value.received_at_utc,
+        transport: Some(RawWebSocketTransport {
+            connection_epoch: value.generation,
+            message_sequence: value.stream_sequence,
+            provider_at: Some(value.provider_at_utc),
+            received_at: value.received_at_utc,
+        }),
+        payload,
+    })
+}
+
+fn private_asset_stream_observation(
+    account_identity: &str,
+    value: &PrivateAssetObservation,
+) -> PrivateStreamObservation {
+    let payload = serde_json::json!({
+        "asset_uuid": value.asset_uuid,
+        "assets": value.assets.iter().map(|asset| serde_json::json!({
+            "currency": asset.currency,
+            "balance": asset.balance.to_string(),
+            "locked": asset.locked.to_string(),
+        })).collect::<Vec<_>>(),
+        "provider_asset_at_utc": value.provider_asset_at_utc,
+    });
+    PrivateStreamObservation {
+        account_identity: account_identity.to_owned(),
+        generation: value.generation,
+        kind: PrivateStreamObservationKind::AssetObserved,
+        event_key: format!("asset:{}:{}", value.asset_uuid, value.event_payload_hash),
+        provider_at_utc: Some(value.provider_at_utc),
+        received_at_utc: value.received_at_utc,
+        transport: Some(RawWebSocketTransport {
+            connection_epoch: value.generation,
+            message_sequence: value.stream_sequence,
+            provider_at: Some(value.provider_at_utc),
+            received_at: value.received_at_utc,
+        }),
+        payload,
+    }
+}
+
+fn account_balance_payload(value: &crate::upbit::client::UpbitAccountBalance) -> Value {
     serde_json::json!({
+        "currency": value.currency,
+        "balance": value.balance.to_string(),
+        "locked": value.locked.to_string(),
+        "avg_buy_price": value.avg_buy_price.to_string(),
+        "avg_buy_price_modified": value.avg_buy_price_modified,
+        "unit_currency": value.unit_currency,
+    })
+}
+
+fn upbit_order_payload(value: &UpbitOrderDetail) -> Value {
+    serde_json::json!({
+        "uuid": value.uuid,
+        "identifier": value.identifier,
+        "side": value.side,
+        "ord_type": value.ord_type,
+        "price": decimal_value(value.price),
+        "state": value.state,
+        "market": value.market,
+        "created_at": value.created_at,
+        "volume": decimal_value(value.volume),
+        "remaining_volume": decimal_value(value.remaining_volume),
+        "reserved_fee": decimal_value(value.reserved_fee),
+        "remaining_fee": decimal_value(value.remaining_fee),
+        "paid_fee": decimal_value(value.paid_fee),
+        "locked": decimal_value(value.locked),
+        "executed_volume": decimal_value(value.executed_volume),
+        "trades_count": value.trades_count,
+        "trades": value.trades,
+    })
+}
+
+fn decimal_value(value: Option<Decimal>) -> Value {
+    value.map_or(Value::Null, |decimal| Value::String(decimal.to_string()))
+}
+
+const fn private_order_state_name(
+    state: crate::upbit::realtime::PrivateOrderState,
+) -> &'static str {
+    match state {
+        crate::upbit::realtime::PrivateOrderState::Wait => "wait",
+        crate::upbit::realtime::PrivateOrderState::Watch => "watch",
+        crate::upbit::realtime::PrivateOrderState::Trade => "trade",
+        crate::upbit::realtime::PrivateOrderState::Done => "done",
+        crate::upbit::realtime::PrivateOrderState::Cancel => "cancel",
+        crate::upbit::realtime::PrivateOrderState::Prevented => "prevented",
+    }
+}
+
+fn evaluation_to_value(evaluation: &StrategyEvaluation, actual_weight: Option<Weight>) -> Value {
+    let mut value = serde_json::json!({
         "decision_time_utc": evaluation.decision_time,
         "state_before": evaluation.state_before,
         "state_after": evaluation.state_after,
@@ -2451,7 +3669,14 @@ fn evaluation_to_value(evaluation: &StrategyEvaluation) -> Value {
         "policy_trace": evaluation.policy_trace,
         "base_state_before": evaluation.base_state_before,
         "base_state_after": evaluation.base_state_after,
-    })
+    });
+    if let Some(weight) = actual_weight {
+        value["actual_weight_at_decision"] = serde_json::json!(weight);
+    }
+    if let Some(trace) = &evaluation.decision_trace {
+        value["decision_trace"] = serde_json::json!(trace);
+    }
+    value
 }
 
 fn restore_checkpoint(record: &AutomationRuntimeRecord) -> Result<AutomationCheckpoint, LabError> {
@@ -2542,15 +3767,10 @@ fn feed_causal_sources(
     decision_close: UtcTimestamp,
 ) -> Result<(), LabError> {
     let indicators = checkpoint.evaluator.source_indicators();
+    let prior_closes = checkpoint.evaluator.cross_last_close();
     for (indicator_id, interval, _) in indicators {
-        let Some(bars) = sources.get(&interval) else {
-            continue;
-        };
-        let mut last_fed = checkpoint
-            .evaluator
-            .cross_last_close()
-            .get(&indicator_id)
-            .copied();
+        let bars = sources.get(&interval).map_or(&[][..], Vec::as_slice);
+        let mut last_fed = prior_closes.get(&indicator_id).copied();
         for bar in bars {
             if !bar.candle.completed || bar.candle.close_time_utc > decision_close {
                 continue;
@@ -2566,6 +3786,19 @@ fn feed_causal_sources(
             }
             checkpoint.evaluator.observe_source(&indicator_id, bar)?;
             last_fed = Some(bar.candle.close_time_utc);
+        }
+        if let Some(last) = last_fed {
+            let expected = crate::scheduling::latest_completed_boundary(decision_close, interval)?;
+            if last > expected {
+                return Err(LabError::DataCorrupt(format!(
+                    "policy source {indicator_id} is ahead of the decision's completed boundary"
+                )));
+            }
+            if last < expected {
+                return Err(LabError::BlockedEvidence(format!(
+                    "AWAITING_POLICY_SOURCE_BOUNDARY: {indicator_id} {interval:?} requires {expected}; last observed {last}"
+                )));
+            }
         }
     }
     Ok(())
@@ -2883,6 +4116,15 @@ fn client_error(error: ClientError) -> LabError {
         ClientError::LiveOrderControlDenied => {
             LabError::BlockedEvidence("LIVE_ORDER_SENDING_DISABLED".into())
         }
+        ClientError::PrivateAccountNotReady => {
+            LabError::BlockedEvidence("PRIVATE_ACCOUNT_RECOVERY_REQUIRED".into())
+        }
+        ClientError::PrivateBaselineLimit { limit } => LabError::ResourceLimit(format!(
+            "private REST baseline exceeds the {limit} order limit"
+        )),
+        ClientError::PrivateBaselineByteLimit { observed, limit } => LabError::ResourceLimit(
+            format!("private REST baseline size {observed} exceeds {limit} bytes"),
+        ),
         ClientError::RateLimited {
             retry_after_seconds,
         } => LabError::RateLimited(format!(

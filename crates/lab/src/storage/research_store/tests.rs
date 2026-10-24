@@ -100,7 +100,7 @@ fn terminal_failure_blocks_until_explicit_resume_marks_retry_pending() {
     store
         .create_research_suite(&frozen, &cases, time("2024-01-02T00:00:00Z"))
         .expect("create suite");
-    let (plan_id, plan_digest) = save_placeholder_plan(&store, "explicit-retry");
+    let (plan_id, plan_digest) = save_real_plan(&mut store, "explicit-retry");
     let causal_digest = ContentHash::of_bytes(b"explicit-retry-causal");
     let submission = backtest_submission("explicit-retry", &plan_id, &plan_digest);
     store
@@ -163,7 +163,7 @@ fn queue_full_rolls_back_child_job_and_case_link() {
     store
         .create_research_suite(&frozen, &cases, time("2024-01-02T00:00:00Z"))
         .expect("create suite");
-    let (plan_id, plan_digest) = save_placeholder_plan(&store, "queue-full");
+    let (plan_id, plan_digest) = save_real_plan(&mut store, "queue-full");
     let causal_digest = ContentHash::of_bytes(b"queue-full-causal");
     assert_ne!(plan_digest, causal_digest);
     let mut occupying_jobs = Vec::new();
@@ -221,6 +221,53 @@ fn queue_full_rolls_back_child_job_and_case_link() {
 }
 
 #[test]
+fn missing_raw_rejects_managed_admission_without_queue_or_case_pin() {
+    let root = TestRoot::new("missing-managed-raw");
+    let mut store = Store::open(&root.0).expect("isolated store");
+    let (frozen, cases) = suite_fixture("missing-managed-raw");
+    store
+        .create_research_suite(&frozen, &cases, time("2024-01-02T00:00:00Z"))
+        .expect("create synthetic suite");
+    let (plan_id, digest) = save_real_plan(&mut store, "missing-managed-raw");
+    let plan = store
+        .load_plan(&plan_id)
+        .expect("read plan")
+        .expect("saved plan");
+    let dataset = store
+        .load_dataset(&plan.resolved.spec.dataset_ids[0])
+        .expect("read input")
+        .expect("saved dataset");
+    let body = store
+        .raw
+        .root
+        .join(&dataset.manifest.raw_objects[0].relative_path)
+        .join(super::super::BODY_FILE);
+    std::fs::remove_file(body).expect("remove isolated synthetic raw body");
+    let submission = backtest_submission("missing-managed-raw", &plan_id, &digest);
+    let before = store.connection.total_changes();
+    assert!(
+        store
+            .admit_prepared_suite_case(
+                &cases[0].id,
+                &plan_id,
+                &ContentHash::of_bytes(b"causal"),
+                &submission,
+                time("2024-01-02T00:00:01Z"),
+            )
+            .is_err()
+    );
+    assert_eq!(store.connection.total_changes(), before);
+    let case = load_case(&store.connection, &cases[0].id).expect("saved case");
+    assert_eq!(case.status, SuiteCaseStatus::Planned);
+    assert!(case.plan_id.is_none() && case.job_id.is_none() && case.attempt_id.is_none());
+    let jobs: i64 = store
+        .connection
+        .query_row("SELECT count(*) FROM jobs", [], |row| row.get(0))
+        .expect("queue count");
+    assert_eq!(jobs, 0);
+}
+
+#[test]
 fn pause_resume_retry_repins_once_and_admission_readback_is_idempotent() {
     let root = TestRoot::new("pause-retry");
     let mut store = Store::open(&root.0).expect("open store");
@@ -228,7 +275,7 @@ fn pause_resume_retry_repins_once_and_admission_readback_is_idempotent() {
     store
         .create_research_suite(&frozen, &cases, time("2024-01-02T00:00:00Z"))
         .expect("create suite");
-    let (plan_id, plan_digest) = save_placeholder_plan(&store, "pause-retry");
+    let (plan_id, plan_digest) = save_real_plan(&mut store, "pause-retry");
     let causal_digest = ContentHash::of_bytes(b"pause-retry-causal");
     assert_ne!(plan_digest, causal_digest);
     let submission = backtest_submission("suite-pause", &plan_id, &plan_digest);
@@ -420,14 +467,30 @@ fn suite_fixture(seed: &str) -> (FrozenResearchSuite, Vec<SuiteCase>) {
     (frozen, cases)
 }
 
-fn save_placeholder_plan(store: &Store, seed: &str) -> (PlanId, ContentHash) {
-    let id = PlanId::new(format!("plan-{seed}")).expect("plan id");
-    let input_digest = ContentHash::of_bytes(format!("input-{seed}").as_bytes());
-    store.connection.execute(
-        "INSERT INTO plans(id,request_id,config_digest,input_digest,evidence_snapshot_id,original_request_json,resolved_plan_json) VALUES (?1,?2,?3,?4,NULL,'{}','{}')",
-        params![id.as_str(), format!("plan-request-{seed}"), ContentHash::of_bytes(format!("config-{seed}").as_bytes()).as_str(), input_digest.as_str()],
-    ).expect("insert placeholder plan");
-    (id, input_digest)
+fn save_real_plan(store: &mut Store, seed: &str) -> (PlanId, ContentHash) {
+    let policy = store
+        .write_policy(
+            &crate::contracts::PolicyWrite::Create {
+                request_id: RequestId::new(format!("suite-policy-{seed}"))
+                    .expect("fixture request"),
+                definition: crate::contracts::PolicyDefinition {
+                    schema_version: "1.0".into(),
+                    name: "Suite input fixture".into(),
+                    description: "SYNTHETIC_TEST_ONLY".into(),
+                    program: crate::contracts::PolicyProgram::Builtin {
+                        strategy: crate::contracts::StrategySpec::BuyAndHold,
+                    },
+                },
+            },
+            time("2024-01-01T00:00:00Z"),
+        )
+        .expect("persist frozen fixture policy");
+    let id = crate::storage::tests::save_v2_policy_plan_fixture(store, &policy);
+    let plan = store
+        .load_plan(&id)
+        .expect("load real fixture plan")
+        .expect("fixture plan exists");
+    (id, plan.resolved.input_digest)
 }
 
 fn backtest_submission(seed: &str, plan_id: &PlanId, digest: &ContentHash) -> JobSubmission {

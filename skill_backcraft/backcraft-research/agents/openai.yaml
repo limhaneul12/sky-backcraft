@@ -1,4 +1,4 @@
 interface:
   display_name: "Backcraft 리서치 스위트"
-  short_description: "파라미터 스윕·walk-forward 스위트·공유자본 포트폴리오·regime 게이팅 연구"
-  default_prompt: "$backcraft-research로 요청한 파라미터 스윕과 리서치 스위트를 계획하고 실행해 주세요."
+  short_description: "생성 전 스윕 preflight·워크포워드·공유자본·regime 비교 연구"
+  default_prompt: "$backcraft-research로 요청한 스윕을 먼저 preflight하고 연구 범위에 맞춰 계획·실행해 주세요."

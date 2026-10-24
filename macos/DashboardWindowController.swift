@@ -22,6 +22,59 @@ extension NSTableView {
     }
 }
 
+private final class DashboardSidebarSymbolView: NSImageView {
+    func updateTint(isSelected: Bool, isEmphasized: Bool) {
+        if isSelected {
+            contentTintColor = isEmphasized ? .alternateSelectedControlTextColor : .labelColor
+        } else {
+            contentTintColor = TerminalTheme.secondaryText
+        }
+    }
+}
+
+private final class HistoryRunsTableView: NSTableView {
+    var openSelectedRun: (() -> Void)?
+    var clearRunSelection: (() -> Void)?
+
+    override func keyDown(with event: NSEvent) {
+        switch event.keyCode {
+        case 36, 76:
+            openSelectedRun?()
+        case 53:
+            clearRunSelection?()
+        default:
+            super.keyDown(with: event)
+        }
+    }
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let point = convert(event.locationInWindow, from: nil)
+        let row = row(at: point)
+        guard row >= 0 else { return nil }
+        if !selectedRowIndexes.contains(row) {
+            selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        }
+        return super.menu(for: event)
+    }
+}
+
+private final class HistoryWorkbenchSplitView: NSSplitView {
+    var orientationDidChange: ((Bool) -> Void)?
+    private var restoredDividerForCurrentOrientation = false
+
+    override func layout() {
+        let shouldBeVertical = bounds.width + 40 >= 900
+        if isVertical != shouldBeVertical {
+            isVertical = shouldBeVertical
+            restoredDividerForCurrentOrientation = false
+        }
+        super.layout()
+        guard !restoredDividerForCurrentOrientation, bounds.width > 0, bounds.height > 0 else { return }
+        restoredDividerForCurrentOrientation = true
+        orientationDidChange?(isVertical)
+    }
+}
+
 enum Formatters {
     static func percent(_ value: Decimal, signed: Bool = false) -> String {
         let magnitude = value < 0 ? -value : value
@@ -472,7 +525,7 @@ final class EquityChartView: NSView {
 
 // MARK: - Native Dashboard Window Controller
 
-final class DashboardWindowController: NSWindowController, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate, NSSplitViewDelegate {
+final class DashboardWindowController: NSWindowController, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate, NSSplitViewDelegate, NSToolbarDelegate {
     private let store: ConfigurationStore
     private let dbReader: DatabaseReader
     private let liveService: UpbitLiveService
@@ -490,9 +543,24 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
     private let sidebarTable = NSTableView()
     private let detailContainer = TerminalSurfaceView()
     private var databaseStatusFooter: NSTextField?
+    private var databaseStatusFooterIcon: NSImageView?
     private var paperSummaryText = "지속 모의: 조회 전"
     private var automationSummaryText = "전략 자동화: 조회 전"
-    private let globalContext = NSTextField(wrappingLabelWithString: "연구: 과거 원장 · 지속 모의: 조회 전 · 거래소: 조회 전 · 실거래: OFF")
+    private struct GlobalContextFact: Equatable {
+        let domain: String
+        let value: String
+    }
+    private var globalContextFacts: [GlobalContextFact] = []
+    private var globalContextStrip: NSView?
+    private var globalContextContent: NSView?
+    private let globalContextPopover = NSPopover()
+    private let realtimeStatusDisclosure = NSButton(title: "실시간 상태 접기", target: nil, action: nil)
+    private var realtimeStatusCollapsed = true
+    private var isSidebarCollapsed = false
+    private var sidebarWidthBeforeCollapse: CGFloat = TerminalTheme.textScale >= 1.5 ? 280 : 230
+    private static let sidebarToolbarIdentifier = NSToolbarItem.Identifier("SkyBackcraft.ToggleSidebar")
+    private static let sidebarSeparatorIdentifier = NSToolbarItem.Identifier("SkyBackcraft.SidebarSeparator")
+    private static let historyDividerDefaultsKey = "dev.skybackcraft.run-history-divider-ratio.v1"
 
     // Navigation sections
     private enum Section: Int, CaseIterable {
@@ -503,6 +571,30 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
         case strategyAutomation
         case liveTradingMonitor
         case policyManagement
+
+        var sidebarRow: Int {
+            switch self {
+            case .backtestAnalysis: return 1
+            case .allRunsHistory: return 2
+            case .strategyCatalog: return 3
+            case .paperTradingTelemetry: return 5
+            case .strategyAutomation: return 6
+            case .liveTradingMonitor: return 8
+            case .policyManagement: return 10
+            }
+        }
+
+        var symbolName: String {
+            switch self {
+            case .backtestAnalysis: return "chart.xyaxis.line"
+            case .allRunsHistory: return "clock.arrow.circlepath"
+            case .strategyCatalog: return "list.bullet.rectangle"
+            case .paperTradingTelemetry: return "waveform.path.ecg"
+            case .strategyAutomation: return "gearshape.2"
+            case .liveTradingMonitor: return "eye"
+            case .policyManagement: return "slider.horizontal.3"
+            }
+        }
 
         var title: String {
             switch self {
@@ -515,6 +607,39 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
             case .policyManagement: return "정책 삭제"
             }
         }
+    }
+
+    private enum SidebarRow {
+        case group(String)
+        case route(Section)
+
+        static let ordered: [SidebarRow] = [
+            .group("연구"), .route(.backtestAnalysis), .route(.allRunsHistory), .route(.strategyCatalog),
+            .group("운영"), .route(.paperTradingTelemetry), .route(.strategyAutomation),
+            .group("계좌 관찰"), .route(.liveTradingMonitor),
+            .group("관리"), .route(.policyManagement)
+        ]
+
+        var isGroup: Bool {
+            if case .group = self { return true }
+            return false
+        }
+
+        var section: Section? {
+            if case .route(let section) = self { return section }
+            return nil
+        }
+    }
+
+    private enum HistoryFilterTokenKind: Int {
+        case search
+        case status
+        case market
+        case policy
+        case revision
+        case cost
+        case date
+        case pinned
     }
     private var currentSection: Section = .backtestAnalysis
     private var synchronizingSidebarSelection = false
@@ -529,11 +654,19 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
     private var policyInventory: PolicyInventoryView?
     private var paperWorkspaceView: PaperTradingWorkspaceView?
     private var automationWorkspaceView: AutomationWorkspaceView?
+    private let realtimeFeedService = RealtimeFeedMCPService.shared
+    private lazy var realtimeStatusView = RealtimeConnectionStatusView(service: realtimeFeedService)
+    private var realtimeStatusHeightConstraint: NSLayoutConstraint?
+    private var realtimeFeedObserverID: UUID?
+    private var privateFeedInvalidation = RealtimeReconciliationInvalidation()
     private var ledgerDetailController: ModelLedgerDetailWindowController?
     private let fillReader = LedgerDetailMCPReader()
     private var markerGeneration: UInt64 = 0
     private let exportQueue = DispatchQueue(label: "dev.skybackcraft.history-export")
     private var selectedModelId: String?
+    private weak var runDetailLedgerButton: NSButton?
+    private weak var runDetailExportButton: NSButton?
+    private weak var runDetailMarkerButton: NSButton?
     private let contextLabel = NSTextField(wrappingLabelWithString: "실행을 선택하세요.")
     private let modelSelector = NSPopUpButton()
     private var dataError: String?
@@ -562,7 +695,7 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
 
     // Section 2 UI elements
     private let runsSearchField = NSSearchField()
-    private let runsTable = NSTableView()
+    private let runsTable = HistoryRunsTableView()
     private let historyStatus = NSPopUpButton()
     private let historyMarket = NSPopUpButton()
     private let historyPolicy = NSPopUpButton()
@@ -572,10 +705,9 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
     private let historyFromDate = NSDatePicker()
     private let historyThroughDate = NSDatePicker()
     private let historyPinnedOnly = NSButton(checkboxWithTitle: "고정만 보기", target: nil, action: nil)
+    private let historyClearFilters = NSButton(title: "필터 모두 지우기", target: nil, action: nil)
     private let historyDisplayMode = NSSegmentedControl(labels: ["컴팩트", "상세 열"], trackingMode: .selectOne, target: nil, action: nil)
     private let historyCompare = NSButton(title: "선택 비교", target: nil, action: nil)
-    private let historyPin = NSButton(title: "선택 고정", target: nil, action: nil)
-    private let historyCopy = NSButton(title: "실행 ID 복사", target: nil, action: nil)
     private let historyRecent = NSButton(title: "최근 실행", target: nil, action: nil)
     private let historyMetricSort = NSPopUpButton()
     private let historyWorkspaceLabel = NSTextField(wrappingLabelWithString: "")
@@ -590,14 +722,44 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
     private let historyCount = NSTextField(labelWithString: "")
     private let historyMore = NSButton(title: "다음 기록 50건", target: nil, action: nil)
     private let historyDetail = NSTextField(wrappingLabelWithString: "행을 선택하면 실행의 정책·데이터셋 근거를 확인할 수 있습니다.")
+    private let historyIdentityRows = NSStackView()
+    private let historyAppliedFiltersSummary = NSTextField(wrappingLabelWithString: "활성 필터 없음")
     private let historyOpen = NSButton(title: "성과에서 열기", target: nil, action: nil)
+    private let historyAdvancedFiltersDisclosure = NSButton(title: "고급 필터", target: nil, action: nil)
+    private var historyAdvancedFiltersPanel: NSStackView?
+    private var historyTableScroll: NSScrollView?
+    private var historyWorkbenchSplitView: HistoryWorkbenchSplitView?
+    private var historyCopyMenuItem: NSMenuItem?
+    private var historyPinMenuItem: NSMenuItem?
+    private var historyClearMenuItem: NSMenuItem?
+    private var historyContextOpenMenuItem: NSMenuItem?
+    private var historyContextCompareMenuItem: NSMenuItem?
+    private var historyContextPinMenuItem: NSMenuItem?
+    private var historyContextCopyMenuItem: NSMenuItem?
+    private let historyActionsPullDown = NSPopUpButton(frame: .zero, pullsDown: true)
+    private var historySplitView: HistoryWorkbenchSplitView? { historyWorkbenchSplitView }
     private var historyCursor: RunHistoryCursor?
     private var historyTotal = 0
     private var pausedSchedules: [RealCollectionSchedule] = []
     private var activeJobs: [RealJob] = []
 
+    private enum JobsListItem {
+        case job(RealJob)
+        case schedule(RealCollectionSchedule)
+    }
+
+    private var visibleJobsListItems: [JobsListItem] {
+        switch jobsListScope.selectedSegment {
+        case 1: return activeJobs.map(JobsListItem.job)
+        case 2: return pausedSchedules.map(JobsListItem.schedule)
+        default: return recentJobs.map(JobsListItem.job)
+        }
+    }
+
     // Section 4 UI elements
     private let jobsTable = NSTableView()
+    private let jobsListScope = NSSegmentedControl(labels: ["최근 30건", "대기·실행", "일시중지 수집"], trackingMode: .selectOne, target: nil, action: nil)
+    private var jobsQueueHeader: NSTextField?
 
     // Section 5 UI elements
     private let upbitBalanceLabel = NSTextField(wrappingLabelWithString: "Upbit 실계좌 잔고 조회 전")
@@ -667,30 +829,47 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
         historyWorkspace = HistoryWorkspaceStore(rootDirectory: uiRoot)
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1200, height: 820),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
         window.title = CommandLine.arguments.contains("--gui-review")
             ? "Sky Backcraft — 검증 세션 · 원장 읽기 / Backend 복사본"
-            : "Sky Backcraft — Quant Research & Trading Terminal"
+            : "Sky Backcraft"
         window.contentMinSize = NSSize(width: 1200, height: 800)
         window.isReleasedWhenClosed = false
         window.appearance = nil
         window.backgroundColor = TerminalTheme.surface
         window.titlebarAppearsTransparent = true
+        window.toolbarStyle = .unified
+        window.titleVisibility = .hidden
         super.init(window: window)
         window.delegate = self
+        realtimeFeedObserverID = realtimeFeedService.observe { [weak self] presentation in
+            guard let self else { return }
+            _ = self.privateFeedInvalidation.observe(
+                presentation.status?.private_feed.last_reconciled_at_utc,
+                hasProjection: presentation.status != nil,
+                isVisible: self.isLiveMonitorVisible
+            )
+        }
 
         do { restoredHistoryState = try historyWorkspace.loadHistoryState() }
         catch { historyWorkspaceError = "저장된 보기 상태 확인 실패 · 기존 파일은 유지됩니다. \(error.localizedDescription)" }
         loadData()
         setupUI()
+        configureWindowToolbar()
         selectSection(.backtestAnalysis)
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { nil }
+
+    deinit {
+        if let realtimeFeedObserverID {
+            realtimeFeedService.removeObserver(realtimeFeedObserverID)
+        }
+    }
 
     func showDashboard() {
         loadData()
@@ -698,7 +877,10 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
         showWindow(nil)
         window?.center()
         NSApp.activate(ignoringOtherApps: true)
+        updateStrategyOverviewVisibility()
+        updateAutomationWorkspaceVisibility()
         updatePolicyDeletionWorkspaceVisibility()
+        updateRealtimeFeedVisibility()
         if currentSection == .liveTradingMonitor { resumeLiveMonitoringIfVisible() }
     }
 
@@ -709,6 +891,15 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
         window?.center()
         NSApp.activate(ignoringOtherApps: true)
         updateAutomationWorkspaceVisibility()
+        updateRealtimeFeedVisibility()
+    }
+
+    func updateRuntimeStatus(_ status: RuntimeStatus) {
+        guard case .running = status else { return }
+        loadData()
+        if window?.isVisible == true {
+            refreshCurrentSectionView()
+        }
     }
 
     private func loadData() {
@@ -717,8 +908,18 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
             allRuns = page.items
             historyTotal = page.totalCount
             historyCursor = page.nextCursor
-            allPolicies = try dbReader.fetchAllPolicies()
+            let loadedPolicies = try dbReader.fetchAllPolicies()
+            let policiesChanged = loadedPolicies.map {
+                "\($0.policyId):\($0.headRevisionId):\($0.name):\($0.historicalRunCount):\($0.historicalModelCount)"
+            } != allPolicies.map {
+                "\($0.policyId):\($0.headRevisionId):\($0.name):\($0.historicalRunCount):\($0.historicalModelCount)"
+            }
+            allPolicies = loadedPolicies
             updateDatabaseStatusFooter()
+            if policiesChanged {
+                strategyOverview?.updatePolicies(allPolicies)
+                policyInventory = nil
+            }
             historyFilterOptions = try dbReader.fetchHistoryFilterOptions()
             userPolicies = allPolicies.filter { $0.origin == "USER" }
             recentJobs = try dbReader.fetchRecentJobs(limit: 30)
@@ -729,6 +930,8 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
             automationWorkspaceView?.updatePolicies(allPolicies)
             logFixtureDatabaseReadResult(policyCount: allPolicies.count, error: nil)
             dataError = nil
+            updateJobsQueuePresentation()
+            if jobsTable.dataSource != nil { jobsTable.reloadData() }
             // An explicit selection is required; a completed replay is not live paper.
             if let current = selectedRun { loadRunDetails(current) }
             else { clearRunMetrics(message: "실행을 선택하면 해당 모델의 원장과 성과를 표시합니다.") }
@@ -775,6 +978,9 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
         contextLabel.stringValue = message
         updateInspector()
         currentComparisons = []
+        runDetailLedgerButton?.isEnabled = false
+        runDetailExportButton?.isEnabled = selectedRun != nil
+        runDetailMarkerButton?.isEnabled = false
         chartView.title = message
         chartView.emptyMessage = message
         chartView.setPoints([], initialEquity: 0)
@@ -827,6 +1033,9 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
             clearRunMetrics(message: "선택된 실행에 비교 가능한 모델 원장이 없습니다. 수익률과 거래 수는 미확인입니다.")
             return
         }
+        runDetailLedgerButton?.isEnabled = true
+        runDetailExportButton?.isEnabled = true
+        runDetailMarkerButton?.isEnabled = true
         do {
             returnMetricLabel.stringValue = model.netReturn.map { String(format: "%+.2f%%", $0 * 100) }
                 ?? (model.netReturnNullReason.map { "산출 불가 · \($0)" } ?? "산출 불가")
@@ -938,31 +1147,46 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
 
     func windowDidMiniaturize(_ notification: Notification) {
         suspendLiveMonitoring()
+        realtimeFeedService.setVisible(false)
+        updateStrategyOverviewVisibility()
         automationWorkspaceView?.setWorkspaceVisible(false)
         policyDeletionWorkspace?.setWorkspaceVisible(false)
     }
 
     func windowDidDeminiaturize(_ notification: Notification) {
         resumeLiveMonitoringIfVisible()
+        updateStrategyOverviewVisibility()
         updateAutomationWorkspaceVisibility()
+        updateRealtimeFeedVisibility()
         updatePolicyDeletionWorkspaceVisibility()
     }
 
     func windowDidBecomeKey(_ notification: Notification) {
+        refreshSidebarSymbolAppearance()
         resumeLiveMonitoringIfVisible()
+        updateStrategyOverviewVisibility()
         updateAutomationWorkspaceVisibility()
+        updateRealtimeFeedVisibility()
         updatePolicyDeletionWorkspaceVisibility()
+    }
+
+    func windowDidResignKey(_ notification: Notification) {
+        refreshSidebarSymbolAppearance()
     }
 
     func windowDidChangeOcclusionState(_ notification: Notification) {
         if isLiveMonitorVisible { resumeLiveMonitoringIfVisible() }
         else { suspendLiveMonitoring() }
+        updateStrategyOverviewVisibility()
         updateAutomationWorkspaceVisibility()
+        updateRealtimeFeedVisibility()
         updatePolicyDeletionWorkspaceVisibility()
     }
 
     func windowWillClose(_ notification: Notification) {
         suspendLiveMonitoring()
+        realtimeFeedService.setVisible(false)
+        strategyOverview?.setWorkspaceVisible(false)
         automationWorkspaceView?.setWorkspaceVisible(false)
         policyDeletionWorkspace?.setWorkspaceVisible(false)
     }
@@ -1002,6 +1226,7 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
         ])
 
         // Sidebar
+        let initialSidebarWidth: CGFloat = TerminalTheme.textScale >= 1.5 ? 280 : 230
         let sidebarView = buildSidebarView()
         splitView.addSubview(sidebarView)
 
@@ -1009,43 +1234,55 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
         // NSSplitView owns its pane frames; pane autoresizing must remain enabled.
         detailContainer.translatesAutoresizingMaskIntoConstraints = true
         detailContainer.autoresizingMask = [.width, .height]
-        detailContainer.frame = NSRect(x: 230, y: 0, width: 970, height: 820)
+        detailContainer.frame = NSRect(x: initialSidebarWidth, y: 0, width: 1200 - initialSidebarWidth, height: 820)
         detailContainer.wantsLayer = true
         detailContainer.layer?.masksToBounds = true
         splitView.addSubview(detailContainer)
 
         content.layoutSubtreeIfNeeded()
         splitView.adjustSubviews()
-        splitView.setPosition(230, ofDividerAt: 0)
+        splitView.setPosition(initialSidebarWidth, ofDividerAt: 0)
     }
 
     private func buildSidebarView() -> NSView {
-        let visualEffect = TerminalSurfaceView()
-        visualEffect.usesPanel = true
-        visualEffect.wantsLayer = true
-        visualEffect.translatesAutoresizingMaskIntoConstraints = true
-        visualEffect.autoresizingMask = [.height]
-        visualEffect.frame = NSRect(x: 0, y: 0, width: 230, height: 820)
+        let initialSidebarWidth: CGFloat = TerminalTheme.textScale >= 1.5 ? 280 : 230
+        let sidebar = NSVisualEffectView()
+        sidebar.material = .sidebar
+        sidebar.blendingMode = .behindWindow
+        sidebar.state = .followsWindowActiveState
+        sidebar.translatesAutoresizingMaskIntoConstraints = true
+        sidebar.autoresizingMask = [.height]
+        sidebar.frame = NSRect(x: 0, y: 0, width: initialSidebarWidth, height: 820)
 
-        let brandIcon = NSImageView(image: NSImage(systemSymbolName: "chart.xyaxis.line", accessibilityDescription: nil) ?? NSImage())
-        brandIcon.contentTintColor = .systemBlue
+        let brandScale = min(TerminalTheme.textScale, 1.5)
+        let brandIcon = NSImageView(image: NSImage(systemSymbolName: "chart.line.uptrend.xyaxis", accessibilityDescription: nil) ?? NSImage())
+        brandIcon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: round(13 * brandScale), weight: .semibold)
+        brandIcon.contentTintColor = .white
+        let brandBadge = NSView()
+        brandBadge.wantsLayer = true
+        brandBadge.layer?.cornerRadius = round(7 * brandScale)
+        brandBadge.layer?.backgroundColor = NSColor.systemBlue.cgColor
+        brandBadge.translatesAutoresizingMaskIntoConstraints = false
         brandIcon.translatesAutoresizingMaskIntoConstraints = false
-        brandIcon.widthAnchor.constraint(equalToConstant: 24).isActive = true
-        brandIcon.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        brandBadge.addSubview(brandIcon)
+        let badgeSize = round(28 * brandScale)
+        NSLayoutConstraint.activate([
+            brandBadge.widthAnchor.constraint(equalToConstant: badgeSize),
+            brandBadge.heightAnchor.constraint(equalToConstant: badgeSize),
+            brandIcon.centerXAnchor.constraint(equalTo: brandBadge.centerXAnchor),
+            brandIcon.centerYAnchor.constraint(equalTo: brandBadge.centerYAnchor)
+        ])
 
-        let brandTitle = NSTextField(labelWithString: "SKY BACKCRAFT")
-        brandTitle.font = .systemFont(ofSize: 13, weight: .bold)
-
-        let brandSub = NSTextField(labelWithString: "Quant Research & Terminal")
-        brandSub.font = .systemFont(ofSize: 10, weight: .medium)
-        brandSub.textColor = TerminalTheme.secondaryText
-
+        let brandTitle = NSTextField(labelWithString: "Sky Backcraft")
+        brandTitle.font = NSFont.systemFont(ofSize: round(13 * brandScale), weight: .semibold)
+        let brandSub = NSTextField(labelWithString: "퀀트 리서치 스튜디오")
+        brandSub.font = NSFont.systemFont(ofSize: round(11 * brandScale))
+        brandSub.textColor = .secondaryLabelColor
         let brandTextStack = NSStackView(views: [brandTitle, brandSub])
         brandTextStack.orientation = .vertical
         brandTextStack.alignment = .leading
-        brandTextStack.spacing = 2
-
-        let brandHeader = NSStackView(views: [brandIcon, brandTextStack])
+        brandTextStack.spacing = 1
+        let brandHeader = NSStackView(views: [brandBadge, brandTextStack])
         brandHeader.orientation = .horizontal
         brandHeader.spacing = 10
         brandHeader.alignment = .centerY
@@ -1057,50 +1294,171 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
         sidebarTable.headerView = nil
         sidebarTable.dataSource = self
         sidebarTable.delegate = self
-        sidebarTable.rowHeight = 36
-        sidebarTable.backgroundColor = TerminalTheme.panel
-        sidebarTable.selectionHighlightStyle = .regular
+        sidebarTable.identifier = NSUserInterfaceItemIdentifier("DashboardNavigationTable")
+        sidebarTable.setAccessibilityLabel("대시보드 기본 화면")
+        sidebarTable.style = .sourceList
+        sidebarTable.rowHeight = TerminalTheme.navigationRowHeight
+        sidebarTable.backgroundColor = .clear
+        sidebarTable.focusRingType = .none
 
         let scroll = NSScrollView()
         scroll.documentView = sidebarTable
         scroll.hasVerticalScroller = true
-        scroll.hasHorizontalScroller = true
-        scroll.drawsBackground = true
-        scroll.backgroundColor = TerminalTheme.panel
+        scroll.hasHorizontalScroller = false
+        scroll.autohidesScrollers = true
+        scroll.drawsBackground = false
+        scroll.contentView.drawsBackground = false
 
         // DB Status Footer
         let footer = NSTextField(labelWithString: DashboardDatabaseStatusSummary(
             historyRunCount: historyTotal,
             policies: allPolicies
         ).label)
-        footer.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
-        footer.textColor = .tertiaryLabelColor
+        footer.font = TerminalTheme.monospacedDigitFont(ofSize: 11)
+        footer.textColor = .secondaryLabelColor
+        footer.setAccessibilityLabel("로컬 실행 및 정책 저장 수")
+        footer.toolTip = footer.stringValue
         databaseStatusFooter = footer
+        updateDatabaseStatusFooter()
+        let footerIcon = NSImageView(image: NSImage(systemSymbolName: "externaldrive", accessibilityDescription: "로컬 데이터베이스") ?? NSImage())
+        footerIcon.contentTintColor = .tertiaryLabelColor
+        footerIcon.setAccessibilityElement(false)
+        footerIcon.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            footerIcon.widthAnchor.constraint(equalToConstant: TerminalTheme.navigationIconSize),
+            footerIcon.heightAnchor.constraint(equalToConstant: TerminalTheme.navigationIconSize)
+        ])
+        databaseStatusFooterIcon = footerIcon
+        let footerRow = NSStackView(views: [footerIcon, footer])
+        footerRow.orientation = .horizontal
+        footerRow.alignment = .centerY
+        footerRow.spacing = 8
 
-        let stack = NSStackView(views: [brandHeader, scroll, footer])
+        let stack = NSStackView(views: [brandHeader, scroll, footerRow])
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 12
+        stack.spacing = 14
+        stack.setCustomSpacing(18, after: brandHeader)
         stack.translatesAutoresizingMaskIntoConstraints = false
-        visualEffect.addSubview(stack)
+        sidebar.addSubview(stack)
 
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: visualEffect.leadingAnchor, constant: 14),
-            stack.trailingAnchor.constraint(equalTo: visualEffect.trailingAnchor, constant: -14),
-            stack.topAnchor.constraint(equalTo: visualEffect.topAnchor, constant: 16),
-            stack.bottomAnchor.constraint(equalTo: visualEffect.bottomAnchor, constant: -14),
+            stack.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 12),
+            stack.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: -12),
+            stack.topAnchor.constraint(equalTo: sidebar.topAnchor, constant: 54),
+            stack.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor, constant: -14),
             scroll.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            brandHeader.widthAnchor.constraint(equalTo: stack.widthAnchor)
+            brandHeader.widthAnchor.constraint(lessThanOrEqualTo: stack.widthAnchor),
+            footerRow.widthAnchor.constraint(lessThanOrEqualTo: stack.widthAnchor)
         ])
+        brandHeader.edgeInsets = NSEdgeInsets(top: 0, left: 6, bottom: 0, right: 0)
+        footerRow.edgeInsets = NSEdgeInsets(top: 0, left: 8, bottom: 0, right: 0)
 
-        return visualEffect
+        return sidebar
     }
 
-    func splitView(_ splitView: NSSplitView, constrainMinCoordinate proposedMinimumPosition: CGFloat, ofSubviewAt dividerIndex: Int) -> CGFloat { 180 }
-    func splitView(_ splitView: NSSplitView, constrainMaxCoordinate proposedMaximumPosition: CGFloat, ofSubviewAt dividerIndex: Int) -> CGFloat { 280 }
+    private func configureWindowToolbar() {
+        guard let window else { return }
+        let toolbar = NSToolbar(identifier: "SkyBackcraft.MainToolbar")
+        toolbar.delegate = self
+        toolbar.displayMode = .iconOnly
+        toolbar.allowsUserCustomization = false
+        window.toolbar = toolbar
+    }
+
+    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        _ = toolbar
+        return [Self.sidebarToolbarIdentifier, Self.sidebarSeparatorIdentifier, .flexibleSpace]
+    }
+
+    func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        _ = toolbar
+        return [Self.sidebarToolbarIdentifier, Self.sidebarSeparatorIdentifier, .space, .flexibleSpace]
+    }
+
+    func toolbar(
+        _ toolbar: NSToolbar,
+        itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier,
+        willBeInsertedIntoToolbar flag: Bool
+    ) -> NSToolbarItem? {
+        _ = toolbar
+        _ = flag
+        if itemIdentifier == Self.sidebarSeparatorIdentifier {
+            return NSTrackingSeparatorToolbarItem(identifier: itemIdentifier, splitView: splitView, dividerIndex: 0)
+        }
+        guard itemIdentifier == Self.sidebarToolbarIdentifier else { return nil }
+        let item = NSToolbarItem(itemIdentifier: itemIdentifier)
+        item.label = "사이드바"
+        item.paletteLabel = "사이드바 표시/가리기"
+        item.toolTip = "사이드바 표시 또는 가리기"
+        item.image = NSImage(systemSymbolName: "sidebar.left", accessibilityDescription: "사이드바")
+        item.target = self
+        item.action = #selector(toggleSidebar(_:))
+        return item
+    }
+
+    @objc func toggleSidebar(_ sender: Any?) {
+        guard let sidebar = splitView.subviews.first else { return }
+        if isSidebarCollapsed {
+            isSidebarCollapsed = false
+            sidebar.isHidden = false
+            splitView.setPosition(sidebarWidthBeforeCollapse, ofDividerAt: 0)
+        } else {
+            let maxSidebarWidth: CGFloat = TerminalTheme.textScale >= 1.5 ? 300 : 280
+            sidebarWidthBeforeCollapse = min(max(sidebar.frame.width, 180), maxSidebarWidth)
+            isSidebarCollapsed = true
+            splitView.setPosition(0, ofDividerAt: 0)
+        }
+        window?.contentView?.layoutSubtreeIfNeeded()
+        if let item = sender as? NSToolbarItem { item.isEnabled = true }
+    }
+
+    func splitView(_ splitView: NSSplitView, constrainMinCoordinate proposedMinimumPosition: CGFloat, ofSubviewAt dividerIndex: Int) -> CGFloat {
+        if splitView === self.splitView { return isSidebarCollapsed ? 0 : 180 }
+        if splitView === historySplitView { return splitView.isVertical ? 420 : 220 }
+        return proposedMinimumPosition
+    }
+
+    func splitView(_ splitView: NSSplitView, constrainMaxCoordinate proposedMaximumPosition: CGFloat, ofSubviewAt dividerIndex: Int) -> CGFloat {
+        if splitView === self.splitView { return TerminalTheme.textScale >= 1.5 ? 300 : 280 }
+        if splitView === historySplitView {
+            return splitView.isVertical ? max(420, splitView.bounds.width - 250) : max(220, splitView.bounds.height - 150)
+        }
+        return proposedMaximumPosition
+    }
 
     func splitView(_ splitView: NSSplitView, shouldAdjustSizeOfSubview view: NSView) -> Bool {
-        view !== splitView.subviews.first
+        if splitView === historySplitView { return true }
+        return view !== splitView.subviews.first
+    }
+
+    func splitView(_ splitView: NSSplitView, canCollapseSubview subview: NSView) -> Bool {
+        guard splitView === self.splitView, subview === splitView.subviews.first else { return false }
+        return isSidebarCollapsed
+    }
+
+    func splitViewDidResizeSubviews(_ notification: Notification) {
+        guard let resized = notification.object as? NSSplitView else { return }
+        if resized === self.splitView, !isSidebarCollapsed, let sidebar = resized.subviews.first {
+            let maxSidebarWidth: CGFloat = TerminalTheme.textScale >= 1.5 ? 300 : 280
+            sidebarWidthBeforeCollapse = min(max(sidebar.frame.width, 180), maxSidebarWidth)
+        } else if resized === historySplitView, let split = historySplitView {
+            let extent = split.isVertical ? split.bounds.width : split.bounds.height
+            guard extent > 0, let leading = split.subviews.first else { return }
+            let leadingExtent = split.isVertical ? leading.frame.width : leading.frame.height
+            let ratio = min(max(leadingExtent / extent, 0.15), 0.85)
+            UserDefaults.standard.set(Double(ratio), forKey: Self.historyDividerDefaultsKey + (split.isVertical ? ".columns" : ".rows"))
+        }
+    }
+
+    private func restoreHistoryDividerPosition(vertical: Bool) {
+        guard let split = historySplitView else { return }
+        let extent = vertical ? split.bounds.width : split.bounds.height
+        guard extent > 0 else { return }
+        let key = Self.historyDividerDefaultsKey + (vertical ? ".columns" : ".rows")
+        let saved = UserDefaults.standard.double(forKey: key)
+        let ratio = (0.15...0.85).contains(saved) ? CGFloat(saved) : (vertical ? 0.62 : 0.55)
+        split.setPosition(extent * ratio, ofDividerAt: 0)
     }
 
     private func selectSection(_ section: Section) {
@@ -1120,9 +1478,10 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
         updateGlobalContextText()
         if section != .backtestAnalysis { markerGeneration &+= 1 }
         synchronizingSidebarSelection = true
-        sidebarTable.selectRowIndexes(IndexSet(integer: section.rawValue), byExtendingSelection: false)
+        sidebarTable.selectRowIndexes(IndexSet(integer: section.sidebarRow), byExtendingSelection: false)
         synchronizingSidebarSelection = false
         refreshCurrentSectionView()
+        refreshSidebarSymbolAppearance()
     }
 
     private func refreshCurrentSectionView() {
@@ -1153,7 +1512,9 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
                         self.selectedModelId = modelId
                         self.loadRunDetails(run)
                         self.refreshCurrentSectionView()
-                    }, onPolicyChange: { [weak self] id in self?.selectedStrategyId = id })
+                    }, onPolicyChange: { [weak self] id in self?.selectedStrategyId = id },
+                    onRefreshCatalog: { [weak self] in self?.loadData() },
+                    initiallyVisible: isStrategyOverviewVisible)
                 strategyOverview = overview
                 view = overview
             }
@@ -1191,18 +1552,44 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
         view.translatesAutoresizingMaskIntoConstraints = false
         configureSectionScrollViews(in: view)
         detailContainer.addSubview(view)
-        globalContext.translatesAutoresizingMaskIntoConstraints = false
-        globalContext.font = TerminalTheme.systemFont(ofSize: 12, weight: .medium)
-        globalContext.textColor = TerminalTheme.secondaryText
-        detailContainer.addSubview(globalContext)
+        mountGlobalContextStrip()
+        realtimeStatusView.translatesAutoresizingMaskIntoConstraints = false
+        let showRealtimeStatus = currentSection == .backtestAnalysis
+        let showRealtimeDetails = showRealtimeStatus && !realtimeStatusCollapsed
+        realtimeStatusDisclosure.setButtonType(.pushOnPushOff)
+        realtimeStatusDisclosure.bezelStyle = .recessed
+        realtimeStatusDisclosure.controlSize = .small
+        realtimeStatusDisclosure.image = NSImage(systemSymbolName: "dot.radiowaves.left.and.right", accessibilityDescription: nil)
+        realtimeStatusDisclosure.imagePosition = .imageLeading
+        realtimeStatusDisclosure.font = TerminalTheme.systemFont(ofSize: 11, weight: .medium)
+        realtimeStatusDisclosure.target = self
+        realtimeStatusDisclosure.action = #selector(toggleRealtimeStatusDisclosure(_:))
+        realtimeStatusDisclosure.title = realtimeStatusCollapsed ? "실시간 상태 펼치기" : "실시간 상태 접기"
+        realtimeStatusDisclosure.state = realtimeStatusCollapsed ? .off : .on
+        realtimeStatusDisclosure.setAccessibilityLabel("실시간 피드 상세 상태")
+        realtimeStatusDisclosure.setAccessibilityValue(realtimeStatusCollapsed ? "접힘" : "펼쳐짐")
+        realtimeStatusDisclosure.isHidden = !showRealtimeStatus
+        realtimeStatusDisclosure.translatesAutoresizingMaskIntoConstraints = false
+        detailContainer.addSubview(realtimeStatusDisclosure)
+        realtimeStatusView.isHidden = !showRealtimeDetails
+        let statusHeight = showRealtimeDetails
+            ? realtimeStatusView.heightAnchor.constraint(greaterThanOrEqualToConstant: max(132, 132 * TerminalTheme.textScale))
+            : realtimeStatusView.heightAnchor.constraint(equalToConstant: 0)
+        statusHeight.isActive = true
+        realtimeStatusHeightConstraint?.isActive = false
+        realtimeStatusHeightConstraint = statusHeight
+        detailContainer.addSubview(realtimeStatusView)
         NSLayoutConstraint.activate([
-            globalContext.leadingAnchor.constraint(equalTo: detailContainer.leadingAnchor, constant: 20),
-            globalContext.trailingAnchor.constraint(equalTo: detailContainer.trailingAnchor, constant: -20),
-            globalContext.topAnchor.constraint(equalTo: detailContainer.topAnchor, constant: 10),
-            globalContext.heightAnchor.constraint(greaterThanOrEqualToConstant: 24),
+            realtimeStatusDisclosure.leadingAnchor.constraint(greaterThanOrEqualTo: detailContainer.leadingAnchor, constant: 20),
+            realtimeStatusDisclosure.trailingAnchor.constraint(equalTo: detailContainer.trailingAnchor, constant: -20),
+            realtimeStatusDisclosure.topAnchor.constraint(equalTo: globalContextStrip?.bottomAnchor ?? detailContainer.topAnchor, constant: showRealtimeStatus ? 8 : 4),
+            realtimeStatusDisclosure.heightAnchor.constraint(equalToConstant: showRealtimeStatus ? ceil(22 * TerminalTheme.textScale) : 0),
+            realtimeStatusView.leadingAnchor.constraint(equalTo: detailContainer.leadingAnchor, constant: 20),
+            realtimeStatusView.trailingAnchor.constraint(equalTo: detailContainer.trailingAnchor, constant: -20),
+            realtimeStatusView.topAnchor.constraint(equalTo: realtimeStatusDisclosure.bottomAnchor, constant: showRealtimeDetails ? 4 : 0),
             view.leadingAnchor.constraint(equalTo: detailContainer.leadingAnchor),
             view.trailingAnchor.constraint(equalTo: detailContainer.trailingAnchor),
-            view.topAnchor.constraint(equalTo: globalContext.bottomAnchor, constant: 4),
+            view.topAnchor.constraint(equalTo: realtimeStatusView.bottomAnchor, constant: showRealtimeDetails ? 4 : 0),
             view.bottomAnchor.constraint(equalTo: detailContainer.bottomAnchor)
         ])
         NSAccessibility.post(element: detailContainer, notification: .layoutChanged)
@@ -1210,6 +1597,8 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
         if currentSection == .paperTradingTelemetry { paperWorkspaceView?.setWorkspaceVisible(true) }
         if currentSection == .strategyAutomation { updateAutomationWorkspaceVisibility() }
         updatePolicyDeletionWorkspaceVisibility()
+        updateRealtimeFeedVisibility()
+        updateStrategyOverviewVisibility()
     }
 
     private func updatePolicyDeletionWorkspaceVisibility() {
@@ -1253,8 +1642,10 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
         let backBtn = NSButton(title: "전략별 그래프", target: self, action: #selector(showStrategyOverview))
         let ledgerButton = NSButton(title: "비용·원장", target: self, action: #selector(openSelectedLedger))
         ledgerButton.isEnabled = currentComparisons.contains { $0.modelId == selectedModelId }
+        runDetailLedgerButton = ledgerButton
         let exportButton = NSButton(title: "CSV", target: self, action: #selector(exportRunResults))
         exportButton.isEnabled = selectedRun != nil
+        runDetailExportButton = exportButton
         let headerRow = NSStackView(views: [headerLabel, spacer1, backBtn, ledgerButton, exportButton, detailBtn, copyBtn, refreshBtn])
         headerRow.orientation = .horizontal
         headerRow.alignment = .centerY
@@ -1265,11 +1656,17 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
 
         runSelector.removeAllItems()
         runSelector.addItem(withTitle: "실행을 선택하세요")
-        for run in allRuns {
+        runSelector.lastItem?.representedObject = nil
+        var selectorRuns = allRuns
+        if let current = selectedRun, !selectorRuns.contains(where: { $0.id == current.id }) {
+            selectorRuns.append(current)
+        }
+        for run in selectorRuns {
             runSelector.addItem(withTitle: runChoiceLabel(run))
+            runSelector.lastItem?.representedObject = run
             runSelector.lastItem?.toolTip = run.id
         }
-        if let current = selectedRun, let idx = allRuns.firstIndex(where: { $0.id == current.id }) {
+        if let current = selectedRun, let idx = selectorRuns.firstIndex(where: { $0.id == current.id }) {
             runSelector.selectItem(at: idx + 1)
         }
         runSelector.target = self
@@ -1345,6 +1742,7 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
         let zoomReset = NSButton(title: "전체", target: self, action: #selector(resetChartZoom))
         let markerButton = NSButton(title: "체결 마커", target: self, action: #selector(loadChartFillMarkers))
         markerButton.isEnabled = selectedModelId != nil
+        runDetailMarkerButton = markerButton
         let modelRow = NSStackView(views: [NSTextField(labelWithString: "표시 모델"), modelSelector, NSView(), markerButton, zoomOut, zoomIn, zoomReset])
         modelRow.orientation = .horizontal
         modelRow.spacing = 10
@@ -1527,6 +1925,10 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
     }
 
     @objc private func runSelectorChanged() {
+        if let run = runSelector.selectedItem?.representedObject as? RealRun {
+            loadRunDetails(run)
+            return
+        }
         let idx = runSelector.indexOfSelectedItem - 1
         if idx >= 0 && idx < allRuns.count {
             loadRunDetails(allRuns[idx])
@@ -1612,86 +2014,380 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
 
     // MARK: - Section 2: All Runs History
 
+    private var hasAdvancedHistoryFilters: Bool {
+        historyPolicy.selectedItem?.representedObject as? String != nil
+            || historyRevision.selectedItem?.representedObject as? String != nil
+            || historyCost.selectedItem?.representedObject as? String != nil
+            || historyDateEnabled.state == .on
+            || historyPinnedOnly.state == .on
+    }
+
+    @objc private func toggleHistoryAdvancedFilters(_ sender: NSButton) {
+        let expanded = sender.state == .on
+        historyAdvancedFiltersPanel?.isHidden = !expanded
+        updateHistoryFilterPresentation()
+        NSAccessibility.post(element: sender, notification: .valueChanged)
+    }
+
     private func buildRunsHistoryView() -> NSView {
         let container = NSView()
+        container.setAccessibilityIdentifier("DashboardRunHistoryWorkspace")
+
         let titleLabel = NSTextField(labelWithString: "실행 이력")
-        titleLabel.font = .systemFont(ofSize: 18, weight: .bold)
+        titleLabel.font = TerminalTheme.screenTitle
 
         runsSearchField.placeholderString = "실행·시장·정책·데이터셋 검색"
         runsSearchField.target = self
         runsSearchField.action = #selector(runsSearchChanged)
+        runsSearchField.font = TerminalTheme.systemFont(ofSize: 12)
+        runsSearchField.setAccessibilityLabel("실행 이력 검색")
+        runsSearchField.widthAnchor.constraint(greaterThanOrEqualToConstant: 220 * TerminalTheme.textScale).isActive = true
 
         let exportButton = NSButton(title: "검색 결과 CSV", target: self, action: #selector(exportHistory))
-        let topBar = NSStackView(views: [titleLabel, runsSearchField, exportButton])
-        topBar.orientation = .horizontal
-        topBar.distribution = .fill
-        topBar.alignment = .centerY
+        let searchRow = NSStackView(views: [runsSearchField, exportButton])
+        searchRow.orientation = .horizontal
+        searchRow.alignment = .centerY
+        searchRow.spacing = 8
+        runsSearchField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let header = NSStackView(views: [titleLabel, searchRow])
+        header.orientation = .vertical
+        header.alignment = .leading
+        header.spacing = 8
+
         configureHistoryFilters()
         historyMore.target = self
         historyMore.action = #selector(loadMoreHistory)
         historyMore.isEnabled = historyCursor != nil
         historyCount.stringValue = "표시 \(filteredRuns.count) / \(historyTotal) · KST"
         historyCount.textColor = TerminalTheme.secondaryText
-        let reset = NSButton(title: "조건 해제", target: self, action: #selector(resetHistoryFilters))
-        let dates = NSStackView(views: [historyStatus, historyMarket, historyDateEnabled, historyFromDate,
-                                      NSTextField(labelWithString: "→"), historyThroughDate, historyPinnedOnly, reset])
-        dates.orientation = .horizontal; dates.spacing = 8
-        let filters = NSStackView(views: [historyPolicy, historyRevision, historyCost])
-        filters.orientation = .horizontal; filters.spacing = 8
-        let scope = NSStackView(views: [historyCount, historyDisplayMode, historyMetricSort, historyMore])
-        scope.orientation = .horizontal; scope.spacing = 10
+        historyCount.font = TerminalTheme.systemFont(ofSize: 12, weight: .medium)
+
+        let scopeTitle = NSTextField(labelWithString: "기본 범위")
+        scopeTitle.font = TerminalTheme.sectionHeading
+        let scopeFilters = NSStackView(views: [historyStatus, historyMarket])
+        scopeFilters.orientation = .horizontal
+        scopeFilters.alignment = .centerY
+        scopeFilters.spacing = 8
+        let primaryScope = NSStackView(views: [scopeTitle, scopeFilters])
+        primaryScope.orientation = .horizontal
+        primaryScope.alignment = .centerY
+        primaryScope.spacing = 8
         historyCount.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
+        let displayTitle = NSTextField(labelWithString: "표시")
+        displayTitle.font = TerminalTheme.sectionHeading
+        let displayControls = NSStackView(views: [displayTitle, historyDisplayMode, historyMetricSort])
+        displayControls.orientation = .horizontal
+        displayControls.alignment = .centerY
+        displayControls.spacing = 8
+
+        historyClearFilters.target = self
+        historyClearFilters.action = #selector(resetHistoryFilters)
+        historyClearFilters.bezelStyle = .rounded
+        historyClearFilters.setAccessibilityLabel("실행 이력 필터 모두 지우기")
+        let identityFilters = NSStackView(views: [historyPolicy, historyRevision])
+        identityFilters.orientation = TerminalTheme.textScale >= 1.5 ? .vertical : .horizontal
+        identityFilters.alignment = TerminalTheme.textScale >= 1.5 ? .leading : .centerY
+        identityFilters.spacing = 8
+        let filterRows = NSStackView(views: [identityFilters, historyCost])
+        filterRows.orientation = .vertical
+        filterRows.alignment = .leading
+        filterRows.spacing = 8
+
+        let dateRows = NSStackView()
+        dateRows.orientation = .vertical
+        dateRows.alignment = .leading
+        dateRows.spacing = 8
+        dateRows.addArrangedSubview(historyDateEnabled)
+        if TerminalTheme.textScale >= 1.5 {
+            dateRows.addArrangedSubview(historyFromDate)
+            dateRows.addArrangedSubview(historyThroughDate)
+        } else {
+            let dateArrow = NSTextField(labelWithString: "→")
+            dateArrow.setAccessibilityElement(false)
+            let dateRange = NSStackView(views: [historyFromDate, dateArrow, historyThroughDate])
+            dateRange.orientation = .horizontal
+            dateRange.alignment = .centerY
+            dateRange.spacing = 8
+            dateRows.addArrangedSubview(dateRange)
+        }
+        let savedFilters = NSStackView(views: [historyPinnedOnly])
+        savedFilters.orientation = .vertical
+        savedFilters.alignment = .leading
+        savedFilters.spacing = 8
+
+        let advancedFilters = NSStackView(views: [filterRows, dateRows, savedFilters])
+        advancedFilters.orientation = .vertical
+        advancedFilters.alignment = .leading
+        advancedFilters.spacing = 10
+        advancedFilters.isHidden = !hasAdvancedHistoryFilters
+        historyAdvancedFiltersPanel = advancedFilters
+        historyAdvancedFiltersDisclosure.setButtonType(.toggle)
+        historyAdvancedFiltersDisclosure.bezelStyle = .rounded
+        historyAdvancedFiltersDisclosure.target = self
+        historyAdvancedFiltersDisclosure.action = #selector(toggleHistoryAdvancedFilters(_:))
+        historyAdvancedFiltersDisclosure.state = advancedFilters.isHidden ? .off : .on
+        historyAdvancedFiltersDisclosure.setAccessibilityLabel("고급 실행 필터")
+        historyAdvancedFiltersDisclosure.setAccessibilityValue(advancedFilters.isHidden ? "접힘" : "펼쳐짐")
+        historyAdvancedFiltersDisclosure.setAccessibilityHelp("정책, 정책 리비전, 비용 조건, 기간, 고정 실행 필터")
+
+        historyAppliedFiltersSummary.font = TerminalTheme.systemFont(ofSize: 11, weight: .medium)
+        historyAppliedFiltersSummary.textColor = TerminalTheme.secondaryText
+        historyAppliedFiltersSummary.maximumNumberOfLines = 2
+        historyAppliedFiltersSummary.lineBreakMode = .byTruncatingTail
+        historyAppliedFiltersSummary.setAccessibilityIdentifier("DashboardRunHistoryAppliedFiltersSummary")
+        historyAppliedFiltersSummary.setAccessibilityLabel("현재 실행 이력 필터")
+        historyAppliedFiltersSummary.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let appliedFilters = NSStackView(views: [historyAppliedFiltersSummary, historyClearFilters, historyAdvancedFiltersDisclosure])
+        appliedFilters.orientation = .horizontal
+        appliedFilters.alignment = .centerY
+        appliedFilters.spacing = 8
+        updateHistoryFilterPresentation()
+
         setupRunsTable()
-        let scroll = NSScrollView()
-        scroll.documentView = runsTable
-        scroll.hasVerticalScroller = true
-        scroll.hasHorizontalScroller = true
+        let tableScroll = NSScrollView()
+        tableScroll.documentView = runsTable
+        tableScroll.hasVerticalScroller = true
+        tableScroll.hasHorizontalScroller = true
+        tableScroll.autohidesScrollers = true
+        tableScroll.drawsBackground = false
+        tableScroll.translatesAutoresizingMaskIntoConstraints = false
+        tableScroll.identifier = NSUserInterfaceItemIdentifier("DashboardRunHistoryTableScroll")
+        tableScroll.setAccessibilityLabel("실행 이력 표")
+        historyTableScroll = tableScroll
+
+        let leftPane = NSView()
+        leftPane.setAccessibilityIdentifier("DashboardRunHistoryTablePane")
+        leftPane.addSubview(tableScroll)
+        historyMore.bezelStyle = .rounded
+        historyMore.setContentCompressionResistancePriority(.required, for: .horizontal)
+        historyMore.setContentHuggingPriority(.required, for: .horizontal)
+        historyCount.lineBreakMode = .byTruncatingTail
+        let footerSpacer = NSView()
+        footerSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let tableFooter = NSStackView(views: TerminalTheme.textScale >= 1.5
+            ? [historyCount, historyMore]
+            : [historyCount, footerSpacer, historyMore])
+        tableFooter.orientation = TerminalTheme.textScale >= 1.5 ? .vertical : .horizontal
+        tableFooter.alignment = TerminalTheme.textScale >= 1.5 ? .leading : .centerY
+        tableFooter.spacing = 8
+        tableFooter.translatesAutoresizingMaskIntoConstraints = false
+        leftPane.addSubview(tableFooter)
+        NSLayoutConstraint.activate([
+            tableScroll.leadingAnchor.constraint(equalTo: leftPane.leadingAnchor),
+            tableScroll.trailingAnchor.constraint(equalTo: leftPane.trailingAnchor, constant: -6),
+            tableScroll.topAnchor.constraint(equalTo: leftPane.topAnchor),
+            tableScroll.bottomAnchor.constraint(equalTo: tableFooter.topAnchor, constant: -6),
+            tableFooter.leadingAnchor.constraint(equalTo: leftPane.leadingAnchor),
+            tableFooter.trailingAnchor.constraint(equalTo: leftPane.trailingAnchor, constant: -6),
+            tableFooter.bottomAnchor.constraint(equalTo: leftPane.bottomAnchor)
+        ])
 
         historyDetail.font = TerminalTheme.body
-        historyDetail.textColor = TerminalTheme.secondaryText
+        historyDetail.textColor = .labelColor
         historyDetail.maximumNumberOfLines = 0
         historyDetail.lineBreakMode = .byWordWrapping
         historyDetail.setAccessibilityLabel("선택된 실행 상세")
+        historyIdentityRows.orientation = .vertical
+        historyIdentityRows.alignment = .leading
+        historyIdentityRows.spacing = 6
+        historyIdentityRows.setAccessibilityIdentifier("DashboardRunHistoryIdentity")
+        historyIdentityRows.setAccessibilityLabel("실행 식별 및 데이터 근거")
         historyOpen.target = self
         historyOpen.action = #selector(openHistorySelection)
         historyOpen.isEnabled = historySelection.count == 1
-        let clearSelection = NSButton(title: "선택 해제", target: self, action: #selector(clearHistorySelection))
-        let actions = NSStackView(views: [historyOpen, historyCopy, historyPin, historyCompare, historyRecent, clearSelection])
-        actions.orientation = .horizontal; actions.spacing = 8
-        let selectedRow = NSStackView(views: [historyDetail, actions])
-        selectedRow.orientation = .vertical
-        selectedRow.spacing = 6
-        selectedRow.alignment = .leading
+        for button in [historyOpen, historyCompare, historyRecent] {
+            button.bezelStyle = .rounded
+        }
+        let primaryActions = NSStackView(views: [historyOpen, historyCompare, historyRecent, historyActionsPullDown])
+        primaryActions.orientation = TerminalTheme.textScale >= 1.5 ? .vertical : .horizontal
+        primaryActions.alignment = TerminalTheme.textScale >= 1.5 ? .leading : .centerY
+        primaryActions.spacing = 8
+        let selectedContent = NSStackView(views: [historyDetail, historyIdentityRows, primaryActions])
+        selectedContent.orientation = .vertical
+        selectedContent.alignment = .leading
+        selectedContent.spacing = 8
+        selectedContent.translatesAutoresizingMaskIntoConstraints = false
         historyDetail.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        historyWorkspaceLabel.font = TerminalTheme.body
+        let selectionPanel = NSBox()
+        selectionPanel.boxType = .custom
+        selectionPanel.cornerRadius = 8
+        selectionPanel.title = "선택 상세"
+        selectionPanel.titleFont = TerminalTheme.sectionHeading
+        selectionPanel.borderWidth = 1
+        selectionPanel.borderColor = TerminalTheme.border
+        selectionPanel.fillColor = TerminalTheme.panel
+        selectionPanel.contentViewMargins = NSSize(width: 12, height: 8)
+        let selectionContent = NSView(frame: .zero)
+        selectionPanel.setAccessibilityIdentifier("DashboardRunHistorySelectionInspector")
+        selectionPanel.contentView = selectionContent
+        selectionContent.addSubview(selectedContent)
+        NSLayoutConstraint.activate([
+            selectedContent.leadingAnchor.constraint(equalTo: selectionContent.leadingAnchor),
+            selectedContent.trailingAnchor.constraint(equalTo: selectionContent.trailingAnchor),
+            selectedContent.topAnchor.constraint(equalTo: selectionContent.topAnchor),
+            selectedContent.bottomAnchor.constraint(equalTo: selectionContent.bottomAnchor)
+        ])
+
+        historyActionsPullDown.removeAllItems()
+        historyActionsPullDown.pullsDown = true
+        historyActionsPullDown.addItem(withTitle: "추가 작업")
+        historyActionsPullDown.setAccessibilityLabel("선택 실행 추가 작업")
+        historyActionsPullDown.toolTip = "선택한 실행 ID 복사, 고정 또는 선택 해제"
+        let actionsMenu = historyActionsPullDown.menu ?? NSMenu(title: "추가 작업")
+        historyCopyMenuItem = NSMenuItem(title: "실행 ID 복사", action: #selector(copyHistoryRunIDs), keyEquivalent: "")
+        historyPinMenuItem = NSMenuItem(title: "선택 고정", action: #selector(pinSelectedHistory), keyEquivalent: "")
+        historyClearMenuItem = NSMenuItem(title: "선택 해제", action: #selector(clearHistorySelection), keyEquivalent: "")
+        for item in [historyCopyMenuItem, historyPinMenuItem, historyClearMenuItem].compactMap({ $0 }) {
+            item.target = self
+            actionsMenu.addItem(item)
+        }
+        historyActionsPullDown.menu = actionsMenu
+
+        let contextMenu = NSMenu(title: "실행 이력")
+        historyContextOpenMenuItem = NSMenuItem(title: "성과에서 열기", action: #selector(openHistorySelection), keyEquivalent: "")
+        historyContextCompareMenuItem = NSMenuItem(title: "선택 비교", action: #selector(compareSelectedHistory), keyEquivalent: "")
+        historyContextPinMenuItem = NSMenuItem(title: "선택 고정", action: #selector(pinSelectedHistory), keyEquivalent: "")
+        historyContextCopyMenuItem = NSMenuItem(title: "실행 ID 복사", action: #selector(copyHistoryRunIDs), keyEquivalent: "")
+        for item in [historyContextOpenMenuItem, historyContextCompareMenuItem,
+                     historyContextPinMenuItem, historyContextCopyMenuItem].compactMap({ $0 }) {
+            item.target = self
+            contextMenu.addItem(item)
+        }
+        runsTable.menu = contextMenu
+        runsTable.openSelectedRun = { [weak self] in self?.openHistorySelection() }
+        runsTable.clearRunSelection = { [weak self] in self?.clearHistorySelection() }
+
+        historyWorkspaceLabel.font = TerminalTheme.systemFont(ofSize: 11)
         historyWorkspaceLabel.textColor = TerminalTheme.secondaryText
-        historyWorkspaceLabel.maximumNumberOfLines = 2
-        historyWorkspaceLabel.stringValue = historyWorkspaceError ?? "필터·고정·선택은 이 기기에 저장됩니다."
-        let stack = NSStackView(views: [topBar, dates, filters, scope, scroll, selectedRow, historyWorkspaceLabel])
+        historyWorkspaceLabel.maximumNumberOfLines = 0
+        historyWorkspaceLabel.lineBreakMode = .byWordWrapping
+        historyWorkspaceLabel.setAccessibilityLabel("실행 이력 보기 상태 및 피드백")
+        showHistoryWorkspaceFeedback(historyWorkspaceError ?? "필터·고정·선택은 이 기기에 저장됩니다.")
+        let inspectorDocument = TerminalFlippedDocumentView()
+        inspectorDocument.translatesAutoresizingMaskIntoConstraints = false
+        let inspectorStack = NSStackView(views: [selectionPanel])
+        inspectorStack.orientation = .vertical
+        inspectorStack.alignment = .leading
+        inspectorStack.spacing = 10
+        inspectorStack.translatesAutoresizingMaskIntoConstraints = false
+        inspectorDocument.addSubview(inspectorStack)
+        let inspectorScroll = NSScrollView()
+        inspectorScroll.documentView = inspectorDocument
+        inspectorScroll.hasVerticalScroller = true
+        inspectorScroll.hasHorizontalScroller = false
+        inspectorScroll.autohidesScrollers = true
+        inspectorScroll.drawsBackground = false
+        inspectorScroll.setAccessibilityLabel("선택 실행 상세 및 보기 상태")
+        inspectorScroll.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            inspectorDocument.widthAnchor.constraint(equalTo: inspectorScroll.contentView.widthAnchor),
+            inspectorStack.leadingAnchor.constraint(equalTo: inspectorDocument.leadingAnchor),
+            inspectorStack.trailingAnchor.constraint(equalTo: inspectorDocument.trailingAnchor),
+            inspectorStack.topAnchor.constraint(equalTo: inspectorDocument.topAnchor),
+            inspectorStack.bottomAnchor.constraint(equalTo: inspectorDocument.bottomAnchor),
+            selectionPanel.widthAnchor.constraint(equalTo: inspectorStack.widthAnchor)
+        ])
+        let inspectorPane = NSView()
+        inspectorPane.setAccessibilityIdentifier("DashboardRunHistoryInspectorPane")
+        inspectorPane.addSubview(inspectorScroll)
+        historyWorkspaceLabel.translatesAutoresizingMaskIntoConstraints = false
+        historyWorkspaceLabel.maximumNumberOfLines = 0
+        inspectorPane.addSubview(historyWorkspaceLabel)
+        NSLayoutConstraint.activate([
+            inspectorScroll.leadingAnchor.constraint(equalTo: inspectorPane.leadingAnchor, constant: 8),
+            inspectorScroll.trailingAnchor.constraint(equalTo: inspectorPane.trailingAnchor),
+            inspectorScroll.topAnchor.constraint(equalTo: inspectorPane.topAnchor),
+            inspectorScroll.bottomAnchor.constraint(equalTo: historyWorkspaceLabel.topAnchor, constant: -8),
+            historyWorkspaceLabel.leadingAnchor.constraint(equalTo: inspectorPane.leadingAnchor, constant: 8),
+            historyWorkspaceLabel.trailingAnchor.constraint(equalTo: inspectorPane.trailingAnchor),
+            historyWorkspaceLabel.bottomAnchor.constraint(equalTo: inspectorPane.bottomAnchor)
+        ])
+
+        let workbench = HistoryWorkbenchSplitView()
+        workbench.isVertical = true
+        workbench.dividerStyle = .thin
+        workbench.delegate = self
+        workbench.identifier = NSUserInterfaceItemIdentifier("DashboardRunHistoryWorkbench")
+        workbench.translatesAutoresizingMaskIntoConstraints = false
+        workbench.addArrangedSubview(leftPane)
+        workbench.addArrangedSubview(inspectorPane)
+        workbench.orientationDidChange = { [weak self] vertical in self?.restoreHistoryDividerPosition(vertical: vertical) }
+        historyWorkbenchSplitView = workbench
+
+        let stack = NSStackView(views: [header, primaryScope, appliedFilters, advancedFilters,
+                                        displayControls, workbench])
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 12
+        stack.spacing = 8
+        stack.detachesHiddenViews = true
         stack.translatesAutoresizingMaskIntoConstraints = false
+        workbench.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
         container.addSubview(stack)
 
         NSLayoutConstraint.activate([
             stack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 20),
             stack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -20),
-            stack.topAnchor.constraint(equalTo: container.topAnchor, constant: 18),
-            stack.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -18),
-            topBar.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            dates.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            filters.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            scope.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            selectedRow.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            selectedRow.heightAnchor.constraint(greaterThanOrEqualToConstant: 76),
-            historyWorkspaceLabel.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            scroll.widthAnchor.constraint(equalTo: stack.widthAnchor)
+            stack.topAnchor.constraint(equalTo: container.topAnchor, constant: 16),
+            stack.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -16),
+            header.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            searchRow.widthAnchor.constraint(equalTo: header.widthAnchor),
+            primaryScope.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            displayControls.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            appliedFilters.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            historyAppliedFiltersSummary.widthAnchor.constraint(lessThanOrEqualTo: appliedFilters.widthAnchor),
+            advancedFilters.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            workbench.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            workbench.heightAnchor.constraint(greaterThanOrEqualToConstant: 260)
         ])
 
         fetchHistoryPage(append: false)
         return container
+    }
+
+    private func showHistoryWorkspaceFeedback(_ message: String) {
+        guard historyWorkspaceLabel.stringValue != message else { return }
+        historyWorkspaceLabel.stringValue = message
+        historyWorkspaceLabel.toolTip = message
+        historyWorkspaceLabel.setAccessibilityValue(message)
+        if historyWorkspaceLabel.superview != nil {
+            NSAccessibility.post(element: historyWorkspaceLabel, notification: .valueChanged)
+        }
+    }
+
+    private func updateHistoryFilterPresentation() {
+        var filters: [String] = []
+        if historyStatus.indexOfSelectedItem > 0, let title = historyStatus.titleOfSelectedItem { filters.append("상태 \(title)") }
+        if historyMarket.indexOfSelectedItem > 0, let title = historyMarket.titleOfSelectedItem { filters.append("시장 \(title)") }
+        if let policyId = historyPolicy.selectedItem?.representedObject as? String {
+            filters.append("정책 \(historyPolicy.titleOfSelectedItem ?? String(policyId.suffix(8)))")
+        }
+        if let revisionId = historyRevision.selectedItem?.representedObject as? String {
+            filters.append("리비전 \(historyRevision.titleOfSelectedItem ?? String(revisionId.suffix(8)))")
+        }
+        if let cost = historyCost.selectedItem?.representedObject as? String { filters.append("비용 \(historyCostTitle(cost))") }
+        if historyDateEnabled.state == .on {
+            let formatter = Self.historyDayFormatter()
+            filters.append("기록일 \(formatter.string(from: historyFromDate.dateValue))–\(formatter.string(from: historyThroughDate.dateValue)) KST")
+        }
+        if historyPinnedOnly.state == .on { filters.append("고정만 \(historyPinnedIds.count)개") }
+        let search = runsSearchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !search.isEmpty { filters.insert("검색 \(search)", at: 0) }
+
+        let summary = filters.isEmpty ? "활성 필터 없음" : "적용 중: " + filters.joined(separator: " · ")
+        historyAppliedFiltersSummary.stringValue = summary
+        historyAppliedFiltersSummary.toolTip = summary
+        historyAppliedFiltersSummary.setAccessibilityValue(summary)
+        historyClearFilters.isEnabled = !filters.isEmpty
+        historyClearFilters.toolTip = filters.isEmpty ? "지울 실행 이력 필터가 없습니다." : summary
+        let advancedCount = (historyPolicy.selectedItem?.representedObject as? String != nil ? 1 : 0)
+            + (historyRevision.selectedItem?.representedObject as? String != nil ? 1 : 0)
+            + (historyCost.selectedItem?.representedObject as? String != nil ? 1 : 0)
+            + (historyDateEnabled.state == .on ? 1 : 0)
+            + (historyPinnedOnly.state == .on ? 1 : 0)
+        historyAdvancedFiltersDisclosure.title = advancedCount > 0 ? "고급 필터 · \(advancedCount)개 적용" : "고급 필터"
+        historyAdvancedFiltersDisclosure.setAccessibilityValue("\(historyAdvancedFiltersPanel?.isHidden == false ? "펼쳐짐" : "접힘") · 고급 필터 \(advancedCount)개 적용")
+        historyAdvancedFiltersDisclosure.setAccessibilityHelp(summary)
     }
 
     private func configureHistoryFilters() {
@@ -1719,9 +2415,11 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
         for (popup, label, width) in [(historyStatus, "실행 상태", 102.0), (historyMarket, "실행 시장", 108.0),
                                       (historyPolicy, "실행 정책", 270.0), (historyRevision, "정책 리비전", 230.0)] {
             popup.setAccessibilityLabel(label)
-            popup.widthAnchor.constraint(equalToConstant: width).isActive = true
+            popup.font = TerminalTheme.systemFont(ofSize: 12)
+            popup.widthAnchor.constraint(equalToConstant: width * TerminalTheme.textScale).isActive = true
         }
         historyCost.setAccessibilityLabel("비용 시나리오")
+        historyCost.font = TerminalTheme.systemFont(ofSize: 12)
         historyCost.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         historyDateEnabled.target = self; historyDateEnabled.action = #selector(runsSearchChanged)
         var calendar = Calendar(identifier: .gregorian)
@@ -1734,7 +2432,7 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
             picker.dateValue = Date()
             picker.target = self; picker.action = #selector(runsSearchChanged)
             picker.setAccessibilityLabel(label)
-            picker.widthAnchor.constraint(equalToConstant: 125).isActive = true
+            picker.widthAnchor.constraint(equalToConstant: 125 * TerminalTheme.textScale).isActive = true
             picker.isEnabled = false
         }
         if let latest = allRuns.first { historyFromDate.dateValue = Date(timeIntervalSince1970: Double(latest.createdAtMilliseconds) / 1000) }
@@ -1742,8 +2440,6 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
         historyDisplayMode.selectedSegment = 0
         historyDisplayMode.target = self; historyDisplayMode.action = #selector(historyDisplayChanged)
         historyCompare.target = self; historyCompare.action = #selector(compareSelectedHistory)
-        historyPin.target = self; historyPin.action = #selector(pinSelectedHistory)
-        historyCopy.target = self; historyCopy.action = #selector(copyHistoryRunIDs)
         historyRecent.target = self; historyRecent.action = #selector(openRecentHistoryRun)
         historyMetricSort.addItems(withTitles: ["표시된 행 정렬", "선택 모델 수익률 ↓", "선택 모델 낙폭 ↑"])
         historyMetricSort.target = self; historyMetricSort.action = #selector(historyMetricSortChanged)
@@ -1772,6 +2468,9 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
         for popup in [historyStatus, historyMarket, historyPolicy, historyCost] { popup.selectItem(at: 0) }
         rebuildHistoryRevisions(); historyRevision.selectItem(at: 0)
         historyDateEnabled.state = .off; historyPinnedOnly.state = .off
+        historyAdvancedFiltersDisclosure.state = .off
+        historyAdvancedFiltersPanel?.isHidden = true
+        updateHistoryFilterPresentation()
         runsSearchChanged()
     }
 
@@ -1850,20 +2549,20 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
             lastOpenedRunId: lastOpenedHistoryRunId)
         do {
             try historyWorkspace.saveHistoryState(state)
-            historyWorkspaceLabel.stringValue = "필터·고정·선택 보기 상태 저장됨"
-        } catch { historyWorkspaceLabel.stringValue = "보기 상태 저장 실패 · 기존 파일을 유지합니다. \(error.localizedDescription)" }
+            showHistoryWorkspaceFeedback("필터·고정·선택 보기 상태 저장됨")
+        } catch { showHistoryWorkspaceFeedback("보기 상태 저장 실패 · 기존 파일을 유지합니다. \(error.localizedDescription)") }
     }
 
     @objc private func openRecentHistoryRun() {
         guard let id = lastOpenedHistoryRunId else { return }
         do {
             guard let run = try dbReader.fetchRunHistoryPage(filter: RunHistoryFilter(pinnedRunIds: [id]), limit: 1).items.first else {
-                historyWorkspaceLabel.stringValue = "최근 실행이 현재 원장에 없습니다. 다른 실행으로 대체하지 않았습니다."
+                showHistoryWorkspaceFeedback("최근 실행이 현재 원장에 없습니다. 다른 실행으로 대체하지 않았습니다.")
                 return
             }
             showingRunDetails = true; selectedModelId = nil
             loadRunDetails(run); selectSection(.backtestAnalysis)
-        } catch { historyWorkspaceLabel.stringValue = "최근 실행 조회 실패 · 원장을 확인하세요." }
+        } catch { showHistoryWorkspaceFeedback("최근 실행 조회 실패 · 원장을 확인하세요.") }
     }
 
     @objc private func historyMetricSortChanged() {
@@ -1871,7 +2570,7 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
         if historyMetricSort.indexOfSelectedItem == 0 {
             resetHistoryMetricOrdering()
             historyCount.stringValue = "표시 \(filteredRuns.count) / \(historyTotal) · KST"
-            historyWorkspaceLabel.stringValue = "지표 정렬 해제 · 표시된 실행을 최신순으로 정렬합니다."
+            showHistoryWorkspaceFeedback("지표 정렬 해제 · 표시된 실행을 최신순으로 정렬합니다.")
         } else { applyHistoryMetricOrdering() }
     }
 
@@ -1894,7 +2593,7 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
               historyMarket.indexOfSelectedItem > 0, let market = historyMarket.titleOfSelectedItem else {
             resetHistoryMetricOrdering()
             persistHistoryState()
-            historyWorkspaceLabel.stringValue = "지표 정렬은 정책과 시장을 정확히 선택한 뒤 사용할 수 있습니다. 독립 모델을 합산하지 않습니다."
+            showHistoryWorkspaceFeedback("지표 정렬은 정책과 시장을 정확히 선택한 뒤 사용할 수 있습니다. 독립 모델을 합산하지 않습니다.")
             return
         }
         do {
@@ -1911,11 +2610,11 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
             restoringHistorySelection = true; setupRunsTable(); runsTable.reloadData(); restoringHistorySelection = false
             restoreHistorySelection(); updateHistorySelection()
             historyCount.stringValue = "표시 \(filteredRuns.count) / \(historyTotal) · 선택 모델 정렬 · 미확인 \(result.unavailableCount) · 모호 \(result.ambiguousCount)"
-            historyWorkspaceLabel.stringValue = "정책·시장·리비전의 단일 모델로 표시된 행만 정렬합니다. 기간·비용·자본 조건을 함께 확인하세요."
+            showHistoryWorkspaceFeedback("정책·시장·리비전의 단일 모델로 표시된 행만 정렬합니다. 기간·비용·자본 조건을 함께 확인하세요.")
         } catch {
             resetHistoryMetricOrdering()
             persistHistoryState()
-            historyWorkspaceLabel.stringValue = "지표 정렬 불가 · 정확한 모델 또는 표시된 행 범위를 확인하세요(최대 100행)."
+            showHistoryWorkspaceFeedback("지표 정렬 불가 · 정확한 모델 또는 표시된 행 범위를 확인하세요(최대 100행).")
         }
     }
 
@@ -1997,18 +2696,98 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
         let hidden = historySelection.keys.filter { !visibleIds.contains($0) }.count
         historyRecent.isEnabled = lastOpenedHistoryRunId != nil
         historyOpen.isEnabled = count == 1
-        historyCopy.isEnabled = count > 0; historyPin.isEnabled = count > 0
         historyCompare.isEnabled = (2...4).contains(count)
-        historyPin.title = count > 0 && historySelection.keys.allSatisfy({ historyPinnedIds.contains($0) }) ? "고정 해제" : "선택 고정"
+        let allSelectedPinned = count > 0 && historySelection.keys.allSatisfy({ historyPinnedIds.contains($0) })
+        let pinTitle = allSelectedPinned ? "선택 고정 해제" : "선택 고정"
+        historyPinMenuItem?.title = pinTitle
+        historyContextPinMenuItem?.title = pinTitle
+        historyCopyMenuItem?.isEnabled = count > 0
+        historyPinMenuItem?.isEnabled = count > 0
+        historyClearMenuItem?.isEnabled = count > 0
+        historyContextOpenMenuItem?.isEnabled = count == 1
+        historyContextCompareMenuItem?.isEnabled = (2...4).contains(count)
+        historyContextPinMenuItem?.isEnabled = count > 0
+        historyContextCopyMenuItem?.isEnabled = count > 0
+        historyActionsPullDown.isEnabled = count > 0
+
+        for row in historyIdentityRows.arrangedSubviews {
+            historyIdentityRows.removeArrangedSubview(row)
+            row.removeFromSuperview()
+        }
         if count == 1, let run = historySelection.values.first {
             let metricSuffix = selectedMetricSummary(for: run.id).map { " · \($0)" } ?? ""
-            historyDetail.stringValue = "\(run.id) · \(TerminalPresentation.state(run.state)) · F08 \(run.f08Status ?? "미검증")\(metricSuffix)\n정책 리비전 \(run.policyRevisionIds?.count ?? 0) · 데이터셋 \(run.datasetIds?.count ?? 0) · \(hidden > 0 ? "현재 필터에서 숨김" : "현재 목록")"
-            historyDetail.toolTip = "평가 \(run.windowStartUTC ?? "미확인") → \(run.windowEndUTC ?? "미확인") UTC\(metricSuffix.isEmpty ? "" : "\n\(metricSuffix.dropFirst(3))")\n데이터셋\n\(run.datasetIds?.joined(separator: "\n") ?? "미확인")\n정책 리비전\n\(run.policyRevisionIds?.joined(separator: "\n") ?? "미확인")"
+            historyDetail.stringValue = "\(TerminalPresentation.state(run.state)) · F08 \(run.f08Status ?? "미검증")\(metricSuffix) · \(hidden > 0 ? "현재 필터에서 숨김" : "현재 목록")"
+            historyDetail.toolTip = historyDetail.stringValue
+            appendHistoryIdentityFields(for: run)
         } else {
-            historyDetail.stringValue = count == 0 ? "실행을 선택하세요. ⌘ 클릭으로 최대 4개를 비교할 수 있습니다." : "\(count)개 선택 · 현재 필터에서 숨김 \(hidden)개 · 고정 \(historyPinnedIds.count)개\n기간·비용·자본이 다른 결과는 독립 그래프로 비교합니다."
+            historyDetail.stringValue = count == 0
+                ? "실행을 선택하세요. ⌘ 클릭으로 최대 4개를 비교할 수 있습니다."
+                : "\(count)개 선택 · 현재 필터에서 숨김 \(hidden)개 · 고정 \(historyPinnedIds.count)개\n기간·비용·자본이 다른 결과는 독립 그래프로 비교합니다."
+            if count > 1 {
+                for run in historySelection.values.sorted(by: { $0.createdAtMilliseconds > $1.createdAtMilliseconds }) {
+                    appendHistoryIdentityFields(for: run, includeHeading: true)
+                }
+            }
         }
         historyDetail.setAccessibilityValue(historyDetail.stringValue)
+        NSAccessibility.post(element: historyDetail, notification: .valueChanged)
         refreshSelectionAppearance(runsTable)
+    }
+
+    private func appendHistoryIdentityFields(for run: RealRun, includeHeading: Bool = false) {
+        if includeHeading {
+            let heading = NSTextField(labelWithString: "\(TerminalPresentation.state(run.state)) · \(run.createdDateStr)")
+            heading.font = TerminalTheme.sectionHeading
+            heading.setAccessibilityLabel("선택 실행 · \(run.id)")
+            historyIdentityRows.addArrangedSubview(heading)
+        }
+
+        let revisionIds = run.policyRevisionIds ?? []
+        let policyIds = Set(historyFilterOptions?.policyRevisions
+            .filter { revisionIds.contains($0.id) }
+            .map(\.policyId) ?? []).sorted()
+        func valueOrDash(_ value: String?) -> String {
+            guard let value, !value.isEmpty else { return "—" }
+            return value
+        }
+        let marketValue = run.markets?.isEmpty == false ? run.markets?.joined(separator: ", ") ?? "—" : "—"
+        let datasetValue = run.datasetIds?.isEmpty == false ? run.datasetIds?.joined(separator: "\n") ?? "—" : "—"
+        let values: [(String, String)] = [
+            ("실행 ID", run.id),
+            ("정책 ID", policyIds.isEmpty ? "—" : policyIds.joined(separator: "\n")),
+            ("리비전 ID", revisionIds.isEmpty ? "—" : revisionIds.joined(separator: "\n")),
+            ("시장", marketValue),
+            ("데이터셋 ID", datasetValue),
+            ("실행 유형", valueOrDash(run.mode)),
+            ("기록 시각 KST", valueOrDash(run.createdDateStr)),
+            ("평가 기간 UTC", "\(valueOrDash(run.windowStartUTC)) → \(valueOrDash(run.windowEndUTC))")
+        ]
+        for (labelText, valueText) in values {
+            let label = NSTextField(labelWithString: labelText)
+            label.font = TerminalTheme.systemFont(ofSize: 10, weight: .semibold)
+            label.textColor = TerminalTheme.secondaryText
+            label.setAccessibilityElement(false)
+            let value = NSTextField(wrappingLabelWithString: valueText)
+            value.font = TerminalTheme.monospacedFont(ofSize: 10)
+            value.textColor = .labelColor
+            value.isSelectable = true
+            value.lineBreakMode = .byTruncatingMiddle
+            value.maximumNumberOfLines = 3
+            value.toolTip = valueText
+            value.setAccessibilityLabel(labelText)
+            value.setAccessibilityValue(valueText)
+            value.setAccessibilityHelp(valueText == "—" ? "이 실행에 대해 확인된 값이 없습니다." : valueText)
+            value.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            let row = NSStackView(views: [label, value])
+            row.orientation = TerminalTheme.textScale >= 1.5 ? .vertical : .horizontal
+            row.alignment = TerminalTheme.textScale >= 1.5 ? .leading : .firstBaseline
+            row.spacing = 4
+            if TerminalTheme.textScale < 1.5 {
+                label.widthAnchor.constraint(equalToConstant: 82).isActive = true
+            }
+            historyIdentityRows.addArrangedSubview(row)
+            row.widthAnchor.constraint(equalTo: historyIdentityRows.widthAnchor).isActive = true
+        }
     }
 
     @objc private func copyHistoryRunIDs() {
@@ -2054,6 +2833,7 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
         historyFromDate.isEnabled = historyDateEnabled.state == .on
         historyThroughDate.isEnabled = historyDateEnabled.state == .on
         historyCost.toolTip = historyCost.selectedItem?.representedObject as? String
+        updateHistoryFilterPresentation()
         persistHistoryState(); fetchHistoryPage(append: false)
     }
 
@@ -2085,6 +2865,7 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
             historyCursor = page.nextCursor
             historyMore.isEnabled = page.nextCursor != nil
             historyCount.stringValue = "표시 \(filteredRuns.count) / \(page.totalCount) · KST"
+            if !append { resetHistoryTableScroll() }
             restoringHistorySelection = true
             runsTable.reloadData()
             restoringHistorySelection = false
@@ -2099,6 +2880,14 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
             if case LedgerReadError.invalidFilter(let reason) = error { historyCount.stringValue = reason }
             historyMore.isEnabled = false
         }
+        updateHistoryFilterPresentation()
+    }
+
+    private func resetHistoryTableScroll() {
+        guard let historyTableScroll else { return }
+        historyTableScroll.contentView.scroll(to: .zero)
+        if runsTable.numberOfRows > 0 { runsTable.scrollRowToVisible(0) }
+        historyTableScroll.reflectScrolledClipView(historyTableScroll.contentView)
     }
 
     @objc private func runTableDoubleClicked() {
@@ -2126,23 +2915,33 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
 
     private func buildPaperTradingView() -> NSView {
         if let existing = paperWorkspaceView {
+            updateJobsQueuePresentation()
             jobsTable.reloadData()
             return existing
         }
 
         let queueContainer = NSView()
-        let queueHeader = NSTextField(
-            labelWithString: "5. 백그라운드 연구 작업 큐 · 최근 30건 (대기/실행 작업: \(activeJobs.count)건 · 일시중지 수집 스케줄: \(pausedSchedules.count)개 — 재개하지 않음)"
-        )
-        queueHeader.font = .systemFont(ofSize: 13, weight: .semibold)
+        queueContainer.setAccessibilityIdentifier("DashboardPaperJobsQueue")
+        let queueHeader = NSTextField(labelWithString: "백그라운드 작업")
+        queueHeader.font = TerminalTheme.sectionHeading
+        queueHeader.setAccessibilityLabel("백그라운드 작업 상태")
+        jobsQueueHeader = queueHeader
 
         setupJobsTable()
+        jobsListScope.target = self
+        jobsListScope.action = #selector(jobsListScopeChanged)
+        jobsListScope.selectedSegment = 0
+        jobsListScope.setAccessibilityLabel("백그라운드 작업 범위")
         let scroll = NSScrollView()
         scroll.documentView = jobsTable
         scroll.hasVerticalScroller = true
         scroll.hasHorizontalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.drawsBackground = false
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.heightAnchor.constraint(equalToConstant: min(360, max(160, TerminalTheme.tableRowHeight * 5))).isActive = true
 
-        let stack = NSStackView(views: [queueHeader, scroll])
+        let stack = NSStackView(views: [queueHeader, jobsListScope, scroll])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 8
@@ -2155,10 +2954,13 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
             stack.topAnchor.constraint(equalTo: queueContainer.topAnchor),
             stack.bottomAnchor.constraint(equalTo: queueContainer.bottomAnchor),
             queueHeader.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            jobsListScope.widthAnchor.constraint(lessThanOrEqualTo: stack.widthAnchor),
             scroll.widthAnchor.constraint(equalTo: stack.widthAnchor)
         ])
+        updateJobsQueuePresentation()
 
         let workspace = PaperTradingWorkspaceView(
+            realtimeFeedService: realtimeFeedService,
             jobsQueueView: queueContainer,
             onSummaryChanged: { [weak self] summary in
                 guard let self else { return }
@@ -2177,6 +2979,7 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
         }
         let workspace = AutomationWorkspaceView(
             policies: allPolicies,
+            realtimeFeedService: realtimeFeedService,
             privacyIsMasked: { [weak self] in self?.isPrivacyMasked ?? false },
             onTogglePrivacyMask: { [weak self] in self?.togglePrivacyMask() },
             onSummaryChanged: { [weak self] summary in
@@ -2191,7 +2994,6 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
 
     private func updateGlobalContextText() {
         let clock = liveClock()
-        let automationContext = currentSection == .strategyAutomation ? " · \(automationSummaryText)" : ""
         let orderFreshness = orderScope.selectedSegment == 1 ? closedOrdersFreshness : openOrdersFreshness
         let accountReadState = balanceFreshness.freshness(clock: clock)
         let orderReadState = orderFreshness.freshness(clock: clock)
@@ -2208,43 +3010,239 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
             readStatus = "잔고·주문 조회: 일부 상태 확인 필요"
         }
         let automationStatus: String
-        guard let snapshot = controlFreshness.lastSuccess?.value else {
-            automationStatus = "실주문 자동매매 상태 미확인 · 주문 기능 사용 불가"
-            globalContext.stringValue = "연구: 과거 원장 · \(paperSummaryText)\(automationContext) · \(readStatus) · \(automationStatus)"
-            return
-        }
-        guard controlFreshness.freshness(clock: clock) == .live else {
-            let lastKnown = !snapshot.live_trading_enabled ? "꺼짐"
-                : (snapshot.order_admission_blocked ? "차단" : "설정 켜짐")
-            automationStatus = "실주문 자동매매 상태 미확인 · 마지막 확인 \(lastKnown) · 주문 기능 사용 불가"
-            globalContext.stringValue = "연구: 과거 원장 · \(paperSummaryText)\(automationContext) · \(readStatus) · \(automationStatus)"
-            return
-        }
-        if !snapshot.live_trading_enabled {
-            automationStatus = "실주문 자동매매: 꺼짐 — 실제 주문 전송 안 함"
-        } else if snapshot.emergency_latched || snapshot.order_admission_blocked {
-            automationStatus = snapshot.emergency_latched
-                ? "실주문 자동매매 설정: 켜짐 · 긴급 차단 확인"
-                : "실주문 자동매매 설정: 켜짐 · 신규 주문 차단"
+        if let snapshot = controlFreshness.lastSuccess?.value {
+            if controlFreshness.freshness(clock: clock) != .live {
+                let lastKnown = !snapshot.live_trading_enabled ? "꺼짐"
+                    : (snapshot.order_admission_blocked ? "차단" : "설정 켜짐")
+                automationStatus = "실주문 자동매매 상태 미확인 · 마지막 확인 \(lastKnown) · 주문 기능 사용 불가"
+            } else if !snapshot.live_trading_enabled {
+                automationStatus = "실주문 자동매매: 꺼짐 — 실제 주문 전송 안 함"
+            } else if snapshot.emergency_latched || snapshot.order_admission_blocked {
+                automationStatus = snapshot.emergency_latched
+                    ? "실주문 자동매매 설정: 켜짐 · 긴급 차단 확인"
+                    : "실주문 자동매매 설정: 켜짐 · 신규 주문 차단"
+            } else {
+                automationStatus = "실주문 자동매매 설정: 켜짐"
+            }
         } else {
-            automationStatus = "실주문 자동매매 설정: 켜짐"
+            automationStatus = "실주문 자동매매 상태 미확인 · 주문 기능 사용 불가"
         }
-        globalContext.stringValue = "연구: 과거 원장 · \(paperSummaryText)\(automationContext) · \(readStatus) · \(automationStatus)"
+
+        func removingPrefix(_ value: String, _ prefix: String) -> String {
+            value.hasPrefix(prefix) ? String(value.dropFirst(prefix.count)) : value
+        }
+
+        var facts = [
+            GlobalContextFact(domain: "연구", value: "과거 원장"),
+            GlobalContextFact(domain: "지속 모의", value: removingPrefix(paperSummaryText, "지속 모의: "))
+        ]
+        if currentSection == .strategyAutomation {
+            facts.append(GlobalContextFact(domain: "전략 자동화", value: removingPrefix(automationSummaryText, "전략 자동화: ")))
+        }
+        facts.append(GlobalContextFact(domain: "계좌 관찰", value: readStatus))
+        facts.append(GlobalContextFact(domain: "실거래", value: automationStatus))
+        guard facts != globalContextFacts else { return }
+
+        let wasMounted = globalContextStrip?.superview === detailContainer
+        globalContextPopover.performClose(nil)
+        globalContextFacts = facts
+        if globalContextStrip == nil {
+            let host = NSView(frame: .zero)
+            host.identifier = NSUserInterfaceItemIdentifier("DashboardGlobalContextStrip")
+            host.setAccessibilityElement(true)
+            host.setAccessibilityRole(.group)
+            host.setAccessibilityLabel("도메인별 상태")
+            globalContextStrip = host
+        }
+        guard let host = globalContextStrip else { return }
+        globalContextContent?.removeFromSuperview()
+        let content = makeGlobalContextStrip(facts)
+        content.translatesAutoresizingMaskIntoConstraints = false
+        host.addSubview(content)
+        NSLayoutConstraint.activate([
+            content.leadingAnchor.constraint(equalTo: host.leadingAnchor),
+            content.trailingAnchor.constraint(equalTo: host.trailingAnchor),
+            content.topAnchor.constraint(equalTo: host.topAnchor),
+            content.bottomAnchor.constraint(equalTo: host.bottomAnchor)
+        ])
+        globalContextContent = content
+        if wasMounted {
+            NSAccessibility.post(element: host, notification: .layoutChanged)
+        }
+    }
+
+    private func makeGlobalContextStrip(_ facts: [GlobalContextFact]) -> NSView {
+        let root = NSView(frame: .zero)
+
+        func row(_ items: [NSView]) -> NSStackView {
+            let spacer = NSView()
+            spacer.setContentHuggingPriority(.init(1), for: .horizontal)
+            spacer.setContentCompressionResistancePriority(.init(1), for: .horizontal)
+            let stack = NSStackView(views: items + [spacer])
+            stack.orientation = .horizontal
+            stack.alignment = .centerY
+            stack.distribution = .fill
+            stack.spacing = 8
+            return stack
+        }
+
+        let rows = NSStackView()
+        rows.orientation = .vertical
+        rows.alignment = .leading
+        rows.spacing = 6
+        rows.translatesAutoresizingMaskIntoConstraints = false
+
+        let liveFact = facts.last.map(makeGlobalContextFactView)
+        if TerminalTheme.textScale >= 1.5 {
+            let leadingFacts = Array(facts.prefix(2)).map(makeGlobalContextFactView)
+            rows.addArrangedSubview(row(leadingFacts))
+            let middleFacts = Array(facts.dropFirst(min(2, facts.count)).dropLast())
+            var trailingItems: [NSView] = []
+            if !middleFacts.isEmpty {
+                trailingItems.append(makeGlobalContextOverflowButton(omittedCount: middleFacts.count))
+            }
+            if let liveFact, facts.count > leadingFacts.count {
+                trailingItems.append(liveFact)
+            }
+            if !trailingItems.isEmpty { rows.addArrangedSubview(row(trailingItems)) }
+        } else if facts.count > 4, let liveFact {
+            let leadingFacts = Array(facts.prefix(3)).map(makeGlobalContextFactView)
+            let omittedCount = facts.count - leadingFacts.count - 1
+            rows.addArrangedSubview(row(leadingFacts + [makeGlobalContextOverflowButton(omittedCount: omittedCount), liveFact]))
+        } else {
+            rows.addArrangedSubview(row(facts.map(makeGlobalContextFactView)))
+        }
+
+        root.addSubview(rows)
+        NSLayoutConstraint.activate([
+            rows.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            rows.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            rows.topAnchor.constraint(equalTo: root.topAnchor),
+            root.bottomAnchor.constraint(equalTo: rows.bottomAnchor)
+        ])
+        for row in rows.arrangedSubviews {
+            row.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+        }
+        return root
+    }
+
+    /// Unknown is amber, confirmed-off is neutral, enabled real orders and emergency stops are red.
+    private static func globalContextTone(_ value: String) -> TerminalTone {
+        if value.contains("긴급 차단") { return .critical }
+        if value.contains("미확인") || value.contains("확인 필요") || value.contains("연결 안 됨")
+            || value.contains("실패") || value.contains("신규 주문 차단") { return .warning }
+        if value.contains("자동매매 설정: 켜짐") { return .critical }
+        if value.contains("연결됨") || value.contains("실행 중") { return .positive }
+        if value.contains("과거 원장") { return .accent }
+        return .neutral
+    }
+
+    private func makeGlobalContextFactView(_ fact: GlobalContextFact) -> NSView {
+        TerminalStatusPill(domain: fact.domain, value: fact.value, tone: Self.globalContextTone(fact.value))
+    }
+
+    private func makeGlobalContextOverflowButton(omittedCount: Int) -> NSButton {
+        let button = NSButton(title: "+\(omittedCount)", target: self, action: #selector(showGlobalContextPopover(_:)))
+        button.bezelStyle = .recessed
+        button.controlSize = .small
+        button.font = TerminalTheme.systemFont(ofSize: 11, weight: .semibold)
+        button.toolTip = "모든 도메인 상태 보기"
+        button.setAccessibilityLabel("모든 도메인 상태 보기")
+        button.setAccessibilityValue("추가 상태 \(omittedCount)개")
+        return button
+    }
+
+    /// Top of the usable content area: below the unified toolbar when content runs under the title bar.
+    private var contentTopAnchor: NSLayoutYAxisAnchor {
+        (window?.contentLayoutGuide as? NSLayoutGuide)?.topAnchor ?? detailContainer.topAnchor
+    }
+
+    private func mountGlobalContextStrip() {
+        guard let strip = globalContextStrip else { return }
+        strip.translatesAutoresizingMaskIntoConstraints = false
+        detailContainer.addSubview(strip)
+        NSLayoutConstraint.activate([
+            strip.leadingAnchor.constraint(equalTo: detailContainer.leadingAnchor, constant: 20),
+            strip.trailingAnchor.constraint(equalTo: detailContainer.trailingAnchor, constant: -20),
+            strip.topAnchor.constraint(equalTo: contentTopAnchor, constant: 10)
+        ])
+    }
+
+    @objc private func showGlobalContextPopover(_ sender: NSButton) {
+        let rowHeight: CGFloat = TerminalTheme.textScale >= 1.5 ? 84 : 52
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: 420, height: max(120, CGFloat(globalContextFacts.count) * rowHeight + 24)))
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 10
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        for fact in globalContextFacts {
+            let item = makeGlobalContextFactView(fact)
+            item.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+            stack.addArrangedSubview(item)
+        }
+        content.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
+            stack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
+            stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
+            stack.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -12)
+        ])
+        let controller = NSViewController()
+        controller.view = content
+        globalContextPopover.contentViewController = controller
+        globalContextPopover.behavior = .transient
+        globalContextPopover.show(relativeTo: sender.bounds, of: sender, preferredEdge: .maxY)
+    }
+
+    @objc private func toggleRealtimeStatusDisclosure(_ sender: NSButton) {
+        realtimeStatusCollapsed = sender.state != .on
+        sender.title = realtimeStatusCollapsed ? "실시간 상태 펼치기" : "실시간 상태 접기"
+        sender.setAccessibilityValue(realtimeStatusCollapsed ? "접힘" : "펼쳐짐")
+        let showDetails = currentSection == .backtestAnalysis && !realtimeStatusCollapsed
+        realtimeStatusView.isHidden = !showDetails
+        realtimeStatusHeightConstraint?.isActive = false
+        realtimeStatusHeightConstraint = showDetails
+            ? realtimeStatusView.heightAnchor.constraint(greaterThanOrEqualToConstant: max(132, 132 * TerminalTheme.textScale))
+            : realtimeStatusView.heightAnchor.constraint(equalToConstant: 0)
+        realtimeStatusHeightConstraint?.isActive = true
+        detailContainer.layoutSubtreeIfNeeded()
+    }
+
+    private func scheduleTooltip(_ schedule: RealCollectionSchedule) -> String {
+        var details = [
+            "스케줄 ID \(schedule.id)",
+            "상태 원문 \(schedule.status)",
+            "등록 시각 KST \(displayKST(schedule.createdAt))",
+            "다음 동작 KST \(displayKST(schedule.nextActionAt))"
+        ]
+        if let datasetId = schedule.lastSuccessDatasetId {
+            details.append("최근 성공 데이터셋 ID \(datasetId)")
+        }
+        if let boundary = schedule.lastSuccessBoundary {
+            details.append("최근 성공 경계 KST \(displayKST(boundary))")
+        }
+        if let failureCode = schedule.failureCode {
+            details.append("최근 실패 코드 \(failureCode)")
+        }
+        return details.joined(separator: "\n")
     }
 
     private func setupJobsTable() {
         jobsTable.removeAllColumns()
+        jobsTable.identifier = NSUserInterfaceItemIdentifier("DashboardPaperJobsTable")
+        jobsTable.setAccessibilityLabel("백그라운드 작업 및 일시중지 수집 목록")
         let cols = [
-            ("JobId", "작업 ID (Job ID)", 260),
-            ("ReqId", "요청 식별자 (Request ID)", 200),
-            ("Kind", "종류", 100),
-            ("JobStatus", "상태", 100),
-            ("JobDate", "제출 시각 (KST)", 160)
+            ("JobId", "작업·스케줄 ID", 260),
+            ("ReqId", "요청 ID", 200),
+            ("Kind", "종류", 130),
+            ("JobStatus", "상태", 115),
+            ("JobDate", "등록 시각 (KST)", 180)
         ]
         for (id, title, w) in cols {
             let tc = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(id))
             tc.title = title
-            tc.width = CGFloat(w)
+            tc.width = CGFloat(w) * TerminalTheme.textScale
             jobsTable.addTableColumn(tc)
         }
         jobsTable.dataSource = self
@@ -2252,16 +3250,36 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
         TerminalTheme.prepareTable(jobsTable)
     }
 
+    @objc private func jobsListScopeChanged() {
+        updateJobsQueuePresentation()
+        jobsTable.reloadData()
+    }
+
+    private func updateJobsQueuePresentation() {
+        jobsListScope.setLabel("최근 30건 · \(recentJobs.count)", forSegment: 0)
+        jobsListScope.setLabel("대기·실행 · \(activeJobs.count)", forSegment: 1)
+        jobsListScope.setLabel("일시중지 · \(pausedSchedules.count)", forSegment: 2)
+        let scopeTitle: String
+        switch jobsListScope.selectedSegment {
+        case 1: scopeTitle = "대기 및 실행 작업"
+        case 2: scopeTitle = "일시중지 수집 스케줄"
+        default: scopeTitle = "최근 작업"
+        }
+        jobsQueueHeader?.stringValue = "백그라운드 작업 · \(scopeTitle) · 조회 전용"
+        jobsQueueHeader?.toolTip = "최근 작업 \(recentJobs.count)건 · 대기/실행 작업 \(activeJobs.count)건 · 일시중지 수집 스케줄 \(pausedSchedules.count)개"
+        jobsListScope.setAccessibilityValue("\(scopeTitle) · 최근 \(recentJobs.count)건 · 대기/실행 \(activeJobs.count)건 · 일시중지 수집 \(pausedSchedules.count)개")
+    }
+
     // MARK: - Section 5: Real-time Live Trading & Balances
 
     private func buildLiveTradingView() -> NSView {
         let container = NSView()
         let titleLabel = NSTextField(labelWithString: "실계좌 및 주문 조회")
-        titleLabel.font = .systemFont(ofSize: 18, weight: .bold)
+        titleLabel.font = TerminalTheme.screenTitle
 
         let safetyBox = NSBox()
         safetyBox.boxType = .custom
-        safetyBox.cornerRadius = 6
+        safetyBox.cornerRadius = 8
         safetyBox.borderWidth = 1.5
         safetyBox.borderColor = NSColor.systemRed.withAlphaComponent(0.6)
         safetyBox.fillColor = TerminalTheme.panel
@@ -2270,7 +3288,7 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
             ? "\n검증 세션 응답은 실제 계좌 관측 증거가 아닙니다."
             : ""
         let safetyText = NSTextField(wrappingLabelWithString: "조회 전용 모니터\n잔고·주문 조회 상태와 실주문 자동매매 허용은 서로 다릅니다. 이 화면은 조회만 하며 주문 제출·취소를 하지 않습니다.\(reviewQualifier)")
-        safetyText.font = .systemFont(ofSize: 12, weight: .semibold)
+        safetyText.font = TerminalTheme.systemFont(ofSize: 12, weight: .semibold)
         safetyText.textColor = TerminalTheme.secondaryText
 
         safetyBox.addSubview(safetyText)
@@ -2283,15 +3301,16 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
         ])
 
         for label in [liveExchangeLabel, liveTradeLockLabel, liveStateLabel] {
-            label.font = .systemFont(ofSize: 12, weight: .semibold)
+            label.font = TerminalTheme.systemFont(ofSize: 12, weight: .semibold)
             label.textColor = TerminalTheme.secondaryText
         }
         liveExchangeLabel.setAccessibilityLabel("잔고·주문 조회 상태")
         liveTradeLockLabel.setAccessibilityLabel("실주문 자동매매 상태")
         liveStateLabel.setAccessibilityLabel("서버 실행 제어 상태")
         let stateRow = NSStackView(views: [liveExchangeLabel, liveTradeLockLabel, liveStateLabel])
-        stateRow.orientation = .horizontal
-        stateRow.distribution = .fillEqually
+        stateRow.orientation = TerminalTheme.textScale >= 1.5 ? .vertical : .horizontal
+        stateRow.alignment = TerminalTheme.textScale >= 1.5 ? .leading : .centerY
+        stateRow.distribution = TerminalTheme.textScale >= 1.5 ? .fill : .fillEqually
         stateRow.spacing = 12
 
         liveRefreshButton.target = self
@@ -2303,22 +3322,23 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
         settingsButton.bezelStyle = .rounded
         let actionRow = NSStackView(views: [liveRefreshButton, automaticLiveReadButton, settingsButton])
         actionRow.orientation = .horizontal
+        actionRow.alignment = .centerY
         actionRow.spacing = 8
 
         // Upbit Balance Card
         let balanceBox = NSBox()
         balanceBox.boxType = .custom
-        balanceBox.cornerRadius = 6
+        balanceBox.cornerRadius = 8
         balanceBox.borderWidth = 1
         balanceBox.borderColor = TerminalTheme.border
         balanceBox.fillColor = TerminalTheme.panel
 
         let balanceHeading = NSTextField(labelWithString: "Upbit 실계좌 · 읽기 전용")
-        balanceHeading.font = .systemFont(ofSize: 13, weight: .bold)
+        balanceHeading.font = TerminalTheme.sectionHeading
 
-        upbitBalanceLabel.font = .monospacedSystemFont(ofSize: 13, weight: .medium)
+        upbitBalanceLabel.font = TerminalTheme.monospacedFont(ofSize: 13, weight: .medium)
         upbitBalanceLabel.textColor = .labelColor
-        balanceReadStatus.font = .systemFont(ofSize: 11)
+        balanceReadStatus.font = TerminalTheme.systemFont(ofSize: 11)
         balanceReadStatus.textColor = TerminalTheme.secondaryText
         balanceReadStatus.setAccessibilityLabel("잔고 조회 출처와 신선도")
 
@@ -2348,13 +3368,13 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
 
         let ordersBox = NSBox()
         ordersBox.boxType = .custom
-        ordersBox.cornerRadius = 6
+        ordersBox.cornerRadius = 8
         ordersBox.borderWidth = 1
         ordersBox.borderColor = TerminalTheme.border
         ordersBox.fillColor = TerminalTheme.panel
 
         let ordersHeading = NSTextField(labelWithString: "Upbit 주문 내역 · 읽기 전용")
-        ordersHeading.font = .systemFont(ofSize: 13, weight: .bold)
+        ordersHeading.font = TerminalTheme.sectionHeading
 
         setupOpenOrdersTable()
         let ordersScroll = NSScrollView()
@@ -2362,12 +3382,12 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
         ordersScroll.hasVerticalScroller = true
         ordersScroll.hasHorizontalScroller = true
         ordersScroll.translatesAutoresizingMaskIntoConstraints = false
-        ordersScroll.heightAnchor.constraint(equalToConstant: 132).isActive = true
+        ordersScroll.heightAnchor.constraint(equalToConstant: max(132, 132 * TerminalTheme.textScale)).isActive = true
 
         orderScope.selectedSegment = max(orderScope.selectedSegment, 0)
         orderScope.target = self
         orderScope.action = #selector(orderScopeChanged)
-        orderReadStatus.font = .systemFont(ofSize: 12)
+        orderReadStatus.font = TerminalTheme.systemFont(ofSize: 12)
         orderReadStatus.textColor = TerminalTheme.secondaryText
         orderReadStatus.setAccessibilityLabel("주문 조회 범위와 신선도")
         nextOrderPageButton.target = self
@@ -2376,7 +3396,7 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
         copyOrderIdButton.target = self
         copyOrderIdButton.action = #selector(copySelectedOrderId)
         copyOrderIdButton.isEnabled = false
-        orderDetailLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        orderDetailLabel.font = TerminalTheme.monospacedFont(ofSize: 11, weight: .regular)
         orderDetailLabel.textColor = TerminalTheme.secondaryText
         let orderButtons = NSStackView(views: [nextOrderPageButton, copyOrderIdButton])
         orderButtons.orientation = .horizontal
@@ -2398,15 +3418,15 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
 
         let auditorBox = NSBox()
         auditorBox.boxType = .custom
-        auditorBox.cornerRadius = 6
+        auditorBox.cornerRadius = 8
         auditorBox.borderWidth = 1
         auditorBox.borderColor = TerminalTheme.border
         auditorBox.fillColor = TerminalTheme.panel
 
         let auditorTitle = NSTextField(labelWithString: "계좌·주문 데이터 근거")
-        auditorTitle.font = .systemFont(ofSize: 13, weight: .bold)
+        auditorTitle.font = TerminalTheme.sectionHeading
 
-        liveAuditLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        liveAuditLabel.font = TerminalTheme.monospacedFont(ofSize: 11, weight: .regular)
         liveAuditLabel.textColor = TerminalTheme.secondaryText
 
         let auditorStack = NSStackView(views: [auditorTitle, liveAuditLabel])
@@ -2423,12 +3443,18 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
             auditorStack.bottomAnchor.constraint(equalTo: auditorBox.bottomAnchor, constant: -12)
         ])
 
-        let stack = NSStackView(views: [titleLabel, safetyBox, stateRow, actionRow, balanceBox, ordersBox, auditorBox])
+        let accountCards = NSStackView(views: [balanceBox, ordersBox])
+        accountCards.orientation = TerminalTheme.textScale >= 1.5 ? .vertical : .horizontal
+        accountCards.alignment = TerminalTheme.textScale >= 1.5 ? .leading : .top
+        accountCards.distribution = .fill
+        accountCards.spacing = 12
+
+        let stack = NSStackView(views: [titleLabel, safetyBox, stateRow, actionRow, accountCards, auditorBox])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 12
         stack.translatesAutoresizingMaskIntoConstraints = false
-        let document = NSView()
+        let document = TerminalFlippedDocumentView()
         document.translatesAutoresizingMaskIntoConstraints = false
         document.addSubview(stack)
         let scroll = NSScrollView()
@@ -2443,9 +3469,6 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
             scroll.trailingAnchor.constraint(equalTo: container.trailingAnchor),
             scroll.topAnchor.constraint(equalTo: container.topAnchor),
             scroll.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-            document.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
-            document.trailingAnchor.constraint(equalTo: scroll.contentView.trailingAnchor),
-            document.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
             document.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
             stack.leadingAnchor.constraint(equalTo: document.leadingAnchor, constant: 20),
             stack.trailingAnchor.constraint(equalTo: document.trailingAnchor, constant: -20),
@@ -2454,10 +3477,19 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
             titleLabel.widthAnchor.constraint(equalTo: stack.widthAnchor),
             safetyBox.widthAnchor.constraint(equalTo: stack.widthAnchor),
             stateRow.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            balanceBox.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            ordersBox.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            accountCards.widthAnchor.constraint(equalTo: stack.widthAnchor),
             auditorBox.widthAnchor.constraint(equalTo: stack.widthAnchor)
         ])
+        if TerminalTheme.textScale >= 1.5 {
+            NSLayoutConstraint.activate([
+                balanceBox.widthAnchor.constraint(equalTo: accountCards.widthAnchor),
+                ordersBox.widthAnchor.constraint(equalTo: accountCards.widthAnchor)
+            ])
+        } else {
+            NSLayoutConstraint.activate([
+                balanceBox.widthAnchor.constraint(equalTo: ordersBox.widthAnchor, multiplier: 0.6)
+            ])
+        }
 
         renderLiveMonitor(reloadOrders: true)
         return container
@@ -2557,6 +3589,28 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
         automationWorkspaceView?.setWorkspaceVisible(isAutomationWorkspaceVisible)
     }
 
+    private var isStrategyOverviewVisible: Bool {
+        currentSection == .backtestAnalysis && !showingRunDetails
+            && window?.isVisible == true
+            && window?.isMiniaturized == false
+            && window?.occlusionState.contains(.visible) == true
+    }
+
+    private func updateStrategyOverviewVisibility() {
+        strategyOverview?.setWorkspaceVisible(isStrategyOverviewVisible)
+    }
+
+    private func updateRealtimeFeedVisibility() {
+        let sectionShowsRealtimeStatus = currentSection == .backtestAnalysis
+            || currentSection == .paperTradingTelemetry
+            || currentSection == .strategyAutomation
+            || currentSection == .liveTradingMonitor
+        let windowIsVisible = window.map {
+            $0.isVisible && !$0.isMiniaturized && $0.occlusionState.contains(.visible)
+        } ?? false
+        realtimeFeedService.setVisible(sectionShowsRealtimeStatus && windowIsVisible)
+    }
+
     private var visibleOrderSnapshot: UpbitOrdersSnapshot? {
         if orderScope.selectedSegment == 1 {
             return closedOrdersFreshness.lastSuccess?.value
@@ -2592,6 +3646,7 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
 
     private func cancelLiveRequests() {
         liveContextGeneration &+= 1
+        privateFeedInvalidation.clearPending()
         let clock = liveClock()
         let reason = ReadFreshnessFailure.other("화면 또는 조회 범위 변경으로 요청 취소")
         if balancePending { balanceFreshness.fail(reason, clock: clock) }
@@ -2624,6 +3679,15 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
         renderOrders()
         renderControlState()
         renderLiveStatusSummary()
+        if privateFeedInvalidation.takeIfReady(
+            isVisible: isLiveMonitorVisible,
+            readInFlight: hasPendingLiveRead,
+            writeInFlight: false,
+            budgetAvailable: liveReadBudgetAvailable
+        ) {
+            refreshLiveCycle(includeControlRead: false)
+            return
+        }
         guard automaticLiveReadButton.state == .on,
               let due = nextAutomaticLiveRead,
               liveMonotonicNow() >= due,
@@ -2632,7 +3696,7 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
         refreshLiveCycle()
     }
 
-    private func refreshLiveCycle() {
+    private func refreshLiveCycle(includeControlRead: Bool = true) {
         guard isLiveMonitorVisible, !hasPendingLiveRead else { return }
         guard !CommandLine.arguments.contains("--gui-review") || CommandLine.arguments.contains("--gui-review-read-only") else {
             liveAuditLabel.stringValue = "GUI 검토 모드 · 실계좌 네트워크 조회를 수행하지 않습니다."
@@ -2642,10 +3706,11 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
             renderLiveMonitor()
             return
         }
+        privateFeedInvalidation.clearPending()
         let generation = liveContextGeneration
         startBalanceRead(generation: generation)
         startOrderRead(generation: generation)
-        startControlRead(generation: generation)
+        if includeControlRead { startControlRead(generation: generation) }
         if automaticLiveReadButton.state == .on {
             nextAutomaticLiveRead = liveMonotonicNow() + 30
         }
@@ -2791,7 +3856,7 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
         case .mockData?: reason = .other("실계좌 연결 아님 · Mock 표시 거부")
         case .cancelled?: reason = .other("조회 취소")
         case .busy?: reason = .other("동시 조회 한도")
-        case .toolRejected?: reason = .other("Backend 요청 거부")
+        case .toolRejected?, .paperEventPageByteBudgetExceeded?: reason = .other("Backend 요청 거부")
         case nil: reason = .other(error.localizedDescription)
         }
         freshness.fail(reason, clock: clock)
@@ -3142,42 +4207,103 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
     }
 
     private func updateDatabaseStatusFooter() {
-        databaseStatusFooter?.stringValue = DashboardDatabaseStatusSummary(
+        let summary = DashboardDatabaseStatusSummary(
             historyRunCount: historyTotal,
             policies: allPolicies
         ).label
+        databaseStatusFooter?.stringValue = TerminalTheme.textScale >= 1.5
+            ? "\(historyTotal) 실행 · \(allPolicies.count) 정책"
+            : summary
+        databaseStatusFooter?.toolTip = summary
+        databaseStatusFooter?.setAccessibilityValue(summary)
     }
 
     // MARK: - NSTableViewDataSource & NSTableViewDelegate
 
     func numberOfRows(in tableView: NSTableView) -> Int {
         if tableView == sidebarTable {
-            return Section.allCases.count
+            return SidebarRow.ordered.count
         } else if tableView == comparisonsTable {
             return currentComparisons.count
         } else if tableView == runsTable {
             return filteredRuns.count
         } else if tableView == jobsTable {
-            return recentJobs.count
+            return visibleJobsListItems.count
         } else if tableView == openOrdersTable {
             return visibleOrders.count
         }
         return 0
     }
 
+    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+        guard tableView == sidebarTable else { return tableView.rowHeight }
+        return TerminalTheme.navigationRowHeight
+    }
+
+    func tableView(_ tableView: NSTableView, isGroupRow row: Int) -> Bool {
+        guard tableView == sidebarTable, SidebarRow.ordered.indices.contains(row) else { return false }
+        return SidebarRow.ordered[row].isGroup
+    }
+
+    func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool {
+        guard tableView == sidebarTable else { return true }
+        return SidebarRow.ordered.indices.contains(row) && !SidebarRow.ordered[row].isGroup
+    }
+
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         let identifier = tableColumn?.identifier.rawValue ?? ""
 
         if tableView == sidebarTable {
-            let sec = Section(rawValue: row) ?? .backtestAnalysis
-            let cell = NSTextField(labelWithString: sec.title)
-            cell.font = .systemFont(ofSize: 12, weight: row == currentSection.rawValue ? .bold : .medium)
-            cell.textColor = row == currentSection.rawValue ? .labelColor : .secondaryLabelColor
-            if tableView.selectedRowIndexes.contains(row) {
-                let emphasized = tableView.rowView(atRow: row, makeIfNecessary: false)?.isEmphasized ?? (tableView.window?.isKeyWindow == true)
-                cell.textColor = emphasized ? .alternateSelectedControlTextColor : .labelColor
+            guard SidebarRow.ordered.indices.contains(row) else { return nil }
+            switch SidebarRow.ordered[row] {
+            case .group(let title):
+                let label = NSTextField(labelWithString: title)
+                label.font = TerminalTheme.navigationGroup
+                label.textColor = .secondaryLabelColor
+                label.setAccessibilityLabel(title)
+                return label
+            case .route(let section):
+                let cell = NSTableCellView()
+                cell.identifier = NSUserInterfaceItemIdentifier("DashboardNavigationRouteCell")
+
+                let icon = DashboardSidebarSymbolView()
+                icon.image = NSImage(systemSymbolName: section.symbolName, accessibilityDescription: nil)
+                icon.symbolConfiguration = NSImage.SymbolConfiguration(
+                    pointSize: TerminalTheme.navigationIconSize,
+                    weight: .medium
+                )
+                icon.updateTint(isSelected: sidebarTable.selectedRow == row, isEmphasized: window?.isKeyWindow == true)
+                icon.translatesAutoresizingMaskIntoConstraints = false
+                NSLayoutConstraint.activate([
+                    icon.widthAnchor.constraint(equalToConstant: TerminalTheme.navigationIconSize),
+                    icon.heightAnchor.constraint(equalToConstant: TerminalTheme.navigationIconSize)
+                ])
+
+                let title = NSTextField(labelWithString: section.title)
+                title.font = TerminalTheme.navigationItem
+                title.lineBreakMode = .byTruncatingTail
+                title.toolTip = section.title
+                title.textColor = sidebarTable.selectedRow == row && window?.isKeyWindow == true
+                    ? .alternateSelectedControlTextColor
+                    : .labelColor
+                title.setAccessibilityIdentifier("dashboard.navigation.\(section.rawValue)")
+                title.setAccessibilityLabel(section.title)
+                title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+                cell.textField = title
+
+                let route = NSStackView(views: [icon, title])
+                route.orientation = .horizontal
+                route.alignment = .centerY
+                route.spacing = 10
+                route.translatesAutoresizingMaskIntoConstraints = false
+                cell.addSubview(route)
+                NSLayoutConstraint.activate([
+                    route.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 12),
+                    route.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -8),
+                    route.centerYAnchor.constraint(equalTo: cell.centerYAnchor)
+                ])
+                return cell
             }
-            return cell
         }
 
         if tableView == comparisonsTable {
@@ -3275,22 +4401,50 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
         }
 
         if tableView == jobsTable {
-            guard row < recentJobs.count else { return nil }
-            let item = recentJobs[row]
+            let items = visibleJobsListItems
+            guard items.indices.contains(row) else { return nil }
             let str: String
+            let toolTip: String
+            let rawStatus: String?
             switch identifier {
-            case "JobId": str = item.id
-            case "ReqId": str = item.requestId
-            case "Kind": str = item.payloadKind
-            case "JobStatus": str = TerminalPresentation.state(item.status)
-            case "JobDate": str = item.createdDateStr
+            case "JobId":
+                switch items[row] {
+                case .job(let job): str = job.id; toolTip = "작업 ID \(job.id)"
+                case .schedule(let schedule): str = schedule.id; toolTip = "수집 스케줄 ID \(schedule.id)"
+                }
+                rawStatus = nil
+            case "ReqId":
+                switch items[row] {
+                case .job(let job): str = job.requestId; toolTip = "요청 ID \(job.requestId)"
+                case .schedule: str = "—"; toolTip = "요청 ID는 이 스케줄 목록에 제공되지 않습니다."
+                }
+                rawStatus = nil
+            case "Kind":
+                switch items[row] {
+                case .job(let job): str = job.payloadKind; toolTip = "작업 종류 \(job.payloadKind)"
+                case .schedule: str = "수집 스케줄"; toolTip = "일시중지 상태로 조회된 수집 스케줄"
+                }
+                rawStatus = nil
+            case "JobStatus":
+                switch items[row] {
+                case .job(let job): str = TerminalPresentation.state(job.status); toolTip = "작업 상태 원문 \(job.status)"; rawStatus = job.status
+                case .schedule(let schedule): str = TerminalPresentation.state(schedule.status.uppercased()); toolTip = "스케줄 상태 원문 \(schedule.status)"; rawStatus = schedule.status
+                }
+            case "JobDate":
+                switch items[row] {
+                case .job(let job): str = job.createdDateStr; toolTip = "작업 등록 시각 KST \(job.createdDateStr)"
+                case .schedule(let schedule): str = displayKST(schedule.createdAt); toolTip = scheduleTooltip(schedule)
+                }
+                rawStatus = nil
             default: str = ""
+                toolTip = ""
+                rawStatus = nil
             }
             let cell = NSTextField(labelWithString: str)
             cell.lineBreakMode = .byTruncatingMiddle
-            cell.toolTip = str
+            cell.toolTip = toolTip
             cell.font = TerminalTheme.table
-            if identifier == "JobStatus" && item.status == "COMPLETED" {
+            if identifier == "JobStatus", rawStatus == "COMPLETED" {
                 cell.textColor = TerminalTheme.positive
             }
             if tableView.selectedRowIndexes.contains(row) {
@@ -3359,15 +4513,30 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
         }
     }
 
+    private func refreshSidebarSymbolAppearance() {
+        for row in 0..<sidebarTable.numberOfRows {
+            guard let cell = sidebarTable.view(atColumn: 0, row: row, makeIfNecessary: false) as? NSTableCellView,
+                  let route = cell.subviews.first as? NSStackView,
+                  let icon = route.views.first as? DashboardSidebarSymbolView else { continue }
+            let selected = sidebarTable.selectedRow == row
+            let emphasized = window?.isKeyWindow == true
+            icon.updateTint(isSelected: selected, isEmphasized: emphasized)
+            if let title = route.views.compactMap({ $0 as? NSTextField }).first {
+                title.textColor = selected && emphasized ? .alternateSelectedControlTextColor : .labelColor
+            }
+        }
+    }
+
     func tableViewSelectionDidChange(_ notification: Notification) {
         guard let table = notification.object as? NSTableView else { return }
         if table == sidebarTable {
             guard !synchronizingSidebarSelection else { return }
             let row = table.selectedRow
-            if row >= 0, let sec = Section(rawValue: row) {
+            if row >= 0, SidebarRow.ordered.indices.contains(row), let sec = SidebarRow.ordered[row].section {
                 if sec == .backtestAnalysis { showingRunDetails = false }
                 selectSection(sec)
             }
+            refreshSidebarSymbolAppearance()
         } else if table == comparisonsTable {
             guard !synchronizingComparisonSelection else { return }
             let row = table.selectedRow
@@ -3392,6 +4561,9 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
     }
 
     func tableView(_ tableView: NSTableView, selectionIndexesForProposedSelection proposed: IndexSet) -> IndexSet {
+        if tableView == sidebarTable {
+            return IndexSet(proposed.filter { SidebarRow.ordered.indices.contains($0) && !SidebarRow.ordered[$0].isGroup })
+        }
         guard tableView == runsTable else { return proposed }
         let visibleIds = Set(filteredRuns.map(\.id))
         let hiddenCount = historySelection.keys.filter { !visibleIds.contains($0) }.count
@@ -3429,7 +4601,7 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
             historyMetricAvailability = [:]
             if let column = runsTable.tableColumn(withIdentifier: NSUserInterfaceItemIdentifier("SelectedMetric")) { runsTable.removeTableColumn(column) }
             persistHistoryState()
-            historyWorkspaceLabel.stringValue = "표시된 행을 선택한 열로 정렬합니다. 지표 정렬은 해제되었습니다."
+            showHistoryWorkspaceFeedback("표시된 행을 선택한 열로 정렬합니다. 지표 정렬은 해제되었습니다.")
             filteredRuns.sort { lhs, rhs in
                 let comparison: ComparisonResult
                 switch key {

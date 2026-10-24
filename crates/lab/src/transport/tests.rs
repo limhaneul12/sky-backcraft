@@ -226,15 +226,22 @@ fn scoped_ndjson_is_correlated_and_excludes_request_secrets() -> Result<(), serd
         .finish();
     let state = Arc::new(TransportState::new(TransportLimits::default()));
     let correlation = RequestCorrelationId(Arc::from("req-0000000000000042"));
+    let request_uri = "/authorize?client_id=route-query-secret-sentinel";
+    let route = route_category(
+        request_uri
+            .parse::<axum::http::Uri>()
+            .expect("fixture URI is valid")
+            .path(),
+    );
     tracing::subscriber::with_default(subscriber, || {
         record_request(
             &state,
             RequestObservation {
                 event: "request_complete",
                 correlation_id: &correlation,
-                route: "/mcp",
+                route_category: route,
                 method: "POST",
-                status: StatusCode::OK,
+                status: StatusCode::BAD_REQUEST,
                 elapsed: Duration::from_millis(7),
                 error_category: "none",
             },
@@ -247,6 +254,154 @@ fn scoped_ndjson_is_correlated_and_excludes_request_secrets() -> Result<(), serd
     assert!(text.contains("request_complete"));
     assert!(!text.contains("secret-header-sentinel"));
     assert!(!text.contains("secret-body-sentinel"));
-    let _: serde_json::Value = serde_json::from_slice(bytes.trim_ascii())?;
+    assert!(!text.contains("route-query-secret-sentinel"));
+    let event: serde_json::Value = serde_json::from_slice(bytes.trim_ascii())?;
+    assert_eq!(event["route_category"], "oauth_authorize");
+    assert_eq!(event["status_code"], 400);
+    assert_eq!(event["status_class"], "4xx");
+    for (path, expected) in [
+        ("/mcp", "mcp"),
+        ("/public/mcp", "mcp"),
+        ("/token", "oauth_token"),
+        ("/register", "oauth_register"),
+        ("/authorize", "oauth_authorize"),
+        ("/authorize/approve", "oauth_authorize"),
+        (
+            "/.well-known/oauth-protected-resource",
+            "protected_resource",
+        ),
+        (
+            "/.well-known/oauth-protected-resource/mcp",
+            "protected_resource",
+        ),
+        ("/.well-known/oauth-authorization-server", "oauth_server"),
+        ("/unrecognized-user-route", "other"),
+    ] {
+        assert_eq!(route_category(path), expected, "path {path}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one real-socket journey covers streaming lifetime, ordinary request capacity and unchanged JSON limits"
+)]
+async fn bounded_status_sse_streams_through_global_limits_and_releases_capacity()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use crate::contracts::{RealtimeFeedStatus, RealtimeStatus, UtcTimestamp};
+    use crate::realtime_events::{RealtimeEventAuthorization, RealtimeEventTasks, RealtimeEvents};
+    let initial = RealtimeStatus {
+        observed_at_utc: UtcTimestamp::now(),
+        market: RealtimeFeedStatus::unavailable(),
+        private: RealtimeFeedStatus::unavailable(),
+    };
+    let (latest, receiver) = tokio::sync::watch::channel(initial);
+    let stop = CancellationToken::new();
+    let tasks = RealtimeEventTasks::default();
+    let events = RealtimeEvents::new(
+        receiver,
+        RealtimeEventAuthorization::PublicMarket,
+        stop.child_token(),
+        Arc::new(Semaphore::new(8)),
+        tasks.clone(),
+    );
+    let limits = TransportLimits {
+        max_inflight_requests: 2,
+        max_response_bytes: 128,
+        request_deadline: Duration::from_millis(200),
+        ..TransportLimits::default()
+    };
+    let tcp = TcpListener::bind("127.0.0.1:0").await?;
+    let listener = BoundedListener::new(tcp, limits);
+    let state = listener.state();
+    let endpoint = format!("http://{}", listener.local_addr()?);
+    let app = events
+        .router("/events")
+        .route("/json", axum::routing::get(|| async { "{}" }))
+        .route(
+            "/large",
+            axum::routing::get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    "x".repeat(256),
+                )
+            }),
+        )
+        .route(
+            "/slow",
+            axum::routing::get(|| async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                "{}"
+            }),
+        );
+    let app = apply_limits(app, Arc::clone(&state));
+    let server_stop = stop.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(server_stop.cancelled_owned())
+            .await
+    });
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()?;
+    let mut response = client.get(format!("{endpoint}/events")).send().await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let snapshot = response.chunk().await?.ok_or("missing first snapshot")?;
+    assert!(std::str::from_utf8(&snapshot)?.contains("event: snapshot"));
+    assert_eq!(state.snapshot().active_requests, 1);
+    // Long streams must leave an ordinary request slot available.
+    let saturated = client.get(format!("{endpoint}/events")).send().await?;
+    assert_eq!(saturated.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        client
+            .get(format!("{endpoint}/json"))
+            .send()
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    latest.send_modify(|value| value.market.subscription_count = 1);
+    let update = response
+        .chunk()
+        .await?
+        .ok_or("stream ended at JSON deadline")?;
+    assert!(std::str::from_utf8(&update)?.contains("event: status"));
+    assert_eq!(state.snapshot().active_requests, 1);
+    assert_eq!(state.snapshot().timed_out_requests, 0);
+    drop(response);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state.snapshot().active_requests != 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+    let large = client
+        .get(format!("{endpoint}/large"))
+        .header(header::ACCEPT, "text/event-stream")
+        .send()
+        .await?;
+    assert_eq!(large.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        client
+            .get(format!("{endpoint}/slow"))
+            .send()
+            .await?
+            .status(),
+        StatusCode::GATEWAY_TIMEOUT
+    );
+    assert_eq!(state.snapshot().response_limit_rejections, 1);
+    assert_eq!(state.snapshot().timed_out_requests, 1);
+    // EOF/shutdown must release the same body-owned request permit.
+    let mut final_response = client.get(format!("{endpoint}/events")).send().await?;
+    assert_eq!(final_response.status(), StatusCode::OK);
+    assert!(final_response.chunk().await?.is_some());
+    stop.cancel();
+    assert!(final_response.chunk().await?.is_none());
+    drop(final_response);
+    tokio::time::timeout(Duration::from_secs(2), server).await???;
+    tasks.shutdown().await?;
+    assert_eq!(state.snapshot().active_requests, 0);
     Ok(())
 }

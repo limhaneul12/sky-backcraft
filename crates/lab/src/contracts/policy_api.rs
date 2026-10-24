@@ -135,6 +135,7 @@ pub enum HistoryQuery {
 pub enum HistoryJobKind {
     Collect,
     Backtest,
+    PortfolioBacktest,
     Export,
     Verify,
 }

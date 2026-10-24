@@ -4,7 +4,7 @@ import Darwin
 enum NativeMCPError: LocalizedError {
     case unavailable, busy, transport, cancelled, timeout, transportContextChanged
     case rateLimited(retryAfterSeconds: Int?)
-    case unauthorized, protocolError, toolRejected, mockData
+    case unauthorized, protocolError, toolRejected, paperEventPageByteBudgetExceeded, mockData
     var errorDescription: String? {
         switch self {
         case .unavailable: return "로컬 Backend에 연결되지 않았습니다."
@@ -19,6 +19,8 @@ enum NativeMCPError: LocalizedError {
         case .unauthorized: return "로컬 Backend 접근 권한을 확인할 수 없습니다."
         case .protocolError: return "Backend 응답 형식이 유효하지 않습니다."
         case .toolRejected: return "Backend가 요청을 거부했습니다. 상태를 다시 조회하세요."
+        case .paperEventPageByteBudgetExceeded:
+            return "단일 이벤트가 조회 크기 제한을 초과했습니다. 해당 이벤트를 표시할 수 없습니다."
         case .mockData: return "거래소 실계좌 연결이 없습니다. Mock 값을 실계좌로 표시하지 않습니다."
         }
     }
@@ -78,6 +80,23 @@ final class NativeMCPRequest {
         }
         children.append(request)
         lock.unlock()
+        return true
+    }
+
+    /// A serialized read chain may replace its single active child without accumulating retries.
+    @discardableResult
+    func replaceSingleChild(with request: NativeMCPRequest) -> Bool {
+        let previous: NativeMCPRequest?
+        lock.lock()
+        guard !cancelled, !finished, children.count <= 1 else {
+            lock.unlock()
+            request.cancel()
+            return false
+        }
+        previous = children.first
+        children = [request]
+        lock.unlock()
+        previous?.cancel()
         return true
     }
 
@@ -145,6 +164,122 @@ private final class LocalSessionDelegate: NSObject, URLSessionTaskDelegate {
     }
 }
 
+private final class NativeMCPRealtimeStatusStreamDelegate: NSObject, URLSessionDataDelegate, URLSessionTaskDelegate {
+    private let expectedContext: NativeMCPTransportContext
+    private let currentContext: () -> NativeMCPTransportContext?
+    private let onOpen: () -> Void
+    private let onData: (Data) -> Void
+    private let onEnd: (Error?) -> Void
+    private weak var owner: NativeMCPRequest?
+    private let lock = NSLock()
+    private var responseAccepted = false
+    private var terminal = false
+
+    init(
+        expectedContext: NativeMCPTransportContext,
+        currentContext: @escaping () -> NativeMCPTransportContext?,
+        onOpen: @escaping () -> Void,
+        onData: @escaping (Data) -> Void,
+        onEnd: @escaping (Error?) -> Void
+    ) {
+        self.expectedContext = expectedContext
+        self.currentContext = currentContext
+        self.onOpen = onOpen
+        self.onData = onData
+        self.onEnd = onEnd
+    }
+
+    func attach(owner: NativeMCPRequest) {
+        self.owner = owner
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask,
+                    didReceive response: URLResponse,
+                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        guard currentContext() == expectedContext else {
+            completionHandler(.cancel)
+            finish(NativeMCPError.transportContextChanged, session: session)
+            return
+        }
+        guard let response = response as? HTTPURLResponse else {
+            completionHandler(.cancel)
+            finish(NativeMCPError.protocolError, session: session)
+            return
+        }
+        guard response.statusCode != 401 && response.statusCode != 403 else {
+            completionHandler(.cancel)
+            finish(NativeMCPError.unauthorized, session: session)
+            return
+        }
+        guard response.statusCode == 200,
+              response.mimeType?.lowercased() == "text/event-stream" else {
+            completionHandler(.cancel)
+            finish(NativeMCPError.protocolError, session: session)
+            return
+        }
+        lock.lock()
+        guard !terminal else {
+            lock.unlock()
+            completionHandler(.cancel)
+            return
+        }
+        responseAccepted = true
+        lock.unlock()
+        completionHandler(.allow)
+        onOpen()
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        guard currentContext() == expectedContext else {
+            finish(NativeMCPError.transportContextChanged, session: session)
+            return
+        }
+        lock.lock()
+        let accepted = responseAccepted && !terminal
+        lock.unlock()
+        guard accepted else {
+            finish(NativeMCPError.protocolError, session: session)
+            return
+        }
+        onData(data)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest,
+                    completionHandler: @escaping (URLRequest?) -> Void) {
+        completionHandler(nil)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        guard currentContext() == expectedContext else {
+            finish(NativeMCPError.transportContextChanged, session: session)
+            return
+        }
+        if let urlError = error as? URLError {
+            switch urlError.code {
+            case .cancelled: finish(NativeMCPError.cancelled, session: session)
+            case .timedOut: finish(NativeMCPError.timeout, session: session)
+            default: finish(NativeMCPError.transport, session: session)
+            }
+        } else {
+            finish(NativeMCPError.transport, session: session)
+        }
+    }
+
+    private func finish(_ error: Error?, session: URLSession) {
+        lock.lock()
+        guard !terminal else {
+            lock.unlock()
+            return
+        }
+        terminal = true
+        lock.unlock()
+        if owner?.claimCompletion() == true { onEnd(error) }
+        session.finishTasksAndInvalidate()
+    }
+}
+
 struct NativeMCPOwnedHelperIdentity: Codable, Equatable {
     let instance_id: String
     let process_id: Int32
@@ -179,13 +314,16 @@ final class NativeMCPClient {
     private let delegate: LocalSessionDelegate?
     private static let allowedTools: Set<String> = [
         "lab_status", "result_query", "history_query", "policy_query",
+        "realtime_status",
         "resource_delete_preview", "policy_delete_write", "policy_delete_query",
         "upbit_account_balances", "upbit_orders_open",
         "upbit_orders_closed", "trading_control",
         "live_order_control",
-        "paper_session_query", "paper_session_write",
+        "paper_review_query", "paper_session_query", "paper_session_write",
         "automation_session_query", "automation_session_write"
     ]
+    private static let paperEventPageByteBudgetError =
+        "RESOURCE_LIMIT: paper event page exceeds byte budget; request a smaller limit"
 
     init(session: URLSession? = nil) {
         if let session { self.session = session; delegate = nil }
@@ -234,6 +372,76 @@ final class NativeMCPClient {
     func currentTransportContext() -> NativeMCPTransportContext? {
         lock.lock(); defer { lock.unlock() }
         return transportContext
+    }
+
+    /// Opens the authenticated, latest-state status stream without exposing the endpoint or token.
+    @discardableResult
+    func streamRealtimeStatus(
+        expectedTransportContext: NativeMCPTransportContext,
+        onOpen: @escaping () -> Void,
+        onData: @escaping (Data) -> Void,
+        onEnd: @escaping (Error?) -> Void
+    ) -> NativeMCPRequest {
+        let endpoint: URL
+        let token: String
+        lock.lock()
+        guard transportContext == expectedTransportContext,
+              let configuredEndpoint = self.endpoint,
+              let configuredToken = self.token else {
+            let error: Error = transportContext == expectedTransportContext
+                ? NativeMCPError.unavailable
+                : NativeMCPError.transportContextChanged
+            lock.unlock()
+            DispatchQueue.main.async { onEnd(error) }
+            return .alreadyFinished()
+        }
+        endpoint = configuredEndpoint
+        token = configuredToken
+        lock.unlock()
+
+        guard var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false) else {
+            DispatchQueue.main.async { onEnd(NativeMCPError.protocolError) }
+            return .alreadyFinished()
+        }
+        components.path = "/desktop/realtime/events"
+        components.query = nil
+        components.fragment = nil
+        guard let streamURL = components.url else {
+            DispatchQueue.main.async { onEnd(NativeMCPError.protocolError) }
+            return .alreadyFinished()
+        }
+
+        var urlRequest = URLRequest(url: streamURL, cachePolicy: .reloadIgnoringLocalCacheData)
+        urlRequest.httpMethod = "GET"
+        urlRequest.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        urlRequest.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        urlRequest.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+
+        let owner = NativeMCPRequest()
+        let streamDelegate = NativeMCPRealtimeStatusStreamDelegate(
+            expectedContext: expectedTransportContext,
+            currentContext: { [weak self] in self?.currentTransportContext() },
+            onOpen: onOpen,
+            onData: onData,
+            onEnd: onEnd
+        )
+        streamDelegate.attach(owner: owner)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 45
+        configuration.timeoutIntervalForResource = 3_600
+        configuration.httpMaximumConnectionsPerHost = 1
+        configuration.httpCookieStorage = nil
+        configuration.urlCredentialStorage = nil
+        configuration.connectionProxyDictionary = [:]
+        let streamSession = URLSession(configuration: configuration, delegate: streamDelegate, delegateQueue: nil)
+        let task = streamSession.dataTask(with: urlRequest)
+        owner.setCancellationHandler { streamSession.invalidateAndCancel() }
+        guard owner.install(task) else {
+            streamSession.invalidateAndCancel()
+            return owner
+        }
+        task.resume()
+        return owner
     }
 
     func confirmOwnedHelperExit(_ context: NativeMCPTransportContext) {
@@ -324,6 +532,10 @@ final class NativeMCPClient {
                                arguments["action"] as? String == "request",
                                errorText.contains("unknown live-order control request") {
                                 finish(.failure(LiveOrderControlRequestError.unknownRequest))
+                            } else if tool == "paper_session_query",
+                                      arguments["action"] as? String == "review_events",
+                                      errorText == Self.paperEventPageByteBudgetError {
+                                finish(.failure(NativeMCPError.paperEventPageByteBudgetExceeded))
                             } else {
                                 finish(.failure(NativeMCPError.toolRejected))
                             }

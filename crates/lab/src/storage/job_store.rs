@@ -5,7 +5,7 @@ use crate::contracts::{
     JobOutput, JobProgress, JobRecord, JobStatus, JobSubmission, LabError, ProgressCountUnit,
     RequestId, RunId, RunModelComparison, UtcTimestamp, ValidationReport,
 };
-use rusqlite::{OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 const MAX_QUEUED_JOBS: i64 = 8;
 pub(super) const MAX_JOB_ATTEMPTS: u32 = 32;
@@ -43,7 +43,13 @@ impl Store {
         now: UtcTimestamp,
     ) -> Result<JobRecord, LabError> {
         let transaction = self.connection.transaction().map_err(sql_error)?;
-        let pin = insert_job_tx(&transaction, submission, now)?;
+        if let Some(pin) = existing_job_pin(&transaction, submission)? {
+            transaction.commit().map_err(sql_error)?;
+            return self
+                .get_job(&pin.job_id)?
+                .ok_or_else(|| LabError::Internal("submitted job disappeared".into()));
+        }
+        let pin = insert_job_tx(&transaction, submission, now, &self.raw)?;
         transaction.commit().map_err(sql_error)?;
         self.get_job(&pin.job_id)?
             .ok_or_else(|| LabError::Internal("submitted job disappeared".into()))
@@ -120,10 +126,14 @@ impl Store {
         }))
     }
 
-    /// Transactionally claim the oldest queued attempt.
+    /// Fail invalid queued input attempts and claim the oldest valid queued attempt.
     ///
     /// # Errors
-    /// Returns an error for corrupt state or SQLite failure.
+    /// Returns an error for storage failure, corrupt queue ownership, or invalid durable state.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one SQLite transaction scans the bounded queue, rejects bad inputs and claims the first valid attempt"
+    )]
     pub fn claim_next(&mut self, now: UtcTimestamp) -> Result<Option<JobAttempt>, LabError> {
         let transaction = self.connection.transaction().map_err(sql_error)?;
         let running: i64 = transaction
@@ -141,35 +151,128 @@ impl Store {
         if running == 1 {
             return Ok(None);
         }
-        let candidate = transaction.query_row(
-            "SELECT id,job_id FROM job_attempts WHERE status=?1 ORDER BY queued_at_ms,job_id,attempt_number LIMIT 1",
-            [enum_text(&JobStatus::Queued)?],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        ).optional().map_err(sql_error)?;
-        let Some((attempt, job)) = candidate else {
-            return Ok(None);
-        };
-        let state = AttemptState::Running {
-            started_at: now,
-            cancel_requested_at: None,
-        };
-        let changed = transaction.execute(
-            "UPDATE job_attempts SET status=?1,state_json=?2,started_at_ms=?3 WHERE id=?4 AND status=?5",
-            params![enum_text(&state.status())?, serde_json::to_string(&state).map_err(json_error)?, timestamp_ms(now), attempt, enum_text(&JobStatus::Queued)?],
-        ).map_err(sql_error)?;
-        if changed != 1 {
-            return Err(LabError::Conflict(
-                "queued attempt changed before claim".into(),
-            ));
-        }
-        transaction
-            .execute(
-                "UPDATE jobs SET current_status=?1 WHERE id=?2",
-                params![enum_text(&JobStatus::Running)?, job],
+        let queued: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM job_attempts WHERE status=?1",
+                [enum_text(&JobStatus::Queued)?],
+                |row| row.get(0),
             )
             .map_err(sql_error)?;
+        if queued > MAX_QUEUED_JOBS {
+            return Err(LabError::DataCorrupt(
+                "durable queue exceeds its bounded claim scan".into(),
+            ));
+        }
+
+        for _ in 0..queued {
+            let candidate = transaction
+                .query_row(
+                    "SELECT a.id,a.job_id,j.payload_json FROM job_attempts a \
+                     JOIN jobs j ON j.id=a.job_id WHERE a.status=?1 \
+                     ORDER BY a.queued_at_ms,a.job_id,a.attempt_number LIMIT 1",
+                    [enum_text(&JobStatus::Queued)?],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(sql_error)?;
+            let Some((attempt, job, payload_json)) = candidate else {
+                return Err(LabError::DataCorrupt(
+                    "queued attempt is missing its owning job row".into(),
+                ));
+            };
+
+            let Ok(attempt_id) = AttemptId::new(attempt.clone()) else {
+                fail_queued_input_tx(
+                    &transaction,
+                    &attempt,
+                    &job,
+                    input_corrupt_failure("stored attempt identity is invalid"),
+                    now,
+                )?;
+                continue;
+            };
+            if self.active_job_input_holds.contains_key(&attempt_id) {
+                return Err(LabError::DataCorrupt(
+                    "queued attempt already has a process-local input hold".into(),
+                ));
+            }
+            let Ok(job_id) = JobId::new(job.clone()) else {
+                fail_queued_input_tx(
+                    &transaction,
+                    &attempt,
+                    &job,
+                    input_corrupt_failure("stored job identity is invalid"),
+                    now,
+                )?;
+                continue;
+            };
+            let Ok(payload) = serde_json::from_str::<crate::contracts::JobPayload>(&payload_json)
+            else {
+                fail_queued_input_tx(
+                    &transaction,
+                    &attempt,
+                    &job,
+                    input_corrupt_failure("stored job payload is invalid"),
+                    now,
+                )?;
+                continue;
+            };
+            let input_hold =
+                match super::job_inputs::active_hold(&transaction, job_id.clone(), &payload) {
+                    Ok(hold) => hold,
+                    Err(error) => {
+                        let Some(failure) = queued_input_failure(&error) else {
+                            return Err(error);
+                        };
+                        fail_queued_input_tx(&transaction, &attempt, &job, failure, now)?;
+                        continue;
+                    }
+                };
+            if let Err(error) = super::job_inputs::verify_files(&self.raw, &transaction, &payload) {
+                let Some(failure) = queued_input_failure(&error) else {
+                    return Err(error);
+                };
+                fail_queued_input_tx(&transaction, &attempt, &job, failure, now)?;
+                continue;
+            }
+
+            let state = AttemptState::Running {
+                started_at: now,
+                cancel_requested_at: None,
+            };
+            let changed = transaction.execute(
+                "UPDATE job_attempts SET status=?1,state_json=?2,started_at_ms=?3 WHERE id=?4 AND status=?5",
+                params![enum_text(&state.status())?, serde_json::to_string(&state).map_err(json_error)?, timestamp_ms(now), attempt, enum_text(&JobStatus::Queued)?],
+            ).map_err(sql_error)?;
+            if changed != 1 {
+                return Err(LabError::Conflict(
+                    "queued attempt changed before claim".into(),
+                ));
+            }
+            let changed = transaction
+                .execute(
+                    "UPDATE jobs SET current_status=?1 WHERE id=?2 AND current_attempt_number=(\
+                     SELECT attempt_number FROM job_attempts WHERE id=?3)",
+                    params![enum_text(&JobStatus::Running)?, job, attempt],
+                )
+                .map_err(sql_error)?;
+            if changed != 1 {
+                return Err(LabError::Conflict("queued job changed before claim".into()));
+            }
+            transaction.commit().map_err(sql_error)?;
+            self.active_job_input_holds
+                .insert(attempt_id.clone(), input_hold);
+            return self.load_attempt(&attempt_id).map(Some);
+        }
+
         transaction.commit().map_err(sql_error)?;
-        self.load_attempt(&AttemptId::new(attempt)?).map(Some)
+        Ok(None)
     }
 
     /// Cancel a queued attempt immediately or persist a running cancellation request.
@@ -216,10 +319,20 @@ impl Store {
             ));
         }
         let transaction = self.connection.transaction().map_err(sql_error)?;
-        retry_job_tx(&transaction, job_id, now)?;
+        retry_job_tx(&transaction, job_id, now, &self.raw)?;
         transaction.commit().map_err(sql_error)?;
         self.get_job(job_id)?
             .ok_or_else(|| LabError::Internal("retried job disappeared".into()))
+    }
+
+    /// Release one process-local input hold after terminal state and runner readback are complete.
+    /// # Errors
+    /// Refuses release while the attempt is not terminal or persisted state is unreadable.
+    pub(crate) fn release_terminal_job_input_hold(
+        &mut self,
+        attempt_id: &AttemptId,
+    ) -> Result<(), LabError> {
+        super::job_inputs::release_terminal_hold(self, attempt_id)
     }
 
     /// Whether an ordinary job is owned by a suite case or schedule fire.
@@ -238,9 +351,12 @@ impl Store {
             .map_err(sql_error)
     }
 
-    /// Mark all process-abandoned running attempts interrupted.
+    /// Mark abandoned running attempts interrupted after no worker can perform post-work.
     ///
     /// # Errors
+    /// Call before starting the runner or after `run_owned_runtime` has joined its
+    /// worker, coordinator, private-stream and public-feed tasks. The terminal-hold
+    /// sweep is safe only at those quiescent boundaries.
     /// Returns an error for corrupt state or SQLite failure.
     pub fn recover_interrupted(&mut self, now: UtcTimestamp) -> Result<u64, LabError> {
         let running = enum_text(&JobStatus::Running)?;
@@ -309,6 +425,16 @@ impl Store {
                 .map_err(sql_error)?;
         }
         transaction.commit().map_err(sql_error)?;
+        for (attempt_id, _, _, _, _) in &ids {
+            self.active_job_input_holds
+                .remove(&AttemptId::new(attempt_id.clone())?);
+        }
+        let remaining_holds: Vec<_> = self.active_job_input_holds.keys().cloned().collect();
+        for attempt_id in remaining_holds {
+            if self.load_attempt(&attempt_id)?.state.is_terminal() {
+                self.active_job_input_holds.remove(&attempt_id);
+            }
+        }
         u64::try_from(ids.len())
             .map_err(|_| LabError::ResourceLimit("interrupted count overflow".into()))
     }
@@ -547,6 +673,9 @@ impl Store {
             return Err(LabError::Conflict("job publication CAS failed".into()));
         }
         transaction.commit().map_err(sql_error)?;
+        if let Some(hold) = self.active_job_input_holds.get_mut(attempt_id) {
+            super::job_inputs::extend_with_terminal_outputs(hold, &terminal);
+        }
         drop(terminal);
         drop(publication);
         Ok(())
@@ -667,7 +796,11 @@ impl Store {
             "UPDATE jobs SET current_status=?1 WHERE id=?2 AND current_attempt_number=(SELECT attempt_number FROM job_attempts WHERE id=?3)",
             params![enum_text(&next.status())?, job_id, id.as_str()],
         ).map_err(sql_error)?;
-        transaction.commit().map_err(sql_error)
+        transaction.commit().map_err(sql_error)?;
+        if let Some(hold) = self.active_job_input_holds.get_mut(id) {
+            super::job_inputs::extend_with_terminal_outputs(hold, next);
+        }
+        Ok(())
     }
 }
 
@@ -675,36 +808,18 @@ pub(super) fn insert_job_tx(
     transaction: &Transaction<'_>,
     submission: &JobSubmission,
     now: UtcTimestamp,
+    raw: &super::RawObjectStore,
 ) -> Result<JobPin, LabError> {
     let input_digest = ContentHash::of_value(&submission.payload)?;
-    if let Some((job_id, stored_digest, attempt_id)) = transaction
-        .query_row(
-            "SELECT j.id,j.normalized_input_digest,a.id FROM jobs j JOIN job_attempts a ON a.job_id=j.id AND a.attempt_number=j.current_attempt_number WHERE j.request_id=?1",
-            [submission.request_id.as_str()],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            },
-        )
-        .optional()
-        .map_err(sql_error)?
-    {
-        if stored_digest != input_digest.as_str() {
-            return Err(LabError::Conflict(
-                "request id already names a different job payload".into(),
-            ));
-        }
-        return Ok(JobPin {
-            job_id: JobId::new(job_id)?,
-            attempt_id: AttemptId::new(attempt_id)?,
-        });
+    if let Some(pin) = existing_job_pin(transaction, submission)? {
+        return Ok(pin);
     }
 
-    enforce_queue_capacity(transaction)?;
     let job_id = JobId::from_seed(submission.request_id.as_str());
+    let _input_hold =
+        super::job_inputs::active_hold(transaction, job_id.clone(), &submission.payload)?;
+    super::job_inputs::verify_files(raw, transaction, &submission.payload)?;
+    enforce_queue_capacity(transaction)?;
     let attempt_id = attempt_id(&job_id, 1);
     let state = AttemptState::Queued { queued_at: now };
     transaction.execute(
@@ -715,16 +830,53 @@ pub(super) fn insert_job_tx(
     Ok(JobPin { job_id, attempt_id })
 }
 
+fn existing_job_pin(
+    connection: &Connection,
+    submission: &JobSubmission,
+) -> Result<Option<JobPin>, LabError> {
+    let input_digest = ContentHash::of_value(&submission.payload)?;
+    let existing = connection
+        .query_row(
+            "SELECT j.id,j.normalized_input_digest,a.id FROM jobs j \
+             JOIN job_attempts a ON a.job_id=j.id \
+               AND a.attempt_number=j.current_attempt_number \
+             WHERE j.request_id=?1",
+            [submission.request_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sql_error)?;
+    let Some((job_id, stored_digest, attempt_id)) = existing else {
+        return Ok(None);
+    };
+    if stored_digest != input_digest.as_str() {
+        return Err(LabError::Conflict(
+            "request id already names a different job payload".into(),
+        ));
+    }
+    Ok(Some(JobPin {
+        job_id: JobId::new(job_id)?,
+        attempt_id: AttemptId::new(attempt_id)?,
+    }))
+}
+
 pub(super) fn retry_job_tx(
     transaction: &Transaction<'_>,
     job_id: &JobId,
     now: UtcTimestamp,
+    raw: &super::RawObjectStore,
 ) -> Result<AttemptId, LabError> {
-    let (attempt_number, input_digest, state_json): (u32, String, String) = transaction
+    let (attempt_number, input_digest, state_json, payload_json): (u32, String, String, String) = transaction
         .query_row(
-            "SELECT a.attempt_number,a.input_digest,a.state_json FROM jobs j JOIN job_attempts a ON a.job_id=j.id AND a.attempt_number=j.current_attempt_number WHERE j.id=?1",
+            "SELECT a.attempt_number,a.input_digest,a.state_json,j.payload_json FROM jobs j JOIN job_attempts a ON a.job_id=j.id AND a.attempt_number=j.current_attempt_number WHERE j.id=?1",
             [job_id.as_str()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()
         .map_err(sql_error)?
@@ -735,6 +887,10 @@ pub(super) fn retry_job_tx(
             "only a terminal job can be retried".into(),
         ));
     }
+    let payload: crate::contracts::JobPayload =
+        serde_json::from_str(&payload_json).map_err(json_error)?;
+    let _input_hold = super::job_inputs::active_hold(transaction, job_id.clone(), &payload)?;
+    super::job_inputs::verify_files(raw, transaction, &payload)?;
     if attempt_number >= MAX_JOB_ATTEMPTS {
         return Err(LabError::ResourceLimit(format!(
             "job attempt history limit is {MAX_JOB_ATTEMPTS}"
@@ -839,6 +995,87 @@ fn insert_attempt(
         "INSERT INTO job_attempts(id,job_id,attempt_number,input_digest,status,state_json,progress_stage,committed_records,last_committed_event_seq,queued_at_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,0,0,?8)",
         params![id.as_str(), job_id.as_str(), number, input_digest.as_str(), enum_text(&state.status())?, serde_json::to_string(state).map_err(json_error)?, INITIAL_STAGE, timestamp_ms(queued_at)],
     ).map_err(sql_error)?;
+    Ok(())
+}
+
+fn queued_input_failure(error: &LabError) -> Option<crate::contracts::FailureRecord> {
+    let (code, message) = match error {
+        LabError::InvalidConfig(_) => (
+            "INPUT_UNAVAILABLE",
+            "A referenced frozen input is missing or unavailable.",
+        ),
+        LabError::InputHashMismatch(_)
+        | LabError::DataCorrupt(_)
+        | LabError::Conflict(_)
+        | LabError::ContractParse(_) => (
+            "INPUT_CORRUPT",
+            "Stored input identity or content is corrupt.",
+        ),
+        LabError::ResourceLimit(_)
+        | LabError::RequestLimit(_)
+        | LabError::InsufficientWarmup(_)
+        | LabError::DataGap(_)
+        | LabError::BlockedEvidence(_)
+        | LabError::UnverifiedMarketRules(_) => (
+            "INPUT_INVALID",
+            "Stored job input does not satisfy its required contract or limits.",
+        ),
+        _ => return None,
+    };
+    Some(crate::contracts::FailureRecord {
+        code: code.into(),
+        message: message.into(),
+    })
+}
+
+fn input_corrupt_failure(message: &str) -> crate::contracts::FailureRecord {
+    crate::contracts::FailureRecord {
+        code: "INPUT_CORRUPT".into(),
+        message: message.into(),
+    }
+}
+
+fn fail_queued_input_tx(
+    transaction: &Transaction<'_>,
+    attempt_id: &str,
+    job_id: &str,
+    failure: crate::contracts::FailureRecord,
+    now: UtcTimestamp,
+) -> Result<(), LabError> {
+    let state = AttemptState::Failed {
+        ended_at: now,
+        error: failure,
+    };
+    update_state(
+        transaction,
+        attempt_id,
+        &enum_text(&JobStatus::Queued)?,
+        &state,
+    )?;
+    let changed = transaction
+        .execute(
+            "UPDATE job_attempts SET progress_stage='failed',committed_records=0,\
+             last_committed_event_seq=0 WHERE id=?1 AND status=?2",
+            params![attempt_id, enum_text(&JobStatus::Failed)?],
+        )
+        .map_err(sql_error)?;
+    if changed != 1 {
+        return Err(LabError::Conflict(
+            "invalid queued attempt changed before terminalization".into(),
+        ));
+    }
+    let changed = transaction
+        .execute(
+            "UPDATE jobs SET current_status=?1 WHERE id=?2 AND current_attempt_number=(\
+             SELECT attempt_number FROM job_attempts WHERE id=?3)",
+            params![enum_text(&JobStatus::Failed)?, job_id, attempt_id],
+        )
+        .map_err(sql_error)?;
+    if changed != 1 {
+        return Err(LabError::Conflict(
+            "invalid queued job attempt is no longer current".into(),
+        ));
+    }
     Ok(())
 }
 

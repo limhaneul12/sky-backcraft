@@ -587,21 +587,7 @@ final class LedgerDetailMCPReader {
         return date
     }
     private static func strictDecimal(_ text: String, key: String) throws -> Decimal {
-        guard !text.isEmpty, text.count <= 64,
-              text.range(of: #"^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$"#,
-                         options: .regularExpression) != nil else {
-            throw LedgerDetailError.invalidResponse("\(key) Decimal")
-        }
-        let unsigned = text.first == "-" ? String(text.dropFirst()) : text
-        let components = unsigned.split(separator: ".", omittingEmptySubsequences: false)
-        let fractionalCount = components.count == 2 ? components[1].count : 0
-        let coefficient = unsigned.replacingOccurrences(of: ".", with: "")
-        let significant = String(coefficient.drop(while: { $0 == "0" }))
-        let maxCoefficient = "79228162514264337593543950335"
-        guard fractionalCount <= 28, significant.count <= 29,
-              significant.count < 29 || significant <= maxCoefficient,
-              let number = Decimal(string: text, locale: Locale(identifier: "en_US_POSIX")),
-              !number.isNaN else {
+        guard let number = StrictDecimal.parse(text) else {
             throw LedgerDetailError.invalidResponse("\(key) Decimal")
         }
         return number

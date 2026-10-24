@@ -408,14 +408,14 @@ private struct ModelComparisonRecord: Decodable {
     let modelId: String
     let market: String
     let status: String
-    let initialEquity: String
-    let finalEquity: String
-    let netPnl: String
+    let initialEquity: String?
+    let finalEquity: String?
+    let netPnl: String?
     let netReturn: DecimalMetric
     let maxDrawdown: DecimalMetric
     let turnover: DecimalMetric
-    let cumulativeFees: String
-    let closedEpisodes: Int
+    let cumulativeFees: String?
+    let closedEpisodes: Int?
 
     private enum CodingKeys: String, CodingKey {
         case runId = "run_id"
@@ -433,9 +433,34 @@ private struct ModelComparisonRecord: Decodable {
     }
 }
 
-final class DatabaseReader {
+/// Thread-safe generation gate for coalescing rapid UI filter/selection reads.
+/// Only the latest generation token is permitted to commit results to UI state.
+final class ReadGenerationGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var generation: UInt64 = 0
+
+    func begin() -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        generation &+= 1
+        return generation
+    }
+
+    func isCurrent(_ token: UInt64) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return token == generation
+    }
+}
+
+final class DatabaseReader: @unchecked Sendable {
     static let shared = DatabaseReader()
     private let dbPath: String
+    private let readQueue = DispatchQueue(
+        label: "com.skybackcraft.database.reader",
+        qos: .userInitiated,
+        attributes: .concurrent
+    )
 
     init(supportDirectory: URL? = nil) {
         if let dir = supportDirectory {
@@ -449,6 +474,25 @@ final class DatabaseReader {
         }
     }
 
+    /// Execute a read closure on the bounded concurrent reader queue, delivering
+    /// the result on the main queue only if `gate` confirms `token` is still current.
+    func performLatestRead<T>(
+        gate: ReadGenerationGate,
+        work: @escaping (DatabaseReader) throws -> T,
+        completion: @escaping (Result<T, Error>) -> Void
+    ) {
+        let token = gate.begin()
+        readQueue.async { [self] in
+            guard gate.isCurrent(token) else { return }
+            let result = Result { try work(self) }
+            guard gate.isCurrent(token) else { return }
+            DispatchQueue.main.async {
+                guard gate.isCurrent(token) else { return }
+                completion(result)
+            }
+        }
+    }
+
     private func openDB() throws -> OpaquePointer {
         var db: OpaquePointer?
         let flags = SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX
@@ -458,6 +502,8 @@ final class DatabaseReader {
             if let db { sqlite3_close(db) }
             throw LedgerReadError.databaseUnavailable(detail)
         }
+        sqlite3_busy_timeout(db, 5_000)
+        _ = sqlite3_exec(db, "PRAGMA query_only = ON;", nil, nil, nil)
         return db
     }
 
@@ -508,28 +554,31 @@ final class DatabaseReader {
         sqlite3_column_text(statement, column).map { String(cString: $0) }
     }
 
-    private func decimal(_ value: String, operation: String, field: String) throws -> Decimal {
-        let unsigned = value.first == "-" ? String(value.dropFirst()) : value
-        let parts = unsigned.split(separator: ".", omittingEmptySubsequences: false)
-        let integer = parts.first.map(String.init) ?? ""
-        let fraction = parts.count == 2 ? String(parts[1]) : ""
-        let isASCIIDigits: (String) -> Bool = { text in
-            !text.isEmpty && text.utf8.allSatisfy { (48...57).contains($0) }
+    private func requiredColumnBytes(
+        _ statement: OpaquePointer, column: Int32, operation: String, field: String
+    ) throws -> UnsafeBufferPointer<UInt8> {
+        guard let pointer = sqlite3_column_text(statement, column) else {
+            throw LedgerReadError.inconsistentData(operation: operation, detail: "\(field) is NULL")
         }
-        let coefficient = integer + fraction
-        let significant = String(coefficient.drop(while: { $0 == "0" }))
-        let maxCoefficient = "79228162514264337593543950335"
-        guard !value.isEmpty, value.count <= 64,
-              parts.count == 1 || parts.count == 2,
-              isASCIIDigits(integer), parts.count == 1 || isASCIIDigits(fraction),
-              integer == "0" || integer.first != "0", fraction.count <= 28,
-              significant.count <= 29,
-              significant.count < 29 || significant <= maxCoefficient,
-              let parsed = Decimal(string: value, locale: Locale(identifier: "en_US_POSIX")),
-              !parsed.isNaN else {
+        return UnsafeBufferPointer(start: pointer, count: Int(sqlite3_column_bytes(statement, column)))
+    }
+
+    private func decimal(_ value: String, operation: String, field: String) throws -> Decimal {
+        guard let parsed = StrictDecimal.parse(value) else {
             throw LedgerReadError.invalidDecimal(operation: operation, field: field, value: value)
         }
         return parsed
+    }
+
+    private func validateDecimalColumn(
+        _ statement: OpaquePointer, column: Int32, operation: String, field: String
+    ) throws -> UnsafeBufferPointer<UInt8> {
+        let bytes = try requiredColumnBytes(statement, column: column, operation: operation, field: field)
+        guard StrictDecimal.isValid(bytes) else {
+            let value = String(decoding: bytes, as: UTF8.self)
+            throw LedgerReadError.invalidDecimal(operation: operation, field: field, value: value)
+        }
+        return bytes
     }
 
     private func utcDate(
@@ -539,11 +588,33 @@ final class DatabaseReader {
         throw LedgerReadError.invalidTimestamp(operation: operation, field: field, value: value)
     }
 
-    private func decode<T: Decodable>(_ type: T.Type, text: String, operation: String) throws -> T {
+    private func decode<T: Decodable>(
+        _ type: T.Type, text: String, operation: String, decoder: JSONDecoder = JSONDecoder()
+    ) throws -> T {
         do {
-            return try JSONDecoder().decode(type, from: Data(text.utf8))
+            return try decoder.decode(type, from: Data(text.utf8))
         } catch {
             throw LedgerReadError.invalidJSON(operation: operation, detail: error.localizedDescription)
+        }
+    }
+
+    private func decodeColumn<T: Decodable>(
+        _ type: T.Type, statement: OpaquePointer, column: Int32, field: String,
+        operation: String, jsonOperation: String, decoder: JSONDecoder
+    ) throws -> T {
+        let bytes = try requiredColumnBytes(statement, column: column, operation: operation, field: field)
+        guard let baseAddress = bytes.baseAddress else {
+            throw LedgerReadError.invalidJSON(operation: jsonOperation, detail: "empty JSON column")
+        }
+        let data = Data(
+            bytesNoCopy: UnsafeMutableRawPointer(mutating: baseAddress),
+            count: bytes.count,
+            deallocator: .none
+        )
+        do {
+            return try decoder.decode(type, from: data)
+        } catch {
+            throw LedgerReadError.invalidJSON(operation: jsonOperation, detail: error.localizedDescription)
         }
     }
 
@@ -867,6 +938,25 @@ final class DatabaseReader {
                     throw LedgerReadError.inconsistentData(operation: operation, detail: "invalid policy definition digest")
                 }
             }
+            if record.status != "COMPLETED",
+               record.initialEquity == nil,
+               record.finalEquity == nil,
+               record.netPnl == nil,
+               record.cumulativeFees == nil,
+               record.closedEpisodes == nil {
+                step = sqlite3_step(statement)
+                continue
+            }
+            guard let initialEquity = record.initialEquity,
+                  let finalEquity = record.finalEquity,
+                  let netPnl = record.netPnl,
+                  let cumulativeFees = record.cumulativeFees,
+                  let closedEpisodes = record.closedEpisodes else {
+                throw LedgerReadError.inconsistentData(
+                    operation: "model comparison \(storedRunId)/\(modelId)",
+                    detail: "completed model comparison requires financial summary fields"
+                )
+            }
             results.append(RealModelComparison(
                 runId: storedRunId,
                 modelId: modelId,
@@ -874,20 +964,20 @@ final class DatabaseReader {
                 status: record.status,
                 policyId: policyId,
                 policyRevisionId: policyRevisionId,
-                initialEquityDecimal: try decimal(record.initialEquity, operation: operation, field: "initial_equity"),
-                finalEquityDecimal: try decimal(record.finalEquity, operation: operation, field: "final_equity"),
-                netPnlDecimal: try decimal(record.netPnl, operation: operation, field: "net_pnl"),
+                initialEquityDecimal: try decimal(initialEquity, operation: operation, field: "initial_equity"),
+                finalEquityDecimal: try decimal(finalEquity, operation: operation, field: "final_equity"),
+                netPnlDecimal: try decimal(netPnl, operation: operation, field: "net_pnl"),
                 netReturnDecimal: record.netReturn.value,
                 maxDrawdownDecimal: record.maxDrawdown.value,
                 turnoverDecimal: record.turnover.value,
                 netReturnNullReason: record.netReturn.nullReason,
                 maxDrawdownNullReason: record.maxDrawdown.nullReason,
                 turnoverNullReason: record.turnover.nullReason,
-                cumulativeFeesDecimal: try decimal(record.cumulativeFees, operation: operation, field: "cumulative_fees"),
+                cumulativeFeesDecimal: try decimal(cumulativeFees, operation: operation, field: "cumulative_fees"),
                 fillCount: Int(sqlite3_column_int64(statement, 5)),
                 accountMarkCount: Int(sqlite3_column_int64(statement, 6)),
                 episodeCount: Int(sqlite3_column_int64(statement, 7)),
-                closedEpisodes: record.closedEpisodes,
+                closedEpisodes: closedEpisodes,
                 f08Status: optionalText(statement, column: 10),
                 policyDefinitionDigest: policyDigest
             ))
@@ -968,53 +1058,74 @@ final class DatabaseReader {
         var nextSampleIndex = 0
         var rowIndex = 0
         let timestampParser = ReadTimestampParser()
+        let jsonDecoder = JSONDecoder()
+        let jsonOperation = "account mark \(runId)/\(modelId)"
+        let modelIdUTF8 = Array(modelId.utf8)
         var step = sqlite3_step(statement)
         while step == SQLITE_ROW {
             guard rowIndex < rowCount else {
                 throw LedgerReadError.inconsistentData(operation: operation, detail: "account mark scan exceeded its snapshot count")
             }
-            let selectedModelId = try requiredText(statement, column: 0, operation: operation, field: "model_id")
-            guard selectedModelId == modelId else {
+            let modelBytes = try requiredColumnBytes(statement, column: 0, operation: operation, field: "model_id")
+            guard modelBytes.elementsEqual(modelIdUTF8) else {
                 throw LedgerReadError.inconsistentData(operation: operation, detail: "query returned a different model_id")
             }
-            let equityText = try requiredText(statement, column: 2, operation: operation, field: "equity_decimal")
-            let cashText = try requiredText(statement, column: 3, operation: operation, field: "cash_total_decimal")
-            let sourceBarId = try requiredText(statement, column: 4, operation: operation, field: "source_bar_id")
-            let recordText = try requiredText(statement, column: 5, operation: operation, field: "record_json")
-            let record: AccountMarkRecord = try decode(
+            let equityBytes = try validateDecimalColumn(statement, column: 2, operation: operation, field: "equity_decimal")
+            let cashBytes = try validateDecimalColumn(statement, column: 3, operation: operation, field: "cash_total_decimal")
+            let sourceBarBytes = try requiredColumnBytes(statement, column: 4, operation: operation, field: "source_bar_id")
+            let record: AccountMarkRecord = try decodeColumn(
                 AccountMarkRecord.self,
-                text: recordText,
-                operation: "account mark \(runId)/\(modelId)"
+                statement: statement,
+                column: 5,
+                field: "record_json",
+                operation: operation,
+                jsonOperation: jsonOperation,
+                decoder: jsonDecoder
             )
             let eventSequence = sqlite3_column_int64(statement, 1)
             guard record.context.runId == runId,
                   record.context.modelId == modelId,
                   record.context.eventSeq == eventSequence,
-                  record.sourceBarId == sourceBarId else {
+                  sourceBarBytes.elementsEqual(record.sourceBarId.utf8) else {
                 throw LedgerReadError.inconsistentData(
                     operation: operation,
                     detail: "record_json context/source identity differs from indexed columns"
                 )
             }
             let closeTimeMilliseconds = sqlite3_column_int64(statement, 6)
-            let equity = try decimal(equityText, operation: operation, field: "equity_decimal")
-            let cash = try decimal(cashText, operation: operation, field: "cash_total_decimal")
             let timestamp = try utcDate(
                 record.context.accountingEventTime,
                 operation: operation,
                 field: "context.accounting_event_time",
                 parser: timestampParser
             )
-            let drawdown = try record.drawdown.map {
-                try decimal($0, operation: operation, field: "record_json.drawdown")
+            if let drawdownText = record.drawdown, !StrictDecimal.isValid(drawdownText) {
+                throw LedgerReadError.invalidDecimal(
+                    operation: operation,
+                    field: "record_json.drawdown",
+                    value: drawdownText
+                )
             }
             if !downsampling || rowIndex == nextSampleIndex {
+                let equity = try decimal(
+                    String(decoding: equityBytes, as: UTF8.self),
+                    operation: operation,
+                    field: "equity_decimal"
+                )
+                let cash = try decimal(
+                    String(decoding: cashBytes, as: UTF8.self),
+                    operation: operation,
+                    field: "cash_total_decimal"
+                )
+                let drawdown = try record.drawdown.map {
+                    try decimal($0, operation: operation, field: "record_json.drawdown")
+                }
                 marks.append(RealAccountMark(
-                    modelId: selectedModelId,
+                    modelId: modelId,
                     seq: Int(eventSequence),
                     equityDecimal: equity,
                     cashDecimal: cash,
-                    sourceBarId: sourceBarId,
+                    sourceBarId: record.sourceBarId,
                     timestamp: timestamp,
                     sourceBarCloseTime: Date(
                         timeIntervalSince1970: TimeInterval(closeTimeMilliseconds) / 1000.0

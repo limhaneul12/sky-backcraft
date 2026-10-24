@@ -399,6 +399,7 @@ impl Store {
         self.protected_automation_blockers(&mut scope)?;
         self.compute_scope_dependencies(&mut scope)?;
         self.check_active_jobs(&mut scope)?;
+        self.check_active_job_inputs(&mut scope)?;
         self.compute_scope_counts(&mut scope)?;
         Ok(scope)
     }
@@ -677,7 +678,13 @@ impl Store {
                  UNION SELECT q.raw_object_id FROM quality_issue_raw_objects q WHERE q.dataset_id NOT IN (SELECT id FROM del_datasets)
                  UNION SELECT o.raw_object_id FROM observation_raw_objects o WHERE o.observation_id NOT IN (SELECT id FROM del_obs)
                  UNION SELECT c.raw_object_id FROM collection_raw_objects c WHERE c.request_id NOT IN (SELECT id FROM del_requests)
-                 UNION SELECT p.raw_object_id FROM collection_pages p WHERE p.request_id NOT IN (SELECT id FROM del_requests);
+                 UNION SELECT p.raw_object_id FROM collection_pages p WHERE p.request_id NOT IN (SELECT id FROM del_requests)
+                 UNION SELECT first_raw_object_id FROM provider_absence_pending_reads
+                 UNION SELECT conflict_raw_object_id FROM provider_absence_pending_reads WHERE conflict_raw_object_id IS NOT NULL
+                 UNION SELECT first_raw_object_id FROM provider_absence_spans
+                 UNION SELECT second_raw_object_id FROM provider_absence_spans
+                 UNION SELECT raw_object_id FROM provider_absence_conflicts
+                 UNION SELECT raw_object_id FROM provider_feed_recovery_pages;
                  DELETE FROM del_raws WHERE id IN (SELECT id FROM keep_raws);
                  DROP TABLE keep_raws;",
             )
@@ -866,6 +873,109 @@ impl Store {
             }
         }
         Ok(())
+    }
+
+    /// Protect every input a queued/running consumer or claimed worker may still read.
+    /// The runtime-owned hold remains authoritative across terminal commit and post-work.
+    fn check_active_job_inputs(&self, scope: &mut DeleteScope) -> Result<(), LabError> {
+        let mut protected_jobs = std::collections::BTreeSet::new();
+        for blocker in &scope.blockers {
+            if blocker.class == DeleteBlockerClass::ActiveJob
+                && let Some(id) = blocker.reference.strip_prefix("job:")
+            {
+                protected_jobs.insert(id.to_owned());
+            }
+        }
+
+        for hold in self.active_job_input_holds.values() {
+            if protected_jobs.contains(hold.job_id.as_str()) {
+                continue;
+            }
+            if self.hold_intersects_scope(&hold.inputs, scope)? {
+                push_active_input_blocker(scope, hold);
+                protected_jobs.insert(hold.job_id.as_str().to_owned());
+            }
+        }
+
+        let queued = super::enum_text(&JobStatus::Queued)?;
+        let running = super::enum_text(&JobStatus::Running)?;
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id,payload_json FROM jobs WHERE current_status IN (?1,?2) \
+                 ORDER BY id LIMIT 10",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(params![queued, running], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(sql_error)?;
+        let active_jobs = rows.collect::<Result<Vec<_>, _>>().map_err(sql_error)?;
+        if active_jobs.len() > 9 {
+            return Err(LabError::DataCorrupt(
+                "durable job queue exceeds its bounded active input scan".into(),
+            ));
+        }
+        for (job_id_text, payload_json) in active_jobs {
+            if protected_jobs.contains(&job_id_text) {
+                continue;
+            }
+            let payload: crate::contracts::JobPayload =
+                serde_json::from_str(&payload_json).map_err(json_error)?;
+            let job_id = crate::contracts::JobId::new(job_id_text.clone())?;
+            let hold = crate::storage::job_inputs::active_hold(&self.connection, job_id, &payload)?;
+            if self.hold_intersects_scope(&hold.inputs, scope)? {
+                push_active_input_blocker(scope, &hold);
+                protected_jobs.insert(job_id_text);
+            }
+        }
+        Ok(())
+    }
+
+    fn hold_intersects_scope(
+        &self,
+        inputs: &[crate::storage::job_inputs::JobInputRef],
+        scope: &DeleteScope,
+    ) -> Result<bool, LabError> {
+        use crate::storage::job_inputs::JobInputRef;
+        use DeleteResource as R;
+
+        for input in inputs {
+            let intersects = match input {
+                JobInputRef::CollectionRequest(request_id) => self
+                    .connection
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM del_requests WHERE id=?1)",
+                        [request_id.as_str()],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .map_err(sql_error)?,
+                JobInputRef::Plan(plan_id) => scope.plans.iter().any(|id| id == plan_id.as_str()),
+                JobInputRef::Resource(resource) => match resource {
+                    R::Policy { policy_id } => {
+                        scope.policies.iter().any(|id| id == policy_id.as_str())
+                    }
+                    R::Dataset { dataset_id } => {
+                        scope.datasets.iter().any(|id| id == dataset_id.as_str())
+                    }
+                    R::Run { run_id } => scope.runs.iter().any(|id| id == run_id.as_str()),
+                    R::EvidenceSnapshot { snapshot_id } => scope
+                        .evidence_snapshots
+                        .iter()
+                        .any(|id| id == snapshot_id.as_str()),
+                    R::Artifact { artifact_id } => {
+                        scope.artifacts.iter().any(|id| id == artifact_id.as_str())
+                    }
+                    R::Job { job_id } => scope.jobs.iter().any(|id| id == job_id.as_str()),
+                    R::Suite { .. } | R::Schedule { .. } | R::Backup { .. } => false,
+                },
+            };
+            if intersects {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn compute_scope_counts(&self, scope: &mut DeleteScope) -> Result<(), LabError> {
@@ -1155,6 +1265,17 @@ fn remove_journal_file(root: &Path, file: &JournalFile) -> Result<(), LabError> 
         }
     }
     Ok(())
+}
+
+fn push_active_input_blocker(
+    scope: &mut DeleteScope,
+    hold: &crate::storage::job_inputs::ActiveJobInputHold,
+) {
+    scope.blockers.push(DeleteBlocker {
+        class: DeleteBlockerClass::ActiveJob,
+        reference: format!("job:{}", hold.job_id),
+        reason: "queued/running work still owns inputs in this deletion scope; wait for its terminal readback and cleanup".into(),
+    });
 }
 
 fn scope_digest(scope: &DeleteScope) -> Result<ContentHash, LabError> {
@@ -1453,6 +1574,8 @@ const SCOPE_EDGES: &[&str] = &[
 
 #[cfg(test)]
 mod automation_tests;
+#[cfg(test)]
+mod input_lifetime_tests;
 #[cfg(test)]
 mod policy_tests;
 

@@ -1102,3 +1102,72 @@ fn shared_capital_btc_xrp_300k_s2_completion_test() {
         "S2 execution must be deterministic"
     );
 }
+
+#[test]
+fn single_market_portfolio_and_engine_reconcile_fills_fees_and_terminal_equity() {
+    let mut btc = dataset("KRW-BTC", &FLAT_PRICES);
+    for obs in &mut btc.observations {
+        obs.candle.volume = AssetQuantity::new(Decimal::from(1_000_000)).expect("vol");
+    }
+    let datasets = vec![btc];
+
+    let mut engine_plan = plan(&["KRW-BTC"], StrategySpec::BuyAndHold);
+    engine_plan.spec.capital_mode = None;
+    engine_plan.spec.initial_cash = quote("300000");
+    engine_plan.spec.costs.buy_fee_bps = BasisPoints::new(decimal("5")).expect("fee");
+    engine_plan.spec.costs.sell_fee_bps = BasisPoints::new(decimal("5")).expect("fee");
+    engine_plan.spec.costs.half_spread_bps = BasisPoints::new(decimal("0")).expect("cost");
+    engine_plan.spec.costs.slippage_bps = BasisPoints::new(decimal("2")).expect("cost");
+    engine_plan.spec.costs.impact_bps = BasisPoints::new(decimal("0")).expect("cost");
+
+    let run_id = RunId::new("run-diff-eq").expect("run id");
+    let admission = engine_plan.admissions[0].clone();
+    let model_ledger = run_model(
+        &engine_plan,
+        &datasets,
+        None,
+        &run_id,
+        &admission,
+        1,
+        &|| false,
+    )
+    .expect("single-market engine run should succeed");
+
+    let mut portfolio_plan = engine_plan;
+    portfolio_plan.spec.capital_mode = Some(crate::contracts::CapitalMode::SharedPortfolio);
+    let spec = portfolio_spec(
+        "300000",
+        &[("KRW-BTC", "1.00")],
+        "1.00",
+        "0.00",
+        "0.00",
+        ArbitrationPolicy::Priority,
+    );
+    let portfolio_ledger =
+        run_portfolio(&portfolio_plan, &datasets, &spec, None, &run_id, 1, &|| {
+            false
+        })
+        .expect("single-market portfolio run should succeed");
+
+    assert_eq!(
+        model_ledger.fills.len(),
+        portfolio_ledger.fills.len(),
+        "single-market fill count must match between engine and portfolio"
+    );
+    for (engine_fill, port_fill) in model_ledger.fills.iter().zip(&portfolio_ledger.fills) {
+        assert_eq!(engine_fill.side, port_fill.side);
+        assert_eq!(engine_fill.price, port_fill.price);
+        assert_eq!(engine_fill.qty, port_fill.qty);
+        assert_eq!(engine_fill.notional, port_fill.notional);
+        assert_eq!(engine_fill.fee, port_fill.fee);
+    }
+    let engine_terminal_equity = model_ledger
+        .account_marks
+        .last()
+        .expect("engine terminal mark")
+        .equity;
+    assert_eq!(
+        engine_terminal_equity, portfolio_ledger.totals.terminal_equity,
+        "single-market terminal equity must match exactly between engine and portfolio"
+    );
+}

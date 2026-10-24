@@ -2,14 +2,19 @@
 
 `sky-backcraft` is a Rust research system for public Upbit spot-market data,
 deterministic strategy simulation, exact accounting, durable research jobs and
-portable independent verification. The supported market boundary is
-`KRW-BTC`, `KRW-ETH` and `KRW-XRP`, long/cash only.
+portable independent verification. Markets are Upbit KRW-quoted spot, long/cash
+only; collection admission validates symbols against the exchange catalog.
 
 Research and paper executions are simulated and do not place exchange orders.
 Private account reads and explicitly authorized LIVE strategy automation use
 separate authenticated surfaces. Managed order sending defaults OFF on every
 process start and requires an explicit GUI or private MCP enable action; see
 [trading control, strategy limits and review](docs/live-trading-mcp.md).
+Persistent paper and MOCK/LIVE strategies share managed market WebSocket inputs;
+private order/asset changes trigger reconciliation. See the
+[realtime feed and recovery contract](REALTIME.md).
+For external JSON review of saved facts, see the
+[read-only review contract and examples](docs/json-review.md).
 For research, fees, spread,
 slippage, impact, tick rules and minimum notional are explicit research inputs,
 not claims about a historical market unless the request supplies matching
@@ -108,7 +113,14 @@ before replacement, serializes publishers, and restores preceding outputs if
 publication fails. Build or validation failures leave preceding outputs intact.
 An explicit `SKY_BACKCRAFT_PACKAGE_OUTPUT_DIR` outside repository `dist` can be
 used for isolated verification; version subdirectories inside `dist` are rejected.
-Copy `dist/Sky Backcraft.app` into your local Applications folder and open it there.
+Packaging to an alternate directory does not update `dist` or an installed app.
+Copy the verified app from the actual package output into `~/Applications` and
+open that exact installed path. Before declaring an installation complete, run
+`make verify-install`: it rejects any remaining `dist` or `/Applications` app
+whose bundled helper, native executable, or bundle metadata differs from the
+installed app. Archive obsolete launchable copies outside those paths first;
+never lower the database schema to run an older app. A Git revision or displayed
+app version alone does not establish bundle identity.
 The app bundles the Rust server and uses AppKit controls;
 its settings are the public domain, local port, and OAuth or no authentication.
 No project folder is required. The initial settings are `skybackcraft.store` and
@@ -154,8 +166,8 @@ app or plugin does not itself create an order.
 For a read-only protocol check against the running app:
 
 ```sh
-python3 scripts/mcp_desktop_smoke.py --url http://127.0.0.1:8130/mcp
-python3 scripts/mcp_desktop_smoke.py --url https://skybackcraft.store/mcp
+python3 scripts/python/mcp_desktop_smoke.py --url http://127.0.0.1:8130/mcp
+python3 scripts/python/mcp_desktop_smoke.py --url https://skybackcraft.store/mcp
 ```
 
 These checks prove MCP initialization, the tool catalog, `lab_status`, and Host
@@ -304,15 +316,36 @@ cargo xtask test
 cargo xtask ci
 ```
 
-Only executed gates are PASS. Public HTTPS SDK selfcheck is current. The 75-test CI,
-local HTTP receipt and financial acceptance are earlier-source evidence. Full latest
-`cargo xtask ci` is pending. Remaining lanes include matching-source financial rerun,
-native SQLite backup/restore closure, durable job restart/cancel/saturation proof,
-stateless transport saturation and shutdown proof, structured-log redaction evidence,
-the real three-market experiment matrix, export reread/offline verification,
-elapsed/RSS/output-size measurement, transient public tunnel evidence and the intended
-client invocation. Local HTTP, tunnel reachability and client execution are separate
-claims.
+Rustfmt uses the defaults from the pinned Rust toolchain. Run `cargo fmt --all`
+to format locally; CI checks formatting without rewriting source. Cargo owns lint
+levels: `all` and `pedantic` are errors, with additional production restrictions
+on `unwrap`, `expect`, panic, unfinished code and debug macros. Narrow exceptions
+need a local reason; fixed test fixtures may use `unwrap`, `expect` and panic via
+`clippy.toml`. Do not enable the entire restriction or nursery lint groups.
+
+`make check` runs the Rust gates plus `make scripts-check` (Python and POSIX shell
+syntax, and existing Python regression tests), then builds and verifies the actual
+helper against current source and lockfile on a disposable database across restart. `make ci` runs that same check in
+an isolated Linux container without mounting application data. CI retains only
+Cargo dependency artifacts in a dedicated Docker volume; both workspace crates
+are always cleaned and rebuilt. `make ci-cold` runs the identical gates with an
+empty compiler target in the disposable container. An inherited file lock
+serializes cache writers, and each run uses the exact image ID just built. Cargo check, Clippy
+and tests use the existing lockfile with `--locked`.
+
+Scripts are grouped under `scripts/python/` and `scripts/shell/`; Python regressions
+live in `scripts/python/tests/`. macOS changes also require `make native-check`,
+which covers lifecycle, child runtime, realtime, automation protocols and read
+projections. These native checks use temporary roots and repository fixtures.
+Before publishing a package, `make package` verifies the bundled helper's source,
+lockfile, migrations and restart on a disposable database. The same isolated gate
+can be run with `make verify-helper HELPER=/absolute/path/to/spot-lab`.
+
+Only executed gates are PASS, scoped to the tested source, artifact and platform.
+These checks do not establish deployment, installed-app identity, live-provider
+connectivity, or continuation of an operating paper session. Those require their
+own current evidence; historical delivery receipts remain tied to their original
+source. `cargo xtask extended` retains the optional documentation and deeper checks.
 
 Official exchange references: [minute candles](https://docs.upbit.com/kr/reference/list-candles-minutes),
 [day candles](https://docs.upbit.com/kr/reference/list-candles-days), and
@@ -324,7 +357,9 @@ Repository-local skills live in `skill_backcraft/`. Point an agent at the releva
 `SKILL.md`, or register its individual folder with the agent's skill loader:
 
 - [backcraft-experiment](skill_backcraft/backcraft-experiment/SKILL.md): collect data, author/revise policies, freeze plans and run backtests.
+- [backcraft-research](skill_backcraft/backcraft-research/SKILL.md): preflight policy sweeps and plan/execute walk-forward, batch, shared-portfolio and regime studies.
 - [backcraft-results](skill_backcraft/backcraft-results/SKILL.md): compare existing runs, interpret costs/exits, receive complete files and verify results.
+- [backcraft-maintenance](skill_backcraft/backcraft-maintenance/SKILL.md): inspect database/WAL/storage usage, run backups/checkpoints/compaction and execute approved deletions.
 
 Each folder includes `agents/openai.yaml` discovery metadata. The repository files
 alone do not imply installation in a global skill directory or a remote plugin.

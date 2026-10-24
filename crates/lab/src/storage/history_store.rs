@@ -293,8 +293,12 @@ fn job_kind(value: &str) -> Result<HistoryJobKind, LabError> {
     match value {
         "COLLECT" => Ok(HistoryJobKind::Collect),
         "BACKTEST" => Ok(HistoryJobKind::Backtest),
+        "PORTFOLIO_BACKTEST" => Ok(HistoryJobKind::PortfolioBacktest),
         "EXPORT" => Ok(HistoryJobKind::Export),
         "VERIFY" => Ok(HistoryJobKind::Verify),
         _ => Err(LabError::DataCorrupt(format!("unknown job kind {value}"))),
     }
 }
+
+#[cfg(test)]
+mod tests;

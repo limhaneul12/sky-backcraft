@@ -168,6 +168,54 @@ async fn managed_post_waiting_for_throttle_cannot_survive_off_then_on() {
 }
 
 #[tokio::test]
+async fn live_post_waiting_for_throttle_cannot_survive_private_generation_recovery() {
+    use std::future::Future as _;
+    use std::task::Poll;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut client = UpbitPrivateClient::loopback_fixture(
+        &format!("http://{}", listener.local_addr().unwrap()),
+        LiveExecutionPolicy::OperatorEnabled,
+    )
+    .unwrap();
+    let send_gate = crate::upbit::live_order_control::LiveOrderSendGate::new_disabled();
+    assert!(send_gate.open_if_current(send_gate.generation()).unwrap());
+    client.live_order_send_gate = Some(send_gate.clone());
+    let fence = client.private_readiness_fence();
+    let captured_generation = fence.ready_generation().unwrap();
+    let request = intent(
+        AutomationSide::Bid,
+        AutomationOrderKind::MarketBuy {
+            budget: QuoteAmount::new(Decimal::new(100, 0)).unwrap(),
+        },
+    );
+    let sending_client = client.clone();
+    let throttle = client.rate_limit.lock().await;
+    let sending = sending_client.submit_automation_order(&request);
+    tokio::pin!(sending);
+    assert!(std::future::poll_fn(|cx| Poll::Ready(sending.as_mut().poll(cx).is_pending())).await);
+
+    let recovered_generation = fence.invalidate_for_recovery(captured_generation).unwrap();
+    fence.mark_recovering(recovered_generation).unwrap();
+    assert!(fence.mark_ready(recovered_generation));
+    assert!(fence.is_ready_generation(recovered_generation));
+    assert!(!fence.is_ready_generation(captured_generation));
+
+    drop(throttle);
+    assert!(matches!(
+        sending.await,
+        Err(ClientError::PrivateAccountNotReady)
+    ));
+    assert!(send_gate.is_enabled());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err(),
+        "a POST admitted under the previous private generation reached the loopback socket"
+    );
+}
+
+#[tokio::test]
 #[expect(
     clippy::too_many_lines,
     reason = "one barrier-controlled loopback POST proves real provider lease drain and denial without actual Upbit access"
@@ -356,23 +404,11 @@ async fn fixture(
         }
         captured
     });
-    let client = UpbitPrivateClient {
-        http: reqwest::Client::builder()
-            .no_proxy()
-            .timeout(Duration::from_secs(2))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap(),
-        base_url: format!("http://{address}"),
-        mode: TransportMode::Live(UpbitCredentials::new(
-            "fixture-access".into(),
-            "fixture-secret".into(),
-        )),
-        live_execution_policy: LiveExecutionPolicy::OperatorEnabled,
-        live_order_send_gate: None,
-        rate_limit: Arc::new(Mutex::new(RateLimitState::new())),
-        effect_fixture: true,
-    };
+    let client = UpbitPrivateClient::loopback_fixture(
+        &format!("http://{address}"),
+        LiveExecutionPolicy::OperatorEnabled,
+    )
+    .unwrap();
     (client, server)
 }
 

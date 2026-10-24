@@ -1,8 +1,8 @@
 use super::*;
 use crate::contracts::{
-    ArtifactId, CandleInterval, CollectionScheduleRequest, DeleteBlockerClass, DeleteResource,
-    FreshnessState, JobSubmission, MarketId, ScheduleFailureClass, ScheduleRecoveryState,
-    ScheduleRetryPolicy, SourceProbeResult,
+    CandleInterval, CollectionScheduleRequest, DeleteBlockerClass, DeleteResource, FreshnessState,
+    JobSubmission, MarketId, ScheduleFailureClass, ScheduleRecoveryState, ScheduleRetryPolicy,
+    SourceProbeResult,
 };
 use crate::scheduling::{ScheduleTick, create_schedule, schedule_tick};
 use rusqlite::params;
@@ -439,10 +439,19 @@ fn full_job_queue_leaves_schedule_and_fire_boundary_unchanged() {
             .submit_job(
                 &JobSubmission {
                     request_id: RequestId::new(format!("filler-{index}")).expect("request id"),
-                    payload: JobPayload::Verify {
-                        artifact_id: ArtifactId::new(format!("artifact-{index}"))
-                            .expect("artifact id"),
-                        replay: false,
+                    payload: JobPayload::Collect {
+                        request: crate::contracts::CollectRequest {
+                            request_id: RequestId::new(format!("filler-{index}")).expect("request"),
+                            markets: vec![MarketId::parse_upbit("KRW-BTC").expect("market")],
+                            range: crate::contracts::UtcRange::new(
+                                time("2024-01-01T00:00:00Z"),
+                                time("2024-01-01T01:00:00Z"),
+                            )
+                            .expect("range"),
+                            data_resolution: CandleInterval::H1,
+                            warmup_bars: 0,
+                            completed_only: true,
+                        },
                     },
                 },
                 now,

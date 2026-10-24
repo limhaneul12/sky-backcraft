@@ -775,6 +775,274 @@ indirect enum AutomationJSONValue: Codable, Equatable {
     }
 }
 
+enum RecordedDecisionPresentation {
+    private static let maximumRowsPerSection = 32
+    private static let maximumEvidenceCharacters = 640
+
+    static func lines(for value: AutomationJSONValue?, masked: Bool) -> [String] {
+        guard !masked else { return ["개인정보 숨김 · 저장된 판단 근거를 표시하지 않습니다."] }
+        guard let value else { return ["저장된 구조화 판단 근거 없음 · 당시 기록을 재실행하거나 재구성하지 않았습니다."] }
+        guard let fields = object(value.redactedForDisplay) else {
+            return ["저장된 판단 근거 형식을 해석할 수 없습니다."]
+        }
+
+        var result = [
+            "엔진 결정 근거 · 스키마 \(string(fields["schema_version"]) ?? "미기록")",
+            "결정 시각: \(display(fields["decision_time"]))",
+            "전략 행동: \(action(fields["strategy_action"]))",
+            "제약 적용 후 행동: \(action(fields["constrained_action"]))",
+            "실행 상태: \(execution(fields["execution_state"]))",
+            "결정 시점 실제 비중: \(display(fields["actual_weight_at_decision"]))",
+            "원시 목표 비중: \(display(fields["raw_target_weight"]))",
+            "제약 후 목표 비중: \(display(fields["constrained_target_weight"]))",
+            "일치 규칙 ID: \(display(fields["matched_rule_id"]))",
+            "조건 기록 상태: \(capture(fields["condition_trace_capture"]))"
+        ]
+
+        if let policyReference = fields["policy_ref"], policyReference != .null {
+            result.append("정책 리비전 참조: \(compact(policyReference))")
+        } else {
+            result.append("정책 리비전 참조: 미기록")
+        }
+
+        appendReasons(fields["reasons"], to: &result)
+        appendConditions(fields["condition_trace"], to: &result)
+        appendOrders(fields["orders"], to: &result)
+        appendFills(fields["fills"], to: &result)
+        return result
+    }
+
+    static func preparationLines(for value: AutomationJSONValue?, masked: Bool) -> [String] {
+        guard let value, value != .null else { return [] }
+        guard !masked else { return ["개인정보 숨김 · 저장 준비 근거를 표시하지 않습니다."] }
+        guard let fields = object(value.redactedForDisplay) else {
+            return ["저장 준비 근거 형식을 해석할 수 없습니다."]
+        }
+        return [
+            "엔진 저장 준비 상태: \(display(fields["status"])) · 처리 봉 수: \(display(fields["completed_bars_seen"])) · 필요 봉 수: \(display(fields["required_bars"]))",
+            "준비 판단 시각: \(display(fields["decision_time"])) · 입력 관측 ID: \(display(fields["observation_id"]))"
+        ]
+    }
+
+    private static func appendReasons(_ value: AutomationJSONValue?, to lines: inout [String]) {
+        guard let values = array(value) else {
+            lines.append("저장 사유: 미기록")
+            return
+        }
+        if values.isEmpty {
+            lines.append("저장된 사유 항목: 0건")
+            return
+        }
+        lines.append("저장된 사유 항목: \(values.count)건")
+        for reason in values.prefix(maximumRowsPerSection) {
+            guard let fields = object(reason) else {
+                lines.append("사유 원본: \(compact(reason))")
+                continue
+            }
+            let stage = enumCode(fields["stage"]) ?? "미기록"
+            let code = string(fields["code"]) ?? "미기록"
+            let label = string(fields["label_ko"]) ?? "미기록"
+            lines.append("사유 · \(stageLabel(stage)) · \(label) [\(code)]")
+        }
+        appendRemainder(values.count, to: &lines)
+    }
+
+    private static func appendConditions(_ value: AutomationJSONValue?, to lines: inout [String]) {
+        guard let values = array(value) else {
+            lines.append("조건 비교 기록: 미기록")
+            return
+        }
+        lines.append("저장 조건 평가: \(values.count)개")
+        for (index, condition) in values.prefix(maximumRowsPerSection).enumerated() {
+            guard let fields = object(condition) else {
+                lines.append("조건 \(index + 1): \(compact(condition))")
+                continue
+            }
+            let path = string(fields["ast_path"]) ?? "경로 미기록"
+            let role = enumCode(fields["role"]) ?? "미기록"
+            let outcome = outcomeLabel(fields["outcome"])
+            let engineResult = engineResultLabel(fields["engine_result"], outcome: fields["outcome"])
+            lines.append("조건 \(index + 1) · \(path) · 역할 \(role) · \(outcome) · 엔진 반환 \(engineResult)")
+            if let evidence = fields["evidence"], evidence != .null {
+                lines.append("  실제 비교 입력: \(compact(evidence))")
+            } else {
+                lines.append(enumCode(fields["outcome"]) == "NOT_EVALUATED"
+                    ? "  실제 비교 입력: 미평가" : "  실제 비교 입력: 미기록")
+            }
+        }
+        appendRemainder(values.count, to: &lines)
+    }
+
+    private static func appendOrders(_ value: AutomationJSONValue?, to lines: inout [String]) {
+        guard let values = array(value) else {
+            lines.append("연결된 주문: 미기록")
+            return
+        }
+        lines.append("연결된 주문: \(values.count)건")
+        for order in values.prefix(maximumRowsPerSection) {
+            guard let fields = object(order) else {
+                lines.append("주문 원본: \(compact(order))")
+                continue
+            }
+            let identifier = display(fields["order_id"])
+            let state = display(fields["state"])
+            let reason = display(fields["reason"])
+            lines.append("주문 · \(identifier) · \(state) · 사유 \(reason)")
+        }
+        appendRemainder(values.count, to: &lines)
+    }
+
+    private static func appendFills(_ value: AutomationJSONValue?, to lines: inout [String]) {
+        guard let values = array(value) else {
+            lines.append("연결된 체결: 미기록")
+            return
+        }
+        lines.append("연결된 체결: \(values.count)건")
+        for fill in values.prefix(maximumRowsPerSection) {
+            guard let fields = object(fill) else {
+                lines.append("체결 원본: \(compact(fill))")
+                continue
+            }
+            lines.append("체결 · \(display(fields["fill_id"])) · 주문 \(display(fields["order_id"]))")
+        }
+        appendRemainder(values.count, to: &lines)
+    }
+
+    private static func appendRemainder(_ count: Int, to lines: inout [String]) {
+        guard count > maximumRowsPerSection else { return }
+        lines.append("나머지 \(count - maximumRowsPerSection)개 항목은 표시를 생략했습니다.")
+    }
+
+    private static func action(_ value: AutomationJSONValue?) -> String {
+        let code = enumCode(value) ?? "미기록"
+        let label: String
+        switch code {
+        case "BUY": label = "매수"
+        case "SELL": label = "매도"
+        case "HOLD": label = "보유"
+        case "NOT_EVALUATED": label = "평가 안 함"
+        case "NOT_CAPTURED": label = "미기록"
+        default: label = "확인 필요"
+        }
+        return "\(label) (\(code))"
+    }
+
+    private static func execution(_ value: AutomationJSONValue?) -> String {
+        let code = enumCode(value) ?? "미기록"
+        let label: String
+        switch code {
+        case "NOT_EVALUATED": label = "평가 안 함"
+        case "NO_ORDER": label = "주문 없음"
+        case "REJECTED": label = "거부"
+        case "PENDING": label = "대기"
+        case "FILLED": label = "체결"
+        case "PARTIALLY_FILLED": label = "일부 체결"
+        case "CANCELLED": label = "취소"
+        case "EXPIRED": label = "만료"
+        case "NOT_CAPTURED": label = "미기록"
+        default: label = "확인 필요"
+        }
+        return "\(label) (\(code))"
+    }
+
+    private static func capture(_ value: AutomationJSONValue?) -> String {
+        let code = enumCode(value) ?? "미기록"
+        let label: String
+        switch code {
+        case "CAPTURED": label = "평가 결과 기록"
+        case "PARTIAL_CAPTURE": label = "일부 기록"
+        case "NOT_CAPTURED": label = "미기록"
+        case "NOT_DECISION_EVENT": label = "판단 이벤트 아님"
+        default: label = "확인 필요"
+        }
+        return "\(label) (\(code))"
+    }
+
+    private static func outcomeLabel(_ value: AutomationJSONValue?) -> String {
+        let code = enumCode(value) ?? "미기록"
+        let reason = enumCode(object(value)?["value"])
+        switch code {
+        case "TRUE": return "충족 (TRUE)"
+        case "FALSE": return "불충족 (FALSE)"
+        case "UNKNOWN": return "확인 불가 (UNKNOWN)" + (reason.map { " · \($0)" } ?? "")
+        case "NOT_EVALUATED": return "미평가 (NOT_EVALUATED)" + (reason.map { " · \($0)" } ?? "")
+        default: return "\(code) · 원본 \(value.map(compact) ?? "미기록")"
+        }
+    }
+
+    private static func engineResultLabel(_ value: AutomationJSONValue?, outcome: AutomationJSONValue?) -> String {
+        if let value {
+            switch value {
+            case .boolean(let result): return result ? "true" : "false"
+            case .null: break
+            default: return compact(value)
+            }
+        }
+        return enumCode(outcome) == "NOT_EVALUATED" ? "미평가" : "미기록"
+    }
+
+    private static func stageLabel(_ stage: String) -> String {
+        switch stage {
+        case "DATA_READINESS": return "데이터 준비"
+        case "STRATEGY": return "전략"
+        case "CONSTRAINTS": return "제약"
+        case "ADMISSION": return "주문 허용"
+        case "EXECUTION": return "실행"
+        case "LIFECYCLE": return "상태 전이"
+        default: return stage
+        }
+    }
+
+    private static func object(_ value: AutomationJSONValue?) -> [String: AutomationJSONValue]? {
+        guard let value else { return nil }
+        if case .object(let fields) = value { return fields }
+        return nil
+    }
+
+    private static func array(_ value: AutomationJSONValue?) -> [AutomationJSONValue]? {
+        guard let value else { return nil }
+        if case .array(let values) = value { return values }
+        return nil
+    }
+
+    private static func string(_ value: AutomationJSONValue?) -> String? {
+        guard let value else { return nil }
+        if case .string(let text) = value { return text }
+        return nil
+    }
+
+    private static func enumCode(_ value: AutomationJSONValue?) -> String? {
+        guard let value else { return nil }
+        if case .string(let text) = value { return text }
+        guard let fields = object(value) else { return nil }
+        if let kind = string(fields["kind"]) { return kind }
+        guard fields.count == 1, let key = fields.keys.first else { return nil }
+        return key
+    }
+
+    private static func display(_ value: AutomationJSONValue?) -> String {
+        guard let value else { return "미기록" }
+        switch value {
+        case .null: return "미기록"
+        case .string(let text): return text.isEmpty ? "미기록" : text
+        case .number(let number): return NSDecimalNumber(decimal: number).stringValue
+        case .boolean(let flag): return flag ? "true" : "false"
+        case .object, .array: return compact(value)
+        }
+    }
+
+    private static func compact(_ value: AutomationJSONValue) -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(value), let text = String(data: data, encoding: .utf8) else {
+            return "미해석 JSON"
+        }
+        let flattened = text.replacingOccurrences(of: "\n", with: " ")
+        guard flattened.count > maximumEvidenceCharacters else { return flattened }
+        return String(flattened.prefix(maximumEvidenceCharacters)) + "…"
+    }
+}
+
 struct AutomationEvent: Codable, Equatable {
     let session_id: String
     let sequence: UInt64
@@ -936,6 +1204,7 @@ struct AutomationReviewDecisionDetail: Codable, Equatable {
     let context_candles: [AutomationReviewCandleObservation]
     let orders: [AutomationOrderView]
     let events: [AutomationEvent]
+    let recorded_decision: AutomationJSONValue?
 }
 
 struct AutomationReviewMetric: Codable, Equatable {
@@ -1762,6 +2031,10 @@ final class AutomationSessionMCPService {
               detail.events.allSatisfy({ $0.session_id == sessionID }) else {
             throw AutomationSessionServiceError.identityMismatch("review decision/session/candle/policy/order/event link")
         }
+        try validateRecordedDecisionPolicyReference(
+            detail.recorded_decision,
+            expected: expectedPolicyReference
+        )
         guard let decisionTime = parseRFC3339(decision.decision_time_utc),
               let recordedAt = parseRFC3339(decision.recorded_at_utc),
               recordedAt >= decisionTime,
@@ -1787,6 +2060,29 @@ final class AutomationSessionMCPService {
         guard contextTimes.count == detail.context_candles.count,
               zip(contextTimes, contextTimes.dropFirst()).allSatisfy({ $0.0 < $0.1 }) else {
             throw AutomationSessionServiceError.invalidResponse("review candle context order")
+        }
+    }
+
+    private static func validateRecordedDecisionPolicyReference(
+        _ value: AutomationJSONValue?,
+        expected: AutomationPolicyRevisionReference
+    ) throws {
+        guard let value, value != .null else { return }
+        guard case .object(let fields) = value else {
+            throw AutomationSessionServiceError.invalidResponse("recorded decision projection")
+        }
+        guard let referenceValue = fields["policy_ref"], referenceValue != .null else { return }
+        do {
+            let encoder = JSONEncoder()
+            let data = try encoder.encode(referenceValue)
+            let reference = try JSONDecoder().decode(AutomationPolicyRevisionReference.self, from: data)
+            guard reference == expected else {
+                throw AutomationSessionServiceError.identityMismatch("recorded decision policy reference")
+            }
+        } catch let error as AutomationSessionServiceError {
+            throw error
+        } catch {
+            throw AutomationSessionServiceError.invalidResponse("recorded decision policy reference")
         }
     }
 

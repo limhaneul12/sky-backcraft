@@ -514,6 +514,7 @@ fn raw_ref(seed: &str) -> RawObjectRef {
         raw_bytes: 1,
         compressed_bytes: 1,
         origin: MarketDataOrigin::SyntheticTestOnly,
+        transport: None,
     }
 }
 

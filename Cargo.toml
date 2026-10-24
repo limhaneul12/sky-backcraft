@@ -11,6 +11,7 @@ edition = "2024"
 [workspace.dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 chrono = { version = "0.4", features = ["serde"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
 rusqlite = { version = "0.40.2", default-features = false, features = ["backup", "bundled"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -32,6 +33,7 @@ sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "fs", "time", "sync", "io-util"] }
 tokio-util = "0.7"
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "json"] }
 toml = "0.9"
@@ -43,7 +45,8 @@ unused_must_use = "deny"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
-pedantic = { level = "warn", priority = -1 }
+# Keep the existing effective severity explicit: warnings = deny also denies pedantic warnings.
+pedantic = { level = "deny", priority = -1 }
 unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"

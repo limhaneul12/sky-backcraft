@@ -1,5 +1,8 @@
 use super::*;
-use crate::contracts::{ContentHash, ObservationId, RawObjectId, StateParameters};
+use crate::contracts::{
+    ContentHash, ObservationId, ProviderAbsenceAnchor, ProviderAbsenceSnapshotRef,
+    ProviderAbsenceSpan, RawObjectId, StateParameters, VerifiedProviderCoverage,
+};
 use chrono::{Duration, TimeZone, Utc};
 
 fn market() -> MarketId {
@@ -60,6 +63,45 @@ fn observation(index: i64, close: i64, high: i64, low: i64) -> CandleObservation
     }
 }
 
+fn verified_h1_gap_coverage() -> VerifiedProviderCoverage {
+    let market = market();
+    let pre_open = time(17);
+    let start = UtcTimestamp(pre_open.0 + CandleInterval::H1.duration());
+    let end = time(22);
+    let first_read = UtcTimestamp(time(23).0 + Duration::seconds(1));
+    let proof_seed = "builtin-h1-gap";
+    VerifiedProviderCoverage::from_verified_spans(vec![ProviderAbsenceSpan {
+        proof_id: ContentHash::of_bytes(proof_seed.as_bytes()),
+        market,
+        interval: CandleInterval::H1,
+        start_utc: start,
+        end_utc: end,
+        pre_anchor: ProviderAbsenceAnchor {
+            observation_id: ObservationId::from_seed("builtin-gap-pre"),
+            open_time_utc: pre_open,
+            content_digest: ContentHash::of_bytes(b"builtin-gap-pre"),
+        },
+        post_anchor: ProviderAbsenceAnchor {
+            observation_id: ObservationId::from_seed("builtin-gap-post"),
+            open_time_utc: end,
+            content_digest: ContentHash::of_bytes(b"builtin-gap-post"),
+        },
+        snapshots: [
+            ProviderAbsenceSnapshotRef {
+                raw_object_id: RawObjectId::from_seed("builtin-gap-raw-1"),
+                fetched_at_utc: first_read,
+                body_digest: ContentHash::of_bytes(b"same raw page"),
+            },
+            ProviderAbsenceSnapshotRef {
+                raw_object_id: RawObjectId::from_seed("builtin-gap-raw-2"),
+                fetched_at_utc: UtcTimestamp(first_read.0 + Duration::seconds(1)),
+                body_digest: ContentHash::of_bytes(b"same raw page"),
+            },
+        ],
+    }])
+    .expect("verified H1 coverage")
+}
+
 fn run(
     spec: StrategySpec,
     closes: &[(i64, i64, i64)],
@@ -82,6 +124,19 @@ fn run(
             .unwrap();
     }
     result.expect("post-warmup strategy decision")
+}
+
+fn decision_trace_row<'a>(
+    evaluation: &'a StrategyEvaluation,
+    path: &str,
+) -> &'a PolicyConditionTrace {
+    evaluation
+        .decision_trace
+        .as_deref()
+        .expect("builtin decisions capture evaluated conditions")
+        .iter()
+        .find(|row| row.ast_path == path)
+        .expect("condition trace row")
 }
 
 #[test]
@@ -123,6 +178,17 @@ fn assert_state_and_breakout_boundaries() {
         s1_equality.reasons,
         vec![ReasonCode::HoldState, ReasonCode::NoAction]
     );
+    let s1_gate = decision_trace_row(&s1_equality, "builtin:entry:close_gt_upper_band");
+    assert_eq!(s1_gate.engine_result, Some(false));
+    assert!(matches!(
+        &s1_gate.evidence,
+        Some(PolicyConditionEvidence::Comparison {
+            left,
+            comparison: CompareOp::Gt,
+            right
+        }) if left.get().to_bits() == 100.0_f64.to_bits()
+            && right.get().to_bits() == 100.0_f64.to_bits()
+    ));
 
     let s2 = run(
         StrategySpec::S2 {
@@ -143,6 +209,17 @@ fn assert_state_and_breakout_boundaries() {
         cash(),
     );
     assert_eq!(s2_equality.state_after, PositionState::Cash);
+    let s2_gate = decision_trace_row(&s2_equality, "builtin:entry:close_gt_prior_entry_high");
+    assert_eq!(s2_gate.engine_result, Some(false));
+    assert!(matches!(
+        &s2_gate.evidence,
+        Some(PolicyConditionEvidence::Comparison {
+            left,
+            comparison: CompareOp::Gt,
+            right
+        }) if left.get().to_bits() == 102.0_f64.to_bits()
+            && right.get().to_bits() == 102.0_f64.to_bits()
+    ));
 }
 
 fn assert_pullback_holding_context() {
@@ -160,6 +237,14 @@ fn assert_pullback_holding_context() {
     );
     assert_eq!(s3_entry.state_after, PositionState::Long);
     assert_eq!(s3_entry.reasons, vec![ReasonCode::TrendPullbackEntry]);
+    assert_eq!(
+        decision_trace_row(&s3_entry, "builtin:entry:close_gt_ema").engine_result,
+        Some(true)
+    );
+    assert_eq!(
+        decision_trace_row(&s3_entry, "builtin:entry:rsi_lt_entry_threshold").engine_result,
+        Some(true)
+    );
 
     let s3_spec = StrategySpec::S3 {
         trend_length: 2,
@@ -188,6 +273,14 @@ fn assert_pullback_holding_context() {
         ]
     );
     assert_eq!(s3.state_after, PositionState::Cash);
+    assert!(matches!(
+        &decision_trace_row(&s3, "builtin:exit:held_bars_gte_maximum").evidence,
+        Some(PolicyConditionEvidence::CountComparison {
+            left: 2,
+            comparison: CompareOp::Gte,
+            right: 2
+        })
+    ));
 
     // The same bar with an unfilled prior signal stays cash and cannot timeout.
     let unfilled = run(
@@ -224,10 +317,61 @@ fn assert_volatility_and_buy_hold_boundaries() {
     );
     assert_eq!(s4.constrained_target_weight.get(), Decimal::ZERO);
     assert!(s4.reasons.contains(&ReasonCode::RebalanceBand));
+    assert!(matches!(
+        &decision_trace_row(&s4, "builtin:rebalance:target_distance_within_band").evidence,
+        Some(PolicyConditionEvidence::WeightBand { difference, band, .. })
+            if difference.get() <= band.get()
+    ));
 
     let buy_hold = run(StrategySpec::BuyAndHold, &[(100, 101, 99)], cash());
     assert_eq!(buy_hold.raw_target_weight.get(), Decimal::ONE);
     assert_eq!(buy_hold.reasons, vec![ReasonCode::StartFromCash]);
+    assert_eq!(
+        decision_trace_row(&buy_hold, "builtin:entry:starts_from_cash").engine_result,
+        Some(true)
+    );
+    assert!(matches!(
+        &decision_trace_row(&buy_hold, "builtin:entry:starts_from_cash").evidence,
+        Some(PolicyConditionEvidence::Position {
+            expected: PositionState::Cash,
+            actual: PositionState::Cash
+        })
+    ));
+    assert!(matches!(
+        &decision_trace_row(&buy_hold, "builtin:action:target_equals_actual_weight").evidence,
+        Some(PolicyConditionEvidence::WeightComparison {
+            left,
+            comparison: CompareOp::Eq,
+            right
+        }) if left.get() == Decimal::ONE && right.get() == Decimal::ZERO
+    ));
+}
+
+#[test]
+fn s3_entry_keeps_short_circuit_and_records_only_the_visited_guard() {
+    let no_trend = run(
+        StrategySpec::S3 {
+            trend_length: 2,
+            rsi_length: 2,
+            entry_threshold: 90.0,
+            exit_threshold: 95.0,
+            max_holding_bars: 2,
+            signal_expiry_bars: 2,
+        },
+        &[(100, 101, 99), (80, 81, 79), (70, 71, 69)],
+        cash(),
+    );
+    assert_eq!(no_trend.state_after, PositionState::Cash);
+    assert_eq!(
+        decision_trace_row(&no_trend, "builtin:entry:close_gt_ema").engine_result,
+        Some(false)
+    );
+    let skipped_rsi = decision_trace_row(&no_trend, "builtin:entry:rsi_lt_entry_threshold");
+    assert_eq!(
+        skipped_rsi.outcome,
+        PolicyConditionOutcome::NotEvaluated(PolicyConditionReason::AndShortCircuit)
+    );
+    assert!(skipped_rsi.evidence.is_none());
 }
 
 #[test]
@@ -263,6 +407,12 @@ fn s5_and_matched_control_share_unavailable_cash_boundary() {
         assert_eq!(decision.state_after, PositionState::Cash);
         assert!(decision.reasons.contains(&ReasonCode::EvidenceUnavailable));
         assert!(!decision.evidence_effect.unwrap().coverage_available);
+        assert!(
+            decision
+                .decision_trace
+                .as_deref()
+                .is_some_and(|trace| !trace.is_empty())
+        );
     }
 }
 
@@ -330,7 +480,12 @@ fn future_suffix_does_not_change_existing_prefix_decisions() {
             )
             .unwrap()
         {
-            first_outputs.push((value.state_after, value.raw_target_weight, value.reasons));
+            first_outputs.push((
+                value.state_after,
+                value.raw_target_weight,
+                value.reasons,
+                value.decision_trace,
+            ));
         }
         if let Some(value) = second
             .observe(
@@ -340,7 +495,12 @@ fn future_suffix_does_not_change_existing_prefix_decisions() {
             )
             .unwrap()
         {
-            second_outputs.push((value.state_after, value.raw_target_weight, value.reasons));
+            second_outputs.push((
+                value.state_after,
+                value.raw_target_weight,
+                value.reasons,
+                value.decision_trace,
+            ));
         }
     }
     second
@@ -405,4 +565,56 @@ fn noncontiguous_input_and_inconsistent_position_fail_closed() {
         evaluator.observe(&observation(0, 100, 101, 99), invalid, None),
         Err(LabError::InvalidConfig(_))
     ));
+}
+
+#[test]
+fn builtin_strategy_coverage_carries_indicators_across_actual_bars_only() {
+    let mut evaluator = StrategyEvaluator::new(
+        StrategySpec::S1 {
+            state: StateParameters {
+                ema_length: 2,
+                vol_length: 2,
+                k: 0.0,
+            },
+        },
+        market(),
+        CandleInterval::H1,
+    )
+    .unwrap();
+    let previous = observation(17, 100, 101, 99);
+    let gap_endpoint = observation(22, 110, 111, 109);
+    assert!(
+        evaluator
+            .observe(&previous, cash(), None)
+            .unwrap()
+            .is_none()
+    );
+    let before_gap = serde_json::to_value(&evaluator).unwrap();
+
+    assert!(matches!(
+        evaluator.observe(&gap_endpoint, cash(), None),
+        Err(LabError::DataGap(_))
+    ));
+    assert_eq!(serde_json::to_value(&evaluator).unwrap(), before_gap);
+
+    let coverage = verified_h1_gap_coverage();
+    assert!(
+        evaluator
+            .observe_with_provider_coverage(&gap_endpoint, cash(), None, &coverage)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(evaluator.completed_bars_seen(), 2);
+    assert_eq!(
+        evaluator.last_close_time,
+        Some(gap_endpoint.candle.close_time_utc)
+    );
+
+    let next_actual = observation(23, 120, 121, 119);
+    let decision = evaluator
+        .observe(&next_actual, cash(), None)
+        .unwrap()
+        .expect("actual third bar clears the unchanged warmup");
+    assert_eq!(decision.indicators.completed_bars_seen, 3);
+    assert_eq!(decision.indicators.ema, Some(115.0));
 }

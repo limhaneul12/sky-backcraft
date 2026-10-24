@@ -1431,12 +1431,22 @@ fn decision_detail_from_snapshot(
     snapshot: AutomationReviewSnapshot,
     intent_id: &AutomationIntentId,
 ) -> Result<AutomationDecisionDetail, LabError> {
+    if snapshot.frozen_policy.reference != snapshot.session.policy_ref {
+        return Err(LabError::DataCorrupt(
+            "automation decision detail session and frozen policy identity differ".into(),
+        ));
+    }
     let decision = snapshot
         .decisions
         .iter()
         .find(|decision| &decision.intent_id == intent_id)
         .cloned()
         .ok_or_else(|| LabError::InvalidConfig(format!("unknown automation intent {intent_id}")))?;
+    if decision.session_id != snapshot.session.session_id {
+        return Err(LabError::DataCorrupt(
+            "automation decision detail belongs to another session".into(),
+        ));
+    }
     let mut context_candles = snapshot
         .candles
         .iter()
@@ -1454,7 +1464,7 @@ fn decision_detail_from_snapshot(
             "automation review context contains a non-prior candle".into(),
         ));
     }
-    let orders = snapshot
+    let orders: Vec<_> = snapshot
         .orders
         .iter()
         .filter(|order| order.order.intent_id == decision.intent_id)
@@ -1467,6 +1477,32 @@ fn decision_detail_from_snapshot(
         .map(|order| order.order.client_identifier.clone())
         .collect::<BTreeSet<_>>();
     let intent_ids = BTreeSet::from([decision.intent_id.clone()]);
+    let selected_events = snapshot
+        .events
+        .iter()
+        .filter(|event| {
+            event_matches(&event.detail, &intent_ids, &order_ids)
+                || event
+                    .detail
+                    .get("observation_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(decision.observation_id.as_str())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let fills = snapshot
+        .fills
+        .iter()
+        .filter(|fill| order_ids.contains(&fill.fill.client_identifier))
+        .map(|fill| fill.fill.clone())
+        .collect::<Vec<_>>();
+    let recorded_decision = crate::reporting::decision_explanation::automation_recorded_decision(
+        &snapshot.session.policy_ref,
+        &decision,
+        &orders,
+        &fills,
+        &selected_events,
+    )?;
     let events = snapshot
         .events
         .into_iter()
@@ -1486,6 +1522,7 @@ fn decision_detail_from_snapshot(
         context_candles,
         orders,
         events,
+        recorded_decision: Some(recorded_decision),
     })
 }
 
@@ -1619,6 +1656,7 @@ fn parse_event_kind(raw: &str) -> Result<AutomationEventKind, LabError> {
         "RESUMED" => Ok(AutomationEventKind::Resumed),
         "STOPPED" => Ok(AutomationEventKind::Stopped),
         "CANDLE_OBSERVED" => Ok(AutomationEventKind::CandleObserved),
+        "DECISION_DEFERRED" => Ok(AutomationEventKind::DecisionDeferred),
         "SIGNAL_OBSERVED" => Ok(AutomationEventKind::SignalObserved),
         "INTENT_REJECTED" => Ok(AutomationEventKind::IntentRejected),
         "ORDER_ADMITTED" => Ok(AutomationEventKind::OrderAdmitted),

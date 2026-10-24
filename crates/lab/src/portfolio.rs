@@ -19,11 +19,12 @@ use crate::contracts::{
     TerminalPolicy, UtcTimestamp, Weight,
 };
 use crate::engine::execution::{bps_rate, floor_to_step, tick_for};
-use crate::policy_engine::{CrossIntervalFeed, PolicyEvaluator};
+use crate::policy_engine::{CrossIntervalFeed, PolicyEvaluator, PreparedBarCache};
 use crate::regime::{RegimeClassifier, gate_action};
 use crate::strategy::PositionView;
 use rust_decimal::Decimal;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// Aggregate equity identity tolerance; mirrors the single-model engine.
 const NUMERIC_TOLERANCE: Decimal = crate::contracts::NUMERIC_TOLERANCE;
@@ -37,8 +38,8 @@ struct MarketSlot {
     model_id: ModelId,
     strategy_kind: StrategyKind,
     evaluator: PolicyEvaluator,
-    decision_bars: Vec<CandleObservation>,
-    execution_bars: Vec<CandleObservation>,
+    decision_bars: Arc<[CandleObservation]>,
+    execution_bars: Arc<[CandleObservation]>,
     qty: Decimal,
     price_basis: Decimal,
     realized: Decimal,
@@ -317,7 +318,7 @@ pub fn run_portfolio(
     // undefined and the run fails closed.
     let timeline = shared_timeline(&slots, plan)?;
     for slot in &mut slots {
-        for bar in &slot.decision_bars {
+        for bar in slot.decision_bars.iter() {
             if bar.candle.close_time_utc >= plan.spec.range.start() {
                 break;
             }
@@ -623,6 +624,7 @@ fn market_slots(
             "portfolio assets must cover exactly the plan markets".into(),
         ));
     }
+    let bar_cache = PreparedBarCache::prewarm_for_plan(plan, datasets, &|| false);
     let mut slots = Vec::new();
     for asset in &spec.assets {
         let admissions: Vec<_> = plan
@@ -662,7 +664,7 @@ fn market_slots(
             .spec
             .range
             .with_warmup(1, plan.spec.execution_resolution)?;
-        let decision_bars = crate::policy_engine::prepare_interval_bars(
+        let decision_bars = crate::policy_engine::prepare_interval_bars_cached(
             datasets,
             &asset.market,
             plan.spec.decision_interval,
@@ -670,16 +672,23 @@ fn market_slots(
                 decision_range,
                 plan.spec.range.start(),
             ),
+            Some(&bar_cache),
         )?;
-        let execution_bars = crate::policy_engine::prepare_interval_bars(
+        let execution_bars = crate::policy_engine::prepare_interval_bars_cached(
             datasets,
             &asset.market,
             plan.spec.execution_resolution,
             execution_range,
+            Some(&bar_cache),
         )?;
         // Bounded causal cross-interval stream per declared source interval.
-        let source_feed =
-            CrossIntervalFeed::new(&evaluator, datasets, &asset.market, plan.spec.range)?;
+        let source_feed = CrossIntervalFeed::new_with_cache(
+            &evaluator,
+            datasets,
+            &asset.market,
+            plan.spec.range,
+            Some(&bar_cache),
+        )?;
         // The classifier keeps its own causal stream: its warmup is usually
         // longer than the strategy's, and the strategy stream must stay at
         // the declared policy warmup for reproducibility.

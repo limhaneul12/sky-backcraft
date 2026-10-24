@@ -340,7 +340,7 @@ impl Store {
             }
         }
         validate_case_submission(&transaction, &case, submission)?;
-        let pin = insert_job_tx(&transaction, submission, now)?;
+        let pin = insert_job_tx(&transaction, submission, now, &self.raw)?;
         if let (Some(job), Some(attempt)) = (&case.job_id, &case.attempt_id) {
             if job != &pin.job_id || attempt != &pin.attempt_id {
                 return Err(LabError::Conflict(
@@ -396,7 +396,7 @@ impl Store {
                 "suite case attempt pin is not the job current attempt".into(),
             ));
         }
-        let attempt_id = retry_job_tx(&transaction, &job_id, now)?;
+        let attempt_id = retry_job_tx(&transaction, &job_id, now, &self.raw)?;
         let changed = transaction.execute(
             "UPDATE research_suite_cases SET status='queued',attempt_id=?1,run_id=NULL,failure_json=NULL WHERE id=?2 AND attempt_id=?3 AND status='retry_pending'",
             params![attempt_id.as_str(), case_id.as_str(), pinned.as_str()],

@@ -6,8 +6,8 @@
 
 use crate::contracts::ContentHash;
 use crate::contracts::{
-    AssetQuantity, CandleInterval, CandleRecord, LabError, MarketDataOrigin, MarketId, PriceKrw,
-    ProbeCount, ProbeReport, QuoteAmount, UtcTimestamp,
+    CandleInterval, CandleRecord, LabError, MarketDataOrigin, MarketId, ProbeCount, ProbeReport,
+    UtcTimestamp,
 };
 use crate::database::DatabaseHandle;
 use crate::storage::RawObjectInput;
@@ -17,6 +17,8 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+
+pub(crate) use crate::upbit_candles::decode_candles;
 
 pub const UPBIT_PUBLIC_BASE: &str = "https://api.upbit.com";
 
@@ -310,6 +312,113 @@ impl UpbitClient {
         Ok((published.object, observations))
     }
 
+    /// Fetch and preserve one complete 200-row public recovery page. Unlike the
+    /// legacy bootstrap projection, this retains every completed row from the raw
+    /// page so absence validation cannot overlook an inner provider candle.
+    ///
+    /// # Errors
+    /// Propagates cancellation, network/HTTP, raw-storage, parse and persistence errors.
+    pub(crate) async fn poll_paper_observation_page(
+        &self,
+        market: &MarketId,
+        interval: CandleInterval,
+        to: Option<UtcTimestamp>,
+        cancellation: Option<&CancellationToken>,
+        database: &DatabaseHandle,
+    ) -> Result<
+        (
+            crate::contracts::RawObjectRef,
+            Vec<crate::contracts::CandleObservation>,
+        ),
+        LabError,
+    > {
+        let scheduled_probe = {
+            let mut next_probe = self.next_probe.lock().await;
+            let scheduled = Instant::now().max(*next_probe);
+            *next_probe = scheduled + PROBE_SPACING;
+            scheduled
+        };
+        if let Some(cancellation) = cancellation {
+            tokio::select! {
+                () = cancellation.cancelled() => {
+                    return Err(LabError::Cancelled("public candle page cancelled before request".into()));
+                }
+                () = tokio::time::sleep_until(scheduled_probe) => {}
+            }
+        } else {
+            tokio::time::sleep_until(scheduled_probe).await;
+        }
+        let fetched_at = UtcTimestamp::now();
+        let mut next_probe_after_response = scheduled_probe + PROBE_SPACING;
+        let response = if let Some(cancellation) = cancellation {
+            tokio::select! {
+                () = cancellation.cancelled() => {
+                    return Err(LabError::Cancelled("public candle page request cancelled".into()));
+                }
+                response = self.request_page(
+                    market,
+                    interval,
+                    200,
+                    to,
+                    fetched_at,
+                    &mut next_probe_after_response,
+                ) => response,
+            }
+        } else {
+            self.request_page(
+                market,
+                interval,
+                200,
+                to,
+                fetched_at,
+                &mut next_probe_after_response,
+            )
+            .await
+        };
+        if next_probe_after_response > scheduled_probe + PROBE_SPACING {
+            let mut next_probe = self.next_probe.lock().await;
+            *next_probe = (*next_probe).max(next_probe_after_response);
+        }
+        let response = response.map_err(|failure| failure.error)?;
+        let raw_sha256 = ContentHash::of_bytes(&response.body);
+        let status = response.http_status;
+        let published = database
+            .call("publish_public_feed_recovery_raw", move |store| {
+                let published = store.publish_raw(RawObjectInput {
+                    source_url: response.source_url,
+                    fetched_at: response.fetched_at,
+                    persisted_at: UtcTimestamp::now(),
+                    http_status: response.http_status,
+                    remaining_req: response.remaining_req,
+                    origin: response.origin,
+                    body: response.body,
+                })?;
+                store.catalog_raw(&published.object)?;
+                Ok(published)
+            })
+            .await?;
+        if !(200..300).contains(&status) {
+            return Err(http_error(
+                status,
+                raw_sha256.as_str(),
+                Some(&format!("{}/body.json.gz", published.object.relative_path)),
+            ));
+        }
+        let candles = decode_candles(&published.body, market, interval, fetched_at)?;
+        let mut observations = Vec::with_capacity(candles.len());
+        for candle in candles.into_iter().filter(|candle| candle.completed).rev() {
+            let content_digest = crate::contracts::observation_digest(&candle)?;
+            observations.push(crate::contracts::CandleObservation {
+                id: crate::contracts::ObservationId::from_seed(content_digest.as_str()),
+                candle,
+                content_digest,
+                raw_object_ids: vec![published.object.id.clone()],
+                constituent_ids: Vec::new(),
+            });
+        }
+        Ok((published.object, observations))
+    }
+
     /// Bounded collection request. Waiting only occurs in the single job runner;
     /// interactive probes still reject immediately. No persistence happens here.
     /// Fetch the live Upbit market catalog (`v1/market/all`). Validation
@@ -491,20 +600,6 @@ fn validate_continuity(candles: &[CandleRecord], interval: CandleInterval) -> Re
     Ok(())
 }
 
-/// Wire DTO for Upbit candle endpoints. Unknown exchange fields are ignored;
-/// numbers stay exact decimal literals via `arbitrary_precision`.
-#[derive(Debug, Deserialize)]
-struct UpbitCandleWire {
-    market: String,
-    candle_date_time_utc: String,
-    opening_price: serde_json::Number,
-    high_price: serde_json::Number,
-    low_price: serde_json::Number,
-    trade_price: serde_json::Number,
-    candle_acc_trade_volume: serde_json::Number,
-    candle_acc_trade_price: serde_json::Number,
-}
-
 /// Pure parse + time normalization. `fetched_at` decides completeness:
 /// candle `[t, t+step)` is completed iff `t+step <= fetched_at`.
 ///
@@ -518,75 +613,7 @@ fn parse_candle_bytes(
     interval: CandleInterval,
     fetched_at: UtcTimestamp,
 ) -> Result<Vec<CandleRecord>, LabError> {
-    let records = decode_candles(raw, market, interval, fetched_at)?;
-    if records
-        .windows(2)
-        .any(|pair| pair[0].open_time_utc <= pair[1].open_time_utc)
-    {
-        return Err(LabError::ContractParse(
-            "candles must be distinct and newest first".into(),
-        ));
-    }
-    Ok(records)
-}
-
-pub(crate) fn decode_candles(
-    raw: &[u8],
-    market: &MarketId,
-    interval: CandleInterval,
-    fetched_at: UtcTimestamp,
-) -> Result<Vec<CandleRecord>, LabError> {
-    let wire: Vec<UpbitCandleWire> = serde_json::from_slice(raw)?;
-    if wire.len() > 200 {
-        return Err(LabError::ContractParse(
-            "Upbit returned more than 200 candles".into(),
-        ));
-    }
-    let step = interval.duration();
-    let expected_market = market.code();
-    let mut records = Vec::with_capacity(wire.len());
-    for candle in wire {
-        if candle.market != expected_market {
-            return Err(LabError::ContractParse(format!(
-                "candle market {} does not match requested {expected_market}",
-                candle.market
-            )));
-        }
-        let open = chrono::NaiveDateTime::parse_from_str(
-            &candle.candle_date_time_utc,
-            "%Y-%m-%dT%H:%M:%S",
-        )
-        .map_err(|error| {
-            LabError::ContractParse(format!(
-                "candle_date_time_utc {:?}: {error}",
-                candle.candle_date_time_utc
-            ))
-        })?
-        .and_utc();
-        if open.timestamp().rem_euclid(step.num_seconds()) != 0 {
-            return Err(LabError::ContractParse(format!(
-                "unaligned candle start: {open}"
-            )));
-        }
-        let close_time = open
-            .checked_add_signed(step)
-            .ok_or_else(|| LabError::ContractParse("candle close timestamp out of range".into()))?;
-        let completed = close_time <= fetched_at.0;
-        records.push(CandleRecord {
-            market: expected_market.clone(),
-            interval,
-            open_time_utc: UtcTimestamp(open),
-            close_time_utc: UtcTimestamp(close_time),
-            open: PriceKrw::from_json_number(&candle.opening_price)?,
-            high: PriceKrw::from_json_number(&candle.high_price)?,
-            low: PriceKrw::from_json_number(&candle.low_price)?,
-            close: PriceKrw::from_json_number(&candle.trade_price)?,
-            volume: AssetQuantity::from_json_number(&candle.candle_acc_trade_volume)?,
-            quote_turnover: QuoteAmount::from_json_number(&candle.candle_acc_trade_price)?,
-            completed,
-        });
-    }
-    Ok(records)
+    decode_candles(raw, market, interval, fetched_at)
 }
 
 #[cfg(test)]

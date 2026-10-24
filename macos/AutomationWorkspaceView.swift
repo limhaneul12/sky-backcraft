@@ -1,15 +1,13 @@
 import AppKit
 
-private final class AutomationFlippedDocumentView: NSView {
-    override var isFlipped: Bool { true }
-}
-
 final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate {
     private static let pendingWriteDefaultsKey = "skyBackcraft.automation.pendingWrite.v2"
     private static let legacyPendingRequestDefaultsKey = "skyBackcraft.automation.pendingRequestID.v1"
     private static let decisionIntervals = ["m1", "m5", "m15", "h1", "h4", "d1"]
 
     private let service: AutomationSessionMCPService
+    private let realtimeFeedService: RealtimeFeedMCPService
+    private let realtimeStatusView: RealtimeConnectionStatusView
     private let policyReader: PolicyDetailMCPReader
     private var policies: [RealPolicy]
     private let privacyIsMasked: () -> Bool
@@ -28,6 +26,10 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
     private var accountProjectionBySession: [String: AutomationAccountRiskProjection] = [:]
     private var accountReceivedAtBySession: [String: Date] = [:]
     private var projectionMissingForSelectedSession = false
+    private var sessionListReadFailure: String?
+    private var selectedProjectionReadAfterListFailure = false
+    private var selectedProjectionReadSessionID: String?
+    private var selectedProjectionReadStatus: String?
     private var lastSuccessfulReadAt: Date?
     private var lastReadFailure: String?
     private var pendingReadbackStatus: String?
@@ -39,6 +41,8 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
     private var activeWriteTicket: UUID?
     private var activeReadRequest: NativeMCPRequest?
     private var readGeneration: UInt64 = 0
+    private var realtimeFeedObserverID: UUID?
+    private var marketFeedInvalidation = RealtimeReconciliationInvalidation()
     private var policyGeneration: UInt64 = 0
     private var policyReadInFlight = false
     private var pollTimer: Timer?
@@ -54,12 +58,13 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
     private var baselineSourceMode: AutomationMode?
     private var baselineSourceChoices: [AutomationBaselineSource] = []
 
-    private let outerScroll = NSScrollView()
     private let statusBanner = NSTextField(wrappingLabelWithString: "전략 자동화: 조회 전")
     private let sessionSummaryLabel = NSTextField(wrappingLabelWithString: "세션을 선택하세요.")
     private let accountBalanceLabel = NSTextField(wrappingLabelWithString: "계좌 잔액: 미확인")
     private let baselineStatusLabel = NSTextField(wrappingLabelWithString: "일일 시작 기준선: 미확인")
     private let admissionBlockReasonLabel = NSTextField(wrappingLabelWithString: "주문 승인 차단 사유: 미확인")
+    private let lifecycleAvailabilityLabel = NSTextField(wrappingLabelWithString: "세션 기능과 현재 차단 사유를 읽는 중입니다.")
+    private let startReadinessLabel = NSTextField(wrappingLabelWithString: "")
     private let riskUsageLabel = NSTextField(wrappingLabelWithString: "위험 한도 사용량: 미확인")
     private let feedFreshnessLabel = NSTextField(wrappingLabelWithString: "시장 데이터: 미확인")
     private let capabilityLabel = NSTextField(wrappingLabelWithString: "서버가 허용한 기능: 미확인")
@@ -100,8 +105,10 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
     private let intervalPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let activationLossLimitField = NSTextField(string: "")
     private let activationLossRow = NSStackView()
+    private let riskLimitsDisclosureButton = NSButton(title: "필수 위험 한도 접기", target: nil, action: nil)
     private let startButton = NSButton(title: "전략 세션 생성 및 시작", target: nil, action: nil)
     private let reviewButton = NSButton(title: "복기 · 성과", target: nil, action: nil)
+    private var riskLimitsStack: NSStackView?
     private var riskFields: [String: NSTextField] = [:]
 
     private let sessionTable = NSTableView()
@@ -114,6 +121,7 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
     init(
         policies: [RealPolicy],
         service: AutomationSessionMCPService = AutomationSessionMCPService(),
+        realtimeFeedService: RealtimeFeedMCPService = .shared,
         policyReader: PolicyDetailMCPReader = PolicyDetailMCPReader(),
         privacyIsMasked: @escaping () -> Bool,
         onTogglePrivacyMask: @escaping () -> Void,
@@ -121,6 +129,8 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
     ) {
         self.policies = policies
         self.service = service
+        self.realtimeFeedService = realtimeFeedService
+        self.realtimeStatusView = RealtimeConnectionStatusView(service: realtimeFeedService)
         self.policyReader = policyReader
         self.privacyIsMasked = privacyIsMasked
         self.onTogglePrivacyMask = onTogglePrivacyMask
@@ -145,10 +155,27 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
         buildView()
         populatePolicies()
         renderWorkspace()
+        realtimeFeedObserverID = realtimeFeedService.observe { [weak self] presentation in
+            guard let self else { return }
+            _ = self.marketFeedInvalidation.observe(
+                presentation.status?.market.last_reconciled_at_utc,
+                hasProjection: presentation.status != nil,
+                isVisible: self.isVisibleWorkspace
+            )
+            self.drainPendingMarketFeedInvalidation()
+        }
     }
 
     required init?(coder: NSCoder) {
         return nil
+    }
+
+    deinit {
+        if let realtimeFeedObserverID {
+            realtimeFeedService.removeObserver(realtimeFeedObserverID)
+        }
+        pollTimer?.invalidate()
+        activeReadRequest?.cancel()
     }
 
     override func viewDidChangeEffectiveAppearance() {
@@ -185,6 +212,7 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
         } else {
             pollTimer?.invalidate()
             pollTimer = nil
+            marketFeedInvalidation.clearPending()
             closeReviewWindow()
             readGeneration &+= 1
             activeReadRequest?.cancel()
@@ -196,28 +224,22 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
     }
 
     private func buildView() {
-        outerScroll.hasVerticalScroller = true
-        outerScroll.hasHorizontalScroller = false
-        outerScroll.drawsBackground = false
-        outerScroll.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(outerScroll)
-
-        let documentView = AutomationFlippedDocumentView()
-        documentView.translatesAutoresizingMaskIntoConstraints = false
-        outerScroll.documentView = documentView
-
         let title = NSTextField(labelWithString: "전략 자동화 세션")
-        title.font = .systemFont(ofSize: 19, weight: .bold)
-        modeBadge.font = .monospacedSystemFont(ofSize: 11, weight: .bold)
-        modeBadge.textColor = TerminalTheme.accent
-        let header = NSStackView(views: [title, modeBadge, privacyButton, refreshButton])
+        let titleFont = TerminalTheme.screenTitle
+        title.font = titleFont
+        let titleLineHeight = titleFont.ascender - titleFont.descender + titleFont.leading
+        title.heightAnchor.constraint(greaterThanOrEqualToConstant: ceil(titleLineHeight + 4)).isActive = true
+        title.setAccessibilityLabel("전략 자동화 세션")
+        let header = NSStackView(views: [title, NSView(), privacyButton, refreshButton])
         header.orientation = .horizontal
         header.alignment = .centerY
         header.spacing = 10
 
-        statusBanner.font = .monospacedSystemFont(ofSize: 12, weight: .medium)
+        statusBanner.font = TerminalTheme.monospacedFont(ofSize: 12, weight: .medium)
         statusBanner.textColor = TerminalTheme.secondaryText
         statusBanner.maximumNumberOfLines = 3
+        statusBanner.lineBreakMode = .byWordWrapping
+        statusBanner.setAccessibilityLabel("전략 자동화 작업 상태와 복구 안내")
 
         configureButton(privacyButton, action: #selector(togglePrivacyMask), label: "계좌 금액 개인정보 표시 전환")
         configureButton(refreshButton, action: #selector(handleManualRefresh), label: "전략 자동화 읽기 전용 새로고침")
@@ -237,29 +259,56 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
         let createBox = makePanelBox(title: "새 전략 세션 · MOCK 기본값 / LIVE 선택", content: makeStartForm())
 
         setupTable(sessionTable, label: "전략 자동화 세션 목록", columns: [
-            ("session_id", "세션 ID", 260),
             ("mode_state", "모드 / 상태", 150),
+            ("admission", "서버 주문 승인", 155),
+            ("session_id", "세션 ID", 260),
             ("market_interval", "시장 / 판단 주기", 145),
             ("sequence", "순번", 88),
             ("orders", "미해결 주문", 112),
             ("fills", "체결", 66)
         ])
         let sessionScroll = tableScroll(sessionTable, height: 155)
-        let sessionControls = NSStackView(views: [pauseButton, resumeButton, stopButton, reviewButton, readbackButton, nextSessionsButton])
-        sessionControls.orientation = .horizontal
-        sessionControls.alignment = .centerY
+        let sessionControls = NSStackView(views: [pauseButton, resumeButton, stopButton, reviewButton, readbackButton])
+        sessionControls.orientation = TerminalTheme.textScale >= 1.5 ? .vertical : .horizontal
+        sessionControls.alignment = TerminalTheme.textScale >= 1.5 ? .leading : .centerY
         sessionControls.spacing = 8
-        sessionSummaryLabel.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        sessionSummaryLabel.font = TerminalTheme.monospacedFont(ofSize: 12, weight: .regular)
         sessionSummaryLabel.textColor = .labelColor
-        let sessionContent = verticalStack([sessionControls, sessionScroll, sessionSummaryLabel], spacing: 8)
-        let sessionBox = makePanelBox(title: "세션 목록 · 상태와 요청 순서", content: sessionContent)
+        sessionSummaryLabel.maximumNumberOfLines = 0
+        sessionSummaryLabel.lineBreakMode = .byWordWrapping
+        sessionSummaryLabel.setAccessibilityLabel("선택한 전략 자동화 세션과 동결 정책 identity")
+        let sessionListContent = verticalStack([sessionScroll, nextSessionsButton], spacing: 8)
+        let sessionBox = makePanelBox(title: "세션 목록 · 모드, 서버 승인과 요청 순서", content: sessionListContent)
+
+        modeBadge.font = TerminalTheme.monospacedFont(ofSize: 12, weight: .bold)
+        modeBadge.textColor = TerminalTheme.accent
+        modeBadge.maximumNumberOfLines = 0
+        modeBadge.lineBreakMode = .byWordWrapping
+        modeBadge.setAccessibilityLabel("선택 세션의 실제 MOCK 또는 LIVE 모드, 계좌 identity와 주문 전송 기능")
+        let modeBand = makePanelBox(
+            title: "선택 세션 · 실제 모드와 서버 응답 기능",
+            content: verticalStack([modeBadge], spacing: 4)
+        )
+
+        admissionBlockReasonLabel.font = TerminalTheme.monospacedFont(ofSize: 11, weight: .medium)
+        admissionBlockReasonLabel.maximumNumberOfLines = 0
+        admissionBlockReasonLabel.setAccessibilityLabel("서버가 제공한 주문 승인 차단 사유")
+        lifecycleAvailabilityLabel.font = TerminalTheme.systemFont(ofSize: 12, weight: .medium)
+        lifecycleAvailabilityLabel.textColor = TerminalTheme.secondaryText
+        lifecycleAvailabilityLabel.maximumNumberOfLines = 0
+        lifecycleAvailabilityLabel.setAccessibilityLabel("선택 세션 제어 기능의 활성 또는 차단 사유")
+        let selectedControls = verticalStack([
+            sessionSummaryLabel,
+            sessionControls,
+            lifecycleAvailabilityLabel,
+            admissionBlockReasonLabel
+        ], spacing: 8)
+        let selectedControlBox = makePanelBox(title: "선택 자동화 · 상태 제어와 identity", content: selectedControls)
 
         accountBalanceLabel.font = TerminalTheme.table
         accountBalanceLabel.maximumNumberOfLines = 8
         baselineStatusLabel.font = TerminalTheme.table
         baselineStatusLabel.maximumNumberOfLines = 12
-        admissionBlockReasonLabel.font = .monospacedSystemFont(ofSize: 12, weight: .medium)
-        admissionBlockReasonLabel.maximumNumberOfLines = 4
         riskUsageLabel.font = TerminalTheme.table
         riskUsageLabel.maximumNumberOfLines = 7
         feedFreshnessLabel.font = TerminalTheme.table
@@ -273,7 +322,7 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
         receivedAtLabel.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
         receivedAtLabel.textColor = TerminalTheme.secondaryText
         let accountContent = verticalStack([
-            riskIdentityLabel, accountBalanceLabel, baselineStatusLabel, admissionBlockReasonLabel,
+            riskIdentityLabel, accountBalanceLabel, baselineStatusLabel,
             riskUsageLabel, feedFreshnessLabel, capabilityLabel, mockAssumptionLabel, receivedAtLabel
         ], spacing: 7)
         let accountBox = makePanelBox(title: "동결 정책 · 계좌 · 일일 시작 기준선 · 위험 사용량 · 데이터 신선도", content: accountContent)
@@ -295,8 +344,8 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
         let ordersScroll = tableScroll(orderTable, height: 170)
         cancelOrderButton.toolTip = "서버가 취소를 허용한 모의 세션에서 선택한 OPEN(미체결) 또는 PARTIALLY_FILLED(일부 체결) 주문만 취소할 수 있습니다. 일시정지·중지·화면 숨김 때는 주문을 취소하지 않습니다."
         let ordersHeader = NSStackView(views: [label("선택한 모의 주문만 직접 취소할 수 있습니다"), cancelOrderButton])
-        ordersHeader.orientation = .horizontal
-        ordersHeader.alignment = .centerY
+        ordersHeader.orientation = TerminalTheme.textScale >= 1.5 ? .vertical : .horizontal
+        ordersHeader.alignment = TerminalTheme.textScale >= 1.5 ? .leading : .centerY
         ordersHeader.spacing = 12
         let orderBox = makePanelBox(title: "주문 내역 · 확인되지 않은 주문은 상태 재확인 필요", content: verticalStack([ordersHeader, ordersScroll], spacing: 8))
 
@@ -312,8 +361,8 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
         ])
         let fillsScroll = tableScroll(fillTable, height: 150)
         let fillHeader = NSStackView(views: [label("거래별 고유 ID와 체결 사실"), nextLedgerButton])
-        fillHeader.orientation = .horizontal
-        fillHeader.alignment = .centerY
+        fillHeader.orientation = TerminalTheme.textScale >= 1.5 ? .vertical : .horizontal
+        fillHeader.alignment = TerminalTheme.textScale >= 1.5 ? .leading : .centerY
         fillHeader.spacing = 12
         let fillBox = makePanelBox(title: "체결 내역 · 거래소 ID와 관측 시각", content: verticalStack([fillHeader, fillsScroll], spacing: 8))
 
@@ -325,36 +374,79 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
         ])
         let eventsScroll = tableScroll(eventTable, height: 180)
         let eventsHeader = NSStackView(views: [label("저장된 순서대로 표시 · 시각과 복구 기록 포함"), nextEventsButton])
-        eventsHeader.orientation = .horizontal
-        eventsHeader.alignment = .centerY
+        eventsHeader.orientation = TerminalTheme.textScale >= 1.5 ? .vertical : .horizontal
+        eventsHeader.alignment = TerminalTheme.textScale >= 1.5 ? .leading : .centerY
         eventsHeader.spacing = 12
         let eventBox = makePanelBox(title: "이벤트 내역 · 원본 시각과 복구 기록", content: verticalStack([eventsHeader, eventsScroll], spacing: 8))
 
         let lifecycleNote = label("일시정지하거나 중지하면 새 전략 주문만 막습니다. 기존 보유 자산·미체결 주문·예약 금액은 유지하며, 확인되지 않은 주문은 계속 확인합니다. 일시정지·중지·화면 숨김 때 주문을 자동 취소하거나 자산을 매도하지 않습니다.")
         lifecycleNote.font = .systemFont(ofSize: 12, weight: .medium)
         lifecycleNote.textColor = TerminalTheme.secondaryText
-        lifecycleNote.maximumNumberOfLines = 3
+        lifecycleNote.maximumNumberOfLines = 0
 
-        let mainStack = verticalStack([
-            header, statusBanner, createBox, sessionBox, accountBox, baselineBox,
+        let leftColumn = verticalStack([sessionBox, createBox], spacing: 12)
+        let rightColumn = verticalStack([
+            modeBand, selectedControlBox, accountBox, baselineBox,
             orderBox, fillBox, eventBox, lifecycleNote
         ], spacing: 12)
-        mainStack.translatesAutoresizingMaskIntoConstraints = false
-        documentView.addSubview(mainStack)
-        NSLayoutConstraint.activate([
-            outerScroll.leadingAnchor.constraint(equalTo: leadingAnchor),
-            outerScroll.trailingAnchor.constraint(equalTo: trailingAnchor),
-            outerScroll.topAnchor.constraint(equalTo: topAnchor),
-            outerScroll.bottomAnchor.constraint(equalTo: bottomAnchor),
-            documentView.widthAnchor.constraint(equalTo: outerScroll.contentView.widthAnchor),
-            mainStack.leadingAnchor.constraint(equalTo: documentView.leadingAnchor, constant: 20),
-            mainStack.trailingAnchor.constraint(equalTo: documentView.trailingAnchor, constant: -20),
-            mainStack.topAnchor.constraint(equalTo: documentView.topAnchor, constant: 16),
-            mainStack.bottomAnchor.constraint(equalTo: documentView.bottomAnchor, constant: -16)
-        ])
-        for view in [statusBanner, createBox, sessionBox, accountBox, baselineBox, orderBox, fillBox, eventBox, lifecycleNote] {
-            view.widthAnchor.constraint(equalTo: mainStack.widthAnchor).isActive = true
+        for view in leftColumn.arrangedSubviews {
+            view.widthAnchor.constraint(equalTo: leftColumn.widthAnchor).isActive = true
         }
+        for view in rightColumn.arrangedSubviews {
+            view.widthAnchor.constraint(equalTo: rightColumn.widthAnchor).isActive = true
+        }
+
+        let columnScrollView: (NSView) -> NSScrollView = { content in
+            let scroll = NSScrollView()
+            scroll.hasVerticalScroller = true
+            scroll.hasHorizontalScroller = false
+            scroll.drawsBackground = false
+            scroll.translatesAutoresizingMaskIntoConstraints = false
+            let document = TerminalFlippedDocumentView()
+            document.translatesAutoresizingMaskIntoConstraints = false
+            scroll.documentView = document
+            content.translatesAutoresizingMaskIntoConstraints = false
+            document.addSubview(content)
+            NSLayoutConstraint.activate([
+                document.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+                content.leadingAnchor.constraint(equalTo: document.leadingAnchor, constant: 10),
+                content.trailingAnchor.constraint(equalTo: document.trailingAnchor, constant: -10),
+                content.topAnchor.constraint(equalTo: document.topAnchor, constant: 12),
+                content.bottomAnchor.constraint(equalTo: document.bottomAnchor, constant: -12)
+            ])
+            return scroll
+        }
+        let leadingScroll = columnScrollView(leftColumn)
+        let detailScroll = columnScrollView(rightColumn)
+        let splitView = NSSplitView()
+        splitView.isVertical = true
+        splitView.dividerStyle = .thin
+        splitView.addArrangedSubview(leadingScroll)
+        splitView.addArrangedSubview(detailScroll)
+        leadingScroll.widthAnchor.constraint(greaterThanOrEqualToConstant: max(280, 280 * min(TerminalTheme.textScale, 1.15))).isActive = true
+        detailScroll.widthAnchor.constraint(greaterThanOrEqualToConstant: max(420, 420 * min(TerminalTheme.textScale, 1.15))).isActive = true
+        let splitMinHeight = splitView.heightAnchor.constraint(greaterThanOrEqualToConstant: 240)
+        splitMinHeight.priority = .defaultHigh
+        splitMinHeight.isActive = true
+        splitView.setContentHuggingPriority(.defaultLow, for: .vertical)
+        splitView.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+        header.setContentCompressionResistancePriority(.required, for: .vertical)
+        realtimeStatusView.setContentCompressionResistancePriority(.required, for: .vertical)
+        statusBanner.setContentCompressionResistancePriority(.required, for: .vertical)
+
+        let mainStack = verticalStack([header, realtimeStatusView, statusBanner, splitView], spacing: 10)
+        mainStack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(mainStack)
+        NSLayoutConstraint.activate([
+            mainStack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 20),
+            mainStack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -20),
+            mainStack.topAnchor.constraint(equalTo: topAnchor, constant: 16),
+            mainStack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -16),
+            header.widthAnchor.constraint(equalTo: mainStack.widthAnchor),
+            realtimeStatusView.widthAnchor.constraint(equalTo: mainStack.widthAnchor),
+            statusBanner.widthAnchor.constraint(equalTo: mainStack.widthAnchor),
+            splitView.widthAnchor.constraint(equalTo: mainStack.widthAnchor)
+        ])
     }
 
     private func makeBaselineForm() -> NSView {
@@ -431,35 +523,62 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
         baselineSourceNoteLabel.textColor = TerminalTheme.secondaryText
         baselineSourceNoteLabel.maximumNumberOfLines = 5
 
-        let row1 = NSStackView(views: [
+        let stacksVertically = TerminalTheme.textScale >= 1.5
+        let row1a = NSStackView(views: [
             labeledControl("기준일(UTC)", baselineDayField),
-            labeledControl("기준선 출처", baselineSourcePopup),
+            labeledControl("기준선 출처", baselineSourcePopup)
+        ])
+        row1a.orientation = stacksVertically ? .vertical : .horizontal
+        row1a.alignment = .leading
+        row1a.spacing = 12
+
+        let row1b = NSStackView(views: [
             labeledControl("KRW 사용 가능", baselineQuoteFreeField),
             labeledControl("KRW 잠금", baselineQuoteLockedField)
         ])
-        row1.orientation = .horizontal
-        row1.alignment = .bottom
-        row1.spacing = 12
+        row1b.orientation = stacksVertically ? .vertical : .horizontal
+        row1b.alignment = .leading
+        row1b.spacing = 12
 
-        let row2 = NSStackView(views: [
+        let row1 = NSStackView(views: [row1a, row1b])
+        row1.orientation = .vertical
+        row1.alignment = .leading
+        row1.spacing = 10
+
+        let row2a = NSStackView(views: [
             labeledControl("기초 자산(선택)", baselineBaseCurrencyField),
             labeledControl("자산 사용 가능", baselineBaseFreeField),
-            labeledControl("자산 잠금", baselineBaseLockedField),
+            labeledControl("자산 잠금", baselineBaseLockedField)
+        ])
+        row2a.orientation = stacksVertically ? .vertical : .horizontal
+        row2a.alignment = .leading
+        row2a.spacing = 12
+
+        let row2b = NSStackView(views: [
             labeledControl("자산 평가 근거", baselineValuationBasisPopup),
             labeledControl("기준 단가(KRW)", baselineBasePriceField)
         ])
-        row2.orientation = .horizontal
-        row2.alignment = .bottom
-        row2.spacing = 12
+        row2b.orientation = stacksVertically ? .vertical : .horizontal
+        row2b.alignment = .leading
+        row2b.spacing = 12
+
+        let row2 = NSStackView(views: [row2a, row2b])
+        row2.orientation = .vertical
+        row2.alignment = .leading
+        row2.spacing = 10
+
+        let baselineButtons = NSStackView(views: [recordBaselineButton, queryBaselineButton])
+        baselineButtons.orientation = stacksVertically ? .vertical : .horizontal
+        baselineButtons.alignment = stacksVertically ? .leading : .centerY
+        baselineButtons.spacing = 8
 
         let row3 = NSStackView(views: [
             labeledControl("비고(선택)", baselineNoteField),
-            recordBaselineButton,
-            queryBaselineButton
+            baselineButtons
         ])
-        row3.orientation = .horizontal
-        row3.alignment = .bottom
-        row3.spacing = 10
+        row3.orientation = stacksVertically ? .vertical : .horizontal
+        row3.alignment = stacksVertically ? .leading : .bottom
+        row3.spacing = 12
 
         baselineQueryResultLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
         baselineQueryResultLabel.textColor = TerminalTheme.secondaryText
@@ -509,19 +628,26 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
             labeledControl("세션 모드", startModePopup),
             label("MOCK가 기본 선택입니다. LIVE Start/Resume에는 Settings → 계좌 전략 주문 허용이 필요할 수 있습니다. 이 세션 화면은 계좌 권한이나 별도 주문 전송 게이트를 바꾸지 않습니다.")
         ])
-        modeRow.orientation = .horizontal
-        modeRow.alignment = .bottom
+        modeRow.orientation = .vertical
+        modeRow.alignment = .leading
         modeRow.spacing = 12
+
+        let marketIntervalRow = NSStackView(views: [
+            labeledControl("시장", marketField),
+            labeledControl("판단 주기", intervalPopup)
+        ])
+        marketIntervalRow.orientation = TerminalTheme.textScale >= 1.5 ? .vertical : .horizontal
+        marketIntervalRow.alignment = TerminalTheme.textScale >= 1.5 ? .leading : .top
+        marketIntervalRow.spacing = 12
 
         let identityRow = NSStackView(views: [
             labeledControl("동결 전략", policyPopup),
             labeledControl("정책 버전", revisionPopup),
-            labeledControl("시장", marketField),
-            labeledControl("판단 주기", intervalPopup)
+            marketIntervalRow
         ])
-        identityRow.orientation = .horizontal
-        identityRow.alignment = .bottom
-        identityRow.spacing = 12
+        identityRow.orientation = .vertical
+        identityRow.alignment = .leading
+        identityRow.spacing = 10
 
         let samplePlaceholders: [(String, String, String)] = [
             ("max_order_notional_krw", "주문당 최대 금액(KRW)", "예: 100000"),
@@ -552,9 +678,9 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
             let row = NSStackView(views: pair.map { key, title, _ in
                 labeledControl(title, riskFields[key]!)
             })
-            row.orientation = .horizontal
-            row.alignment = .bottom
-            row.spacing = 14
+            row.orientation = TerminalTheme.textScale >= 1.5 ? .vertical : .horizontal
+            row.alignment = TerminalTheme.textScale >= 1.5 ? .leading : .top
+            row.spacing = 12
             rows.append(row)
         }
 
@@ -565,8 +691,8 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
         activationLossLimitField.setAccessibilityLabel("LIVE 계좌 활성화 기준 손실 한도 KRW · 선택 입력")
         activationLossLimitField.setAccessibilityHelp("LIVE에서만 사용합니다. MOCK를 선택하면 전송하지 않습니다.")
         activationLossLimitField.delegate = self
-        activationLossRow.orientation = .horizontal
-        activationLossRow.alignment = .bottom
+        activationLossRow.orientation = .vertical
+        activationLossRow.alignment = .leading
         activationLossRow.spacing = 12
         activationLossRow.addArrangedSubview(labeledControl("LIVE 활성화 손실 한도(KRW · 선택)", activationLossLimitField))
         activationLossRow.addArrangedSubview(label("LIVE 전용 · 비워 두면 activation_loss_limit_krw를 전송하지 않습니다."))
@@ -581,7 +707,31 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
         startRow.alignment = .centerY
         startRow.spacing = 8
 
-        return verticalStack([modeRow, identityRow, riskTitle] + rows + [activationLossRow, startRow], spacing: 8)
+        riskLimitsDisclosureButton.bezelStyle = .rounded
+        riskLimitsDisclosureButton.title = "필수 위험 한도 접기"
+        riskLimitsDisclosureButton.setAccessibilityLabel("필수 위험 한도 입력 표시 전환")
+        riskLimitsDisclosureButton.target = self
+        riskLimitsDisclosureButton.action = #selector(toggleRiskLimitsDisclosure)
+        let riskLimitsStack = verticalStack(rows + [activationLossRow], spacing: 8)
+        self.riskLimitsStack = riskLimitsStack
+
+        startReadinessLabel.font = TerminalTheme.systemFont(ofSize: 11, weight: .medium)
+        startReadinessLabel.textColor = TerminalTheme.secondaryText
+        startReadinessLabel.maximumNumberOfLines = 0
+        startReadinessLabel.setAccessibilityLabel("새 전략 세션 시작 가능 여부와 입력 차단 사유")
+
+        return verticalStack([
+            modeRow, identityRow, riskTitle, riskLimitsDisclosureButton, riskLimitsStack,
+            startRow, startReadinessLabel
+        ], spacing: 8)
+    }
+
+    @objc private func toggleRiskLimitsDisclosure() {
+        guard let riskLimitsStack else { return }
+        riskLimitsStack.isHidden.toggle()
+        riskLimitsDisclosureButton.title = riskLimitsStack.isHidden
+            ? "필수 위험 한도 펼치기" : "필수 위험 한도 접기"
+        riskLimitsDisclosureButton.setAccessibilityValue(riskLimitsStack.isHidden ? "접힘" : "펼침")
     }
 
     private func populatePolicies() {
@@ -632,7 +782,7 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
         scroll.hasHorizontalScroller = true
         scroll.drawsBackground = true
         scroll.backgroundColor = TerminalTheme.chart
-        scroll.heightAnchor.constraint(equalToConstant: height).isActive = true
+        scroll.heightAnchor.constraint(equalToConstant: max(height, height * min(TerminalTheme.textScale, 1.5))).isActive = true
         return scroll
     }
 
@@ -699,6 +849,7 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
 
     private func reloadWorkspace() {
         guard isVisibleWorkspace, activeWriteTicket == nil else { return }
+        marketFeedInvalidation.clearPending()
         readGeneration &+= 1
         activeReadRequest?.cancel()
         activeReadRequest = nil
@@ -711,6 +862,15 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
         }
     }
 
+    private func drainPendingMarketFeedInvalidation() {
+        guard marketFeedInvalidation.takeIfReady(
+            isVisible: isVisibleWorkspace,
+            readInFlight: activeReadRequest != nil,
+            writeInFlight: activeWriteTicket != nil
+        ) else { return }
+        reloadWorkspace()
+    }
+
     private func loadSessionPage(offset: UInt32, reset: Bool, ticket: UInt64) {
         guard isCurrentRead(ticket) else { return }
         beginRead(ticket: ticket, operation: { completion in
@@ -719,9 +879,13 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
             guard let self else { return }
             switch result {
             case .failure(let error):
+                self.sessionListReadFailure = error.localizedDescription
+                self.selectedProjectionReadAfterListFailure = false
                 self.recordReadFailure(error)
             case .success(let page):
                 let receivedAt = Date()
+                self.sessionListReadFailure = nil
+                self.selectedProjectionReadAfterListFailure = false
                 if reset { self.sessions = page.items }
                 else {
                     let existing = Set(self.sessions.map(\.session_id))
@@ -754,16 +918,33 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
 
     private func loadSelectedSession(_ sessionID: String, ticket: UInt64) {
         guard isCurrentRead(ticket) else { return }
+        if selectedSessionID == sessionID {
+            selectedProjectionReadAfterListFailure = false
+            selectedProjectionReadSessionID = sessionID
+            selectedProjectionReadStatus = "선택 세션 조회 중 · 최신 계좌·위험 투영은 아직 확인되지 않았습니다."
+            sessionTable.reloadData()
+        }
         beginRead(ticket: ticket, operation: { completion in
             service.getSession(sessionID: sessionID, completion: completion)
         }) { [weak self] (result: Result<AutomationSessionView, Error>) in
             guard let self else { return }
             switch result {
-            case .failure(let error): self.recordReadFailure(error)
+            case .failure(let error):
+                if self.selectedSessionID == sessionID {
+                    self.selectedProjectionReadAfterListFailure = false
+                    self.selectedProjectionReadSessionID = sessionID
+                    self.selectedProjectionReadStatus = "선택 세션 조회 실패 · \(error.localizedDescription)"
+                }
+                self.recordReadFailure(error)
             case .success(let session):
                 self.selectedSession = session
                 self.projectionMissingForSelectedSession = session.account_risk == nil
                 self.cacheProjection(from: session, receivedAt: Date())
+                if self.selectedSessionID == sessionID {
+                    self.selectedProjectionReadAfterListFailure = true
+                    self.selectedProjectionReadSessionID = sessionID
+                    self.selectedProjectionReadStatus = nil
+                }
                 self.lastSuccessfulReadAt = Date()
                 self.lastReadFailure = nil
                 self.renderWorkspace()
@@ -929,6 +1110,7 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
             guard let self, self.isCurrentRead(ticket) else { return }
             self.activeReadRequest = nil
             completion(result)
+            self.drainPendingMarketFeedInvalidation()
         }
         if request.isPending { activeReadRequest = request }
     }
@@ -1007,6 +1189,7 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
                 guard let self, self.activeWriteTicket == ticket else { return }
                 self.activeWriteTicket = nil
                 self.activeWriteRequest = nil
+                defer { self.drainPendingMarketFeedInvalidation() }
                 switch result {
                 case .success(let response):
                     do {
@@ -1039,6 +1222,7 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
             statusBanner.stringValue = "요청을 보내기 전에 오류가 확인되어 전송하지 않았습니다: \(error.localizedDescription)"
             statusBanner.textColor = TerminalTheme.negative
             updateControlEnablement()
+            drainPendingMarketFeedInvalidation()
         }
     }
 
@@ -1046,6 +1230,9 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
         selectedSession = response.session
         selectedSessionID = response.session.session_id
         projectionMissingForSelectedSession = response.session.account_risk == nil
+        selectedProjectionReadAfterListFailure = true
+        selectedProjectionReadSessionID = response.session.session_id
+        selectedProjectionReadStatus = nil
         cacheProjection(from: response.session, receivedAt: Date())
         if let baseline = response.baseline {
             queriedBaselineStatus = AutomationAccountDayBaselineStatus(
@@ -1127,10 +1314,47 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
 
     private func updateControlEnablement() {
         let hasPendingWrite = pendingRequestID != nil || activeWriteTicket != nil || pendingMetadataError != nil
-        let riskValid = (try? selectedRiskLimits(for: selectedStartMode)) != nil
+        let riskValidationError: String?
+        do {
+            _ = try selectedRiskLimits(for: selectedStartMode)
+            riskValidationError = nil
+        } catch {
+            riskValidationError = userFacingError(error)
+        }
+        let riskValid = riskValidationError == nil
         reviewButton.isEnabled = isVisibleWorkspace && selectedSession != nil
         let market = marketField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         let interval = intervalPopup.selectedItem?.title
+        var startBlockReasons: [String] = []
+        if pendingMetadataError != nil {
+            startBlockReasons.append("이전 요청 작업 정보가 확인될 때까지 새 변경 요청을 차단합니다.")
+        } else if pendingRequestID != nil || activeWriteTicket != nil {
+            startBlockReasons.append("이전 요청 결과를 읽기 전용으로 확인하는 중입니다.")
+        }
+        if policyReadInFlight {
+            startBlockReasons.append("정책 원본과 동결 버전 확인이 끝나지 않았습니다.")
+        }
+        if selectedPolicyReference == nil {
+            startBlockReasons.append("확인된 정책과 동결 버전을 선택하세요.")
+        }
+        if market.isEmpty {
+            startBlockReasons.append("시장 코드를 입력하세요.")
+        }
+        if interval.map({ Self.decisionIntervals.contains($0) }) != true {
+            startBlockReasons.append("지원되는 판단 주기를 선택하세요.")
+        }
+        if let riskValidationError {
+            startBlockReasons.append("위험 한도 입력 검증 실패 · \(riskValidationError). 예시와 빈 값을 기본값으로 바꾸지 않습니다.")
+        }
+        if startBlockReasons.isEmpty {
+            startReadinessLabel.stringValue = "모든 필수 입력을 확인했습니다. \(modeLabel(selectedStartMode)) 모드가 표시되며 서버 admission은 요청 응답에서 확인합니다."
+            startReadinessLabel.textColor = TerminalTheme.secondaryText
+        } else {
+            startReadinessLabel.stringValue = "세션 시작 차단 · \(startBlockReasons.joined(separator: " · "))"
+            startReadinessLabel.textColor = TerminalTheme.negative
+        }
+        startReadinessLabel.toolTip = startReadinessLabel.stringValue
+        startReadinessLabel.setAccessibilityValue(startReadinessLabel.stringValue)
         startButton.isEnabled = isVisibleWorkspace && !hasPendingWrite && !policyReadInFlight
             && selectedPolicyReference != nil && !market.isEmpty
             && interval.map { Self.decisionIntervals.contains($0) } == true && riskValid
@@ -1148,6 +1372,8 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
             recordBaselineButton.isEnabled = false
             queryBaselineButton.isEnabled = false
             baselineSourcePopup.isEnabled = false
+            lifecycleAvailabilityLabel.stringValue = "세션을 선택하면 실제 계좌 identity, 서버가 허용한 기능과 제어 차단 사유를 표시합니다."
+            lifecycleAvailabilityLabel.textColor = TerminalTheme.secondaryText
             return
         }
         let capabilities = session.account_risk?.capabilities
@@ -1165,6 +1391,44 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
             && session.state == .paused && capabilities?.can_resume == true
         stopButton.isEnabled = lifecycleEnabled
             && session.state != .stopped && capabilities?.can_stop == true
+        let lifecycleBlockReasons: [String]
+        if hasPendingWrite {
+            lifecycleBlockReasons = ["이전 변경 요청의 결과가 확인될 때까지 모든 변경 제어가 차단됩니다."]
+        } else if !sessionIdentityValid {
+            lifecycleBlockReasons = ["선택한 모드와 계좌 identity가 일치하지 않아 제어를 차단합니다."]
+        } else if !lifecycleProjectionIsCurrent {
+            lifecycleBlockReasons = ["현재 계좌·위험 정보가 확인되지 않았거나 30초보다 오래되어 제어를 차단합니다."]
+        } else if !lifecycleSafe {
+            lifecycleBlockReasons = ["모의 세션의 실주문 전송 기능이 켜졌다고 응답되어 안전 잠금으로 제어를 차단합니다."]
+        } else {
+            var reasons: [String] = []
+            if session.state != .running { reasons.append("일시정지에는 RUNNING 상태가 필요합니다.") }
+            else if capabilities?.can_pause != true { reasons.append("서버가 일시정지를 허용하지 않습니다.") }
+            if session.state != .paused { reasons.append("재개에는 PAUSED 상태가 필요합니다.") }
+            else if capabilities?.can_resume != true { reasons.append("서버가 재개를 허용하지 않습니다.") }
+            if session.state == .stopped { reasons.append("세션이 이미 중지되었습니다.") }
+            else if capabilities?.can_stop != true { reasons.append("서버가 중지를 허용하지 않습니다.") }
+            lifecycleBlockReasons = reasons
+        }
+        let availableLifecycleActions = [
+            pauseButton.isEnabled ? "일시정지" : nil,
+            resumeButton.isEnabled ? "재개" : nil,
+            stopButton.isEnabled ? "중지" : nil
+        ].compactMap(\.self)
+        if lifecycleBlockReasons.isEmpty {
+            lifecycleAvailabilityLabel.stringValue = "현재 RUNNING / PAUSED 상태와 서버 기능 projection 기준 사용 가능 · \(availableLifecycleActions.joined(separator: " · "))"
+            lifecycleAvailabilityLabel.textColor = TerminalTheme.secondaryText
+        } else {
+            lifecycleAvailabilityLabel.stringValue = "비활성 제어 사유 · \(lifecycleBlockReasons.joined(separator: " · "))"
+            let capabilityBlocked = (session.state == .running && capabilities?.can_pause != true)
+                || (session.state == .paused && capabilities?.can_resume != true)
+                || (session.state != .stopped && capabilities?.can_stop != true)
+            lifecycleAvailabilityLabel.textColor = hasPendingWrite || !sessionIdentityValid
+                || !lifecycleProjectionIsCurrent || !lifecycleSafe || capabilityBlocked
+                ? TerminalTheme.negative : TerminalTheme.secondaryText
+        }
+        lifecycleAvailabilityLabel.toolTip = lifecycleAvailabilityLabel.stringValue
+        lifecycleAvailabilityLabel.setAccessibilityValue(lifecycleAvailabilityLabel.stringValue)
         nextEventsButton.isEnabled = isVisibleWorkspace && eventNextSequence != nil && activeReadRequest == nil
         nextLedgerButton.isEnabled = isVisibleWorkspace && ledgerNextSequence != nil && activeReadRequest == nil
         let selectedOrder = selectedOwnedOrder()
@@ -1222,6 +1486,9 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
             modeBadge.stringValue = "새 세션 모드 \(modeLabel(selectedStartMode)) · 실주문 전송 상태 미확인"
             modeBadge.textColor = selectedStartMode == .live ? TerminalTheme.negative : TerminalTheme.accent
         }
+        modeBadge.toolTip = modeBadge.stringValue
+        modeBadge.setAccessibilityValue(modeBadge.stringValue)
+        modeBadge.setAccessibilityHelp("선택한 session projection의 실제 MOCK/LIVE, account identity와 live_effects_enabled 값. 새 세션 전에는 주문 전송 상태가 미확인입니다.")
         sessionTable.reloadData()
         orderTable.reloadData()
         restoreOrderSelection()
@@ -1245,6 +1512,8 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
     private func renderSessionSummary() {
         guard let session = selectedSession else {
             sessionSummaryLabel.stringValue = "선택된 세션이 없습니다. 새 세션은 기본 MOCK이며 LIVE를 직접 선택할 수 있습니다. 모든 위험 한도는 직접 입력해야 합니다."
+            sessionSummaryLabel.toolTip = sessionSummaryLabel.stringValue
+            sessionSummaryLabel.setAccessibilityHelp(sessionSummaryLabel.stringValue)
             return
         }
         let unresolved = session.unresolved_order_count
@@ -1265,6 +1534,7 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
             "미해결 주문: \(unresolved) · 체결: \(session.fill_count) · 복구 사유: \(recovery)"
         ].joined(separator: "\n")
         sessionSummaryLabel.toolTip = sessionSummaryLabel.stringValue
+        sessionSummaryLabel.setAccessibilityValue(sessionSummaryLabel.stringValue)
         sessionSummaryLabel.setAccessibilityHelp(sessionSummaryLabel.stringValue)
     }
 
@@ -2361,6 +2631,11 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
         selectedSessionID = session.session_id
         selectedSession = session
         projectionMissingForSelectedSession = session.account_risk == nil
+        if sessionListReadFailure != nil {
+            selectedProjectionReadAfterListFailure = false
+            selectedProjectionReadSessionID = session.session_id
+            selectedProjectionReadStatus = "선택 세션 조회 중 · 최신 계좌·위험 투영은 아직 확인되지 않았습니다."
+        }
         queriedBaselineStatus = nil
         baselineQueryResultLabel.stringValue = "세션이 변경되어 기준선 상태를 다시 조회해야 합니다."
         baselineDayField.stringValue = ""
@@ -2436,6 +2711,100 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
         if tableView === sessionTable, sessions.indices.contains(row) {
             let item = sessions[row]
             tooltip = "session_id: \(item.session_id)\naccount_identity scope: \(AutomationAccountIdentityScope.presentation(for: item.mode))\npolicy_id: \(item.policy_ref.policy_id)\nrevision_id: \(item.policy_ref.revision_id)\ndigest: \(item.policy_ref.definition_digest)\nmarket: \(item.market)\ninterval: \(item.decision_interval)\nsequence: \(item.sequence)"
+            let selectedProjectionStatus = selectedProjectionReadSessionID == item.session_id
+                ? selectedProjectionReadStatus : nil
+            let currentRisk: AutomationAccountRiskProjection?
+            let unavailableReason: String?
+            if let selectedProjectionStatus {
+                currentRisk = nil
+                unavailableReason = selectedProjectionStatus
+            } else if selectedSessionID == item.session_id,
+                      let session = selectedSession, session.session_id == item.session_id {
+                if sessionListReadFailure != nil && !selectedProjectionReadAfterListFailure {
+                    currentRisk = nil
+                    unavailableReason = "더 최근의 세션 목록 조회가 실패했습니다. 그 뒤 선택 세션을 성공적으로 다시 읽기 전까지 현재 projection은 미확인입니다."
+                } else if projectionMissingForSelectedSession {
+                    currentRisk = nil
+                    unavailableReason = "최신 선택 세션 응답에 계좌·위험 projection이 없습니다."
+                } else if let risk = session.account_risk {
+                    currentRisk = risk
+                    unavailableReason = nil
+                } else {
+                    currentRisk = nil
+                    unavailableReason = "최신 선택 세션 응답의 계좌·위험 projection을 확인할 수 없습니다."
+                }
+            } else if let sessionListReadFailure {
+                currentRisk = nil
+                unavailableReason = "세션 목록 조회 실패 · \(sessionListReadFailure)"
+            } else if let risk = item.account_risk {
+                currentRisk = risk
+                unavailableReason = nil
+            } else {
+                currentRisk = nil
+                unavailableReason = "최신 세션 목록 응답에 계좌·위험 projection이 없습니다."
+            }
+
+            if let risk = currentRisk {
+                let reasons = risk.admission_block_reasons
+                let admission = reasons.isEmpty
+                    ? (risk.capabilities.can_submit_orders ? "차단 사유 없음" : "서버 불허 · 사유 미제공")
+                    : "차단 \(reasons.count)건"
+                let receiveTime = accountReceivedAtBySession[item.session_id]
+                let receiveAge = receiveTime.map { Date().timeIntervalSince($0) }
+                let isSelectedSessionResponse = selectedSession?.session_id == item.session_id
+                    && selectedProjectionStatus == nil
+                    && !projectionMissingForSelectedSession
+                let qualifier: String
+                if let receiveAge, receiveAge >= 0, receiveAge <= 30 {
+                    qualifier = isSelectedSessionResponse
+                        ? "현재 선택 세션 응답 · 앱 수신 30초 이내"
+                        : "목록 응답 · 앱 수신 30초 이내"
+                } else if let receiveAge, receiveAge < 0 {
+                    qualifier = "미래 앱 수신 시각 · 신선도 미확인"
+                } else if receiveTime != nil {
+                    qualifier = "마지막 응답"
+                } else {
+                    qualifier = "응답 시각 미확인"
+                }
+                value = identifier == "admission" ? "\(qualifier) · \(admission)" : value
+                tooltip += "\nprojection_source: \(isSelectedSessionResponse ? "selected get_session" : "session list row")\nadmission_state: \(admission)\ncan_submit_orders: \(risk.capabilities.can_submit_orders)\nadmission_block_reasons: \(reasons.isEmpty ? "없음" : reasons.joined(separator: " · "))"
+                tooltip += "\napp_received_at_utc: \(receiveTime.map(utcString) ?? "미확인")"
+            } else {
+                let lastKnownRisk = accountProjectionBySession[item.session_id]
+                let visibleReason: String
+                if selectedProjectionStatus?.contains("조회 중") == true {
+                    visibleReason = "조회 중 · 최신값 미확인"
+                } else if selectedProjectionStatus != nil {
+                    visibleReason = "조회 실패 · 최신값 미확인"
+                } else if selectedSessionID == item.session_id,
+                          selectedSession?.session_id == item.session_id,
+                          sessionListReadFailure != nil && !selectedProjectionReadAfterListFailure {
+                    visibleReason = "목록 조회 실패 · 최신값 미확인"
+                } else if selectedSessionID == item.session_id,
+                          selectedSession?.session_id == item.session_id,
+                          projectionMissingForSelectedSession {
+                    visibleReason = "응답 projection 없음 · 미확인"
+                } else if sessionListReadFailure != nil {
+                    visibleReason = "목록 조회 실패 · 최신값 미확인"
+                } else {
+                    visibleReason = "응답 projection 없음 · 미확인"
+                }
+                if identifier == "admission" {
+                    value = lastKnownRisk == nil ? visibleReason : "\(visibleReason) · 마지막값 보유"
+                }
+                tooltip += "\ncurrent_admission_state: 미확인\nprojection_unavailable_reason: \(unavailableReason ?? "최신 투영 없음")"
+                if let lastKnownRisk {
+                    let reasons = lastKnownRisk.admission_block_reasons
+                    let lastKnownAdmission = reasons.isEmpty
+                        ? (lastKnownRisk.capabilities.can_submit_orders ? "차단 사유 없음" : "서버 불허 · 사유 미제공")
+                        : "차단 \(reasons.count)건"
+                    tooltip += "\nlast_known_admission_state: \(lastKnownAdmission) · 역사적 값이며 현재 승인이 아닙니다."
+                    tooltip += "\nlast_known_block_reasons: \(reasons.isEmpty ? "없음" : reasons.joined(separator: " · "))"
+                    tooltip += "\nlast_known_app_received_at_utc: \(accountReceivedAtBySession[item.session_id].map(utcString) ?? "미확인")"
+                } else {
+                    tooltip += "\nlast_known_admission_state: 없음"
+                }
+            }
             switch identifier {
             case "session_id": value = shortened(item.session_id)
             case "mode_state": value = "\(modeLabel(item.mode)) / \(stateLabel(item.state)) (\(item.state.rawValue))"
@@ -2493,6 +2862,7 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
         cell.lineBreakMode = .byTruncatingMiddle
         cell.toolTip = tooltip
         cell.setAccessibilityLabel("\(tableColumn?.title ?? "") · \(value)")
+        cell.setAccessibilityHelp(tooltip)
         if ["sequence", "orders", "fills", "notional", "reserved_fee", "locked_quote", "locked_base", "executed", "paid_fee", "trades", "price", "volume", "funds"].contains(identifier) {
             cell.alignment = .right
         }

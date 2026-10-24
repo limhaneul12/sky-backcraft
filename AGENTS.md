@@ -36,7 +36,10 @@ Canonical entrypoints:
 - `cargo xtask fmt`
 - `cargo xtask check`
 - `cargo xtask test`
-- repository closure: `cargo xtask ci`
+- Rust closure: `cargo xtask ci`
+- portable repository closure: `make check` (Rust gates, script syntax/tests, built-helper identity and isolated DB restart)
+- Linux container equivalent: `make ci`
+- macOS changes: `make native-check`; package generation also verifies the staged and archive-restored helper
 
 `cargo xtask deps` is explicit and fail-closed (requires project-owned `deny.toml`); `cargo xtask extended` includes it only when `HARNESS.toml [verification].supply_chain = true`.
 
@@ -48,7 +51,9 @@ Report only meaningful changes, affected authority/runtime surfaces, exact valid
 ## Project Subagents
 - Load `.codex/LUNA_TASK_CONTRACT.md` before delegation.
 - Use only these project role profiles: `backcraft_explorer`, `backcraft_backend`,
-  `backcraft_gui`, and `backcraft_verifier`.
-- All four use `gpt-6-luna` / `max`; Main retains its current model and final acceptance.
+  `backcraft_gui`, `backcraft_verifier`, and `backcraft_reviewer`.
+- Mapping, implementation and test/runtime verification use `gpt-6-luna` / `max`.
+  Code review uses `backcraft_reviewer` with `gpt-6-astra` / `high`, per the user's
+  2026-10-20 routing change. Main retains its current model and final acceptance.
 - Maximum four concurrent children; no nested delegation or silent model fallback.
 - Give each writer disjoint explicit ownership. Verification must not repair its inputs.

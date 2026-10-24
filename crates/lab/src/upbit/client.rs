@@ -16,15 +16,20 @@ use crate::upbit::auth::{
 };
 use crate::upbit::execution::LiveExecutionPolicy;
 use crate::upbit::live_order_control::LiveOrderSendGate;
+use crate::upbit::realtime::PrivateReadinessFence;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 
 /// Maximum response body allowed for private API calls (1 MiB).
 const MAX_BODY_BYTES: usize = 1_048_576;
+const MAX_OPEN_ORDER_BASELINE_PAGES: u32 = 100;
+const OPEN_ORDER_PAGE_SIZE: u32 = 100;
+pub(crate) const MAX_PRIVATE_BASELINE_BYTES: usize = 4 * 1_048_576;
 mod rate_limit;
 use rate_limit::RateLimitState;
 
@@ -35,6 +40,12 @@ pub enum ClientError {
     LiveTradingDisabled,
     #[error("LIVE_ORDER_SENDING_DISABLED: runtime gate denied before provider POST")]
     LiveOrderControlDenied,
+    #[error("LIVE_PRIVATE_ACCOUNT_NOT_READY: private account baseline/recovery is incomplete")]
+    PrivateAccountNotReady,
+    #[error("private open-order baseline exceeded its {limit} order bound")]
+    PrivateBaselineLimit { limit: u64 },
+    #[error("private REST baseline used {observed} bytes; limit is {limit}")]
+    PrivateBaselineByteLimit { observed: usize, limit: usize },
     #[error(
         "provider request budget exhausted; next request allowed after {retry_after_seconds} seconds"
     )]
@@ -55,6 +66,39 @@ pub enum ClientError {
     InvalidParams(String),
     #[error("Response size {observed} exceeded max limit {limit}")]
     ResponseTooLarge { observed: u64, limit: u64 },
+}
+
+/// Shared aggregate wire-byte budget for one REST snapshot plus bootstrap events.
+pub(crate) struct PrivateBaselineByteBudget {
+    used: AtomicUsize,
+}
+
+impl PrivateBaselineByteBudget {
+    pub(crate) fn new() -> Self {
+        Self {
+            used: AtomicUsize::new(0),
+        }
+    }
+
+    pub(crate) fn record(&self, bytes: usize) -> Result<usize, ClientError> {
+        let result = self
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes)
+                    .filter(|total| *total <= MAX_PRIVATE_BASELINE_BYTES)
+            });
+        match result {
+            Ok(previous) => Ok(previous + bytes),
+            Err(previous) => Err(ClientError::PrivateBaselineByteLimit {
+                observed: previous.saturating_add(bytes),
+                limit: MAX_PRIVATE_BASELINE_BYTES,
+            }),
+        }
+    }
+
+    pub(crate) fn used(&self) -> usize {
+        self.used.load(Ordering::Acquire)
+    }
 }
 
 /// Upbit account balance row from `GET /v1/accounts`.
@@ -156,6 +200,7 @@ pub struct UpbitPrivateClient {
     live_execution_policy: LiveExecutionPolicy,
     live_order_send_gate: Option<LiveOrderSendGate>,
     rate_limit: Arc<Mutex<RateLimitState>>,
+    private_readiness: Arc<OnceLock<PrivateReadinessFence>>,
     #[cfg(test)]
     effect_fixture: bool,
 }
@@ -191,6 +236,7 @@ impl UpbitPrivateClient {
             live_execution_policy,
             live_order_send_gate: None,
             rate_limit: Arc::new(Mutex::new(RateLimitState::new())),
+            private_readiness: Arc::new(OnceLock::new()),
             #[cfg(test)]
             effect_fixture: false,
         })
@@ -223,6 +269,7 @@ impl UpbitPrivateClient {
             live_execution_policy: LiveExecutionPolicy::Disabled,
             live_order_send_gate: None,
             rate_limit: Arc::new(Mutex::new(RateLimitState::new())),
+            private_readiness: Arc::new(OnceLock::new()),
             #[cfg(test)]
             effect_fixture: false,
         }
@@ -260,6 +307,20 @@ impl UpbitPrivateClient {
         base_url: &str,
         live_execution_policy: LiveExecutionPolicy,
     ) -> Result<Self, ClientError> {
+        let credentials = UpbitCredentials::generated_for_test().map_err(ClientError::Auth)?;
+        let client =
+            Self::loopback_fixture_with_credentials(base_url, live_execution_policy, credentials)?;
+        client.private_readiness_fence().mark_test_ready();
+        Ok(client)
+    }
+
+    /// Construct an isolated loopback client with explicitly supplied test credentials.
+    #[cfg(test)]
+    pub(crate) fn loopback_fixture_with_credentials(
+        base_url: &str,
+        live_execution_policy: LiveExecutionPolicy,
+        credentials: UpbitCredentials,
+    ) -> Result<Self, ClientError> {
         let parsed = reqwest::Url::parse(base_url)
             .map_err(|error| ClientError::InvalidParams(error.to_string()))?;
         if parsed.scheme() != "http"
@@ -285,13 +346,11 @@ impl UpbitPrivateClient {
         Ok(Self {
             http,
             base_url,
-            mode: TransportMode::Live(UpbitCredentials::new(
-                "loopback-fixture-access".into(),
-                "loopback-fixture-secret".into(),
-            )),
+            mode: TransportMode::Live(credentials),
             live_execution_policy,
             live_order_send_gate: None,
             rate_limit: Arc::new(Mutex::new(RateLimitState::new())),
+            private_readiness: Arc::new(OnceLock::new()),
             effect_fixture: true,
         })
     }
@@ -308,13 +367,52 @@ impl UpbitPrivateClient {
         self.live_execution_policy
     }
 
+    /// Install or retrieve this client's shared private-stream fence.
+    /// Every clone of this client observes the same readiness generation.
+    #[must_use]
+    pub(crate) fn private_readiness_fence(&self) -> PrivateReadinessFence {
+        self.private_readiness
+            .get_or_init(PrivateReadinessFence::new)
+            .clone()
+    }
+
+    /// Sign the fixed private WebSocket handshake inside the Rust credential boundary.
+    /// The returned header is marked sensitive and must never be logged or persisted.
+    ///
+    /// # Errors
+    /// Rejects MOCK clients and signing/header construction failures.
+    pub(crate) fn private_websocket_authorization_header(
+        &self,
+    ) -> Result<reqwest::header::HeaderValue, ClientError> {
+        let TransportMode::Live(credentials) = &self.mode else {
+            return Err(ClientError::InvalidParams(
+                "private WebSocket requires a configured LIVE account".into(),
+            ));
+        };
+        let authorization = credentials.sign_request(None)?;
+        let mut header =
+            reqwest::header::HeaderValue::try_from(authorization.as_str()).map_err(|_| {
+                ClientError::InvalidParams("invalid private authorization header".into())
+            })?;
+        header.set_sensitive(true);
+        Ok(header)
+    }
+
     /// Fetch account balances (`GET /v1/accounts`).
     ///
     /// # Errors
     /// Returns `ClientError` on HTTP, network, or decoding error.
     pub async fn get_accounts(&self) -> Result<Vec<UpbitAccountBalance>, ClientError> {
+        self.get_accounts_with_size()
+            .await
+            .map(|(accounts, _)| accounts)
+    }
+
+    async fn get_accounts_with_size(
+        &self,
+    ) -> Result<(Vec<UpbitAccountBalance>, usize), ClientError> {
         match &self.mode {
-            TransportMode::Mock => Ok(Vec::new()),
+            TransportMode::Mock => Ok((Vec::new(), 0)),
             TransportMode::Live(creds) => {
                 let url = format!("{}/v1/accounts", self.base_url);
                 self.verify_request_host(&url)?;
@@ -335,8 +433,9 @@ impl UpbitPrivateClient {
                     return Err(ClientError::Api { status, body });
                 }
 
+                let response_bytes = bytes.len();
                 let accounts: Vec<UpbitAccountBalance> = serde_json::from_slice(&bytes)?;
-                Ok(accounts)
+                Ok((accounts, response_bytes))
             }
         }
     }
@@ -732,6 +831,16 @@ impl UpbitPrivateClient {
         let TransportMode::Live(credentials) = &self.mode else {
             return Err(ClientError::LiveTradingDisabled);
         };
+        let private_generation = if method == reqwest::Method::POST {
+            let generation = self
+                .private_readiness
+                .get()
+                .and_then(PrivateReadinessFence::ready_generation)
+                .ok_or(ClientError::PrivateAccountNotReady)?;
+            Some(generation)
+        } else {
+            None
+        };
         let url = if method == reqwest::Method::DELETE {
             format!("{}{path}?{query}", self.base_url)
         } else {
@@ -758,6 +867,14 @@ impl UpbitPrivateClient {
         } else {
             None
         };
+        if let Some(generation) = private_generation
+            && !self
+                .private_readiness
+                .get()
+                .is_some_and(|fence| fence.is_ready_generation(generation))
+        {
+            return Err(ClientError::PrivateAccountNotReady);
+        }
         let response = request
             .send()
             .await
@@ -787,6 +904,17 @@ impl UpbitPrivateClient {
         page: Option<u32>,
         limit: Option<u32>,
     ) -> Result<Vec<UpbitOrderDetail>, ClientError> {
+        self.get_open_orders_page_with_size(market, page, limit)
+            .await
+            .map(|(orders, _)| orders)
+    }
+
+    async fn get_open_orders_page_with_size(
+        &self,
+        market: Option<&str>,
+        page: Option<u32>,
+        limit: Option<u32>,
+    ) -> Result<(Vec<UpbitOrderDetail>, usize), ClientError> {
         let page = page.unwrap_or(1);
         if !(1..=10_000).contains(&page) {
             return Err(ClientError::InvalidParams(
@@ -809,8 +937,57 @@ impl UpbitPrivateClient {
         params.push("states[]=watch".into());
         params.push(format!("page={page}"));
         params.push(format!("limit={limit}"));
-        self.get_order_list("/v1/orders/open", &params.join("&"))
+        self.get_order_list_with_size("/v1/orders/open", &params.join("&"))
             .await
+    }
+
+    /// Read account balances plus every open-order page under one aggregate
+    /// response-byte and record budget.
+    pub(crate) async fn get_private_account_baseline_bounded(
+        &self,
+        byte_budget: Arc<PrivateBaselineByteBudget>,
+    ) -> Result<(Vec<UpbitAccountBalance>, Vec<UpbitOrderDetail>, usize), ClientError> {
+        let (balances, mut observed_bytes) = self.get_accounts_with_size().await?;
+        byte_budget.record(observed_bytes)?;
+        let mut orders = Vec::with_capacity(OPEN_ORDER_PAGE_SIZE as usize);
+        let mut uuids = std::collections::HashSet::with_capacity(OPEN_ORDER_PAGE_SIZE as usize);
+        for page in 1..=MAX_OPEN_ORDER_BASELINE_PAGES + 1 {
+            let (page_orders, page_bytes) = self
+                .get_open_orders_page_with_size(None, Some(page), Some(OPEN_ORDER_PAGE_SIZE))
+                .await?;
+            byte_budget.record(page_bytes)?;
+            observed_bytes = observed_bytes.checked_add(page_bytes).ok_or(
+                ClientError::PrivateBaselineByteLimit {
+                    observed: usize::MAX,
+                    limit: MAX_PRIVATE_BASELINE_BYTES,
+                },
+            )?;
+            if observed_bytes > MAX_PRIVATE_BASELINE_BYTES {
+                return Err(ClientError::PrivateBaselineByteLimit {
+                    observed: observed_bytes,
+                    limit: MAX_PRIVATE_BASELINE_BYTES,
+                });
+            }
+            let page_len = page_orders.len();
+            if page > MAX_OPEN_ORDER_BASELINE_PAGES && page_len > 0 {
+                return Err(ClientError::PrivateBaselineLimit { limit: 10_000 });
+            }
+            if orders.len().saturating_add(page_len) > 10_000 {
+                return Err(ClientError::PrivateBaselineLimit { limit: 10_000 });
+            }
+            for order in page_orders {
+                if !uuids.insert(order.uuid.clone()) {
+                    return Err(ClientError::InvalidParams(
+                        "open-order pagination returned a duplicate UUID".into(),
+                    ));
+                }
+                orders.push(order);
+            }
+            if page_len < OPEN_ORDER_PAGE_SIZE as usize {
+                return Ok((balances, orders, observed_bytes));
+            }
+        }
+        Err(ClientError::PrivateBaselineLimit { limit: 10_000 })
     }
 
     /// Fetch closed orders from the current official endpoint.
@@ -862,8 +1039,18 @@ impl UpbitPrivateClient {
         path: &str,
         query: &str,
     ) -> Result<Vec<UpbitOrderDetail>, ClientError> {
+        self.get_order_list_with_size(path, query)
+            .await
+            .map(|(orders, _)| orders)
+    }
+
+    async fn get_order_list_with_size(
+        &self,
+        path: &str,
+        query: &str,
+    ) -> Result<(Vec<UpbitOrderDetail>, usize), ClientError> {
         match &self.mode {
-            TransportMode::Mock => Ok(vec![]),
+            TransportMode::Mock => Ok((vec![], 0)),
             TransportMode::Live(creds) => {
                 let url = format!("{}{path}?{query}", self.base_url);
                 self.verify_request_host(&url)?;
@@ -884,8 +1071,9 @@ impl UpbitPrivateClient {
                     return Err(ClientError::Api { status, body });
                 }
 
+                let response_bytes = bytes.len();
                 let orders: Vec<UpbitOrderDetail> = serde_json::from_slice(&bytes)?;
-                Ok(orders)
+                Ok((orders, response_bytes))
             }
         }
     }

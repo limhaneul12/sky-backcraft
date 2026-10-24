@@ -1,9 +1,12 @@
-# Sky Backcraft — all-Luna task contract
+# Sky Backcraft — project agent task contract
 
-All four project roles use `gpt-6-luna` with `max` reasoning. Main keeps its
-existing model, owns decomposition and integration, and makes final acceptance
-decisions. At most four children may run concurrently. Children do not delegate
-or silently select a different model; material ambiguity returns to Main.
+Mapping, implementation and test/runtime verification use `gpt-6-luna` with `max`
+reasoning. Code review uses `gpt-6-astra` with `high` reasoning, per the user's
+2026-10-20 routing change. Main keeps its existing model, owns decomposition and
+integration, and makes final acceptance decisions. At most four children may run
+concurrently. Children do not delegate or silently select a different model;
+material ambiguity returns to Main. The legacy contract filename is retained for
+existing references.
 
 Use these project roles instead of global role profiles for this repository:
 
@@ -13,9 +16,10 @@ Use these project roles instead of global role profiles for this repository:
 | `backcraft_backend` | Bounded Rust, SQLite-owner, job and MCP implementation |
 | `backcraft_gui` | Bounded native AppKit GUI and read-projection implementation |
 | `backcraft_verifier` | Independent tests, runtime and native GUI evidence |
+| `backcraft_reviewer` | Read-only code, contract and regression review; Astra / high |
 
 Main assigns build-error repair and packaging to the relevant Backend or GUI
-writer, or performs integration directly; there is no separate fifth role.
+writer, or performs integration directly; there is no separate packaging role.
 
 Capacity is a ceiling, not a requirement to launch four workers. Dispatch only
 independent, useful packets; use one active writer per file or authority boundary.

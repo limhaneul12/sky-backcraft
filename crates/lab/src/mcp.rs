@@ -10,9 +10,9 @@ use crate::contracts::{
     CandleObservation, CollectRequest, ContentHash, DatasetId, DatasetManifest, DatasetStatus,
     DeleteResource, EvidenceImport, EvidenceSnapshotId, HardDeleteRequest, HistoryQuery,
     JobAttempt, JobControl, JobId, JobPayload, JobRecord, JobSubmission, LabError,
-    MarketDataOrigin, MarketId, PaperSessionQuery, PaperSessionWrite, PlanRequest,
-    PolicyDeleteQueryRequest, PolicyDeleteWriteRequest, PolicyQuery, PolicyWrite, ProbeCount,
-    RequestId, ResultQuery, RunId, RunRequest, UtcRange,
+    MarketDataOrigin, MarketId, PaperReviewQuery, PaperSessionQuery, PaperSessionWrite,
+    PlanRequest, PolicyDeleteQueryRequest, PolicyDeleteWriteRequest, PolicyQuery, PolicyWrite,
+    ProbeCount, RequestId, ResultQuery, RunId, RunRequest, UtcRange,
 };
 use crate::database::DatabaseHandle;
 use crate::jobs::JobService;
@@ -58,11 +58,13 @@ const TRADING_CONTROL_TOOL_NAMES: &[&str] = &[
 const TRADING_ACCESS_DENIED_MESSAGE: &str = "private Upbit account, order and control tools require the native desktop capability or an explicitly scoped OAuth trading grant";
 const DESKTOP_TOOL_NAMES: &[&str] = &[
     "lab_status",
+    "realtime_status",
     "automation_session_query",
     "automation_session_write",
     "result_query",
     "history_query",
     "policy_query",
+    "paper_review_query",
     "paper_session_query",
     "paper_session_write",
     "resource_delete_preview",
@@ -768,10 +770,409 @@ fn tagged_schema<T: JsonSchema + 'static>() -> std::sync::Arc<JsonObject> {
     let mut schema = rmcp::handler::server::common::schema_for_type::<T>()
         .as_ref()
         .clone();
+    let root_keys_supported = schema.keys().all(|key| {
+        matches!(
+            key.as_str(),
+            "$defs" | "definitions" | "title" | "description" | "type" | "oneOf" | "$schema"
+        )
+    });
+    let root_type_supported = schema
+        .get("type")
+        .is_none_or(|value| value.as_str() == Some("object"));
+    let host_extensible_union = if !root_keys_supported || !root_type_supported {
+        None
+    } else {
+        schema
+            .get("oneOf")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|branches| {
+                if branches.is_empty() {
+                    return None;
+                }
+                let mut union_fields = std::collections::BTreeSet::new();
+                let mut branch_fields = Vec::with_capacity(branches.len());
+                for branch in branches {
+                    let branch_object = branch.as_object()?;
+                    if branch_object.keys().any(|key| {
+                        !matches!(
+                            key.as_str(),
+                            "type"
+                                | "properties"
+                                | "required"
+                                | "additionalProperties"
+                                | "title"
+                                | "description"
+                                | "$schema"
+                        )
+                    }) {
+                        return None;
+                    }
+                    if !matches!(
+                        branch_object.get("type"),
+                        Some(serde_json::Value::String(kind)) if kind == "object"
+                    ) || !matches!(
+                        branch_object.get("additionalProperties"),
+                        Some(serde_json::Value::Bool(false))
+                    ) {
+                        return None;
+                    }
+                    let properties = branch_object.get("properties")?.as_object()?;
+                    let names = properties
+                        .keys()
+                        .cloned()
+                        .collect::<std::collections::BTreeSet<_>>();
+                    union_fields.extend(names.iter().cloned());
+                    branch_fields.push(names);
+                }
+                let transformed_branches = branches
+                    .iter()
+                    .cloned()
+                    .zip(branch_fields)
+                    .map(|(mut branch, fields)| {
+                        let branch_object = branch.as_object_mut()?;
+                        branch_object.remove("additionalProperties");
+                        let absent_fields = union_fields
+                            .difference(&fields)
+                            .map(|name| serde_json::json!({"required": [name]}))
+                            .collect::<Vec<_>>();
+                        if !absent_fields.is_empty() {
+                            branch_object.insert(
+                                "not".to_owned(),
+                                serde_json::json!({"anyOf": absent_fields}),
+                            );
+                        }
+                        Some(branch)
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                Some((union_fields, transformed_branches))
+            })
+    };
     // Internally tagged enums are object-shaped at the wire even though Schemars
     // expresses their alternatives with oneOf and omits the common root type.
     schema.insert("type".into(), serde_json::Value::String("object".into()));
+    if let Some((union_fields, branches)) = host_extensible_union {
+        // Root closure allows host-added properties; absent-field guards keep
+        // fields exclusive to another action invalid within each oneOf branch.
+        let properties = union_fields
+            .into_iter()
+            .map(|name| (name, serde_json::Value::Object(JsonObject::new())))
+            .collect();
+        schema.insert("properties".into(), serde_json::Value::Object(properties));
+        schema.insert(
+            "additionalProperties".into(),
+            serde_json::Value::Bool(false),
+        );
+        schema.insert("oneOf".into(), serde_json::Value::Array(branches));
+    }
     std::sync::Arc::new(schema)
+}
+
+#[expect(
+    dead_code,
+    reason = "schema-only MCP input projection; runtime validation stays on PaperReviewQuery"
+)]
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+enum PaperReviewToolInput {
+    Decision {
+        selection: crate::contracts::PaperReviewSelection,
+    },
+    AuditRules {
+        selection: crate::contracts::PaperReviewSelection,
+    },
+    AuditIndicators {
+        selection: crate::contracts::PaperReviewSelection,
+        max_source_bars: u32,
+    },
+    CompareContract {
+        selection: crate::contracts::PaperReviewSelection,
+        contract: crate::contracts::MachineContractComparisonInput,
+    },
+    Counterfactual {
+        request: PaperReviewCounterfactualInput,
+    },
+}
+
+#[expect(
+    dead_code,
+    reason = "opaque counterfactual request objects exist here only to generate the MCP schema"
+)]
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PaperReviewCounterfactualInput {
+    #[schemars(length(
+        min = 1,
+        max = crate::contracts::MAX_COUNTERFACTUAL_CANDIDATES
+    ))]
+    candidates: Vec<std::collections::BTreeMap<String, serde_json::Value>>,
+    #[schemars(length(
+        min = 1,
+        max = crate::contracts::MAX_COUNTERFACTUAL_VARIANTS
+    ))]
+    variants: Vec<std::collections::BTreeMap<String, serde_json::Value>>,
+}
+
+/// MCP-only schema projection. Runtime validation continues to use `PaperReviewQuery`.
+#[must_use]
+pub fn paper_review_tool_input_schema() -> std::sync::Arc<JsonObject> {
+    tagged_schema::<PaperReviewToolInput>()
+}
+
+#[derive(Clone, Copy)]
+enum PaperQueryDiagnosticTool {
+    Session,
+    Review,
+}
+
+impl PaperQueryDiagnosticTool {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Session => "paper_session_query",
+            Self::Review => "paper_review_query",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PaperQueryDiagnosticAction {
+    StartOptions,
+    List,
+    Get,
+    Events,
+    ReviewEvents,
+    Request,
+    Decision,
+    AuditRules,
+    AuditIndicators,
+    CompareContract,
+    Counterfactual,
+    Other,
+    Missing,
+}
+
+impl PaperQueryDiagnosticAction {
+    fn from_arguments(tool: PaperQueryDiagnosticTool, arguments: &JsonObject) -> Self {
+        let Some(action) = arguments.get("action") else {
+            return Self::Missing;
+        };
+        let Some(action) = action.as_str() else {
+            return Self::Other;
+        };
+        match (tool, action) {
+            (PaperQueryDiagnosticTool::Session, "start_options") => Self::StartOptions,
+            (PaperQueryDiagnosticTool::Session, "list") => Self::List,
+            (PaperQueryDiagnosticTool::Session, "get") => Self::Get,
+            (PaperQueryDiagnosticTool::Session, "events") => Self::Events,
+            (PaperQueryDiagnosticTool::Session, "review_events") => Self::ReviewEvents,
+            (PaperQueryDiagnosticTool::Session, "request") => Self::Request,
+            (PaperQueryDiagnosticTool::Review, "decision") => Self::Decision,
+            (PaperQueryDiagnosticTool::Review, "audit_rules") => Self::AuditRules,
+            (PaperQueryDiagnosticTool::Review, "audit_indicators") => Self::AuditIndicators,
+            (PaperQueryDiagnosticTool::Review, "compare_contract") => Self::CompareContract,
+            (PaperQueryDiagnosticTool::Review, "counterfactual") => Self::Counterfactual,
+            _ => Self::Other,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::StartOptions => "start_options",
+            Self::List => "list",
+            Self::Get => "get",
+            Self::Events => "events",
+            Self::ReviewEvents => "review_events",
+            Self::Request => "request",
+            Self::Decision => "decision",
+            Self::AuditRules => "audit_rules",
+            Self::AuditIndicators => "audit_indicators",
+            Self::CompareContract => "compare_contract",
+            Self::Counterfactual => "counterfactual",
+            Self::Other => "other",
+            Self::Missing => "missing",
+        }
+    }
+}
+
+fn paper_query_selection_shape(value: Option<&serde_json::Value>) -> &'static str {
+    match value {
+        Some(serde_json::Value::Object(_)) => "object",
+        Some(serde_json::Value::Null) => "null",
+        Some(_) => "other",
+        None => "missing",
+    }
+}
+
+fn paper_query_number_repr(value: Option<&serde_json::Value>) -> &'static str {
+    match value {
+        Some(serde_json::Value::Number(number)) if number.is_u64() => "unsigned_integer",
+        Some(serde_json::Value::Number(number)) if number.is_i64() => "signed_integer",
+        Some(serde_json::Value::Number(number)) if number.is_f64() => "floating_point",
+        Some(serde_json::Value::String(_)) => "string",
+        Some(serde_json::Value::Null) => "null",
+        Some(_) => "other",
+        None => "missing",
+    }
+}
+
+struct PaperQueryTraceContext<'a> {
+    request_id: &'a str,
+    origin: &'static str,
+    protocol_header: &'static str,
+}
+
+impl<'a> PaperQueryTraceContext<'a> {
+    fn from_request_context(context: &'a RequestContext<RoleServer>) -> Self {
+        let Some(parts) = context.extensions.get::<axum::http::request::Parts>() else {
+            return Self {
+                request_id: "unavailable",
+                origin: "local",
+                protocol_header: "unavailable",
+            };
+        };
+        let request_id = parts
+            .extensions
+            .get::<crate::transport::RequestCorrelationId>()
+            .map_or("unavailable", |correlation| correlation.0.as_ref());
+        let protocol_header = match parts.headers.get("mcp-protocol-version") {
+            None => "missing",
+            Some(value) => match value.to_str() {
+                Ok("2025-03-26") => "known_2025_03_26",
+                Ok(_) => "other",
+                Err(_) => "invalid",
+            },
+        };
+        Self {
+            request_id,
+            origin: "http",
+            protocol_header,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PaperQueryDiagnosticShape {
+    tool: PaperQueryDiagnosticTool,
+    action: PaperQueryDiagnosticAction,
+    selection: &'static str,
+    event_sequence: &'static str,
+    as_of_sequence: &'static str,
+    after_sequence: &'static str,
+    limit: &'static str,
+}
+
+impl PaperQueryDiagnosticShape {
+    fn from_arguments(tool: PaperQueryDiagnosticTool, arguments: &JsonObject) -> Self {
+        let action = PaperQueryDiagnosticAction::from_arguments(tool, arguments);
+        match tool {
+            PaperQueryDiagnosticTool::Review => {
+                let selection = arguments.get("selection");
+                let selection_object = selection.and_then(serde_json::Value::as_object);
+                Self {
+                    tool,
+                    action,
+                    selection: paper_query_selection_shape(selection),
+                    event_sequence: paper_query_number_repr(
+                        selection_object.and_then(|selection| selection.get("event_sequence")),
+                    ),
+                    as_of_sequence: paper_query_number_repr(
+                        selection_object.and_then(|selection| selection.get("as_of_sequence")),
+                    ),
+                    after_sequence: "not_applicable",
+                    limit: "not_applicable",
+                }
+            }
+            PaperQueryDiagnosticTool::Session => Self {
+                tool,
+                action,
+                selection: "not_applicable",
+                event_sequence: "not_applicable",
+                as_of_sequence: paper_query_number_repr(arguments.get("as_of_sequence")),
+                after_sequence: paper_query_number_repr(arguments.get("after_sequence")),
+                limit: paper_query_number_repr(arguments.get("limit")),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PaperQueryDiagnosticStage {
+    ParseError,
+    ValidationError,
+    Dispatch,
+}
+
+impl PaperQueryDiagnosticStage {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ParseError => "parse_error",
+            Self::ValidationError => "validation_error",
+            Self::Dispatch => "dispatch",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PaperQueryDiagnosticOutcome {
+    InvalidParams,
+    Success,
+    ToolError,
+    RpcError,
+}
+
+impl PaperQueryDiagnosticOutcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidParams => "invalid_params",
+            Self::Success => "success",
+            Self::ToolError => "tool_error",
+            Self::RpcError => "rpc_error",
+        }
+    }
+}
+
+fn record_paper_query_entry(
+    context: &RequestContext<RoleServer>,
+    shape: PaperQueryDiagnosticShape,
+) {
+    let trace_context = PaperQueryTraceContext::from_request_context(context);
+    tracing::info!(
+        target: "spot_lab::mcp::paper_query_diagnostics",
+        event = "paper_query_entry",
+        request_id = trace_context.request_id,
+        context_origin = trace_context.origin,
+        protocol_version_header = trace_context.protocol_header,
+        tool = shape.tool.as_str(),
+        action = shape.action.as_str(),
+        selection_shape = shape.selection,
+        event_sequence_repr = shape.event_sequence,
+        as_of_sequence_repr = shape.as_of_sequence,
+        after_sequence_repr = shape.after_sequence,
+        limit_repr = shape.limit,
+        elapsed_ms = 0_u64,
+    );
+}
+
+fn record_paper_query_completion(
+    context: &RequestContext<RoleServer>,
+    shape: PaperQueryDiagnosticShape,
+    stage: PaperQueryDiagnosticStage,
+    outcome: PaperQueryDiagnosticOutcome,
+    started_at: std::time::Instant,
+) {
+    let trace_context = PaperQueryTraceContext::from_request_context(context);
+    let elapsed_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+    tracing::info!(
+        target: "spot_lab::mcp::paper_query_diagnostics",
+        event = "paper_query_completion",
+        request_id = trace_context.request_id,
+        context_origin = trace_context.origin,
+        protocol_version_header = trace_context.protocol_header,
+        tool = shape.tool.as_str(),
+        action = shape.action.as_str(),
+        stage = stage.as_str(),
+        outcome = outcome.as_str(),
+        elapsed_ms,
+    );
 }
 
 /// Credential-free projection of the transport owner's authentication decision.
@@ -997,6 +1398,26 @@ impl LabMcpService {
     }
 
     #[tool(
+        description = "Current market connection health and authorized private feed health; no account facts or credentials",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn realtime_status(
+        &self,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut status = self.jobs.realtime_status();
+        if self.require_trading_read(&context).is_err() {
+            status.private = crate::contracts::RealtimeFeedStatus::unavailable();
+        }
+        text_result(&status)
+    }
+
+    #[tool(
         description = "Lab version, implemented capabilities, exposure mode and fixed resource limits",
         annotations(
             title = "Lab Status",
@@ -1086,6 +1507,8 @@ impl LabMcpService {
                 "auth": self.exposure.auth_name(),
                 "public_no_auth": self.exposure.public_no_auth(),
                 "progress_stream": false,
+                "realtime_status_stream": "/realtime/events",
+                "realtime_stream_semantics": "latest health snapshots; durable results remain queryable",
                 "job_results": "poll job_control by opaque job_id",
             },
             "deletion": {
@@ -2426,20 +2849,123 @@ impl LabMcpService {
     }
 
     #[tool(
-        description = "Read persistent paper investment start options, session list, session detail, request receipt readback, or paged session events",
+        description = "Read paper start options, sessions, receipts or events. For query-only saved facts use review_events: pins as_of_sequence, returns original configuration and bounded events without polling/reconciliation. Echo as_of_sequence with after_sequence on continuation. Legacy list/get/events may advance paper processing. Policy AST is resolved by exact configuration.policy_ref; condition evaluation and independent strategy/indicator audits are not provided by review_events.",
         input_schema = tagged_schema::<PaperSessionQuery>(),
         annotations(
             title = "Paper Session Query",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn paper_session_query(
+        &self,
+        arguments: JsonObject,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let started_at = std::time::Instant::now();
+        let shape = PaperQueryDiagnosticShape::from_arguments(
+            PaperQueryDiagnosticTool::Session,
+            &arguments,
+        );
+        record_paper_query_entry(&context, shape);
+        let query: PaperSessionQuery = match parse_arguments(arguments) {
+            Ok(query) => query,
+            Err(error) => {
+                record_paper_query_completion(
+                    &context,
+                    shape,
+                    PaperQueryDiagnosticStage::ParseError,
+                    PaperQueryDiagnosticOutcome::InvalidParams,
+                    started_at,
+                );
+                return Err(error);
+            }
+        };
+        if let Err(error) = validate_paper_session_query(&query) {
+            record_paper_query_completion(
+                &context,
+                shape,
+                PaperQueryDiagnosticStage::ValidationError,
+                PaperQueryDiagnosticOutcome::InvalidParams,
+                started_at,
+            );
+            return Err(invalid_params(&error));
+        }
+        let response = result_or_error(self.jobs.paper_session_query(query).await);
+        let outcome = match &response {
+            Ok(result) if result.is_error == Some(true) => PaperQueryDiagnosticOutcome::ToolError,
+            Ok(_) => PaperQueryDiagnosticOutcome::Success,
+            Err(_) => PaperQueryDiagnosticOutcome::RpcError,
+        };
+        record_paper_query_completion(
+            &context,
+            shape,
+            PaperQueryDiagnosticStage::Dispatch,
+            outcome,
+            started_at,
+        );
+        response
+    }
+
+    #[tool(
+        description = "Read-only saved paper decision evidence, independent snapshot-rule/source-indicator audits, explicit machine-contract comparison, or virtual counterfactual scenarios. Pin event_sequence/as_of_sequence; missing historical trace/seed remains unknown. compare_contract requires CallerDeclared expectations and an empty observed array, resolved from the saved session. Counterfactual supplied source events/configuration/bars must exactly match stored facts. No polling, reconciliation, session/policy writes or order admission.",
+        input_schema = paper_review_tool_input_schema(),
+        annotations(
+            title = "Paper Saved Evidence Review",
             read_only_hint = true,
             destructive_hint = false,
             idempotent_hint = true,
             open_world_hint = false
         )
     )]
-    async fn paper_session_query(&self, arguments: JsonObject) -> Result<CallToolResult, McpError> {
-        let query: PaperSessionQuery = parse_arguments(arguments)?;
-        validate_paper_session_query(&query).map_err(|error| invalid_params(&error))?;
-        result_or_error(self.jobs.paper_session_query(query).await)
+    async fn paper_review_query(
+        &self,
+        arguments: JsonObject,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let started_at = std::time::Instant::now();
+        let shape =
+            PaperQueryDiagnosticShape::from_arguments(PaperQueryDiagnosticTool::Review, &arguments);
+        record_paper_query_entry(&context, shape);
+        let query: PaperReviewQuery = match parse_arguments(arguments) {
+            Ok(query) => query,
+            Err(error) => {
+                record_paper_query_completion(
+                    &context,
+                    shape,
+                    PaperQueryDiagnosticStage::ParseError,
+                    PaperQueryDiagnosticOutcome::InvalidParams,
+                    started_at,
+                );
+                return Err(error);
+            }
+        };
+        if let Err(error) = query.validate() {
+            record_paper_query_completion(
+                &context,
+                shape,
+                PaperQueryDiagnosticStage::ValidationError,
+                PaperQueryDiagnosticOutcome::InvalidParams,
+                started_at,
+            );
+            return Err(invalid_params(&error));
+        }
+        let response = result_or_error(self.jobs.paper_review_query(query).await);
+        let outcome = match &response {
+            Ok(result) if result.is_error == Some(true) => PaperQueryDiagnosticOutcome::ToolError,
+            Ok(_) => PaperQueryDiagnosticOutcome::Success,
+            Err(_) => PaperQueryDiagnosticOutcome::RpcError,
+        };
+        record_paper_query_completion(
+            &context,
+            shape,
+            PaperQueryDiagnosticStage::Dispatch,
+            outcome,
+            started_at,
+        );
+        response
     }
 
     #[tool(
@@ -2621,9 +3147,9 @@ fn validate_policy_query(query: &PolicyQuery) -> Result<(), LabError> {
 
 fn validate_paper_session_query(query: &PaperSessionQuery) -> Result<(), LabError> {
     match query {
-        PaperSessionQuery::List { limit, .. } | PaperSessionQuery::Events { limit, .. } => {
-            validate_history_limit(*limit)
-        }
+        PaperSessionQuery::List { limit, .. }
+        | PaperSessionQuery::Events { limit, .. }
+        | PaperSessionQuery::ReviewEvents { limit, .. } => validate_history_limit(*limit),
         PaperSessionQuery::StartOptions
         | PaperSessionQuery::Get { .. }
         | PaperSessionQuery::Request { .. } => Ok(()),

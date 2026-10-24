@@ -1,14 +1,16 @@
 use super::*;
+#[path = "realtime_tests.rs"]
+mod realtime;
 use crate::contracts::{
-    AdmissionStatus, ArtifactId, AssetQuantity, AttemptState, BasisPoints, CandleInterval,
-    CandleRecord, CostPolicy, DatasetManifest, DatasetStatus, DeleteBlockerClass, DeleteEntryKind,
-    DeletePreview, DeleteResource, EvidenceUnavailablePolicy, ExecutionPolicy, ExperimentSpec,
-    HardDeleteRequest, JobOutput, JobPayload, JobProgress, JobStatus, JobSubmission,
-    MarketRuleSnapshot, ModelAdmission, ModelId, PitPolicy, PlanId, PlanRequest, PolicyDefinition,
-    PolicyProgram, PolicyRevision, PolicyWrite, PriceKrw, ProgressCountUnit, QualityIssue,
-    QualityKind, QualitySeverity, QuoteAmount, ReportClock, ResolvedPlan, RuleProvenance,
-    RuleSnapshotId, RunHeader, RunId, RunRequest, StrategyKind, StrategySpec, TerminalPolicy,
-    TickBand, UtcRange, ValidationReport, ValidationStatus, Weight, builtin_policy_definitions,
+    AdmissionStatus, AssetQuantity, AttemptState, BasisPoints, CandleInterval, CandleRecord,
+    CostPolicy, DatasetManifest, DatasetStatus, DeleteBlockerClass, DeleteEntryKind, DeletePreview,
+    DeleteResource, EvidenceUnavailablePolicy, ExecutionPolicy, ExperimentSpec, HardDeleteRequest,
+    JobOutput, JobPayload, JobProgress, JobStatus, JobSubmission, MarketRuleSnapshot,
+    ModelAdmission, ModelId, PitPolicy, PlanId, PlanRequest, PolicyDefinition, PolicyProgram,
+    PolicyRevision, PolicyWrite, PriceKrw, ProgressCountUnit, QualityIssue, QualityKind,
+    QualitySeverity, QuoteAmount, ReportClock, ResolvedPlan, RuleProvenance, RuleSnapshotId,
+    RunHeader, RunId, RunRequest, StrategyKind, StrategySpec, TerminalPolicy, TickBand, UtcRange,
+    ValidationReport, ValidationStatus, Weight, builtin_policy_definitions,
     experiment_config_digest,
 };
 use rust_decimal::Decimal;
@@ -84,6 +86,68 @@ fn observation_at(raw: &RawObjectRef, open_at: &str, open: &str) -> CandleObserv
     observation.id = crate::contracts::ObservationId::from_seed(digest.as_str());
     observation.content_digest = digest;
     observation
+}
+
+#[test]
+fn direct_exchange_observation_preserves_existing_derived_lineage_and_replay() {
+    let root = TempRoot::new("observed-derived-identity");
+    let mut store = Store::open(&root.0).expect("open store");
+    let derived_raw = publish(&store, b"derived-source", time("2024-01-01T02:00:00Z"));
+    let direct_raw = publish(
+        &store,
+        b"direct-exchange-source",
+        time("2024-01-01T02:01:00Z"),
+    );
+    store
+        .catalog_raw(&derived_raw.object)
+        .expect("catalog derived raw");
+    store
+        .catalog_raw(&direct_raw.object)
+        .expect("catalog direct raw");
+    let constituent = observation_at(&derived_raw.object, "2024-01-01T00:00:00Z", "100");
+    let mut derived = observation_at(&derived_raw.object, "2024-01-01T01:00:00Z", "101");
+    derived.constituent_ids = vec![constituent.id.clone()];
+    let mut direct = derived.clone();
+    direct.constituent_ids.clear();
+    direct.raw_object_ids = vec![direct_raw.object.id.clone()];
+    let transaction = store
+        .connection
+        .transaction()
+        .expect("begin fixture transaction");
+    insert_observation(&transaction, &constituent).expect("insert constituent");
+    insert_observation(&transaction, &derived).expect("insert derived observation");
+    insert_observation(&transaction, &direct).expect("append direct exchange provenance");
+    insert_observation(&transaction, &direct).expect("replay direct provenance");
+    let stored: String = transaction
+        .query_row(
+            "SELECT observation_json FROM candle_observations WHERE id=?1",
+            [derived.id.as_str()],
+            |row| row.get(0),
+        )
+        .expect("load unchanged stored observation");
+    assert_eq!(
+        stored,
+        serde_json::to_string(&derived).expect("serialize original")
+    );
+    let constituents: u32 = transaction.query_row("SELECT COUNT(*) FROM observation_constituents WHERE observation_id=?1 AND constituent_id=?2", params![derived.id.as_str(), constituent.id.as_str()], |row| row.get(0)).expect("count preserved lineage");
+    let raw_links: u32 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM observation_raw_objects WHERE observation_id=?1",
+            [derived.id.as_str()],
+            |row| row.get(0),
+        )
+        .expect("count independent provenance");
+    assert_eq!(constituents, 1);
+    assert_eq!(raw_links, 2);
+    let mut incompatible = derived.clone();
+    incompatible.constituent_ids = vec![derived.id.clone()];
+    assert!(matches!(
+        insert_observation(&transaction, &incompatible),
+        Err(LabError::Conflict(_))
+    ));
+    transaction
+        .commit()
+        .expect("commit unchanged lineage plus HTTP evidence");
 }
 
 fn request(id: &str) -> CollectRequest {
@@ -189,7 +253,7 @@ fn ordered_link_snapshot(store: &Store, request_id: &str) -> DatasetSnapshot {
     clippy::too_many_lines,
     reason = "one exact fixture binds a real immutable dataset and complete frozen portfolio plan for publication/reopen tests"
 )]
-fn save_portfolio_plan_fixture(
+pub(super) fn save_portfolio_plan_fixture(
     store: &mut Store,
 ) -> Result<ResolvedPlan, Box<dyn std::error::Error>> {
     #[derive(serde::Serialize)]
@@ -309,7 +373,7 @@ fn save_portfolio_plan_fixture(
     clippy::too_many_lines,
     reason = "complete validated v2 frozen-policy plan fixture"
 )]
-fn save_v2_policy_plan_fixture(store: &mut Store, policy: &PolicyRevision) -> PlanId {
+pub(super) fn save_v2_policy_plan_fixture(store: &mut Store, policy: &PolicyRevision) -> PlanId {
     #[derive(serde::Serialize)]
     struct Input<'a> {
         config_digest: &'a ContentHash,
@@ -663,6 +727,149 @@ fn migration_checksum_and_newer_version_fail_closed() {
         Store::open(&version_root.0),
         Err(LabError::DataCorrupt(_))
     ));
+}
+
+fn migration_checksums_through_24(connection: &rusqlite::Connection) -> Vec<(i64, String)> {
+    let mut statement = connection
+        .prepare(
+            "SELECT version,checksum FROM schema_migrations \
+             WHERE version BETWEEN 1 AND 24 ORDER BY version",
+        )
+        .expect("prepare prior migration checksum readback");
+    statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("read prior migration checksums")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect prior migration checksums")
+}
+
+fn maximum_migration_version(connection: &rusqlite::Connection) -> Option<i64> {
+    connection
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .expect("read latest migration version")
+}
+
+fn paper_provider_proof_index_exists(connection: &rusqlite::Connection) -> bool {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+             WHERE type='index' AND name='paper_session_provider_proofs')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read paper provider proof index")
+}
+
+#[test]
+fn paper_provider_proof_index_migration_upgrades_and_reopens_without_rewriting_prior_checksums() {
+    let root = TempRoot::new("paper-proof-index-upgrade");
+    let store = Store::open(&root.0).expect("open current schema");
+    assert_eq!(maximum_migration_version(&store.connection), Some(26));
+    let prior_checksums = migration_checksums_through_24(&store.connection);
+    assert_eq!(prior_checksums.len(), 24);
+    assert!(paper_provider_proof_index_exists(&store.connection));
+
+    store
+        .connection
+        .execute_batch(
+            "DROP INDEX IF EXISTS paper_session_provider_proofs; \
+             DELETE FROM schema_migrations WHERE version>=25;",
+        )
+        .expect("simulate a schema 24 database");
+    assert_eq!(maximum_migration_version(&store.connection), Some(24));
+    drop(store);
+
+    let upgraded = Store::open(&root.0).expect("upgrade schema 24 to current");
+    assert_eq!(maximum_migration_version(&upgraded.connection), Some(26));
+    assert_eq!(
+        migration_checksums_through_24(&upgraded.connection),
+        prior_checksums
+    );
+    assert!(paper_provider_proof_index_exists(&upgraded.connection));
+    let (name, checksum): (String, String) = upgraded
+        .connection
+        .query_row(
+            "SELECT name,checksum FROM schema_migrations WHERE version=25",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read applied migration identity");
+    assert_eq!(name, "0025_paper_provider_proofs_index");
+    assert_eq!(
+        checksum,
+        crate::contracts::ContentHash::of_bytes(
+            include_str!("migrations/0025_paper_provider_proofs_index.sql").as_bytes()
+        )
+        .to_string()
+    );
+    drop(upgraded);
+
+    let reopened = Store::open(&root.0).expect("reopen current schema");
+    assert_eq!(maximum_migration_version(&reopened.connection), Some(26));
+    assert_eq!(
+        migration_checksums_through_24(&reopened.connection),
+        prior_checksums
+    );
+    assert!(paper_provider_proof_index_exists(&reopened.connection));
+}
+
+#[test]
+fn malformed_paper_event_rolls_back_provider_proof_index_migration() {
+    let root = TempRoot::new("paper-proof-index-rollback");
+    let store = Store::open(&root.0).expect("open current schema");
+    let prior_checksums = migration_checksums_through_24(&store.connection);
+    store
+        .connection
+        .execute_batch(
+            "DROP INDEX IF EXISTS paper_session_provider_proofs; \
+             DELETE FROM schema_migrations WHERE version>=25; \
+             PRAGMA foreign_keys=OFF; \
+             PRAGMA ignore_check_constraints=ON;",
+        )
+        .expect("simulate schema 24 and permit corrupt test input");
+    store
+        .connection
+        .execute(
+            "INSERT INTO paper_session_events(session_id,sequence,kind,occurred_at_utc,event_json) \
+             VALUES ('synthetic-corrupt-session',1,'CANDLE_PROCESSED', \
+                     '2025-01-02T00:00:00Z','{')",
+            [],
+        )
+        .expect("insert malformed historical event");
+    drop(store);
+
+    assert!(
+        Store::open(&root.0).is_err(),
+        "migration must fail closed on malformed historical event JSON"
+    );
+    let connection = rusqlite::Connection::open(root.0.join("lab.sqlite"))
+        .expect("open database after failed migration");
+    let applied: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE version=25",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read failed migration ledger");
+    assert_eq!(applied, 0, "failed migration must not be recorded");
+    assert!(!paper_provider_proof_index_exists(&connection));
+    connection
+        .execute(
+            "DELETE FROM paper_session_events WHERE session_id='synthetic-corrupt-session'",
+            [],
+        )
+        .expect("remove malformed test event");
+    drop(connection);
+
+    let repaired = Store::open(&root.0).expect("retry migration after removing corrupt input");
+    assert_eq!(maximum_migration_version(&repaired.connection), Some(26));
+    assert_eq!(
+        migration_checksums_through_24(&repaired.connection),
+        prior_checksums
+    );
+    assert!(paper_provider_proof_index_exists(&repaired.connection));
 }
 
 #[test]
@@ -1038,11 +1245,12 @@ fn durable_job_queue_rejects_ninth_queued_request() {
 fn attempt_publication_loses_cancel_race_and_rolls_back_injected_failure() {
     let root = TempRoot::new("attempt-publication");
     let mut store = Store::open(&root.0).expect("open store");
-    let submit = |request_id: &str, artifact_id: &str| JobSubmission {
+    // This storage-level publication/CAS fixture needs a valid queued request,
+    // independent of artifact parsing, which is exercised by Verify tests.
+    let submit = |request_id: &str| JobSubmission {
         request_id: RequestId::new(request_id).expect("request id"),
-        payload: JobPayload::Verify {
-            artifact_id: ArtifactId::new(artifact_id).expect("artifact id"),
-            replay: false,
+        payload: JobPayload::Collect {
+            request: request(request_id),
         },
     };
     let report = |check_id: &str| ValidationReport {
@@ -1057,10 +1265,7 @@ fn attempt_publication_loses_cancel_race_and_rolls_back_injected_failure() {
     };
 
     let cancelled_job = store
-        .submit_job(
-            &submit("publish-cancel", "artifact-cancel"),
-            time("2024-01-01T00:00:00Z"),
-        )
+        .submit_job(&submit("publish-cancel"), time("2024-01-01T00:00:00Z"))
         .expect("submit cancel-race job");
     let cancelled_attempt = store
         .claim_next(time("2024-01-01T00:01:00Z"))
@@ -1109,10 +1314,7 @@ fn attempt_publication_loses_cancel_race_and_rolls_back_injected_failure() {
         JobStatus::Cancelled
     );
     let rollback_job = store
-        .submit_job(
-            &submit("publish-rollback", "artifact-rollback"),
-            time("2024-01-01T00:05:00Z"),
-        )
+        .submit_job(&submit("publish-rollback"), time("2024-01-01T00:05:00Z"))
         .expect("submit rollback job");
     let rollback_attempt = store
         .claim_next(time("2024-01-01T00:06:00Z"))
@@ -1770,6 +1972,10 @@ fn policy_cascade_delete_removes_frozen_plans_and_reseeding_stays_explicit() {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one shared-raw deletion lifecycle proves exclusive cleanup, proof retention, stale preview and active-job refusal"
+)]
 fn dataset_hard_delete_removes_exclusive_files_refuses_stale_and_active_jobs() {
     let root = TempRoot::new("delete-dataset-files");
     let mut store = Store::open(&root.0).expect("open store");
@@ -1829,6 +2035,46 @@ fn dataset_hard_delete_removes_exclusive_files_refuses_stale_and_active_jobs() {
     assert!(raw_b_path.exists());
     assert!(store.load_dataset(&dataset_a).expect("load").is_none());
     assert!(store.load_dataset(&dataset_b).expect("load").is_some());
+
+    // A pending source-evidence reference must retain its raw even when the
+    // dataset/observation that also owns it is deleted. This is an isolated FK
+    // fixture, not a confirmed provider-absence claim.
+    let digest = ContentHash::of_bytes(b"SYNTHETIC_TEST_ONLY retention reference");
+    store.connection.execute(
+        "INSERT INTO provider_absence_pending_reads(\
+             market,interval,start_ms,end_ms,pre_anchor_id,pre_anchor_digest,post_anchor_id,post_anchor_digest,\
+             first_raw_object_id,first_fetched_at_ms,first_body_digest,first_request_scope_digest) \
+         VALUES ('KRW-BTC','m5',0,300000,'fixture-pre',?1,'fixture-post',?1,?2,?3,?4,?1)",
+        params![digest.as_str(), second.object.id.as_str(), timestamp_ms(second.object.fetched_at), second.object.raw_sha256.as_str()],
+    ).expect("seed a pending raw-reference retention fixture");
+    let retained = store
+        .delete_preview(
+            &DeleteResource::Dataset {
+                dataset_id: dataset_b.clone(),
+            },
+            time("2024-01-02T00:01:00Z"),
+        )
+        .expect("preview dataset with source-evidence reference");
+    assert_eq!(retained.exclusive_file_count, 0);
+    assert!(
+        retained
+            .retained_shared
+            .iter()
+            .any(|group| group.kind == DeleteEntryKind::RawObject && group.count == 1)
+    );
+    store
+        .execute_hard_delete(
+            &hard_delete_request(&retained, false),
+            time("2024-01-02T00:01:00Z"),
+        )
+        .expect("delete dataset while retaining source evidence");
+    assert!(store.load_dataset(&dataset_b).expect("load").is_none());
+    assert!(raw_b_path.exists());
+    store
+        .raw_objects()
+        .read_verified(&second.object)
+        .expect("retained raw stays verifiable");
+    assert!(store.scan_orphans().expect("orphan scan").is_empty());
 
     // Queued jobs in scope refuse deletion even with cascade.
     let job = store
@@ -1975,6 +2221,73 @@ fn slim_pages_store_headers_only_and_legacy_rows_still_rebuild() {
     store.close().expect("close");
 }
 
+// Reporting fixtures use symbolic raw refs. Storage admission instead needs real
+// immutable files and their corresponding dataset/plan content identities.
+fn materialize_storage_fixture_inputs(store: &Store, bundle: &mut crate::contracts::RunBundle) {
+    #[derive(serde::Serialize)]
+    struct Input<'a> {
+        config_digest: &'a ContentHash,
+        dataset_digests: &'a [(DatasetId, ContentHash)],
+        evidence_digest: &'a Option<ContentHash>,
+    }
+    for dataset in &mut bundle.datasets {
+        let mut raw_ids = std::collections::BTreeMap::new();
+        for raw in &mut dataset.manifest.raw_objects {
+            let old_id = raw.id.clone();
+            let published = store
+                .publish_raw(RawObjectInput {
+                    source_url: raw.source_url.clone(),
+                    fetched_at: raw.fetched_at,
+                    persisted_at: raw.persisted_at,
+                    http_status: raw.http_status,
+                    remaining_req: raw.remaining_req.clone(),
+                    origin: raw.origin,
+                    body: format!("SYNTHETIC_TEST_ONLY {old_id}").into_bytes(),
+                })
+                .expect("publish real immutable fixture raw");
+            raw_ids.insert(old_id, published.object.id.clone());
+            *raw = published.object;
+        }
+        for observation in &mut dataset.observations {
+            for raw_id in &mut observation.raw_object_ids {
+                *raw_id = raw_ids.get(raw_id).expect("fixture raw reference").clone();
+            }
+        }
+        for issue in &mut dataset.manifest.quality_issues {
+            for raw_id in &mut issue.raw_object_ids {
+                *raw_id = raw_ids
+                    .get(raw_id)
+                    .expect("fixture issue reference")
+                    .clone();
+            }
+        }
+        let digests = dataset_digests(dataset).expect("materialized dataset digests");
+        dataset.manifest.id = dataset_id(&digests);
+        dataset.manifest.semantic_digest = digests.semantic;
+        dataset.manifest.provenance_digest = digests.provenance;
+    }
+    bundle.plan.spec.dataset_ids = bundle
+        .datasets
+        .iter()
+        .map(|d| d.manifest.id.clone())
+        .collect();
+    bundle.plan.dataset_digests = bundle
+        .datasets
+        .iter()
+        .map(|d| (d.manifest.id.clone(), d.manifest.semantic_digest.clone()))
+        .collect();
+    bundle.plan.config_digest =
+        experiment_config_digest(&bundle.plan.spec, &bundle.plan.policy_revisions)
+            .expect("materialized config digest");
+    bundle.plan.input_digest = ContentHash::of_value(&Input {
+        config_digest: &bundle.plan.config_digest,
+        dataset_digests: &bundle.plan.dataset_digests,
+        evidence_digest: &bundle.plan.evidence_digest,
+    })
+    .expect("materialized input digest");
+    bundle.plan.id = PlanId::from_seed(bundle.plan.input_digest.as_str());
+}
+
 #[test]
 #[expect(
     clippy::too_many_lines,
@@ -1984,6 +2297,7 @@ fn compacted_multi_model_bundle_summary_and_costs_match_detail() {
     let root = TempRoot::new("compacted-multi-model-readers");
     let mut store = Store::open(&root.0).expect("open store");
     let mut expected = crate::reporting::tests::multi_market_fixture();
+    materialize_storage_fixture_inputs(&store, &mut expected);
     assert_eq!(expected.models.len(), 2);
     assert!(expected.models.iter().all(|model| !model.orders.is_empty()));
     let range_end = expected.plan.spec.range.end();

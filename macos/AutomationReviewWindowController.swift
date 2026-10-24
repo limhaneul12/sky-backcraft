@@ -134,13 +134,14 @@ final class AutomationReviewWindowController: NSWindowController, NSWindowDelega
     private let eventCoverageLabel = NSTextField(wrappingLabelWithString: "")
     private let reasonsLabel = NSTextField(wrappingLabelWithString: "저장된 판단 이유를 불러오는 중…")
     private let ruleTraceLabel = NSTextField(wrappingLabelWithString: "")
+    private let recordedDecisionLabel = NSTextField(wrappingLabelWithString: "선택한 판단의 엔진 기록 근거를 불러오는 중…")
     private let rawEvaluationText = NSTextView()
     private let rawEvaluationScroll = NSScrollView()
     private let rawEvaluationButton = NSButton(title: "저장된 평가 원본 펼치기", target: nil, action: nil)
     private let previousPageButton = NSButton(title: "이전 50개", target: nil, action: nil)
     private let nextPageButton = NSButton(title: "다음 50개", target: nil, action: nil)
     private let refreshButton = NSButton(title: "새로고침", target: nil, action: nil)
-    private let exportButton = NSButton(title: "실거래 복기 파일 내보내기", target: nil, action: nil)
+    private let exportButton = NSButton(title: "복기 파일 내보내기", target: nil, action: nil)
     private let exportProgress = NSProgressIndicator()
 
     private var decisions: [AutomationReviewDecisionSummary] = []
@@ -336,41 +337,43 @@ final class AutomationReviewWindowController: NSWindowController, NSWindowDelega
         root.translatesAutoresizingMaskIntoConstraints = false
         window.contentView = root
 
-        let scroll = NSScrollView()
-        scroll.hasVerticalScroller = true
-        scroll.hasHorizontalScroller = false
-        scroll.drawsBackground = false
-        scroll.translatesAutoresizingMaskIntoConstraints = false
-        root.addSubview(scroll)
-
-        let document = AutomationReviewFlippedView()
-        document.translatesAutoresizingMaskIntoConstraints = false
-        scroll.documentView = document
-
         let title = NSTextField(labelWithString: "전략 자동매매 복기")
-        title.font = TerminalTheme.systemFont(ofSize: 21, weight: .semibold)
+        let titleFont = TerminalTheme.screenTitle
+        title.font = titleFont
+        let titleLineHeight = titleFont.ascender - titleFont.descender + titleFont.leading
+        title.heightAnchor.constraint(greaterThanOrEqualToConstant: ceil(titleLineHeight + 4)).isActive = true
         title.setAccessibilityLabel("전략 자동매매 복기와 성과 보고서")
         modeBadge.font = TerminalTheme.monospacedFont(ofSize: 12, weight: .bold)
         modeBadge.wantsLayer = true
         modeBadge.layer?.cornerRadius = 4
         modeBadge.layer?.borderWidth = 1
+        modeBadge.maximumNumberOfLines = 0
+        modeBadge.lineBreakMode = .byWordWrapping
         modeBadge.setAccessibilityLabel("선택한 세션의 MOCK 또는 LIVE 기록 모드")
         configure(refreshButton, title: "새로고침", selector: #selector(refreshReview), label: "선택한 자동매매 복기와 성과를 다시 조회")
         exportButton.bezelStyle = .rounded
         exportButton.target = self
         exportButton.action = #selector(exportReview)
-        exportButton.setAccessibilityLabel("선택 세션의 CSV와 성과 보고서 내보내기")
+        exportButton.setAccessibilityLabel("현재 표시된 MOCK 또는 LIVE 세션의 복기 CSV와 성과 보고서 내보내기")
         exportButton.toolTip = "명시적으로 선택한 폴더에 6개 파일을 저장합니다. 거래 금액과 식별 정보가 포함될 수 있습니다."
-        let header = NSStackView(views: [title, modeBadge, NSView(), refreshButton, exportButton])
-        header.orientation = .horizontal
-        header.alignment = .centerY
-        header.spacing = 12
+        let titleRow = NSStackView(views: [title, modeBadge, NSView()])
+        titleRow.orientation = .horizontal
+        titleRow.alignment = .centerY
+        titleRow.spacing = 12
+        let actionRow = NSStackView(views: [NSView(), refreshButton, exportButton])
+        actionRow.orientation = .horizontal
+        actionRow.alignment = .centerY
+        actionRow.spacing = 8
+        let header = verticalStack([titleRow, actionRow], spacing: 6)
 
         identityLabel.font = TerminalTheme.table
-        identityLabel.maximumNumberOfLines = 3
+        identityLabel.maximumNumberOfLines = 0
+        identityLabel.lineBreakMode = .byWordWrapping
+        identityLabel.setAccessibilityLabel("복기 대상 세션, 정책 버전과 시장 identity")
         statusLabel.font = TerminalTheme.systemFont(ofSize: 12, weight: .medium)
         statusLabel.textColor = TerminalTheme.secondaryText
-        statusLabel.maximumNumberOfLines = 3
+        statusLabel.maximumNumberOfLines = 0
+        statusLabel.lineBreakMode = .byWordWrapping
 
         setupTable(decisionTable, label: "저장된 전략 판단 시간순 목록", columns: [
             TableColumnSpec(id: "time", title: "판단 시각(UTC)", width: 190),
@@ -402,6 +405,10 @@ final class AutomationReviewWindowController: NSWindowController, NSWindowDelega
         reasonsLabel.maximumNumberOfLines = 0
         ruleTraceLabel.font = TerminalTheme.table
         ruleTraceLabel.maximumNumberOfLines = 0
+        recordedDecisionLabel.font = TerminalTheme.table
+        recordedDecisionLabel.maximumNumberOfLines = 0
+        recordedDecisionLabel.lineBreakMode = .byWordWrapping
+        recordedDecisionLabel.setAccessibilityLabel("저장된 결정 행동, 조건 평가, 차단 이유, 주문과 체결 근거")
         setupTable(indicatorTable, label: "저장된 전략 지표 값", columns: [
             TableColumnSpec(id: "name", title: "지표", width: 230),
             TableColumnSpec(id: "value", title: "저장 값", width: 220)
@@ -422,6 +429,7 @@ final class AutomationReviewWindowController: NSWindowController, NSWindowDelega
         let evaluationPanel = makePanel(title: "당시 이유 · 지표 · 규칙 상태 전이", content: verticalStack([
             reasonsLabel,
             ruleTraceLabel,
+            recordedDecisionLabel,
             labeledControl("당시 저장된 지표", tableScroll(indicatorTable, height: 130)),
             rawEvaluationButton,
             rawEvaluationScroll
@@ -471,22 +479,48 @@ final class AutomationReviewWindowController: NSWindowController, NSWindowDelega
             performanceLabel, methodologyLabel, warningLabel, exportProgress
         ], spacing: 8))
 
-        let contentStack = verticalStack([
-            header, identityLabel, statusLabel, timelinePanel, candlePanel, evaluationPanel,
-            orderPanel, eventPanel, reportPanel
+        let detailContent = verticalStack([
+            candlePanel, evaluationPanel, orderPanel, eventPanel, reportPanel
         ], spacing: 12)
-        contentStack.translatesAutoresizingMaskIntoConstraints = false
-        document.addSubview(contentStack)
+        for panel in detailContent.arrangedSubviews {
+            panel.widthAnchor.constraint(equalTo: detailContent.widthAnchor).isActive = true
+        }
+        let detailScroll = NSScrollView()
+        detailScroll.hasVerticalScroller = true
+        detailScroll.hasHorizontalScroller = false
+        detailScroll.drawsBackground = false
+        detailScroll.translatesAutoresizingMaskIntoConstraints = false
+        let detailDocument = AutomationReviewFlippedView()
+        detailDocument.translatesAutoresizingMaskIntoConstraints = false
+        detailScroll.documentView = detailDocument
+        detailContent.translatesAutoresizingMaskIntoConstraints = false
+        detailDocument.addSubview(detailContent)
         NSLayoutConstraint.activate([
-            scroll.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            scroll.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            scroll.topAnchor.constraint(equalTo: root.topAnchor),
-            scroll.bottomAnchor.constraint(equalTo: root.bottomAnchor),
-            document.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
-            contentStack.leadingAnchor.constraint(equalTo: document.leadingAnchor, constant: 16),
-            contentStack.trailingAnchor.constraint(equalTo: document.trailingAnchor, constant: -16),
-            contentStack.topAnchor.constraint(equalTo: document.topAnchor, constant: 16),
-            contentStack.bottomAnchor.constraint(equalTo: document.bottomAnchor, constant: -16)
+            detailDocument.widthAnchor.constraint(equalTo: detailScroll.contentView.widthAnchor),
+            detailContent.leadingAnchor.constraint(equalTo: detailDocument.leadingAnchor, constant: 12),
+            detailContent.trailingAnchor.constraint(equalTo: detailDocument.trailingAnchor, constant: -12),
+            detailContent.topAnchor.constraint(equalTo: detailDocument.topAnchor, constant: 12),
+            detailContent.bottomAnchor.constraint(equalTo: detailDocument.bottomAnchor, constant: -12)
+        ])
+
+        let split = NSSplitView()
+        split.isVertical = true
+        split.dividerStyle = .thin
+        split.addArrangedSubview(timelinePanel)
+        split.addArrangedSubview(detailScroll)
+        timelinePanel.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
+        detailScroll.widthAnchor.constraint(greaterThanOrEqualToConstant: 500).isActive = true
+        split.heightAnchor.constraint(greaterThanOrEqualToConstant: 320).isActive = true
+        split.setContentHuggingPriority(.defaultLow, for: .vertical)
+
+        let contentStack = verticalStack([header, identityLabel, statusLabel, split], spacing: 10)
+        contentStack.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(contentStack)
+        NSLayoutConstraint.activate([
+            contentStack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 16),
+            contentStack.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -16),
+            contentStack.topAnchor.constraint(equalTo: root.topAnchor, constant: 16),
+            contentStack.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -16)
         ])
         for view in contentStack.arrangedSubviews {
             view.widthAnchor.constraint(equalTo: contentStack.widthAnchor).isActive = true
@@ -687,6 +721,8 @@ final class AutomationReviewWindowController: NSWindowController, NSWindowDelega
             "시장: \(AutomationReviewPrivacyPresentation.identity(session.market, masked: masked)) · 주기: \(AutomationReviewPrivacyPresentation.identity(session.decision_interval, masked: masked))"
         ].joined(separator: "   ·   ")
         identityLabel.toolTip = masked ? AutomationReviewPrivacyPresentation.hiddenText : identityLabel.stringValue
+        identityLabel.setAccessibilityValue(identityLabel.stringValue)
+        identityLabel.setAccessibilityHelp(identityLabel.toolTip)
         renderDecisionDetail()
         renderPerformance()
         decisionTable.reloadData()
@@ -706,6 +742,8 @@ final class AutomationReviewWindowController: NSWindowController, NSWindowDelega
             modeBadge.textColor = TerminalTheme.negative
             modeBadge.layer?.borderColor = TerminalTheme.negative.cgColor
         }
+        modeBadge.toolTip = modeBadge.stringValue
+        modeBadge.setAccessibilityValue(modeBadge.stringValue)
     }
 
     private func renderDecisionDetail() {
@@ -715,6 +753,9 @@ final class AutomationReviewWindowController: NSWindowController, NSWindowDelega
             candleChart.isMasked = privacyIsMasked()
             reasonsLabel.stringValue = decisions.isEmpty ? "저장된 전략 판단이 없습니다." : "시간순 목록에서 판단을 선택하세요."
             ruleTraceLabel.stringValue = ""
+            recordedDecisionLabel.stringValue = decisions.isEmpty
+                ? "저장된 결정 근거가 없습니다."
+                : "시간순 목록에서 판단을 선택하세요."
             indicatorRows = []
             indicatorTable.reloadData()
             orderTable.reloadData()
@@ -723,6 +764,12 @@ final class AutomationReviewWindowController: NSWindowController, NSWindowDelega
             return
         }
         let masked = privacyIsMasked()
+        recordedDecisionLabel.stringValue = RecordedDecisionPresentation.lines(
+            for: detail.recorded_decision,
+            masked: masked
+        ).joined(separator: "\n")
+        recordedDecisionLabel.toolTip = recordedDecisionLabel.stringValue
+        recordedDecisionLabel.setAccessibilityValue(recordedDecisionLabel.stringValue)
         let evaluation = Self.evaluationObject(from: detail.decision.evaluation)
         let isWarmup = detail.decision.action == .hold
             && ["phase", "kind"].contains(where: { evaluation[$0]?.stringValue == "POLICY_WARMUP" })
@@ -1114,7 +1161,7 @@ final class AutomationReviewWindowController: NSWindowController, NSWindowDelega
         scroll.hasHorizontalScroller = true
         scroll.drawsBackground = true
         scroll.backgroundColor = TerminalTheme.chart
-        scroll.heightAnchor.constraint(equalToConstant: height).isActive = true
+        scroll.heightAnchor.constraint(equalToConstant: max(height, height * min(TerminalTheme.textScale, 1.5))).isActive = true
         return scroll
     }
 

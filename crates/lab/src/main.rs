@@ -7,6 +7,10 @@ use spot_lab::contracts::{
 use spot_lab::database::{DatabaseHandle, DatabaseOwner};
 use spot_lab::market_data::UpbitClient;
 use spot_lab::mcp::{self, LabMcpService};
+use spot_lab::realtime_events::{
+    MAX_REALTIME_EVENT_CLIENTS, RealtimeEventAuthorization, RealtimeEventTasks, RealtimeEvents,
+    RealtimeVisibility,
+};
 
 use spot_lab::observability::{LifecyclePhase, record_lifecycle_phase};
 use std::collections::HashSet;
@@ -1206,7 +1210,8 @@ fn server_auth_config(args: &[String]) -> Result<ServerAuth, LabError> {
 }
 
 /// Load only operator-owned public client IDs and callback allowlists.
-/// Missing config leaves DCR clients ephemeral; invalid or unreadable config fails startup.
+/// Dynamic clients are restored from the issuer-scoped SQLite registry; invalid or unreadable
+/// operator config still fails startup.
 fn read_oauth_client_registry(
     data_root: &std::path::Path,
 ) -> Result<Option<spot_lab::oauth::OAuthClientRegistryConfig>, LabError> {
@@ -1433,6 +1438,12 @@ async fn run_mcp_serve(
         live_order_control,
         live_policy,
     } = server;
+    let server_auth = match server_auth {
+        ServerAuth::OAuth(oauth) => {
+            ServerAuth::OAuth(oauth.with_persistent_clients(database.clone()).await?)
+        }
+        other => other,
+    };
     let exposure = server_auth.exposure();
     let public_no_auth = exposure.public_no_auth();
     let cancellation = tokio_util::sync::CancellationToken::new();
@@ -1542,6 +1553,32 @@ async fn run_mcp_serve(
     )
     .await?;
     let job_service = jobs.service();
+    let realtime_tasks = RealtimeEventTasks::default();
+    let realtime_clients =
+        std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_REALTIME_EVENT_CLIENTS));
+    let realtime_route = |path: &str, authorization| {
+        RealtimeEvents::new(
+            job_service.subscribe_realtime_status(),
+            authorization,
+            cancellation.child_token(),
+            realtime_clients.clone(),
+            realtime_tasks.clone(),
+        )
+        .router(path)
+    };
+    let realtime_authorization = match &server_auth {
+        ServerAuth::OAuth(oauth) => RealtimeEventAuthorization::OAuth(oauth.clone()),
+        ServerAuth::Bearer(secret) => RealtimeEventAuthorization::Bearer {
+            expected: std::sync::Arc::new(secret.clone()),
+            visibility: RealtimeVisibility::MarketOnly,
+        },
+        ServerAuth::None | ServerAuth::PublicNoAuth => RealtimeEventAuthorization::PublicMarket,
+    };
+    let realtime_router =
+        realtime_route("/realtime/events", realtime_authorization).merge(realtime_route(
+            "/public/realtime/events",
+            RealtimeEventAuthorization::PublicMarket,
+        ));
     let (mcp_router, oauth_routes) = match &server_auth {
         ServerAuth::OAuth(oauth) => {
             let oauth_resource_metadata_url = trading_mcp.then(|| oauth.resource_metadata_url());
@@ -1725,8 +1762,16 @@ async fn run_mcp_serve(
             LocalSessionManager::default().into(),
             desktop_config,
         );
+        let desktop_events = realtime_route(
+            "/desktop/realtime/events",
+            RealtimeEventAuthorization::Bearer {
+                expected: std::sync::Arc::new(expected_token.clone()),
+                visibility: RealtimeVisibility::TradingObservations,
+            },
+        );
         axum::Router::new()
             .nest_service("/desktop/mcp", desktop_service)
+            .merge(desktop_events)
             .route_layer(axum::middleware::from_fn(
                 move |request: axum::http::Request<axum::body::Body>,
                       next: axum::middleware::Next| {
@@ -1755,80 +1800,79 @@ async fn run_mcp_serve(
     .chain(allow_hosts)
     .collect::<Vec<_>>()
     .into();
-    let app =
-        oauth_routes
-            .merge(mcp_router)
-            .merge(desktop_router)
-            .layer(axum::middleware::from_fn(
-                move |request: axum::http::Request<axum::body::Body>,
-                      next: axum::middleware::Next| {
-                    let allowed_hosts = allowed_hosts.clone();
-                    let allowed_origins = allowed_origins.clone();
-                    async move {
-                        let host = request
-                            .headers()
-                            .get(axum::http::header::HOST)
-                            .and_then(|value| value.to_str().ok());
-                        let origin = request
-                            .headers()
-                            .get(axum::http::header::ORIGIN)
-                            .and_then(|value| value.to_str().ok());
+    let app = oauth_routes
+        .merge(mcp_router)
+        .merge(desktop_router)
+        .merge(realtime_router)
+        .layer(axum::middleware::from_fn(
+            move |request: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
+                let allowed_hosts = allowed_hosts.clone();
+                let allowed_origins = allowed_origins.clone();
+                async move {
+                    let host = request
+                        .headers()
+                        .get(axum::http::header::HOST)
+                        .and_then(|value| value.to_str().ok());
+                    let origin = request
+                        .headers()
+                        .get(axum::http::header::ORIGIN)
+                        .and_then(|value| value.to_str().ok());
 
-                        let host_matches = |candidate: &str, allowed: &str| {
-                            candidate == allowed
-                                || candidate.strip_suffix(":443").is_some_and(|h| h == allowed)
-                                || candidate.strip_suffix(":80").is_some_and(|h| h == allowed)
-                                || allowed.strip_suffix(":443").is_some_and(|h| h == candidate)
-                                || allowed.strip_suffix(":80").is_some_and(|h| h == candidate)
-                        };
+                    let host_matches = |candidate: &str, allowed: &str| {
+                        candidate == allowed
+                            || candidate.strip_suffix(":443").is_some_and(|h| h == allowed)
+                            || candidate.strip_suffix(":80").is_some_and(|h| h == allowed)
+                            || allowed.strip_suffix(":443").is_some_and(|h| h == candidate)
+                            || allowed.strip_suffix(":80").is_some_and(|h| h == candidate)
+                    };
 
-                        let host_ok = host.is_some_and(|h| {
-                            allowed_hosts.iter().any(|allowed| host_matches(h, allowed))
-                        });
+                    let host_ok = host.is_some_and(|h| {
+                        allowed_hosts.iter().any(|allowed| host_matches(h, allowed))
+                    });
 
-                        let origin_matches = |candidate: &str, allowed: &str| {
-                            candidate == allowed
-                                || candidate.strip_suffix(":443").is_some_and(|o| o == allowed)
-                                || candidate.strip_suffix(":80").is_some_and(|o| o == allowed)
-                                || allowed.strip_suffix(":443").is_some_and(|o| o == candidate)
-                                || allowed.strip_suffix(":80").is_some_and(|o| o == candidate)
-                        };
+                    let origin_matches = |candidate: &str, allowed: &str| {
+                        candidate == allowed
+                            || candidate.strip_suffix(":443").is_some_and(|o| o == allowed)
+                            || candidate.strip_suffix(":80").is_some_and(|o| o == allowed)
+                            || allowed.strip_suffix(":443").is_some_and(|o| o == candidate)
+                            || allowed.strip_suffix(":80").is_some_and(|o| o == candidate)
+                    };
 
-                        let path = request.uri().path();
-                        let is_oauth_form = path == "/authorize/approve" || path == "/authorize";
+                    let path = request.uri().path();
+                    let is_oauth_form = path == "/authorize/approve" || path == "/authorize";
 
-                        let origin_ok = origin.is_none_or(|orig| {
-                            orig == "null"
-                                || is_oauth_form
-                                || allowed_origins
-                                    .iter()
-                                    .any(|allowed| origin_matches(orig, allowed))
-                        });
+                    let origin_ok = origin.is_none_or(|orig| {
+                        orig == "null"
+                            || is_oauth_form
+                            || allowed_origins
+                                .iter()
+                                .any(|allowed| origin_matches(orig, allowed))
+                    });
 
-                        if host_ok && origin_ok {
-                            next.run(request).await
-                        } else {
-                            tracing::warn!(
-                                event = "host_or_origin_rejected",
-                                host = ?host,
-                                origin = ?origin,
-                                path = %path,
-                                target = "spot_lab::security"
-                            );
-                            axum::http::Response::builder()
-                                .status(axum::http::StatusCode::FORBIDDEN)
-                                .header(
-                                    axum::http::header::CONTENT_TYPE,
-                                    "text/plain; charset=utf-8",
-                                )
-                                .body(axum::body::Body::from(
-                                    "접근 거부: 허용되지 않은 Host 또는 Origin입니다.",
-                                ))
-                                .unwrap_or_else(|_| axum::response::Response::default())
-                        }
+                    if host_ok && origin_ok {
+                        next.run(request).await
+                    } else {
+                        tracing::warn!(
+                            event = "host_or_origin_rejected",
+                            host = ?host,
+                            origin = ?origin,
+                            path = %path,
+                            target = "spot_lab::security"
+                        );
+                        axum::http::Response::builder()
+                            .status(axum::http::StatusCode::FORBIDDEN)
+                            .header(
+                                axum::http::header::CONTENT_TYPE,
+                                "text/plain; charset=utf-8",
+                            )
+                            .body(axum::body::Body::from(
+                                "접근 거부: 허용되지 않은 Host 또는 Origin입니다.",
+                            ))
+                            .unwrap_or_else(|_| axum::response::Response::default())
                     }
-                },
-            ));
+                }
+            },
+        ));
     let app = spot_lab::transport::apply_limits(app, state.clone());
     record_lifecycle_phase(LifecyclePhase::Startup, &state);
     tracing::info!(event = "mcp_listening", bind = %bind_address, port, public_no_auth, auth = exposure.auth_name(), transport = "STATELESS_JSON");
@@ -1867,10 +1911,12 @@ async fn run_mcp_serve(
             ))
         }
     };
-    let (server_result, jobs_result) = tokio::join!(joined_server, jobs.shutdown());
+    let (server_result, jobs_result, realtime_result) =
+        tokio::join!(joined_server, jobs.shutdown(), realtime_tasks.shutdown());
     record_lifecycle_phase(LifecyclePhase::Drain, &state);
     server_result?;
     jobs_result?;
+    realtime_result?;
     if !matches!(
         state
             .wait_for_drain(std::time::Duration::from_secs(1))
@@ -2029,6 +2075,52 @@ fn run_schemas(args: &[String]) -> Result<(), LabError> {
     std::fs::create_dir_all(&out)
         .map_err(|error| LabError::InvalidConfig(format!("create {}: {error}", out.display())))?;
     let schemas = [
+        (
+            "recorded-decision-explanation",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::RecordedDecisionExplanation
+            ))?,
+        ),
+        (
+            "decision-preparation",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::DecisionPreparation
+            ))?,
+        ),
+        (
+            "admission-deferred-fact",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::AdmissionDeferredFact
+            ))?,
+        ),
+        (
+            "paper-review-tool-input",
+            serde_json::to_string(spot_lab::mcp::paper_review_tool_input_schema().as_ref())?,
+        ),
+        (
+            "paper-review-query",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::PaperReviewQuery
+            ))?,
+        ),
+        (
+            "paper-decision-review",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::PaperDecisionReview
+            ))?,
+        ),
+        (
+            "paper-review-audit-response",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::PaperReviewAuditResponse
+            ))?,
+        ),
+        (
+            "counterfactual-report",
+            schema_json(&schemars::schema_for!(
+                spot_lab::contracts::CounterfactualReport
+            ))?,
+        ),
         (
             "live-order-control-request",
             schema_json(&schemars::schema_for!(

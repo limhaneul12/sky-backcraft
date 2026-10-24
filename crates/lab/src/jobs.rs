@@ -3,7 +3,9 @@
 #[path = "automation/service.rs"]
 mod automation_service;
 mod coordinator;
+mod realtime_runtime;
 mod research_control;
+mod review_control;
 
 const AUTOMATION_REVIEW_WORK_CAPACITY: usize = 2;
 
@@ -13,8 +15,8 @@ use crate::contracts::{
     FailureRecord, FillRecord, INDICATOR_VERSION, JobAttempt, JobControl, JobId, JobOutput,
     JobPayload, JobProgress, JobRecord, JobStatus, JobSubmission, LabError, MAX_RUN_EVENTS,
     MarketDataOrigin, ModelLedger, ModelStatus, OrderRecord, ProgressCountUnit, ROUNDING_VERSION,
-    RunBundle, RunHeader, RunId, RunManifest, RunRequest, SCHEMA_VERSION, SignalRecord,
-    UtcTimestamp, ValidationStatus,
+    RealtimeStatus, RunBundle, RunHeader, RunId, RunManifest, RunRequest, SCHEMA_VERSION,
+    SignalRecord, UtcTimestamp, ValidationStatus,
 };
 use crate::database::DatabaseHandle;
 use crate::market_data::UpbitClient;
@@ -58,6 +60,7 @@ impl Drop for ActiveGuard<'_> {
 struct Inner {
     database: DatabaseHandle,
     upbit: UpbitClient,
+    public_market_feed: Option<crate::realtime::PublicMarketFeed>,
     automation_live_venue: UpbitPrivateClient,
     automation_mock_venue: PersistentMockVenue,
     risk_guard: RiskGuard,
@@ -69,12 +72,17 @@ struct Inner {
     root: PathBuf,
     revision: Option<String>,
     wake: Notify,
+    realtime_status: tokio::sync::watch::Sender<RealtimeStatus>,
     stop: CancellationToken,
     admitting: AtomicBool,
     admission_gate: Arc<tokio::sync::Mutex<()>>,
     automation_review_budget: Arc<tokio::sync::Semaphore>,
     runner_available: AtomicBool,
     active: Mutex<Option<(JobId, CancellationToken)>>,
+}
+
+fn new_realtime_status_channel() -> tokio::sync::watch::Sender<RealtimeStatus> {
+    realtime_runtime::status_channel()
 }
 
 /// Point-in-time runtime ownership and persisted queue counts.
@@ -147,10 +155,6 @@ impl JobRuntime {
     /// the exchange control service.
     /// # Errors
     /// Reports durable recovery, mock venue seed, storage, or runtime admission failures.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "startup seeds MOCK, fences restart recovery, builds the owned service and joins both runtime tasks"
-    )]
     pub async fn start_with_venue_and_risk_guard(
         database: DatabaseHandle,
         upbit: UpbitClient,
@@ -158,6 +162,59 @@ impl JobRuntime {
         risk_guard: RiskGuard,
         root: PathBuf,
         revision: Option<String>,
+    ) -> Result<Self, LabError> {
+        #[cfg(test)]
+        let feed_config = None;
+        #[cfg(not(test))]
+        let feed_config = Some(crate::realtime::PublicMarketFeedConfig::upbit_production()?);
+        Self::start_with_market_feed_config(
+            database,
+            upbit,
+            automation_live_venue,
+            risk_guard,
+            root,
+            revision,
+            feed_config,
+        )
+        .await
+    }
+
+    /// Test-only entrypoint that keeps the runtime owner and coordinator in
+    /// place while pointing the public feed at a validated loopback fixture.
+    #[cfg(test)]
+    pub(crate) async fn start_with_test_market_feed_config(
+        database: DatabaseHandle,
+        upbit: UpbitClient,
+        automation_live_venue: UpbitPrivateClient,
+        risk_guard: RiskGuard,
+        root: PathBuf,
+        revision: Option<String>,
+        feed_config: crate::realtime::PublicMarketFeedConfig,
+    ) -> Result<Self, LabError> {
+        Self::start_with_market_feed_config(
+            database,
+            upbit,
+            automation_live_venue,
+            risk_guard,
+            root,
+            revision,
+            Some(feed_config),
+        )
+        .await
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "startup seeds MOCK, fences restart recovery, builds the owned service and joins both runtime tasks"
+    )]
+    async fn start_with_market_feed_config(
+        database: DatabaseHandle,
+        upbit: UpbitClient,
+        automation_live_venue: UpbitPrivateClient,
+        risk_guard: RiskGuard,
+        root: PathBuf,
+        revision: Option<String>,
+        feed_config: Option<crate::realtime::PublicMarketFeedConfig>,
     ) -> Result<Self, LabError> {
         let exchange_read_mode = if automation_live_venue.is_live() {
             ExchangeReadMode::LiveRead
@@ -185,10 +242,11 @@ impl JobRuntime {
                 store.recover_interrupted(UtcTimestamp::now())
             })
             .await?;
-        let service = JobService {
+        let mut service = JobService {
             inner: Arc::new(Inner {
                 database,
                 upbit,
+                public_market_feed: None,
                 automation_live_venue,
                 automation_mock_venue,
                 risk_guard,
@@ -200,6 +258,7 @@ impl JobRuntime {
                 root,
                 revision,
                 wake: Notify::new(),
+                realtime_status: new_realtime_status_channel(),
                 stop: CancellationToken::new(),
                 admitting: AtomicBool::new(true),
                 admission_gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -223,96 +282,48 @@ impl JobRuntime {
                 store.automation_require_restart_reconciliation(UtcTimestamp::now())
             })
             .await?;
-        let owner = service.clone();
-        let producer = service.clone();
-        let supervisor = service.clone();
+        let (public_market_feed, market_owner) = match feed_config {
+            Some(config) => {
+                let (feed, owner) = realtime_runtime::start_public_feed(
+                    service.inner.upbit.clone(),
+                    service.inner.database.clone(),
+                    config,
+                )?;
+                (Some(feed), Some(owner))
+            }
+            None => (None, None),
+        };
+        let Some(inner) = Arc::get_mut(&mut service.inner) else {
+            if let Some(owner) = market_owner {
+                let _joined = owner.shutdown().await;
+            }
+            return Err(LabError::Internal(
+                "job service was cloned before realtime startup".into(),
+            ));
+        };
+        inner.public_market_feed = public_market_feed;
+        let private_channels =
+            realtime_runtime::private_channels(&service.inner.automation_live_venue);
+        let (private_producer, private_consumer) = match private_channels {
+            Some((producer, consumer)) => (Some(producer), Some(consumer)),
+            None => (None, None),
+        };
+        let private_task = private_producer.map(|producer| {
+            realtime_runtime::spawn_private_stream(
+                service.inner.automation_live_venue.clone(),
+                service.inner.stop.clone(),
+                producer,
+            )
+        });
+        realtime_runtime::publish_status_if_changed(&service);
+        let owned_realtime = realtime_runtime::OwnedRealtimeRuntime {
+            market_owner,
+            private_consumer,
+            private_task,
+        };
+        let runtime_service = service.clone();
         let runner = tokio::spawn(async move {
-            let mut worker = tokio::spawn(async move { owner.run().await });
-            let mut coordinator = tokio::spawn(async move { producer.coordinate().await });
-            let (first, worker_finished) = tokio::select! {
-                result = &mut worker => (result, true),
-                result = &mut coordinator => (result, false),
-            };
-            supervisor.inner.admitting.store(false, Ordering::Release);
-            supervisor.inner.stop.cancel();
-            let (active, control_poisoned) = match supervisor.inner.active.lock() {
-                Ok(mut active) => (active.take(), false),
-                Err(poisoned) => (poisoned.into_inner().take(), true),
-            };
-            if let Some((id, token)) = active {
-                let cancellation = supervisor
-                    .persist_cancel(id, CancellationAuthority::RuntimeOwner)
-                    .await;
-                token.cancel();
-                if cancellation.is_err() {
-                    tracing::error!(
-                        event = "runtime_cancel_unconfirmed",
-                        recovery = "DURABLE_READBACK_REQUIRED"
-                    );
-                }
-            }
-            if let Ok(mut guard) = supervisor.inner.active.lock() {
-                *guard = None;
-            }
-            // A completed or failed child never detaches its sibling, including blocking work.
-            let second = if worker_finished {
-                coordinator.await
-            } else {
-                worker.await
-            };
-            let (first_role, second_role) = if worker_finished {
-                ("worker", "coordinator")
-            } else {
-                ("coordinator", "worker")
-            };
-            supervisor
-                .inner
-                .runner_available
-                .store(false, Ordering::Release);
-            {
-                let _admitted = supervisor.inner.admission_gate.lock().await;
-            }
-            let first = first
-                .map_err(|_| LabError::Internal("research runtime child panicked".into()))
-                .and_then(std::convert::identity);
-            let second = second
-                .map_err(|_| LabError::Internal("research runtime sibling panicked".into()))
-                .and_then(std::convert::identity);
-            if let Err(error) = &first {
-                tracing::error!(
-                    event = "research_runtime_child_failed",
-                    role = first_role,
-                    error = %error
-                );
-            }
-            if let Err(error) = &second {
-                tracing::error!(
-                    event = "research_runtime_sibling_failed",
-                    role = second_role,
-                    error = %error
-                );
-            }
-            let result = first.and(second);
-            let result = if control_poisoned {
-                Err(LabError::Internal(
-                    "job control lock poisoned; children joined".into(),
-                ))
-            } else {
-                result
-            };
-            if result.is_err() {
-                let recovered = supervisor
-                    .inner
-                    .database
-                    .call("recover_failed_runner", |store| {
-                        store.recover_interrupted(UtcTimestamp::now())
-                    })
-                    .await;
-                if recovered.is_err() {
-                    tracing::error!(event = "runner_interruption_unconfirmed");
-                }
-            }
-            result
+            realtime_runtime::run_owned_runtime(runtime_service, owned_realtime).await
         });
         Ok(Self { service, runner })
     }
@@ -377,6 +388,18 @@ impl JobRuntime {
 }
 
 impl JobService {
+    /// Current secret-free market/private connection health snapshot.
+    #[must_use]
+    pub fn realtime_status(&self) -> RealtimeStatus {
+        realtime_runtime::status_snapshot(self)
+    }
+
+    /// Subscribe to coalesced connection-health transitions.
+    #[must_use]
+    pub fn subscribe_realtime_status(&self) -> tokio::sync::watch::Receiver<RealtimeStatus> {
+        self.inner.realtime_status.subscribe()
+    }
+
     pub(super) fn live_execution_policy(&self) -> LiveExecutionPolicy {
         self.inner.automation_live_venue.live_execution_policy()
     }
@@ -787,6 +810,13 @@ impl JobService {
                     ),
                 }
             }
+            let completed_attempt_id = attempt.id.clone();
+            self.inner
+                .database
+                .call("release_terminal_job_inputs", move |store| {
+                    store.release_terminal_job_input_hold(&completed_attempt_id)
+                })
+                .await?;
             drop(active_guard);
             tracing::info!(event = "job_attempt_finished", job_id = %job.id, attempt_id = %attempt.id);
         }
@@ -1057,6 +1087,20 @@ impl JobService {
         let plan = Arc::new(stored.resolved);
         let datasets = Arc::new(datasets);
         let evidence = Arc::new(evidence);
+        let prewarm_plan = plan.clone();
+        let prewarm_data = datasets.clone();
+        let prewarm_token = cancellation.clone();
+        let bar_cache = Arc::new(
+            tokio::task::spawn_blocking(move || {
+                crate::policy_engine::PreparedBarCache::prewarm_for_plan(
+                    &prewarm_plan,
+                    &prewarm_data,
+                    &|| prewarm_token.is_cancelled(),
+                )
+            })
+            .await
+            .map_err(|_| LabError::Internal("bar prewarm worker panicked".into()))?,
+        );
         let mut models = Vec::new();
         let mut next_seq = 1_u64;
         let mut total_records = 0usize;
@@ -1065,11 +1109,12 @@ impl JobService {
             let worker_plan = plan.clone();
             let worker_data = datasets.clone();
             let worker_evidence = evidence.clone();
+            let worker_cache = bar_cache.clone();
             let worker_run = run_id.clone();
             let worker_admission = admission.clone();
             let token = cancellation.clone();
             let (model, batches) = tokio::task::spawn_blocking(move || {
-                let model = crate::engine::run_model(
+                let model = crate::engine::run_model_with_cache(
                     &worker_plan,
                     &worker_data,
                     worker_evidence.as_ref().as_ref(),
@@ -1077,6 +1122,7 @@ impl JobService {
                     &worker_admission,
                     next_seq,
                     &|| token.is_cancelled(),
+                    Some(worker_cache.as_ref()),
                 )?;
                 let batches = fact_batches(&model)?;
                 Ok::<_, LabError>((model, batches))
@@ -1163,10 +1209,11 @@ impl JobService {
                 let blocked = bundle.models.len() - completed;
                 let count = u64::try_from(bundle.models.len())
                     .map_err(|_| LabError::ResourceLimit("model count overflow".into()))?;
-                let causal_digest = crate::research::causal_input_digest(
+                let causal_digest = crate::research::causal_input_digest_with_cache(
                     &bundle.plan,
                     &bundle.datasets,
                     bundle.evidence.as_ref(),
+                    Some(bar_cache.as_ref()),
                 )?;
                 let comparisons = crate::reporting::build_comparisons(&bundle, &causal_digest)?;
                 Ok((

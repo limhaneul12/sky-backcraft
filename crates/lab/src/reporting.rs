@@ -6,10 +6,12 @@
 
 pub mod automation_review;
 pub mod comparison;
+pub(crate) mod decision_explanation;
 pub mod export;
 pub mod metrics;
 pub(crate) mod portfolio_projection;
 pub(crate) mod regime_projection;
+pub mod review_audit;
 pub use comparison::build_comparisons;
 pub mod verify;
 

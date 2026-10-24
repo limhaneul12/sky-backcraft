@@ -1,0 +1,128 @@
+{
+  "fixture_kind": "synthetic_policy_delete_wire_examples",
+  "api": {
+    "policy_delete_write": {
+      "request_id": "policy-delete-request-001",
+      "items": [
+        {
+          "policy_id": "policy-example-user-001",
+          "preview": {
+            "scope_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+            "expires_at": "2026-10-15T03:00:00Z",
+            "confirmation_token": "2222222222222222222222222222222222222222222222222222222222222222"
+          }
+        }
+      ],
+      "confirmation_text": "Synthetic policy example"
+    },
+    "policy_delete_query": {
+      "request_id": "policy-delete-request-001"
+    },
+    "policy_delete_readback_not_found": {
+      "request_id": "policy-delete-not-found-001",
+      "found": false
+    },
+    "policy_delete_readback_pending": {
+      "request_id": "policy-delete-request-001",
+      "found": true,
+      "request_digest": "3333333333333333333333333333333333333333333333333333333333333333",
+      "state": "PENDING",
+      "requested_count": 2,
+      "items": [
+        {
+          "policy_id": "policy-example-user-001",
+          "preview_scope_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+          "preview_digest": "4444444444444444444444444444444444444444444444444444444444444444",
+          "status": "DELETED",
+          "reason_code": null,
+          "remediation_code": null,
+          "deleted_revision_count": 3,
+          "retained": false,
+          "effect": "APPLIED"
+        },
+        {
+          "policy_id": "policy-example-user-002",
+          "preview_scope_digest": "5555555555555555555555555555555555555555555555555555555555555555",
+          "preview_digest": "6666666666666666666666666666666666666666666666666666666666666666",
+          "status": "PENDING",
+          "reason_code": null,
+          "remediation_code": null,
+          "deleted_revision_count": 0,
+          "retained": true,
+          "effect": "NOT_APPLIED"
+        }
+      ],
+      "counts": {
+        "pending": 1,
+        "deleted": 1,
+        "blocked": 0,
+        "stale": 0,
+        "failed": 0,
+        "interrupted_not_applied": 0,
+        "retained": 1
+      }
+    },
+    "policy_delete_readback_complete": {
+      "request_id": "policy-delete-request-001",
+      "found": true,
+      "request_digest": "3333333333333333333333333333333333333333333333333333333333333333",
+      "state": "COMPLETE",
+      "requested_count": 1,
+      "items": [
+        {
+          "policy_id": "policy-example-user-001",
+          "preview_scope_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+          "preview_digest": "4444444444444444444444444444444444444444444444444444444444444444",
+          "status": "DELETED",
+          "reason_code": null,
+          "remediation_code": null,
+          "deleted_revision_count": 3,
+          "retained": false,
+          "effect": "APPLIED"
+        }
+      ],
+      "counts": {
+        "pending": 0,
+        "deleted": 1,
+        "blocked": 0,
+        "stale": 0,
+        "failed": 0,
+        "interrupted_not_applied": 0,
+        "retained": 0
+      }
+    },
+    "policy_delete_write_error": {
+      "error": {
+        "request_id": "policy-delete-request-conflict-001",
+        "submitted_request_digest": "7777777777777777777777777777777777777777777777777777777777777777",
+        "existing_request_digest": "8888888888888888888888888888888888888888888888888888888888888888",
+        "code": "REQUEST_ID_CONFLICT",
+        "item_index": null,
+        "policy_id": null,
+        "effect": "NO_NEW_EFFECT"
+      }
+    },
+    "desktop_capability": {
+      "mode": "POLICY_ONLY_CONFIRMED",
+      "max_items": 100,
+      "archive_available": false,
+      "request_readback": true,
+      "confirmation_required": true
+    },
+    "non_desktop_capability": {
+      "mode": "UNAVAILABLE",
+      "max_items": 100,
+      "archive_available": false,
+      "request_readback": true,
+      "confirmation_required": true
+    }
+  },
+  "invariants": {
+    "status_partition": "pending+deleted+blocked+stale+failed+interrupted_not_applied=requested_count",
+    "retained": "overlapping verified-retained count; not part of the status partition",
+    "request_state": "PENDING if any PENDING; INTERRUPTED if none pending and any INTERRUPTED_NOT_APPLIED; COMPLETE iff all items DELETED; otherwise PARTIAL",
+    "single_confirmation": "exact full policy_id or exact current policy name only if unique",
+    "batch_confirmation": "exact DELETE N POLICIES where N is the submitted batch count",
+    "selection_limit": "each backend request is 1..=100 items; larger logical selections require separate fresh preview and confirmation per batch"
+  }
+}

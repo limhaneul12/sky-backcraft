@@ -17,7 +17,7 @@ use crate::contracts::{
     PitPolicy, PlanId, PolicyRevisionRef, PriceKrw, QuoteAmount, ReasonCode, ReportClock,
     RequestId, ResolvedPlan, RuleProvenance, RuleSnapshotId, RunId, Side, SignalOutcome,
     SignalRecord, SignedAmount, SimulatedOrderType, StrategyBinding, TerminalPolicy, TickBand,
-    UtcRange, UtcTimestamp, Weight, checked, observation_digest,
+    UtcRange, UtcTimestamp, VerifiedProviderCoverage, Weight, checked, observation_digest,
 };
 use crate::engine::{
     EngineState, PendingExecution,
@@ -32,6 +32,15 @@ use chrono::{TimeZone, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+
+mod verification;
+pub(crate) use verification::{
+    MAX_PAPER_SESSION_VERIFICATION_EVENT_BYTES, MAX_PAPER_SESSION_VERIFICATION_EVENTS,
+    MAX_PAPER_SESSION_VERIFICATION_JSON_BYTES, MAX_PAPER_SESSION_VERIFICATION_OBSERVATION_BYTES,
+    MAX_PAPER_SESSION_VERIFICATION_OBSERVATIONS, StoredCheckpointRow, StoredEventRow,
+    failed_paper_verification, unavailable_paper_verification, verification_observation_ids,
+    verify_paper_session,
+};
 
 /// Schema version for persisted per-market paper checkpoints.
 pub const PAPER_CHECKPOINT_SCHEMA_VERSION: &str = "paper-market-checkpoint-v1";
@@ -80,6 +89,7 @@ pub(crate) struct PreparedPaperSourceFrame<'a> {
     market_code: String,
     requirements: Vec<(CandleInterval, usize)>,
     streams: BTreeMap<CandleInterval, PreparedPaperSourceStream<'a>>,
+    provider_coverage: VerifiedProviderCoverage,
 }
 
 impl<'a> PreparedPaperSourceFrame<'a> {
@@ -130,7 +140,13 @@ impl<'a> PreparedPaperSourceFrame<'a> {
             market_code: market.code(),
             requirements,
             streams,
+            provider_coverage: VerifiedProviderCoverage::empty(),
         }
+    }
+
+    pub(crate) fn with_provider_coverage(mut self, coverage: &VerifiedProviderCoverage) -> Self {
+        self.provider_coverage = coverage.clone();
+        self
     }
 }
 
@@ -283,6 +299,7 @@ pub struct PendingPaperEvent {
     pub candle: Option<PaperCandleReference>,
     pub source_event_at: Option<UtcTimestamp>,
     pub finalized_at: Option<UtcTimestamp>,
+    pub preparation: Option<crate::contracts::DecisionPreparation>,
     pub signals: Vec<SignalRecord>,
     pub orders: Vec<OrderRecord>,
     pub order_events: Vec<OrderRecord>,
@@ -298,6 +315,7 @@ pub struct PaperStepOutcome {
     pub did_advance: bool,
     pub recovery_required: Option<String>,
     pub recovery_cause: Option<PaperRecoveryCause>,
+    pub preparation: Option<crate::contracts::DecisionPreparation>,
 }
 
 /// Build the canonical start options for the paper session creation form.
@@ -623,6 +641,25 @@ impl PaperMarketCheckpoint {
                 "paper checkpoint immutable identity mismatch".into(),
             ));
         }
+        match (
+            &self.prior_execution_bar,
+            self.last_finalized_candle_at,
+            &self.last_finalized_candle_digest,
+        ) {
+            (None, None, None) => {}
+            (Some(prior), Some(close), Some(digest))
+                if prior.candle.completed
+                    && prior.candle.market == self.market.code()
+                    && prior.candle.interval == self.plan.spec.decision_interval
+                    && prior.candle.close_time_utc == close
+                    && prior.content_digest == *digest
+                    && observation_digest(&prior.candle)? == *digest => {}
+            _ => {
+                return Err(LabError::DataCorrupt(
+                    "paper checkpoint lost its actual prior candle or finalized identity".into(),
+                ));
+            }
+        }
         self.engine_state.account.validate()?;
         self.benchmark_account.validate()?;
         if let Some(pending) = &self.pending
@@ -705,12 +742,52 @@ impl PaperMarketCheckpoint {
             if !self.feed_sources_until_prepared(&mut source_frame, bar.candle.close_time_utc)? {
                 return Ok(());
             }
-            self.evaluator
-                .observe(bar, cash, Some(&evidence_evaluator))?;
+            self.evaluator.observe_with_provider_coverage(
+                bar,
+                cash,
+                Some(&evidence_evaluator),
+                &source_frame.provider_coverage,
+            )?;
         }
         let seen = u32::try_from(self.evaluator.completed_bars_seen()).unwrap_or(u32::MAX);
         self.warmup_completed_bars = seen.min(self.warmup_required_bars);
         Ok(())
+    }
+
+    /// Whether every cross-interval source has enough pre-start history and its
+    /// cursor lies between the latest source boundary available to the last
+    /// completed decision bar and the latest boundary available at session start.
+    /// This admits finer source streams that warm only through the decision
+    /// boundary while still rejecting future or stale cursors.
+    ///
+    /// # Errors
+    /// Propagates source-boundary calculation errors.
+    pub(crate) fn pre_start_source_history_ready(
+        &self,
+        started_at: UtcTimestamp,
+    ) -> Result<bool, LabError> {
+        let decision_boundary = crate::scheduling::latest_completed_boundary(
+            started_at,
+            self.plan.spec.decision_interval,
+        )?;
+        for (interval, required_bars) in self.evaluator.source_requirements() {
+            let earliest_causal_close =
+                crate::scheduling::latest_completed_boundary(decision_boundary, interval)?;
+            let latest_available_close =
+                crate::scheduling::latest_completed_boundary(started_at, interval)?;
+            let Some(cursor) = self.source_cursors.get(&interval) else {
+                return Ok(false);
+            };
+            let required_bars = u64::try_from(required_bars)
+                .map_err(|_| LabError::ResourceLimit("source warmup count overflow".into()))?;
+            if cursor.last_bar_close_utc.is_none_or(|last_close| {
+                last_close < earliest_causal_close || last_close > latest_available_close
+            }) || cursor.completed_bars < required_bars
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Fast-forward indicator and cross-interval state across bars that closed while the
@@ -726,9 +803,33 @@ impl PaperMarketCheckpoint {
         evidence: Option<&EvidenceSnapshot>,
         now_utc: UtcTimestamp,
     ) -> Result<PaperStepOutcome, LabError> {
+        self.catch_up_with_provider_coverage(
+            decision_bars,
+            source_bars,
+            evidence,
+            now_utc,
+            &VerifiedProviderCoverage::empty(),
+        )
+    }
+
+    pub(crate) fn catch_up_with_provider_coverage(
+        &mut self,
+        decision_bars: &[CandleObservation],
+        source_bars: &BTreeMap<CandleInterval, Vec<CandleObservation>>,
+        evidence: Option<&EvidenceSnapshot>,
+        now_utc: UtcTimestamp,
+        coverage: &VerifiedProviderCoverage,
+    ) -> Result<PaperStepOutcome, LabError> {
+        if self.pending.is_some() {
+            return Err(LabError::Conflict(
+                "paper catch-up requires pending orders to be resolved before advancing history"
+                    .into(),
+            ));
+        }
         let mut staged = self.clone();
         let mut source_frame =
-            PreparedPaperSourceFrame::new(&staged.evaluator, &staged.market, source_bars);
+            PreparedPaperSourceFrame::new(&staged.evaluator, &staged.market, source_bars)
+                .with_provider_coverage(coverage);
         let outcome = staged.catch_up_paused_bars_in_place(
             decision_bars,
             &mut source_frame,
@@ -744,6 +845,10 @@ impl PaperMarketCheckpoint {
         Ok(outcome)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one ordered state-only candle loop keeps validation, causal observation and checkpoint publication together"
+    )]
     fn catch_up_paused_bars_in_place(
         &mut self,
         decision_bars: &[CandleObservation],
@@ -791,7 +896,12 @@ impl PaperMarketCheckpoint {
                 }
             }
             if let Some(prior) = &self.prior_execution_bar
-                && prior.candle.close_time_utc != bar.candle.open_time_utc
+                && !source_frame.provider_coverage.covers(
+                    &self.market,
+                    self.plan.spec.decision_interval,
+                    prior.candle.close_time_utc,
+                    bar.candle.open_time_utc,
+                )
             {
                 return Ok(self.fail_checkpoint(
                     bar,
@@ -808,14 +918,22 @@ impl PaperMarketCheckpoint {
                 PausedSourceFeed::Ready(ready) => ready,
                 PausedSourceFeed::Recovery(outcome) => return Ok(outcome),
             };
+            if !source_ready {
+                // Retry this actual candle after the source suffix is published.
+                // Never consume it without updating the policy's observation state.
+                break;
+            }
             let marked = self.engine_state.account.mark(bar.candle.close)?;
             let position = self
                 .engine_state
                 .position_view(marked.actual_weight, bar.candle.close_time_utc)?;
-            if source_ready {
-                let _ = self
-                    .evaluator
-                    .observe(bar, position, Some(&evidence_evaluator))?;
+            {
+                let _ = self.evaluator.observe_with_provider_coverage(
+                    bar,
+                    position,
+                    Some(&evidence_evaluator),
+                    &source_frame.provider_coverage,
+                )?;
                 let seen = u32::try_from(self.evaluator.completed_bars_seen()).unwrap_or(u32::MAX);
                 self.warmup_completed_bars = seen.min(self.warmup_required_bars);
             }
@@ -835,8 +953,8 @@ impl PaperMarketCheckpoint {
             self.last_heartbeat_at = Some(now_utc);
             self.prior_passive_liquidity_bar = self.prior_execution_bar.take();
             self.prior_execution_bar = Some(bar.clone());
-            // A paused catch-up consumes the candle without producing a
-            // retroactive decision, even when source history is not ready.
+            // A paused catch-up observes the candle without producing a
+            // retroactive decision.
             self.prior_bar_evaluated = true;
             let event = self.drain_candle_event(bar, bar_digest, now_utc);
             events.push(event);
@@ -844,6 +962,7 @@ impl PaperMarketCheckpoint {
         }
         self.refresh_freshness(now_utc);
         Ok(PaperStepOutcome {
+            preparation: None,
             events,
             did_advance,
             recovery_required: None,
@@ -868,14 +987,26 @@ impl PaperMarketCheckpoint {
                 PausedSourceFeed::Ready(ready) => ready,
                 PausedSourceFeed::Recovery(outcome) => return Ok(Some(outcome)),
             };
-        if source_ready {
+        if !source_ready {
+            return Ok(Some(PaperStepOutcome {
+                preparation: None,
+                events: Vec::new(),
+                did_advance: false,
+                recovery_required: None,
+                recovery_cause: None,
+            }));
+        }
+        {
             let marked = self.engine_state.account.mark(previous.candle.close)?;
             let position = self
                 .engine_state
                 .position_view(marked.actual_weight, previous.candle.close_time_utc)?;
-            let _ = self
-                .evaluator
-                .observe(&previous, position, Some(evidence_evaluator))?;
+            let _ = self.evaluator.observe_with_provider_coverage(
+                &previous,
+                position,
+                Some(evidence_evaluator),
+                &source_frame.provider_coverage,
+            )?;
             let seen = u32::try_from(self.evaluator.completed_bars_seen()).unwrap_or(u32::MAX);
             self.warmup_completed_bars = seen.min(self.warmup_required_bars);
         }
@@ -945,6 +1076,7 @@ impl PaperMarketCheckpoint {
                     self.last_heartbeat_at = Some(now_utc);
                     self.refresh_freshness(now_utc);
                     return Ok(PaperStepOutcome {
+                        preparation: None,
                         events: Vec::new(),
                         did_advance: false,
                         recovery_required: None,
@@ -964,7 +1096,12 @@ impl PaperMarketCheckpoint {
             }
         }
         if let Some(prior) = &self.prior_execution_bar
-            && prior.candle.close_time_utc != bar.candle.open_time_utc
+            && !source_frame.provider_coverage.covers(
+                &self.market,
+                self.plan.spec.decision_interval,
+                prior.candle.close_time_utc,
+                bar.candle.open_time_utc,
+            )
         {
             return Ok(self.fail_checkpoint(
                 bar,
@@ -978,7 +1115,44 @@ impl PaperMarketCheckpoint {
             ));
         }
 
+        if self.last_finalized_candle_at.is_none()
+            && self.prior_execution_bar.is_none()
+            && !self.feed_sources_until_prepared(source_frame, bar.candle.close_time_utc)?
+        {
+            return Ok(PaperStepOutcome {
+                preparation: Some(self.decision_preparation(
+                    bar,
+                    crate::contracts::DecisionPreparationStatus::AwaitingPolicySources,
+                )),
+                events: Vec::new(),
+                did_advance: false,
+                recovery_required: None,
+                recovery_cause: None,
+            });
+        }
+
         let evidence_evaluator = EvidenceEvaluator::new(evidence, self.plan.spec.pit_policy)?;
+        // A published decision candle can arrive before its source intervals.
+        // Wait before touching pending execution or replacing the prior candle;
+        // the same durable decision row must be retried once dependencies arrive.
+        if !self.prior_bar_evaluated
+            && let Some(prior_close) = self
+                .prior_execution_bar
+                .as_ref()
+                .map(|prior| prior.candle.close_time_utc)
+            && !self.feed_sources_until_prepared(source_frame, prior_close)?
+        {
+            return Ok(PaperStepOutcome {
+                preparation: Some(self.decision_preparation(
+                    bar,
+                    crate::contracts::DecisionPreparationStatus::AwaitingPolicySources,
+                )),
+                events: Vec::new(),
+                did_advance: false,
+                recovery_required: None,
+                recovery_cause: None,
+            });
+        }
         let participation_cap = match self.plan.spec.execution {
             ExecutionPolicy::NextBarOpen { participation_cap }
             | ExecutionPolicy::PassiveBuy {
@@ -1038,9 +1212,12 @@ impl PaperMarketCheckpoint {
                 if source_ready {
                     let marked = self.engine_state.account.mark(prev.candle.close)?;
                     let position = self.engine_state.position_view(marked.actual_weight, now)?;
-                    let evaluation =
-                        self.evaluator
-                            .observe(&prev, position, Some(&evidence_evaluator))?;
+                    let evaluation = self.evaluator.observe_with_provider_coverage(
+                        &prev,
+                        position,
+                        Some(&evidence_evaluator),
+                        &source_frame.provider_coverage,
+                    )?;
                     let seen =
                         u32::try_from(self.evaluator.completed_bars_seen()).unwrap_or(u32::MAX);
                     self.warmup_completed_bars = seen.min(self.warmup_required_bars);
@@ -1160,8 +1337,12 @@ impl PaperMarketCheckpoint {
                 held_decision_bars: None,
             };
             if self.feed_sources_until_prepared(source_frame, bar.candle.close_time_utc)? {
-                self.evaluator
-                    .observe(bar, cash, Some(&evidence_evaluator))?;
+                self.evaluator.observe_with_provider_coverage(
+                    bar,
+                    cash,
+                    Some(&evidence_evaluator),
+                    &source_frame.provider_coverage,
+                )?;
                 let seen = u32::try_from(self.evaluator.completed_bars_seen()).unwrap_or(u32::MAX);
                 self.warmup_completed_bars = seen.min(self.warmup_required_bars);
                 true
@@ -1180,9 +1361,18 @@ impl PaperMarketCheckpoint {
         self.prior_execution_bar = Some(bar.clone());
         self.prior_bar_evaluated = bar_evaluated;
 
-        let event = self.drain_candle_event(bar, bar_digest, now_utc);
+        let mut event = self.drain_candle_event(bar, bar_digest, now_utc);
+        if event.signals.is_empty() {
+            let status = if next_seen < u64::from(self.warmup_required_bars) {
+                crate::contracts::DecisionPreparationStatus::PolicyWarmup
+            } else {
+                crate::contracts::DecisionPreparationStatus::AwaitingExecutionBar
+            };
+            event.preparation = Some(self.decision_preparation(bar, status));
+        }
         self.refresh_freshness(now_utc);
         Ok(PaperStepOutcome {
+            preparation: None,
             events: vec![event],
             did_advance: true,
             recovery_required: None,
@@ -1351,6 +1541,7 @@ impl PaperMarketCheckpoint {
                 stream,
                 ordered_prefix,
                 decision_close,
+                &source_frame.provider_coverage,
             )? {
                 plans.push(plan);
             } else {
@@ -1374,8 +1565,11 @@ impl PaperMarketCheckpoint {
                 .indicator_ids;
             for planned_bar in plan.bars {
                 for indicator_id in indicator_ids {
-                    self.evaluator
-                        .observe_source(indicator_id, planned_bar.bar)?;
+                    self.evaluator.observe_source_with_provider_coverage(
+                        indicator_id,
+                        planned_bar.bar,
+                        &source_frame.provider_coverage,
+                    )?;
                 }
                 let cursor =
                     self.source_cursors
@@ -1397,7 +1591,11 @@ impl PaperMarketCheckpoint {
             let Some(cursor) = self.source_cursors.get(interval) else {
                 return Ok(false);
             };
-            if cursor.last_bar_close_utc != Some(expected) {
+            if cursor.last_bar_close_utc.is_none_or(|last| {
+                !source_frame
+                    .provider_coverage
+                    .covers(&self.market, *interval, last, expected)
+            }) {
                 return Err(LabError::DataGap(format!(
                     "paper source cursor for {interval:?} does not reach completed boundary {expected}"
                 )));
@@ -1422,6 +1620,7 @@ impl PaperMarketCheckpoint {
         stream: &PreparedPaperSourceStream<'a>,
         ordered_prefix: &[usize],
         decision_close: UtcTimestamp,
+        coverage: &VerifiedProviderCoverage,
     ) -> Result<Option<PlannedPaperSourceFeed<'a>>, LabError> {
         let expected = crate::scheduling::latest_completed_boundary(decision_close, interval)?;
         let cursor = self.source_cursors.get(&interval);
@@ -1451,14 +1650,24 @@ impl PaperMarketCheckpoint {
             let Some(last_index) = ordered_prefix.last().copied() else {
                 return Ok(None);
             };
-            if stream.rows_by_close[last_index].bar.candle.close_time_utc != expected {
+            if !coverage.covers(
+                &self.market,
+                interval,
+                stream.rows_by_close[last_index].bar.candle.close_time_utc,
+                expected,
+            ) {
                 return Ok(None);
             }
             let mut contiguous_start = ordered_prefix.len() - 1;
             while contiguous_start > 0 {
                 let previous = &stream.rows_by_close[ordered_prefix[contiguous_start - 1]].bar;
                 let current = &stream.rows_by_close[ordered_prefix[contiguous_start]].bar;
-                if previous.candle.close_time_utc == current.candle.open_time_utc {
+                if coverage.covers(
+                    &self.market,
+                    interval,
+                    previous.candle.close_time_utc,
+                    current.candle.open_time_utc,
+                ) {
                     contiguous_start -= 1;
                 } else {
                     break;
@@ -1514,7 +1723,12 @@ impl PaperMarketCheckpoint {
                     "paper source row for {interval:?} exceeds completed boundary {expected}"
                 )));
             }
-            if bar.candle.open_time_utc != expected_open {
+            if !coverage.covers(
+                &self.market,
+                interval,
+                expected_open,
+                bar.candle.open_time_utc,
+            ) {
                 return Err(LabError::DataGap(format!(
                     "paper source gap for {interval:?} after {expected_open}"
                 )));
@@ -1522,10 +1736,11 @@ impl PaperMarketCheckpoint {
             expected_open = bar.candle.close_time_utc;
             successors.push(stream.planned_row(*row_index)?);
         }
-        if expected_open != expected {
-            return Err(LabError::DataGap(format!(
-                "paper source stream {interval:?} does not contain completed boundary {expected}"
-            )));
+        if !coverage.covers(&self.market, interval, expected_open, expected) {
+            // There is no later eligible observed row beyond this edge. An
+            // asynchronous source publication may still provide the suffix.
+            // Interior holes before observed successors were rejected above.
+            return Ok(None);
         }
         Ok(Some(PlannedPaperSourceFeed {
             interval,
@@ -1636,6 +1851,22 @@ impl PaperMarketCheckpoint {
         Ok(())
     }
 
+    fn decision_preparation(
+        &self,
+        bar: &CandleObservation,
+        status: crate::contracts::DecisionPreparationStatus,
+    ) -> crate::contracts::DecisionPreparation {
+        crate::contracts::DecisionPreparation {
+            status,
+            market: self.market.clone(),
+            interval: bar.candle.interval,
+            observation_id: bar.id.clone(),
+            decision_time: bar.candle.close_time_utc,
+            completed_bars_seen: self.evaluator.completed_bars_seen(),
+            required_bars: u64::from(self.warmup_required_bars),
+        }
+    }
+
     fn drain_candle_event(
         &mut self,
         bar: &CandleObservation,
@@ -1665,6 +1896,7 @@ impl PaperMarketCheckpoint {
         }
 
         PendingPaperEvent {
+            preparation: None,
             kind: PaperEventKind::CandleProcessed,
             market: Some(self.market.clone()),
             candle: Some(PaperCandleReference {
@@ -1697,7 +1929,9 @@ impl PaperMarketCheckpoint {
         self.recovery_reason = Some(reason.clone());
         self.market_event_count = self.market_event_count.saturating_add(1);
         PaperStepOutcome {
+            preparation: None,
             events: vec![PendingPaperEvent {
+                preparation: None,
                 kind: PaperEventKind::RecoveryRequired,
                 market: Some(self.market.clone()),
                 candle: Some(PaperCandleReference {
@@ -1727,6 +1961,7 @@ impl PaperMarketCheckpoint {
 #[must_use]
 pub fn materialize_candle_event(sequence: u64, pending: PendingPaperEvent) -> PaperSessionEvent {
     PaperSessionEvent {
+        preparation: pending.preparation,
         sequence,
         kind: pending.kind,
         market: pending.market,
@@ -1734,6 +1969,7 @@ pub fn materialize_candle_event(sequence: u64, pending: PendingPaperEvent) -> Pa
         source_event_at: pending.source_event_at,
         finalized_at: pending.finalized_at,
         control: None,
+        provider_recovery: None,
         signals: pending.signals,
         orders: pending.orders,
         order_events: pending.order_events,
@@ -1868,6 +2104,551 @@ mod tests {
         value.parse().expect("valid decimal")
     }
 
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "real Store engine journeys verify full/partial order lifecycle, exact trace persistence and passive readback"
+    )]
+    fn engine_recorded_buy_trace_survives_store_and_passive_decision_readback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (cash, partial) in [("1000", false), ("100000", true)] {
+            let root = PaperFeedTestRoot::new()?;
+            let mut store = crate::storage::Store::open(&root.0)?;
+            let started = ts("2025-01-02T00:00:00Z");
+            store.seed_builtin_policies_once(
+                &crate::contracts::builtin_policy_definitions()?,
+                started,
+            )?;
+            let policy = store
+                .paper_start_options()?
+                .policy_options
+                .into_iter()
+                .find(|option| option.family == StrategyKind::BuyAndHold && option.supported)
+                .expect("supported buy-and-hold fixture policy");
+            let market = MarketId::parse_upbit("KRW-BTC")?;
+            let created = store.paper_write(
+                &PaperSessionWrite::Start {
+                    request_id: RequestId::new("engine-recorded-buy")?,
+                    policy_ref: policy.reference,
+                    decision_interval: CandleInterval::H1,
+                    execution_resolution: CandleInterval::H1,
+                    latency_ms: 0,
+                    execution: ExecutionPolicy::NextBarOpen {
+                        participation_cap: Weight::new(Decimal::ONE)?,
+                    },
+                    markets: vec![PaperMarketStart {
+                        market: market.clone(),
+                        initial_cash: QuoteAmount::new(dec(cash))?,
+                        costs: zero_cost_policy(),
+                        market_rules: simple_rules(),
+                    }],
+                },
+                started,
+            )?;
+            let id = &created.session.session_id;
+            let mut bars =
+                constant_bars("engine-recorded-buy", started, 3, CandleInterval::H1, "100");
+            if partial {
+                // Size against the previous 100-unit bar, then fill against ten units
+                // on the next bar: the engine emits fill followed by cancellation.
+                bars[1].candle.volume = AssetQuantity::new(dec("10"))?;
+                let digest = observation_digest(&bars[1].candle)?;
+                bars[1].id = ObservationId::from_seed(digest.as_str());
+                bars[1].content_digest = digest;
+            }
+            let now = bars
+                .last()
+                .expect("three fixture bars")
+                .candle
+                .close_time_utc;
+            store.step_paper_session_bars(id, &market, &bars, &BTreeMap::new(), now)?;
+            let before = store.paper_review_events(id, None, None, 100)?;
+            let event = before
+                .page
+                .items
+                .iter()
+                .find(|event| !event.signals.is_empty())
+                .expect("engine generated a strategy decision");
+            let signal = &event.signals[0];
+            assert_eq!(
+                signal.actual_weight_at_decision,
+                Some(Weight::new(Decimal::ZERO)?)
+            );
+            assert!(
+                signal.decision_trace.as_ref().is_some_and(|trace| trace
+                    .iter()
+                    .any(|condition| condition.evidence.is_some()))
+            );
+            let stored_json = serde_json::to_value(signal)?;
+            assert_eq!(stored_json["actual_weight_at_decision"], "0");
+            assert!(stored_json["decision_trace"][0]["evidence"].is_object());
+            let review = store.paper_review_decision(&crate::contracts::PaperReviewSelection {
+                session_id: id.clone(),
+                event_sequence: event.sequence,
+                as_of_sequence: before.as_of_sequence,
+                signal_id: Some(signal.signal_id.clone()),
+            })?;
+            let explanation = review
+                .recorded_decision
+                .expect("passive saved-fact explanation");
+            assert_eq!(
+                explanation.strategy_action,
+                crate::contracts::RecordedDecisionAction::Buy
+            );
+            assert_eq!(
+                explanation.actual_weight_at_decision,
+                Some(Weight::new(Decimal::ZERO)?)
+            );
+            assert_eq!(
+                explanation.condition_trace_capture,
+                crate::contracts::SavedFactCaptureStatus::Captured
+            );
+            assert!(!explanation.condition_trace.is_empty());
+            assert!(!explanation.orders.is_empty());
+            assert!(!explanation.fills.is_empty());
+            if partial {
+                assert!(
+                    explanation
+                        .orders
+                        .iter()
+                        .any(|order| order.state == "CANCELLED")
+                );
+            } else {
+                let (hold_event, hold_signal) = before
+                    .page
+                    .items
+                    .iter()
+                    .find_map(|event| {
+                        event
+                            .signals
+                            .iter()
+                            .find(|signal| {
+                                signal.outcome == crate::contracts::SignalOutcome::NoAction
+                            })
+                            .map(|signal| (event, signal))
+                    })
+                    .expect("engine recorded the later no-rebalance decision");
+                let hold = store
+                    .paper_review_decision(&crate::contracts::PaperReviewSelection {
+                        session_id: id.clone(),
+                        event_sequence: hold_event.sequence,
+                        as_of_sequence: before.as_of_sequence,
+                        signal_id: Some(hold_signal.signal_id.clone()),
+                    })?
+                    .recorded_decision
+                    .expect("saved no-buy explanation");
+                assert_eq!(
+                    hold.strategy_action,
+                    crate::contracts::RecordedDecisionAction::Hold
+                );
+                assert_eq!(
+                    hold.execution_state,
+                    crate::contracts::RecordedExecutionState::NoOrder
+                );
+                assert!(!hold.reasons.is_empty());
+            }
+            let after = store.paper_review_events(id, None, Some(before.as_of_sequence), 100)?;
+            assert_eq!(serde_json::to_value(after)?, serde_json::to_value(before)?);
+            store.close()?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one real Store journey checks deferred capture, dedup, cursor stability and later readiness"
+    )]
+    fn saved_preparation_deduplicates_without_advancing_evaluator_and_then_becomes_ready()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = PaperFeedTestRoot::new()?;
+        let mut store = crate::storage::Store::open(&root.0)?;
+        let started = ts("2025-01-05T12:00:30Z");
+        let definition = rules_revision_with_indicators(
+            "preparation-policy",
+            "preparation-revision",
+            "preparation",
+            vec![PolicyIndicator {
+                id: "h1_ema".into(),
+                indicator: PolicyIndicatorKind::Ema { window: 2 },
+                source_interval: Some(CandleInterval::H1),
+            }],
+        )
+        .definition;
+        let revision = store.write_policy(
+            &PolicyWrite::Create {
+                request_id: RequestId::new("preparation-policy-create")?,
+                definition,
+            },
+            started,
+        )?;
+        let market = MarketId::parse_upbit("KRW-BTC")?;
+        let created = store.paper_write(
+            &PaperSessionWrite::Start {
+                request_id: RequestId::new("preparation-session-start")?,
+                policy_ref: revision.snapshot.reference,
+                decision_interval: CandleInterval::M5,
+                execution_resolution: CandleInterval::M5,
+                latency_ms: 0,
+                execution: ExecutionPolicy::NextBarOpen {
+                    participation_cap: Weight::new(Decimal::ONE)?,
+                },
+                markets: vec![PaperMarketStart {
+                    market: market.clone(),
+                    initial_cash: QuoteAmount::new(dec("100000"))?,
+                    costs: zero_cost_policy(),
+                    market_rules: simple_rules(),
+                }],
+            },
+            started,
+        )?;
+        let id = &created.session.session_id;
+        let before = store.paper_checkpoint_digests_for_test(id)?;
+        let bar = candle_obs(
+            "preparation",
+            "KRW-BTC",
+            CandleInterval::M5,
+            "2025-01-05T12:00:00Z",
+            "100",
+            "100",
+        );
+        let now = ts("2025-01-05T12:06:00Z");
+        let waiting = store.step_paper_session_bars(
+            id,
+            &market,
+            std::slice::from_ref(&bar),
+            &BTreeMap::new(),
+            now,
+        )?;
+        assert_eq!(waiting.last_evaluated_at, created.session.last_evaluated_at);
+        assert!(waiting.markets[0].last_finalized_candle_at.is_none());
+        assert_eq!(
+            waiting.markets[0].quantity,
+            created.session.markets[0].quantity
+        );
+        assert_eq!(store.paper_checkpoint_digests_for_test(id)?, before);
+        let pinned = store.paper_review_events(id, None, None, 100)?;
+        assert_eq!(pinned.page.items.len(), 1);
+        assert_eq!(pinned.page.items[0].kind, PaperEventKind::DecisionDeferred);
+        assert!(pinned.page.items[0].signals.is_empty());
+        assert!(pinned.page.items[0].orders.is_empty());
+        assert_eq!(
+            pinned.page.items[0]
+                .preparation
+                .as_ref()
+                .map(|fact| fact.status),
+            Some(crate::contracts::DecisionPreparationStatus::AwaitingPolicySources)
+        );
+        let repeated = store.step_paper_session_bars(
+            id,
+            &market,
+            std::slice::from_ref(&bar),
+            &BTreeMap::new(),
+            now,
+        )?;
+        assert_eq!(repeated.sequence, waiting.sequence);
+        assert_eq!(store.paper_checkpoint_digests_for_test(id)?, before);
+        let sources = BTreeMap::from([(
+            CandleInterval::H1,
+            constant_bars(
+                "preparation-source",
+                ts("2025-01-05T10:00:00Z"),
+                2,
+                CandleInterval::H1,
+                "100",
+            ),
+        )]);
+        let ready = store.step_paper_session_bars(
+            id,
+            &market,
+            std::slice::from_ref(&bar),
+            &sources,
+            now,
+        )?;
+        assert_eq!(
+            ready.markets[0].last_finalized_candle_at,
+            Some(bar.candle.close_time_utc)
+        );
+        assert!(ready.sequence > waiting.sequence);
+        let prefix = store.paper_review_events(id, None, Some(pinned.as_of_sequence), 100)?;
+        assert_eq!(serde_json::to_value(prefix)?, serde_json::to_value(pinned)?);
+        store.close()?;
+        Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one isolated fixture verifies immutable reads across append and cursor failures"
+    )]
+    fn paper_review_pins_pages_without_changing_saved_facts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::contracts::{PaperSessionQuery, PaperSessionReviewPage};
+
+        let root = PaperFeedTestRoot::new()?;
+        let mut store = crate::storage::Store::open(&root.0)?;
+        let now = ts("2025-01-02T00:00:00Z");
+        store.seed_builtin_policies_once(&crate::contracts::builtin_policy_definitions()?, now)?;
+        let policies = store
+            .paper_start_options()?
+            .policy_options
+            .into_iter()
+            .filter(|p| p.supported)
+            .take(2)
+            .collect::<Vec<_>>();
+        assert_eq!(policies.len(), 2);
+        assert_ne!(policies[0].reference, policies[1].reference);
+        for (index, policy) in policies.iter().enumerate() {
+            let write = PaperSessionWrite::Start {
+                request_id: RequestId::new(format!("review-fixture-{index}"))?,
+                policy_ref: policy.reference.clone(),
+                decision_interval: CandleInterval::H1,
+                execution_resolution: CandleInterval::H1,
+                latency_ms: 0,
+                execution: ExecutionPolicy::NextBarOpen {
+                    participation_cap: Weight::new(Decimal::ONE)?,
+                },
+                markets: vec![PaperMarketStart {
+                    market: MarketId::parse_upbit("KRW-ADA")?,
+                    initial_cash: QuoteAmount::new(dec("100000"))?,
+                    costs: zero_cost_policy(),
+                    market_rules: simple_rules(),
+                }],
+            };
+            let created = store.paper_write(&write, now)?;
+            let session_id = &created.session.session_id;
+            let market = MarketId::parse_upbit("KRW-ADA")?;
+            let bars = (0..3)
+                .map(|hour| {
+                    candle_obs_at(
+                        "review",
+                        "KRW-ADA",
+                        CandleInterval::H1,
+                        UtcTimestamp(now.0 + chrono::Duration::hours(hour)),
+                        "100",
+                        "110",
+                    )
+                })
+                .collect::<Vec<_>>();
+            let later = bars.last().expect("bars").candle.close_time_utc;
+            store.step_paper_session_bars(session_id, &market, &bars, &BTreeMap::new(), later)?;
+            let before = paper_store_test_snapshot(&store, session_id, later)?;
+            let first = store.paper_review_events(session_id, None, None, 1)?;
+            let repeated = store.paper_review_events(session_id, None, None, 1)?;
+            for event_sequence in 1..=3 {
+                let selection = crate::contracts::PaperReviewSelection {
+                    session_id: session_id.clone(),
+                    event_sequence,
+                    as_of_sequence: 3,
+                    signal_id: None,
+                };
+                let review = store.paper_review_decision(&selection)?;
+                assert_eq!(review.event.sequence, event_sequence);
+                assert_eq!(review.policy.reference, policy.reference);
+                assert_eq!(review.configuration.policy_ref, policy.reference);
+                assert_eq!(review.data_quality.realtime_tradable, None);
+                assert!(
+                    review
+                        .source_observations
+                        .iter()
+                        .all(|source| source.provider_first_seen_at_utc.is_none())
+                );
+                assert_eq!(
+                    serde_json::to_value(&review)?,
+                    serde_json::to_value(store.paper_review_decision(&selection)?)?
+                );
+                // Missing retained inputs may only produce insufficient evidence;
+                // the read path never creates observations or advances the engine.
+                let _ = store.paper_rule_audit_input(&review)?;
+                let _ = store.paper_indicator_audit_input(&review, 32)?;
+            }
+            assert!(
+                store
+                    .paper_review_decision(&crate::contracts::PaperReviewSelection {
+                        session_id: session_id.clone(),
+                        event_sequence: 4,
+                        as_of_sequence: 3,
+                        signal_id: None,
+                    })
+                    .is_err()
+            );
+            assert_eq!(
+                serde_json::to_value(&first)?,
+                serde_json::to_value(repeated)?
+            );
+            let after = paper_store_test_snapshot(&store, session_id, later)?;
+            assert_eq!(
+                serde_json::to_value(before.view)?,
+                serde_json::to_value(after.view)?
+            );
+            assert_eq!(
+                serde_json::to_value(before.events)?,
+                serde_json::to_value(after.events)?
+            );
+            assert_eq!(before.checkpoint_digests, after.checkpoint_digests);
+            assert_eq!(first.configuration.policy_ref, policy.reference);
+            assert_eq!(first.mode, crate::contracts::PaperSessionMode::Simulated);
+            assert_eq!(first.configuration.markets[0].market, market);
+            assert_eq!(first.page.total_count, 3);
+            assert_eq!(first.as_of_sequence, 3);
+            let value = serde_json::to_value(&first)?;
+            let decoded: PaperSessionReviewPage = serde_json::from_value(value.clone())?;
+            assert_eq!(serde_json::to_value(decoded)?, value);
+            if index == 0
+                && let Ok(path) = std::env::var("BACKCRAFT_REVIEW_FIXTURE_OUT")
+            {
+                let full = store.paper_review_events(session_id, None, Some(3), 100)?;
+                std::fs::write(path, serde_json::to_vec_pretty(&full)?)?;
+            }
+            store.paper_write(
+                &PaperSessionWrite::Pause {
+                    request_id: RequestId::new(format!("review-append-{index}"))?,
+                    session_id: session_id.clone(),
+                    expected_sequence: 3,
+                },
+                later,
+            )?;
+            let mut items = first.page.items;
+            let mut cursor = first.page.next_cursor;
+            while let Some(next) = cursor {
+                let page =
+                    store.paper_review_events(session_id, Some(next.sequence), Some(3), 1)?;
+                assert_eq!(page.page.total_count, 3);
+                cursor = page.page.next_cursor;
+                items.extend(page.page.items);
+            }
+            assert_eq!(
+                items.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+                vec![1, 2, 3]
+            );
+            let original = store.paper_list_events(session_id, None, 100)?;
+            assert_eq!(
+                serde_json::to_value(&items)?,
+                serde_json::to_value(&original.items[..3])?
+            );
+            assert_eq!(original.total_count, 4);
+            for limit in [0, 101] {
+                assert!(
+                    store
+                        .paper_review_events(session_id, None, None, limit)
+                        .is_err()
+                );
+            }
+            assert!(
+                store
+                    .paper_review_events(session_id, Some(1), None, 1)
+                    .is_err()
+            );
+            assert!(
+                store
+                    .paper_review_events(session_id, None, Some(5), 1)
+                    .is_err()
+            );
+            assert!(
+                store
+                    .paper_review_events(session_id, Some(4), Some(3), 1)
+                    .is_err()
+            );
+            assert!(
+                store
+                    .paper_review_events(session_id, Some(u64::MAX), Some(3), 1)
+                    .is_err()
+            );
+            let end = store.paper_review_events(session_id, Some(3), Some(3), 1)?;
+            assert!(end.page.items.is_empty());
+            assert!(end.page.next_cursor.is_none());
+            let empty = store.paper_review_events(session_id, None, Some(0), 1)?;
+            assert_eq!(empty.page.total_count, 0);
+            assert!(empty.page.items.is_empty());
+        }
+        let legacy = serde_json::json!({"action":"events", "session_id":"fixture-session", "after_sequence":null,"limit":1});
+        assert_eq!(
+            serde_json::to_value(serde_json::from_value::<PaperSessionQuery>(legacy.clone())?)?,
+            legacy
+        );
+        assert!(
+            serde_json::from_value::<PaperSessionQuery>(serde_json::json!({
+                "action":"review_events", "session_id":"fixture-session", "limit":1,"typo":true
+            }))
+            .is_err()
+        );
+        assert!(
+            store
+                .paper_review_events(&PaperSessionId::new("unknown-review")?, None, None, 1)
+                .is_err()
+        );
+        // Corrupt only the isolated fixture's duplicate SQL header. A stale JSON
+        // view must not silently redefine the latest review cutoff.
+        let id = store.paper_list_sessions(None, 1, now)?.items[0]
+            .session_id
+            .clone();
+        let fixture_connection = rusqlite::Connection::open(root.0.join("lab.sqlite"))?;
+        fixture_connection.execute(
+            "UPDATE paper_sessions SET sequence=sequence+1 WHERE session_id=?1",
+            [id.as_str()],
+        )?;
+        assert!(matches!(
+            store.paper_review_events(&id, None, None, 1),
+            Err(LabError::DataCorrupt(_))
+        ));
+        drop(fixture_connection);
+        store.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn passive_review_envelope_preserves_fractional_money_and_additive_trace()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = PaperFeedTestRoot::new()?;
+        let mut store = crate::storage::Store::open(&root.0)?;
+        let now = ts("2025-01-02T00:00:00Z");
+        store.seed_builtin_policies_once(&crate::contracts::builtin_policy_definitions()?, now)?;
+        let policy = store
+            .paper_start_options()?
+            .policy_options
+            .into_iter()
+            .find(|p| p.supported)
+            .expect("policy");
+        let created = store.paper_write(
+            &PaperSessionWrite::Start {
+                request_id: RequestId::new("fractional-review")?,
+                policy_ref: policy.reference,
+                decision_interval: CandleInterval::H1,
+                execution_resolution: CandleInterval::H1,
+                latency_ms: 0,
+                execution: ExecutionPolicy::NextBarOpen {
+                    participation_cap: Weight::new(Decimal::ONE)?,
+                },
+                markets: vec![PaperMarketStart {
+                    market: MarketId::parse_upbit("KRW-ADA")?,
+                    initial_cash: QuoteAmount::new(dec("100000.123456789"))?,
+                    costs: zero_cost_policy(),
+                    market_rules: simple_rules(),
+                }],
+            },
+            now,
+        )?;
+        let page = store.paper_review_events(&created.session.session_id, None, Some(0), 1)?;
+        let value = serde_json::to_value(&page)?;
+        assert_eq!(
+            value["configuration"]["markets"][0]["initial_cash"],
+            "100000.123456789"
+        );
+        let decoded: crate::contracts::PaperSessionReviewPage =
+            serde_json::from_value(value.clone())?;
+        assert_eq!(serde_json::to_value(decoded)?, value);
+        let legacy: crate::contracts::PolicyTrace = serde_json::from_value(serde_json::json!({
+            "matched_rule_id":null,"state_before":[],"state_after":[],"evidence":null
+        }))?;
+        assert!(legacy.condition_trace.is_none());
+        assert!(legacy.source_provenance.is_none());
+        let encoded = serde_json::to_value(legacy)?;
+        assert!(encoded.get("condition_trace").is_none());
+        assert!(encoded.get("source_provenance").is_none());
+        store.close()?;
+        Ok(())
+    }
+
     fn ts(value: &str) -> UtcTimestamp {
         UtcTimestamp::parse_rfc3339(value).expect("valid timestamp")
     }
@@ -1917,6 +2698,386 @@ mod tests {
     ) -> CandleObservation {
         let open_at = open_at.0.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         candle_obs(id, market, interval, &open_at, open, close)
+    }
+
+    #[test]
+    fn paper_recovery_rejects_a_finalized_cursor_without_its_actual_prior_bar()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let session = PaperSessionId::new("paper-lost-prior")?;
+        let mut cp = s1_checkpoint(&session, ts("2025-01-02T10:00:00Z"))?;
+        let bar = candle_obs(
+            "prior",
+            "KRW-BTC",
+            CandleInterval::M1,
+            "2025-01-02T10:00:00Z",
+            "100",
+            "100",
+        );
+        cp.step_bar(&bar, &BTreeMap::new(), None, bar.candle.close_time_utc)?;
+        cp.verify_integrity(&session, &cp.market, &cp.policy_ref, cp.initial_cash)?;
+        cp.prior_execution_bar = None;
+        assert!(matches!(
+            cp.verify_integrity(&session, &cp.market, &cp.policy_ref, cp.initial_cash),
+            Err(LabError::DataCorrupt(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn paper_catch_up_refuses_unresolved_pending_order_without_changing_checkpoint()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let started_at = ts("2025-01-02T00:00:00Z");
+        let mut revision = rules_revision_with_indicators(
+            "policy-pending-recovery",
+            "revision-pending-recovery",
+            "pending recovery",
+            Vec::new(),
+        );
+        if let PolicyProgram::Rules { program } = &mut revision.definition.program {
+            program.fallback = PolicyTarget::Weight {
+                value: NumericExpr::Constant { value: 1.0 },
+            };
+        }
+        revision.reference.definition_digest = ContentHash::of_value(&revision.definition)?;
+        let mut checkpoint = PaperMarketCheckpoint::new(
+            &PaperSessionId::new("paper-pending-catch-up")?,
+            MarketId::parse_upbit("KRW-BTC")?,
+            &revision,
+            CandleInterval::H1,
+            CandleInterval::H1,
+            1,
+            ExecutionPolicy::PassiveBuy {
+                offset_bps: crate::contracts::BasisPoints::new(dec("100"))?,
+                penetration_ticks: 1,
+                fill_fraction: crate::contracts::PassiveFraction::Full,
+                ttl_execution_bars: 1,
+                participation_cap: Weight::new(Decimal::ONE)?,
+            },
+            QuoteAmount::new(dec("1000"))?,
+            zero_cost_policy(),
+            simple_rules(),
+            started_at,
+        )?;
+        let sources = BTreeMap::new();
+        let pre_bars = [
+            candle_obs(
+                "pre-1",
+                "KRW-BTC",
+                CandleInterval::H1,
+                "2025-01-01T21:00:00Z",
+                "100",
+                "100",
+            ),
+            candle_obs(
+                "pre-2",
+                "KRW-BTC",
+                CandleInterval::H1,
+                "2025-01-01T22:00:00Z",
+                "100",
+                "100",
+            ),
+            candle_obs(
+                "pre-3",
+                "KRW-BTC",
+                CandleInterval::H1,
+                "2025-01-01T23:00:00Z",
+                "100",
+                "110",
+            ),
+        ];
+        checkpoint.warm_up_pre_start(&pre_bars, &sources, None, started_at)?;
+        for (open_at, open, close) in [
+            ("2025-01-02T00:00:00Z", "110", "115"),
+            ("2025-01-02T01:00:00Z", "115", "120"),
+        ] {
+            let bar = candle_obs("live", "KRW-BTC", CandleInterval::H1, open_at, open, close);
+            checkpoint.step_bar(&bar, &sources, None, bar.candle.close_time_utc)?;
+        }
+        assert!(
+            checkpoint.pending.is_some(),
+            "fixture must retain a real passive intent"
+        );
+        let before = checkpoint.checkpoint_digest()?;
+        let catch_up = candle_obs(
+            "catch-up",
+            "KRW-BTC",
+            CandleInterval::H1,
+            "2025-01-02T02:00:00Z",
+            "108",
+            "108",
+        );
+        assert!(matches!(
+            checkpoint.catch_up_paused_bars(
+                std::slice::from_ref(&catch_up),
+                &sources,
+                None,
+                catch_up.candle.close_time_utc
+            ),
+            Err(LabError::Conflict(_))
+        ));
+        assert_eq!(checkpoint.checkpoint_digest()?, before);
+        Ok(())
+    }
+
+    fn provider_absence_page(
+        store: &mut crate::storage::Store,
+        fetched_at: UtcTimestamp,
+    ) -> Result<(crate::contracts::RawObjectRef, Vec<CandleObservation>), LabError> {
+        provider_page_at_opens(
+            store,
+            &[ts("2025-01-02T10:00:00Z"), ts("2025-01-02T11:00:00Z")],
+            fetched_at,
+        )
+    }
+
+    fn provider_page_at_opens(
+        store: &mut crate::storage::Store,
+        opens: &[UtcTimestamp],
+        fetched_at: UtcTimestamp,
+    ) -> Result<(crate::contracts::RawObjectRef, Vec<CandleObservation>), LabError> {
+        let body = serde_json::to_vec(&opens.iter().rev().map(|open| {
+            serde_json::json!({
+                "market": "KRW-BTC", "candle_date_time_utc": open.0.format("%Y-%m-%dT%H:%M:%S").to_string(),
+                "opening_price": 100, "high_price": 101, "low_price": 99,
+                "trade_price": 100, "candle_acc_trade_volume": 1,
+                "candle_acc_trade_price": 100,
+            })
+        }).collect::<Vec<_>>())?;
+        let published = store.publish_raw(crate::storage::RawObjectInput {
+            source_url: "https://api.upbit.com/v1/candles/minutes/5?market=KRW-BTC&count=200"
+                .into(),
+            fetched_at,
+            persisted_at: fetched_at,
+            http_status: 200,
+            remaining_req: None,
+            origin: crate::contracts::MarketDataOrigin::ExchangeObserved,
+            body,
+        })?;
+        store.catalog_raw(&published.object)?;
+        let candles = crate::market_data::decode_candles(
+            &published.body,
+            &MarketId::parse_upbit("KRW-BTC")?,
+            CandleInterval::M5,
+            fetched_at,
+        )?;
+        let rows = candles
+            .into_iter()
+            .rev()
+            .map(|candle| {
+                let content_digest = observation_digest(&candle)?;
+                Ok(CandleObservation {
+                    id: ObservationId::from_seed(content_digest.as_str()),
+                    candle,
+                    content_digest,
+                    raw_object_ids: vec![published.object.id.clone()],
+                    constituent_ids: Vec::new(),
+                })
+            })
+            .collect::<Result<Vec<_>, LabError>>()?;
+        Ok((published.object, rows))
+    }
+
+    #[test]
+    fn confirmed_provider_absence_restores_same_session_without_rewriting_its_history()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for initially_halted in [false, true] {
+            assert_provider_absence_restores_same_session(initially_halted, None)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn missing_or_corrupt_provider_absence_raw_cannot_reclassify_paper_history()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for damage in ["missing", "corrupt"] {
+            assert_provider_absence_restores_same_session(false, Some(damage))?;
+        }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one isolated same-session fixture proves proof integrity, non-trading catch-up, restart and future normal decisions while preserving frozen history"
+    )]
+    fn assert_provider_absence_restores_same_session(
+        initially_halted: bool,
+        raw_damage: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let root = PaperFeedTestRoot::new()?;
+        let mut store = crate::storage::Store::open(&root.0)?;
+        let started_at = ts("2025-01-02T10:00:00Z");
+        store.seed_builtin_policies_once(
+            &crate::contracts::builtin_policy_definitions()?,
+            started_at,
+        )?;
+        let policy = store
+            .paper_start_options()?
+            .policy_options
+            .into_iter()
+            .find(|policy| policy.reference.policy_id.as_str() == "builtin-buy-and-hold")
+            .expect("existing builtin fixture")
+            .reference;
+        let write = paper_start_write_for_interval(
+            "provider-gap-start",
+            policy.clone(),
+            CandleInterval::M5,
+            "KRW-BTC",
+        )?;
+        let created = store.paper_write(&write, started_at)?;
+        let session_id = created.session.session_id;
+        let market = MarketId::parse_upbit("KRW-BTC")?;
+        let first_at = ts("2025-01-02T11:05:01Z");
+        let (first_raw, first_rows) = provider_absence_page(&mut store, first_at)?;
+        assert_eq!(first_rows[0].candle.open_time_utc, started_at);
+        store.step_paper_session_bars(
+            &session_id,
+            &market,
+            &first_rows[..1],
+            &BTreeMap::new(),
+            first_at,
+        )?;
+        if initially_halted {
+            let halted = store.step_paper_session_bars(
+                &session_id,
+                &market,
+                &first_rows[1..],
+                &BTreeMap::new(),
+                first_at,
+            )?;
+            assert_eq!(halted.recovery_cause, Some(PaperRecoveryCause::FeedGap));
+        }
+        let before = paper_store_test_snapshot(&store, &session_id, first_at)?;
+        assert!(
+            store
+                .observe_provider_absence_snapshot(
+                    &first_raw,
+                    &market,
+                    CandleInterval::M5,
+                    &first_rows,
+                    first_at,
+                )?
+                .confirmed_spans
+                .is_empty()
+        );
+        let second_at = ts("2025-01-02T11:05:02Z");
+        let (second_raw, second_rows) = provider_absence_page(&mut store, second_at)?;
+        let outcome = store.observe_provider_absence_snapshot(
+            &second_raw,
+            &market,
+            CandleInterval::M5,
+            &second_rows,
+            second_at,
+        )?;
+        let spans = outcome.confirmed_spans;
+        assert_eq!(spans.len(), 1);
+        if let Some(damage) = raw_damage {
+            let body_path = root.0.join(&second_raw.relative_path).join("body.json.gz");
+            if damage == "missing" {
+                std::fs::remove_file(body_path)?;
+            } else {
+                std::fs::write(body_path, b"damaged immutable evidence")?;
+            }
+            assert!(
+                store
+                    .reconcile_running_paper_sessions(&[], second_at)
+                    .is_err()
+            );
+            let after = paper_store_test_snapshot(&store, &session_id, second_at)?;
+            assert_eq!(after.view.sequence, before.view.sequence);
+            assert_eq!(after.view.recovery_cause, before.view.recovery_cause);
+            assert_eq!(after.checkpoint_digests, before.checkpoint_digests);
+            assert_eq!(
+                serde_json::to_value(after.events)?,
+                serde_json::to_value(before.events)?
+            );
+            return Ok(());
+        }
+        store.reconcile_running_paper_sessions(&[(second_raw, second_rows)], second_at)?;
+        let after = paper_store_test_snapshot(&store, &session_id, second_at)?;
+        assert_eq!(after.view.state, PaperSessionState::Running);
+        assert_eq!(after.view.recovery_cause, None);
+        assert_eq!(after.view.recovery_detail, None);
+        assert_eq!(after.view.policy_ref, policy);
+        assert_eq!(after.view.session_id, session_id);
+        assert_ne!(after.checkpoint_digests, before.checkpoint_digests);
+        assert!(after.view.sequence > before.view.sequence);
+        for (old, saved) in before.events.iter().zip(&after.events) {
+            assert_eq!(serde_json::to_value(old)?, serde_json::to_value(saved)?);
+        }
+        let recovered = &after.events[before.events.len()..];
+        assert!(recovered.iter().all(|event| event.signals.is_empty()
+            && event.orders.is_empty()
+            && event.fills.is_empty()));
+        assert!(recovered.iter().all(|event| {
+            event
+                .provider_recovery
+                .as_ref()
+                .is_some_and(|meta| meta.proof_ids.contains(&spans[0].proof_id))
+        }));
+        assert_eq!(
+            recovered
+                .last()
+                .and_then(|event| event.provider_recovery.as_ref())
+                .map(|meta| meta.phase),
+            Some(crate::contracts::PaperProviderRecoveryPhase::Completed)
+        );
+        assert_eq!(
+            after.view.markets[0].last_finalized_candle_at,
+            Some(ts("2025-01-02T11:05:00Z"))
+        );
+        assert_eq!(
+            after.view.markets[0].signal_count,
+            before.view.markets[0].signal_count
+        );
+        assert_eq!(
+            after.view.markets[0].fill_count,
+            before.view.markets[0].fill_count
+        );
+        assert_eq!(
+            after.view.markets[0].verification.status,
+            PaperVerificationStatus::Pass
+        );
+        drop(store);
+        let mut reopened = crate::storage::Store::open(&root.0)?;
+        reopened.reconcile_running_paper_sessions(&[], second_at)?;
+        let readback = reopened.paper_get_session(&session_id, second_at)?.session;
+        assert_eq!(
+            readback.sequence, after.view.sequence,
+            "restart must not re-feed recovered inputs"
+        );
+        assert_eq!(readback.state, PaperSessionState::Running);
+        for open in ["2025-01-02T11:05:00Z", "2025-01-02T11:10:00Z"] {
+            let open = ts(open);
+            let fetched =
+                UtcTimestamp(open.0 + CandleInterval::M5.duration() + chrono::Duration::seconds(1));
+            let (_, rows) = provider_page_at_opens(&mut reopened, &[open], fetched)?;
+            reopened.step_paper_session_bars(
+                &session_id,
+                &market,
+                &rows,
+                &BTreeMap::new(),
+                fetched,
+            )?;
+        }
+        let live = paper_store_test_snapshot(&reopened, &session_id, ts("2025-01-02T11:15:01Z"))?;
+        assert_eq!(live.view.state, PaperSessionState::Running);
+        assert_eq!(live.view.policy_ref, policy);
+        assert!(
+            live.view.markets[0].signal_count > after.view.markets[0].signal_count,
+            "future actual candles must produce normal decisions"
+        );
+        assert!(
+            live.events
+                .iter()
+                .skip(after.events.len())
+                .any(|event| !event.signals.is_empty() && event.provider_recovery.is_none())
+        );
+        assert_eq!(
+            live.view.markets[0].verification.status,
+            PaperVerificationStatus::Pass
+        );
+
+        Ok(())
     }
 
     fn sample_s1_revision() -> FrozenPolicyRevision {
@@ -2016,13 +3177,17 @@ mod tests {
         request_id: &str,
         policy_ref: PolicyRevisionRef,
     ) -> Result<PaperSessionWrite, LabError> {
+        let mut costs = zero_cost_policy();
+        costs.buy_fee_bps = BasisPoints::new(Decimal::from(10))?;
+        costs.sell_fee_bps = BasisPoints::new(Decimal::from(10))?;
+        costs.maker_fee_bps = BasisPoints::new(Decimal::from(5))?;
         let markets = ["KRW-BTC", "KRW-XRP"]
             .into_iter()
             .map(|market| {
                 Ok(PaperMarketStart {
                     market: MarketId::parse_upbit(market)?,
                     initial_cash: QuoteAmount::new(dec("1000000"))?,
-                    costs: zero_cost_policy(),
+                    costs: costs.clone(),
                     market_rules: simple_rules(),
                 })
             })
@@ -2219,6 +3384,7 @@ mod tests {
             description: "SYNTHETIC_TEST_ONLY H1 source gate for M1 paper decisions".into(),
             program: PolicyProgram::Rules {
                 program: RulesProgram {
+                    condition_roles: Vec::new(),
                     indicators: vec![
                         PolicyIndicator {
                             id: "h1_fast".into(),
@@ -2270,9 +3436,35 @@ mod tests {
         let PolicyProgram::Rules { program } = &mut revision.definition.program else {
             unreachable!("MTF fixture has a rules program");
         };
+        program.indicators.push(PolicyIndicator {
+            id: "m1_close".into(),
+            indicator: PolicyIndicatorKind::Close,
+            source_interval: Some(CandleInterval::M1),
+        });
         program.rules[0].target = PolicyTarget::Weight {
             value: NumericExpr::Constant { value: 1.0 },
         };
+        program.rules.insert(
+            0,
+            PolicyRule {
+                id: "m1_partial_sell_after_h1_gate".into(),
+                condition: BoolExpr::Compare {
+                    comparison: CompareOp::Gt,
+                    left: NumericExpr::Indicator {
+                        id: "m1_close".into(),
+                    },
+                    right: NumericExpr::Sub {
+                        left: Box::new(NumericExpr::Indicator {
+                            id: "h1_fast".into(),
+                        }),
+                        right: Box::new(NumericExpr::Constant { value: 100.0 }),
+                    },
+                },
+                target: PolicyTarget::Weight {
+                    value: NumericExpr::Constant { value: 0.5 },
+                },
+            },
+        );
         revision.reference.policy_id = PolicyId::new("policy-paper-mtf-buy").expect("policy id");
         revision.reference.revision_id =
             PolicyRevisionId::new("policy-paper-mtf-buy-r1").expect("revision id");
@@ -2314,6 +3506,7 @@ mod tests {
             description: "SYNTHETIC_TEST_ONLY paper source-feed fixture".into(),
             program: PolicyProgram::Rules {
                 program: RulesProgram {
+                    condition_roles: Vec::new(),
                     indicators,
                     states: Vec::new(),
                     rules: Vec::new(),
@@ -2784,18 +3977,29 @@ mod tests {
             "100",
             "100",
         );
-        no_source_checkpoint.step_bar(
+        let no_source_before = no_source_checkpoint.checkpoint_digest()?;
+        let first_deferred = no_source_checkpoint.step_bar(
             &first_incomplete_live,
             &incomplete_sources,
             None,
             first_incomplete_live.candle.close_time_utc,
         )?;
-        no_source_checkpoint.step_bar(
+        assert!(!first_deferred.did_advance);
+        assert!(first_deferred.events.is_empty());
+        assert_eq!(
+            first_deferred.preparation.as_ref().map(|fact| fact.status),
+            Some(crate::contracts::DecisionPreparationStatus::AwaitingPolicySources)
+        );
+        let second_deferred = no_source_checkpoint.step_bar(
             &second_incomplete_live,
             &incomplete_sources,
             None,
             second_incomplete_live.candle.close_time_utc,
         )?;
+        assert!(!second_deferred.did_advance);
+        assert!(second_deferred.events.is_empty());
+        assert_eq!(no_source_checkpoint.checkpoint_digest()?, no_source_before);
+        assert!(no_source_checkpoint.last_finalized_candle_at.is_none());
         assert_eq!(no_source_checkpoint.signal_count, 0);
         assert_eq!(no_source_checkpoint.fill_count, 0);
         assert_eq!(no_source_checkpoint.evaluator.completed_bars_seen(), 0);
@@ -2815,6 +4019,282 @@ mod tests {
             checkpoint.source_cursors[&CandleInterval::H1].completed_bars,
             0
         );
+        Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one causal fixture compares cold, warmed, reopened and replayed M5 state"
+    )]
+    fn paper_m5_first_bar_waits_for_prestart_h1_h4_warmup_and_reopens_idempotently()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let started_at = ts("2025-01-05T12:00:30Z");
+        let revision = rules_revision_with_indicators(
+            "policy-paper-m5-h1-h4-first-bar",
+            "policy-paper-m5-h1-h4-first-bar-r1",
+            "paper_m5_h1_h4_first_bar",
+            vec![
+                PolicyIndicator {
+                    id: "h1_prior_high20".into(),
+                    indicator: PolicyIndicatorKind::PriorHigh { window: 20 },
+                    source_interval: Some(CandleInterval::H1),
+                },
+                PolicyIndicator {
+                    id: "h1_prior_low10".into(),
+                    indicator: PolicyIndicatorKind::PriorLow { window: 10 },
+                    source_interval: Some(CandleInterval::H1),
+                },
+                PolicyIndicator {
+                    id: "h4_ema60".into(),
+                    indicator: PolicyIndicatorKind::Ema { window: 60 },
+                    source_interval: Some(CandleInterval::H4),
+                },
+            ],
+        );
+        let session_id = PaperSessionId::new("paper-m5-h1-h4-first-bar")?;
+        let create_checkpoint = || {
+            PaperMarketCheckpoint::new(
+                &session_id,
+                MarketId::parse_upbit("KRW-BTC")?,
+                &revision,
+                CandleInterval::M5,
+                CandleInterval::M5,
+                0,
+                ExecutionPolicy::NextBarOpen {
+                    participation_cap: Weight::new(Decimal::ONE)?,
+                },
+                QuoteAmount::new(dec("1000000"))?,
+                zero_cost_policy(),
+                simple_rules(),
+                started_at,
+            )
+        };
+        let mut ready = create_checkpoint()?;
+        let mut delayed = create_checkpoint()?;
+        assert_eq!(ready.warmup_required_bars, 1);
+
+        let history = |prefix: &str, interval: CandleInterval, count: usize| {
+            let last_close = crate::scheduling::latest_completed_boundary(started_at, interval)
+                .expect("aligned source boundary");
+            (0..count)
+                .map(|index| {
+                    let bars_back = i32::try_from(count - index - 1).expect("fixture count fits");
+                    let close = UtcTimestamp(last_close.0 - interval.duration() * bars_back);
+                    candle_obs_at(
+                        &format!("{prefix}-{index}"),
+                        "KRW-BTC",
+                        interval,
+                        UtcTimestamp(close.0 - interval.duration()),
+                        "100",
+                        "100",
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let source_bars = BTreeMap::from([
+            (
+                CandleInterval::H1,
+                history("first-h1", CandleInterval::H1, 21),
+            ),
+            (
+                CandleInterval::H4,
+                history("first-h4", CandleInterval::H4, 60),
+            ),
+        ]);
+        let first_m5 = candle_obs_at(
+            "first-m5",
+            "KRW-BTC",
+            CandleInterval::M5,
+            ts("2025-01-05T12:00:00Z"),
+            "100",
+            "100",
+        );
+        let second_m5 = candle_obs_at(
+            "second-m5",
+            "KRW-BTC",
+            CandleInterval::M5,
+            ts("2025-01-05T12:05:00Z"),
+            "100",
+            "100",
+        );
+
+        ready.warm_up_pre_start(&[], &source_bars, None, started_at)?;
+        assert!(ready.pre_start_source_history_ready(started_at)?);
+        let before_partial = delayed.checkpoint_digest()?;
+        assert!(!delayed.pre_start_source_history_ready(started_at)?);
+        let cold = delayed.step_bar(
+            &first_m5,
+            &BTreeMap::new(),
+            None,
+            first_m5.candle.close_time_utc,
+        )?;
+        assert!(!cold.did_advance);
+        assert!(cold.events.is_empty());
+        assert_eq!(delayed.checkpoint_digest()?, before_partial);
+        assert!(delayed.last_finalized_candle_at.is_none());
+        assert_eq!(delayed.signal_count, 0);
+        assert_eq!(delayed.fill_count, 0);
+
+        delayed.warm_up_pre_start(&[], &source_bars, None, started_at)?;
+        assert!(delayed.pre_start_source_history_ready(started_at)?);
+        let ready_first = ready.step_bar(
+            &first_m5,
+            &source_bars,
+            None,
+            first_m5.candle.close_time_utc,
+        )?;
+        let delayed_first = delayed.step_bar(
+            &first_m5,
+            &source_bars,
+            None,
+            first_m5.candle.close_time_utc,
+        )?;
+        assert!(ready_first.did_advance && delayed_first.did_advance);
+        assert_eq!(
+            serde_json::to_value(materialize_candle_event(
+                1,
+                ready_first
+                    .events
+                    .into_iter()
+                    .next()
+                    .expect("first ready event"),
+            ))?,
+            serde_json::to_value(materialize_candle_event(
+                1,
+                delayed_first
+                    .events
+                    .into_iter()
+                    .next()
+                    .expect("first delayed event"),
+            ))?
+        );
+
+        // Reopen the delayed checkpoint between bars; the first eligible M5 trace must match.
+        delayed = serde_json::from_str(&serde_json::to_string(&delayed)?)?;
+        let ready_second = ready.step_bar(
+            &second_m5,
+            &source_bars,
+            None,
+            second_m5.candle.close_time_utc,
+        )?;
+        let delayed_second = delayed.step_bar(
+            &second_m5,
+            &source_bars,
+            None,
+            second_m5.candle.close_time_utc,
+        )?;
+        assert_eq!(
+            serde_json::to_value(materialize_candle_event(
+                2,
+                ready_second
+                    .events
+                    .into_iter()
+                    .next()
+                    .expect("ready decision event"),
+            ))?,
+            serde_json::to_value(materialize_candle_event(
+                2,
+                delayed_second
+                    .events
+                    .into_iter()
+                    .next()
+                    .expect("delayed decision event"),
+            ))?
+        );
+        assert_eq!(ready.signal_count, delayed.signal_count);
+        assert_eq!(ready.fill_count, 0);
+        assert_eq!(delayed.fill_count, 0);
+        assert!(ready.engine_state.orders.is_empty());
+        assert!(delayed.engine_state.orders.is_empty());
+        assert_eq!(ready.checkpoint_digest()?, delayed.checkpoint_digest()?);
+
+        delayed = serde_json::from_str(&serde_json::to_string(&delayed)?)?;
+        let before_replay = delayed.checkpoint_digest()?;
+        let replay = delayed.step_bar(
+            &second_m5,
+            &source_bars,
+            None,
+            second_m5.candle.close_time_utc,
+        )?;
+        assert!(!replay.did_advance);
+        assert!(replay.events.is_empty());
+        assert_eq!(delayed.checkpoint_digest()?, before_replay);
+        assert_eq!(delayed.market_event_count, 2);
+        assert_eq!(delayed.fill_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn prestart_finer_source_cursor_at_decision_boundary_is_ready()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let started_at = ts("2025-01-05T03:17:30Z");
+        let revision = rules_revision_with_indicators(
+            "policy-paper-h1-m5-boundary",
+            "policy-paper-h1-m5-boundary-r1",
+            "paper_h1_m5_boundary",
+            vec![
+                PolicyIndicator {
+                    id: "h1_ema2".into(),
+                    indicator: PolicyIndicatorKind::Ema { window: 2 },
+                    source_interval: Some(CandleInterval::H1),
+                },
+                PolicyIndicator {
+                    id: "m5_close".into(),
+                    indicator: PolicyIndicatorKind::Close,
+                    source_interval: Some(CandleInterval::M5),
+                },
+            ],
+        );
+        let session_id = PaperSessionId::new("paper-h1-m5-boundary")?;
+        let mut checkpoint = PaperMarketCheckpoint::new(
+            &session_id,
+            MarketId::parse_upbit("KRW-BTC")?,
+            &revision,
+            CandleInterval::H1,
+            CandleInterval::H1,
+            0,
+            ExecutionPolicy::NextBarOpen {
+                participation_cap: Weight::new(Decimal::ONE)?,
+            },
+            QuoteAmount::new(dec("1000000"))?,
+            zero_cost_policy(),
+            simple_rules(),
+            started_at,
+        )?;
+        assert_eq!(checkpoint.warmup_required_bars, 2);
+
+        let pre_start_decision = [candle_obs_at(
+            "pre-start-h1",
+            "KRW-BTC",
+            CandleInterval::H1,
+            ts("2025-01-05T02:00:00Z"),
+            "100",
+            "100",
+        )];
+        let pre_start_sources = BTreeMap::from([(
+            CandleInterval::M5,
+            vec![candle_obs_at(
+                "pre-start-m5",
+                "KRW-BTC",
+                CandleInterval::M5,
+                ts("2025-01-05T02:55:00Z"),
+                "100",
+                "100",
+            )],
+        )]);
+        checkpoint.warm_up_pre_start(&pre_start_decision, &pre_start_sources, None, started_at)?;
+
+        let cursor = &checkpoint.source_cursors[&CandleInterval::M5];
+        let latest_source_at_start =
+            crate::scheduling::latest_completed_boundary(started_at, CandleInterval::M5)?;
+        assert_eq!(cursor.last_bar_close_utc, Some(ts("2025-01-05T03:00:00Z")));
+        assert!(
+            cursor
+                .last_bar_close_utc
+                .is_some_and(|close| close < latest_source_at_start)
+        );
+        assert!(checkpoint.pre_start_source_history_ready(started_at)?);
         Ok(())
     }
 
@@ -2895,7 +4375,379 @@ mod tests {
     }
 
     #[test]
-    fn paper_mtf_reuses_source_within_interval_then_rejects_missing_completed_boundary()
+    fn provider_coverage_accounts_for_source_suffix_without_advancing_actual_cursor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::contracts::{
+            ProviderAbsenceAnchor, ProviderAbsenceSnapshotRef, ProviderAbsenceSpan, RawObjectId,
+        };
+        let mut cp = mtf_checkpoint(
+            &PaperSessionId::new("paper-proof-source-suffix")?,
+            ts("2025-01-02T10:00:30Z"),
+        )?;
+        let history = BTreeMap::from([(
+            CandleInterval::H1,
+            h1_history("pre-gap", ts("2025-01-02T07:00:00Z"), &["80", "82", "84"]),
+        )]);
+        cp.feed_sources_until(&history, ts("2025-01-02T10:00:00Z"))?;
+        let cursor_before = cp.source_cursors[&CandleInterval::H1].clone();
+        let coverage = VerifiedProviderCoverage::from_verified_spans(vec![ProviderAbsenceSpan {
+            proof_id: ContentHash::of_bytes(b"synthetic source omission"),
+            market: cp.market.clone(),
+            interval: CandleInterval::H1,
+            start_utc: ts("2025-01-02T10:00:00Z"),
+            end_utc: ts("2025-01-02T12:00:00Z"),
+            pre_anchor: ProviderAbsenceAnchor {
+                observation_id: ObservationId::new("synthetic-pre")?,
+                open_time_utc: ts("2025-01-02T09:00:00Z"),
+                content_digest: ContentHash::of_bytes(b"pre"),
+            },
+            post_anchor: ProviderAbsenceAnchor {
+                observation_id: ObservationId::new("synthetic-post")?,
+                open_time_utc: ts("2025-01-02T12:00:00Z"),
+                content_digest: ContentHash::of_bytes(b"post"),
+            },
+            snapshots: [
+                ProviderAbsenceSnapshotRef {
+                    raw_object_id: RawObjectId::new("synthetic-first")?,
+                    fetched_at_utc: ts("2025-01-02T13:00:01Z"),
+                    body_digest: ContentHash::of_bytes(b"identical"),
+                },
+                ProviderAbsenceSnapshotRef {
+                    raw_object_id: RawObjectId::new("synthetic-second")?,
+                    fetched_at_utc: ts("2025-01-02T13:00:02Z"),
+                    body_digest: ContentHash::of_bytes(b"identical"),
+                },
+            ],
+        }])?;
+        let future = BTreeMap::from([(
+            CandleInterval::H1,
+            vec![candle_obs(
+                "post",
+                "KRW-BTC",
+                CandleInterval::H1,
+                "2025-01-02T12:00:00Z",
+                "90",
+                "90",
+            )],
+        )]);
+        let before = cp.checkpoint_digest()?;
+        let mut dense = PreparedPaperSourceFrame::new(&cp.evaluator, &cp.market, &future);
+        assert!(!cp.feed_sources_until_prepared(&mut dense, ts("2025-01-02T12:59:00Z"))?);
+        assert_eq!(cp.checkpoint_digest()?, before);
+        // The later row is not causal at 12:59. Once it closes, the unproved
+        // missing slots are an interior gap and still fail closed.
+        assert!(matches!(
+            cp.feed_sources_until_prepared(&mut dense, ts("2025-01-02T13:00:00Z")),
+            Err(LabError::DataGap(_))
+        ));
+        assert_eq!(cp.checkpoint_digest()?, before);
+        let mut sparse = PreparedPaperSourceFrame::new(&cp.evaluator, &cp.market, &future)
+            .with_provider_coverage(&coverage);
+        assert!(cp.feed_sources_until_prepared(&mut sparse, ts("2025-01-02T11:30:00Z"))?);
+        assert!(cp.feed_sources_until_prepared(&mut sparse, ts("2025-01-02T12:59:00Z"))?);
+        assert_eq!(cp.source_cursors[&CandleInterval::H1], cursor_before);
+        assert_eq!(
+            cp.checkpoint_digest()?,
+            before,
+            "absence cannot update an indicator or actual cursor"
+        );
+        assert!(cp.feed_sources_until_prepared(&mut sparse, ts("2025-01-02T13:00:00Z"))?);
+        let after = &cp.source_cursors[&CandleInterval::H1];
+        assert_eq!(after.last_bar_close_utc, Some(ts("2025-01-02T13:00:00Z")));
+        assert_eq!(after.completed_bars, cursor_before.completed_bars + 1);
+        Ok(())
+    }
+
+    fn verified_h1_omission_10_to_11(
+        market: &MarketId,
+    ) -> Result<VerifiedProviderCoverage, LabError> {
+        use crate::contracts::{
+            ProviderAbsenceAnchor, ProviderAbsenceSnapshotRef, ProviderAbsenceSpan, RawObjectId,
+        };
+
+        VerifiedProviderCoverage::from_verified_spans(vec![ProviderAbsenceSpan {
+            proof_id: ContentHash::of_bytes(b"synthetic H1 omission 10-11"),
+            market: market.clone(),
+            interval: CandleInterval::H1,
+            start_utc: ts("2025-01-02T10:00:00Z"),
+            end_utc: ts("2025-01-02T11:00:00Z"),
+            pre_anchor: ProviderAbsenceAnchor {
+                observation_id: ObservationId::new("synthetic-h1-pre")?,
+                open_time_utc: ts("2025-01-02T09:00:00Z"),
+                content_digest: ContentHash::of_bytes(b"synthetic H1 pre anchor"),
+            },
+            post_anchor: ProviderAbsenceAnchor {
+                observation_id: ObservationId::new("synthetic-h1-post")?,
+                open_time_utc: ts("2025-01-02T11:00:00Z"),
+                content_digest: ContentHash::of_bytes(b"synthetic H1 post anchor"),
+            },
+            snapshots: [
+                ProviderAbsenceSnapshotRef {
+                    raw_object_id: RawObjectId::new("synthetic-h1-first")?,
+                    fetched_at_utc: ts("2025-01-02T13:00:01Z"),
+                    body_digest: ContentHash::of_bytes(b"same admitted response"),
+                },
+                ProviderAbsenceSnapshotRef {
+                    raw_object_id: RawObjectId::new("synthetic-h1-second")?,
+                    fetched_at_utc: ts("2025-01-02T13:00:02Z"),
+                    body_digest: ContentHash::of_bytes(b"same admitted response"),
+                },
+            ],
+        }])
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one fixture preserves real reserved intent state across source wait, arrival and exact replay"
+    )]
+    fn paper_mtf_wait_preserves_pending_and_replays_same_bar_after_h1_arrives()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let started_at = ts("2025-01-02T10:00:30Z");
+        let market = MarketId::parse_upbit("KRW-BTC")?;
+        let mut checkpoint = PaperMarketCheckpoint::new(
+            &PaperSessionId::new("paper-mtf-source-wait")?,
+            market.clone(),
+            &mtf_rules_revision(),
+            CandleInterval::M1,
+            CandleInterval::M1,
+            0,
+            ExecutionPolicy::PassiveBuy {
+                offset_bps: crate::contracts::BasisPoints::new(dec("100"))?,
+                penetration_ticks: 1,
+                fill_fraction: crate::contracts::PassiveFraction::Full,
+                ttl_execution_bars: 1,
+                participation_cap: Weight::new(Decimal::ONE)?,
+            },
+            QuoteAmount::new(dec("1000000"))?,
+            zero_cost_policy(),
+            simple_rules(),
+            started_at,
+        )?;
+
+        let mut source_history = BTreeMap::from([(
+            CandleInterval::H1,
+            h1_history("wait-h1", ts("2025-01-02T07:00:00Z"), &["80", "82", "84"]),
+        )]);
+        assert!(checkpoint.feed_sources_until(&source_history, ts("2025-01-02T10:00:00Z"))?);
+        let coverage = verified_h1_omission_10_to_11(&market)?;
+
+        // Model an existing persisted pending passive intent at the H1 boundary. The order
+        // reserves cash and is due to expire when the next M1 bar opens at 12:01.
+        let signal_bar = candle_obs_at(
+            "wait-signal-bar",
+            "KRW-BTC",
+            CandleInterval::M1,
+            ts("2025-01-02T11:59:00Z"),
+            "100",
+            "100",
+        );
+        let target = Weight::new(dec("0.5"))?;
+        let evaluation = crate::strategy::StrategyEvaluation {
+            decision_trace: None,
+            decision_time: signal_bar.candle.close_time_utc,
+            state_before: crate::contracts::PositionState::Cash,
+            state_after: crate::contracts::PositionState::Cash,
+            raw_target_weight: target,
+            constrained_target_weight: target,
+            reasons: Vec::new(),
+            indicators: crate::contracts::IndicatorSnapshot {
+                version: crate::contracts::INDICATOR_VERSION.into(),
+                ema: None,
+                bar_sigma: None,
+                annual_vol: None,
+                rsi: None,
+                entry_high: None,
+                exit_low: None,
+                completed_bars_seen: 1,
+                policy_values: Vec::new(),
+            },
+            evidence_effect: None,
+            policy_ref: None,
+            policy_trace: None,
+            base_state_before: None,
+            base_state_after: None,
+        };
+        let signal_index = checkpoint.engine_state.push_signal(
+            &signal_bar,
+            &evaluation,
+            Weight::new(Decimal::ZERO)?,
+            ts("2025-01-02T13:00:00Z"),
+        )?;
+        checkpoint.pending = checkpoint.engine_state.create_pending(
+            signal_index,
+            target,
+            &signal_bar,
+            &signal_bar,
+            dec("500000"),
+            signal_bar.candle.close_time_utc,
+            ts("2025-01-02T12:00:30Z"),
+            &checkpoint.plan,
+        )?;
+        assert!(checkpoint.pending.is_some());
+
+        let prior = candle_obs_at(
+            "wait-prior-at-h1-boundary",
+            "KRW-BTC",
+            CandleInterval::M1,
+            ts("2025-01-02T12:00:00Z"),
+            "100",
+            "100",
+        );
+        checkpoint.prior_passive_liquidity_bar = Some(signal_bar);
+        checkpoint.prior_execution_bar = Some(prior.clone());
+        checkpoint.prior_bar_evaluated = false;
+        checkpoint.last_finalized_candle_at = Some(prior.candle.close_time_utc);
+        checkpoint.last_finalized_candle_digest = Some(prior.content_digest.clone());
+        let next_bar = candle_obs_at(
+            "wait-next-m1",
+            "KRW-BTC",
+            CandleInterval::M1,
+            ts("2025-01-02T12:01:00Z"),
+            "100",
+            "100",
+        );
+
+        let before = serde_json::to_value(&checkpoint)?;
+        let account_before = serde_json::to_value(checkpoint.engine_state.account.state()?)?;
+        let mut unavailable = PreparedPaperSourceFrame::new(
+            &checkpoint.evaluator,
+            &checkpoint.market,
+            &source_history,
+        )
+        .with_provider_coverage(&coverage);
+        let waiting = checkpoint.step_bar_with_prepared_sources(
+            &next_bar,
+            &mut unavailable,
+            None,
+            next_bar.candle.close_time_utc,
+        )?;
+        assert!(!waiting.did_advance);
+        assert!(waiting.events.is_empty());
+        assert!(waiting.recovery_required.is_none());
+        assert_eq!(serde_json::to_value(&checkpoint)?, before);
+        assert_eq!(
+            serde_json::to_value(checkpoint.engine_state.account.state()?)?,
+            account_before,
+            "reserved cash and pending expiry remain untouched while H1 is incomplete"
+        );
+
+        source_history
+            .get_mut(&CandleInterval::H1)
+            .expect("H1 history exists")
+            .push(candle_obs_at(
+                "wait-h1-post-absence",
+                "KRW-BTC",
+                CandleInterval::H1,
+                ts("2025-01-02T11:00:00Z"),
+                "86",
+                "86",
+            ));
+        let mut available = PreparedPaperSourceFrame::new(
+            &checkpoint.evaluator,
+            &checkpoint.market,
+            &source_history,
+        )
+        .with_provider_coverage(&coverage);
+        let advanced = checkpoint.step_bar_with_prepared_sources(
+            &next_bar,
+            &mut available,
+            None,
+            next_bar.candle.close_time_utc,
+        )?;
+        assert!(advanced.did_advance);
+        assert!(advanced.recovery_required.is_none());
+        assert_eq!(
+            checkpoint.last_finalized_candle_at,
+            Some(next_bar.candle.close_time_utc)
+        );
+        assert_eq!(
+            checkpoint.source_cursors[&CandleInterval::H1].last_bar_close_utc,
+            Some(ts("2025-01-02T12:00:00Z"))
+        );
+        assert!(checkpoint.pending.is_none());
+        assert_eq!(
+            checkpoint.engine_state.account.state()?.cash_reserved.get(),
+            Decimal::ZERO
+        );
+
+        let events_after_advance = checkpoint.market_event_count;
+        let signals_after_advance = checkpoint.engine_state.signals.len();
+        let fills_after_advance = checkpoint.engine_state.fills.len();
+        let mut replay = PreparedPaperSourceFrame::new(
+            &checkpoint.evaluator,
+            &checkpoint.market,
+            &source_history,
+        )
+        .with_provider_coverage(&coverage);
+        let duplicate = checkpoint.step_bar_with_prepared_sources(
+            &next_bar,
+            &mut replay,
+            None,
+            next_bar.candle.close_time_utc,
+        )?;
+        assert!(!duplicate.did_advance);
+        assert!(duplicate.events.is_empty());
+        assert_eq!(checkpoint.market_event_count, events_after_advance);
+        assert_eq!(checkpoint.engine_state.signals.len(), signals_after_advance);
+        assert_eq!(checkpoint.engine_state.fills.len(), fills_after_advance);
+        Ok(())
+    }
+
+    #[test]
+    fn paper_mtf_trailing_source_suffix_waits_but_later_actual_bar_keeps_interior_gap_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut checkpoint = mtf_checkpoint(
+            &PaperSessionId::new("paper-mtf-trailing-vs-interior")?,
+            ts("2025-01-02T10:00:30Z"),
+        )?;
+        let history = BTreeMap::from([(
+            CandleInterval::H1,
+            h1_history(
+                "trailing-h1",
+                ts("2025-01-02T07:00:00Z"),
+                &["80", "82", "84"],
+            ),
+        )]);
+        assert!(checkpoint.feed_sources_until(&history, ts("2025-01-02T10:00:00Z"))?);
+        let before = serde_json::to_value(&checkpoint)?;
+        let mut no_new_source =
+            PreparedPaperSourceFrame::new(&checkpoint.evaluator, &checkpoint.market, &history);
+        assert!(
+            !checkpoint
+                .feed_sources_until_prepared(&mut no_new_source, ts("2025-01-02T11:00:00Z"))?
+        );
+        assert_eq!(serde_json::to_value(&checkpoint)?, before);
+
+        let coverage = verified_h1_omission_10_to_11(&checkpoint.market)?;
+        let later_h1 = BTreeMap::from([(
+            CandleInterval::H1,
+            vec![candle_obs_at(
+                "interior-gap-later-h1",
+                "KRW-BTC",
+                CandleInterval::H1,
+                ts("2025-01-02T12:00:00Z"),
+                "90",
+                "90",
+            )],
+        )]);
+        let mut interior =
+            PreparedPaperSourceFrame::new(&checkpoint.evaluator, &checkpoint.market, &later_h1)
+                .with_provider_coverage(&coverage);
+        assert!(matches!(
+            checkpoint.feed_sources_until_prepared(&mut interior, ts("2025-01-02T13:00:00Z")),
+            Err(LabError::DataGap(_))
+        ));
+        assert_eq!(serde_json::to_value(&checkpoint)?, before);
+        Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one chronological fixture proves source reuse, boundary wait and same-row retry without resetting state"
+    )]
+    fn paper_mtf_reuses_source_then_waits_and_retries_missing_completed_boundary()
     -> Result<(), Box<dyn std::error::Error>> {
         let session_id = PaperSessionId::new("paper-mtf-source-boundary-gap")?;
         let started_at = ts("2025-01-02T10:00:30Z");
@@ -2973,16 +4825,45 @@ mod tests {
             "100",
             "100",
         );
+        let before = checkpoint.checkpoint_digest()?;
         let gap = checkpoint.step_bar(
             &missing_h1_boundary,
             &no_new_h1,
             None,
             missing_h1_boundary.candle.close_time_utc,
-        );
-        assert!(matches!(gap, Err(LabError::DataGap(_))));
+        )?;
+        assert!(!gap.did_advance);
+        assert!(gap.events.is_empty());
+        assert!(gap.recovery_required.is_none());
+        assert_eq!(checkpoint.checkpoint_digest()?, before);
         assert_eq!(checkpoint.signal_count, signals_before_gap);
         assert_eq!(checkpoint.fill_count, 0);
         assert!(checkpoint.engine_state.orders.is_empty());
+        let arrived = BTreeMap::from([(
+            CandleInterval::H1,
+            h1_history("mtf-late-source", boundary, &["86"]),
+        )]);
+        let resumed = checkpoint.step_bar(
+            &missing_h1_boundary,
+            &arrived,
+            None,
+            missing_h1_boundary.candle.close_time_utc,
+        )?;
+        assert!(resumed.did_advance);
+        assert_eq!(checkpoint.signal_count, signals_before_gap + 1);
+        assert_eq!(
+            checkpoint.source_cursors[&CandleInterval::H1].completed_bars,
+            4
+        );
+        let after = checkpoint.checkpoint_digest()?;
+        let duplicate = checkpoint.step_bar(
+            &missing_h1_boundary,
+            &arrived,
+            None,
+            missing_h1_boundary.candle.close_time_utc,
+        )?;
+        assert!(!duplicate.did_advance);
+        assert_eq!(checkpoint.checkpoint_digest()?, after);
         Ok(())
     }
 
@@ -3122,7 +5003,7 @@ mod tests {
     }
 
     #[test]
-    fn paused_mtf_source_gap_returns_existing_recovery_outcome()
+    fn paused_mtf_source_suffix_wait_preserves_prior_observation_until_arrival()
     -> Result<(), Box<dyn std::error::Error>> {
         let session_id = PaperSessionId::new("paper-mtf-paused-source-gap")?;
         let started_at = ts("2025-01-02T10:00:30Z");
@@ -3147,6 +5028,8 @@ mod tests {
         );
         checkpoint.prior_execution_bar = Some(prior);
         checkpoint.prior_bar_evaluated = false;
+        let before = checkpoint.checkpoint_digest()?;
+        let seen = checkpoint.evaluator.completed_bars_seen();
         let outcome = checkpoint.catch_up_paused_bars(
             &[],
             &BTreeMap::new(),
@@ -3154,13 +5037,28 @@ mod tests {
             ts("2025-01-02T11:00:30Z"),
         )?;
 
-        assert!(
-            outcome
-                .recovery_required
-                .as_deref()
-                .is_some_and(|reason| reason.starts_with("DATA_GAP:"))
+        assert!(!outcome.did_advance);
+        assert!(outcome.events.is_empty());
+        assert!(outcome.recovery_required.is_none());
+        assert_eq!(checkpoint.checkpoint_digest()?, before);
+        assert!(!checkpoint.prior_bar_evaluated);
+        let arrived = BTreeMap::from([(
+            CandleInterval::H1,
+            h1_history(
+                "mtf-paused-late-source",
+                ts("2025-01-02T10:00:00Z"),
+                &["86"],
+            ),
+        )]);
+        checkpoint.catch_up_paused_bars(&[], &arrived, None, ts("2025-01-02T11:00:30Z"))?;
+        assert!(checkpoint.prior_bar_evaluated);
+        assert_eq!(checkpoint.evaluator.completed_bars_seen(), seen + 1);
+        assert_eq!(
+            checkpoint.source_cursors[&CandleInterval::H1].completed_bars,
+            4
         );
-        assert_eq!(checkpoint.recovery_reason, outcome.recovery_required);
+        checkpoint.catch_up_paused_bars(&[], &arrived, None, ts("2025-01-02T11:00:30Z"))?;
+        assert_eq!(checkpoint.evaluator.completed_bars_seen(), seen + 1);
         assert_eq!(checkpoint.signal_count, 0);
         assert_eq!(checkpoint.fill_count, 0);
         assert!(checkpoint.engine_state.orders.is_empty());
@@ -4950,9 +6848,10 @@ mod tests {
                     seed_now,
                 )
             })?;
+        let after_success_session_id = session_id.clone();
         let after_success = database
             .call_blocking("paper_multi_market_after_success", move |store| {
-                paper_store_test_snapshot(store, &session_id, seed_now)
+                paper_store_test_snapshot(store, &after_success_session_id, seed_now)
             })?;
         test_require_eq(
             &PaperSessionState::Running,
@@ -5060,6 +6959,195 @@ mod tests {
             &after_success.checkpoint_digests,
             &after_replay.checkpoint_digests,
             "successful request replay does not change checkpoints",
+        )?;
+        test_require(
+            after_success.view.markets.iter().all(|market| {
+                market.verification.status == crate::contracts::PaperVerificationStatus::Pass
+                    && market.total_fees.get() > Decimal::ZERO
+                    && market.realized_pnl.get() > Decimal::ZERO
+                    && market.cash_reserved.get().is_zero()
+                    && market
+                        .verification
+                        .reason
+                        .contains("VERIFIED=ACCOUNTING+EVENT+REFERENCES+FACT_IDEMPOTENCE")
+            }),
+            "Store read projection independently verifies the persisted multi-market ledger",
+        )?;
+        for market in &after_success.view.markets {
+            let mut bought = Decimal::ZERO;
+            let mut sold = Decimal::ZERO;
+            for fill in after_success
+                .events
+                .iter()
+                .flat_map(|event| &event.fills)
+                .filter(|fill| fill.context.market == market.market)
+            {
+                let total = match fill.side {
+                    crate::contracts::Side::Buy => &mut bought,
+                    crate::contracts::Side::Sell => &mut sold,
+                };
+                *total = total
+                    .checked_add(fill.qty.get())
+                    .ok_or("fixture fill quantity total overflow")?;
+            }
+            test_require(
+                bought > Decimal::ZERO && sold > Decimal::ZERO && sold < bought,
+                format!(
+                    "{} fixture includes a fee-bearing partial position sale",
+                    market.market.code()
+                ),
+            )?;
+        }
+        let first_fill = after_success
+            .events
+            .iter()
+            .flat_map(|event| &event.fills)
+            .next()
+            .ok_or("fee fixture has no fill")?;
+        test_require_eq(
+            &Decimal::from(10),
+            &first_fill.fee_bps.get(),
+            "fee fixture uses its explicit 10-bps taker assumption",
+        )?;
+        let expected_fee = first_fill
+            .notional
+            .get()
+            .checked_mul(first_fill.fee_bps.get())
+            .and_then(|notional_fee| notional_fee.checked_div(Decimal::from(10_000_u32)))
+            .ok_or("fee fixture arithmetic overflow")?;
+        test_require_eq(
+            &expected_fee,
+            &first_fill.fee.get(),
+            "stored nonzero fill fee equals hand-computed notional times 10 bps",
+        )?;
+
+        let tampered_session_id = session_id.clone();
+        let (stored_before, tampered_projection, stored_after) =
+            database.call_blocking("paper_multi_market_projection_tamper", move |store| {
+                store.paper_tamper_market_cash_total_for_test(
+                    &tampered_session_id,
+                    &MarketId::parse_upbit("KRW-BTC")?,
+                )?;
+                let stored_before = store.paper_stored_view_json_for_test(&tampered_session_id)?;
+                let projection = store
+                    .paper_get_session(&tampered_session_id, seed_now)?
+                    .session;
+                let stored_after = store.paper_stored_view_json_for_test(&tampered_session_id)?;
+                Ok((stored_before, projection, stored_after))
+            })?;
+        let tampered_market = tampered_projection
+            .markets
+            .iter()
+            .find(|market| market.market.code() == "KRW-BTC")
+            .ok_or("tampered market projection missing")?;
+        test_require_eq(
+            &crate::contracts::PaperVerificationStatus::Fail,
+            &tampered_market.verification.status,
+            "tampered snapshot cash fails the independent replay",
+        )?;
+        test_require(
+            tampered_market
+                .verification
+                .reason
+                .contains("SNAPSHOT_CASH_TOTAL"),
+            "cash tamper failure identifies the independently recomputed field",
+        )?;
+        test_require_eq(
+            &stored_before,
+            &stored_after,
+            "derived verification never rewrites the durable view_json",
+        )?;
+
+        let restore_session_id = session_id.clone();
+        let restore_view = after_success.view.clone();
+        database.call_blocking("paper_multi_market_restore_view", move |store| {
+            store.paper_restore_session_view_for_test(&restore_session_id, &restore_view)
+        })?;
+        let fee_session_id = session_id.clone();
+        let (fee_market, fee_tamper) =
+            database.call_blocking("paper_multi_market_fee_tamper", move |store| {
+                let market = store.paper_tamper_first_fill_fee_for_test(&fee_session_id)?;
+                let view = store.paper_get_session(&fee_session_id, seed_now)?.session;
+                Ok((market, view))
+            })?;
+        let fee_tampered_market = fee_tamper
+            .markets
+            .iter()
+            .find(|market| market.market == fee_market)
+            .ok_or("fee-tampered market projection missing")?;
+        test_require_eq(
+            &crate::contracts::PaperVerificationStatus::Fail,
+            &fee_tampered_market.verification.status,
+            "tampered exact fee fails the independent accounting fold",
+        )?;
+        test_require(
+            fee_tampered_market
+                .verification
+                .reason
+                .contains("FILL_FEE_MISMATCH"),
+            "fee tamper reports its independently recomputed exact-fee mismatch",
+        )?;
+
+        let restore_session_id = session_id.clone();
+        let baseline_events = after_success.events.clone();
+        database.call_blocking(
+            "paper_multi_market_restore_events_after_fee",
+            move |store| store.paper_restore_events_for_test(&restore_session_id, &baseline_events),
+        )?;
+        let source_session_id = session_id.clone();
+        let (source_market, source_tamper) =
+            database.call_blocking("paper_multi_market_source_tamper", move |store| {
+                let market = store.paper_tamper_first_fill_source_for_test(&source_session_id)?;
+                let view = store
+                    .paper_get_session(&source_session_id, seed_now)?
+                    .session;
+                Ok((market, view))
+            })?;
+        let source_tampered_market = source_tamper
+            .markets
+            .iter()
+            .find(|market| market.market == source_market)
+            .ok_or("source-tampered market projection missing")?;
+        test_require_eq(
+            &crate::contracts::PaperVerificationStatus::NotAvailable,
+            &source_tampered_market.verification.status,
+            "missing exact source ID cannot pass through a slot/latest fallback",
+        )?;
+        test_require(
+            source_tampered_market
+                .verification
+                .reason
+                .contains("FILL_LIQUIDITY_NOT_CAPTURED"),
+            "unresolved exact source ID is identified as unsupported evidence",
+        )?;
+
+        let restore_session_id = session_id.clone();
+        let baseline_events = after_success.events.clone();
+        database.call_blocking(
+            "paper_multi_market_restore_events_after_source",
+            move |store| store.paper_restore_events_for_test(&restore_session_id, &baseline_events),
+        )?;
+        let sequence_session_id = session_id.clone();
+        let sequence_tamper =
+            database.call_blocking("paper_multi_market_event_sequence_tamper", move |store| {
+                store.paper_tamper_first_event_sequence_for_test(&sequence_session_id)?;
+                store.paper_get_session(&sequence_session_id, seed_now)
+            })?;
+        test_require(
+            sequence_tamper.session.markets.iter().all(|market| {
+                market.verification.status == crate::contracts::PaperVerificationStatus::Fail
+                    && market
+                        .verification
+                        .reason
+                        .contains("EVENT_SQL_JSON_SEQUENCE")
+            }),
+            "SQL/JSON event sequence mismatch fails every affected market projection",
+        )?;
+        let restore_session_id = session_id.clone();
+        let baseline_events = after_success.events.clone();
+        database.call_blocking(
+            "paper_multi_market_restore_events_after_sequence",
+            move |store| store.paper_restore_events_for_test(&restore_session_id, &baseline_events),
         )?;
 
         owner.shutdown()?;

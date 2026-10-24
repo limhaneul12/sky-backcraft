@@ -392,11 +392,14 @@ fn evaluation(decision_time: &str, extra: &str) -> serde_json::Value {
         "decision_time_utc": decision_time,
         "reasons": [extra],
         "indicators": {"ema": "101.25", "volatility": "0.02"},
-        "policy_trace": {"matched_rule_id": extra},
     })
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the persisted review lifecycle regression checks pagination, linked fills, and restart identity together"
+)]
 fn review_details_preserve_decisions_partial_fills_and_restart_identity() -> Result<(), LabError> {
     let mut fixture = ReviewFixture::new()?;
     let warmup = fixture.add_warmup_candle()?;
@@ -434,6 +437,26 @@ fn review_details_preserve_decisions_partial_fills_and_restart_identity() -> Res
         .automation_review_detail(&fixture.session_id, &third)?;
     assert_eq!(detail.decision.action, AutomationReviewAction::Sell);
     assert_eq!(detail.decision.evaluation["reasons"][0], "SELL_RULE");
+    let recorded_decision = detail
+        .recorded_decision
+        .as_ref()
+        .ok_or_else(|| LabError::DataCorrupt("saved decision projection was omitted".into()))?;
+    assert_eq!(
+        recorded_decision.strategy_action,
+        crate::contracts::RecordedDecisionAction::NotCaptured
+    );
+    assert_eq!(
+        recorded_decision.constrained_action,
+        crate::contracts::RecordedDecisionAction::NotCaptured
+    );
+    assert_eq!(
+        recorded_decision.condition_trace_capture,
+        crate::contracts::SavedFactCaptureStatus::NotCaptured
+    );
+    assert!(recorded_decision.actual_weight_at_decision.is_none());
+    assert!(recorded_decision.raw_target_weight.is_none());
+    assert!(recorded_decision.constrained_target_weight.is_none());
+    assert!(recorded_decision.matched_rule_id.is_none());
     assert_eq!(detail.context_candles.len(), 4);
     assert_eq!(detail.context_candles[0].id, warmup.id);
     assert_eq!(

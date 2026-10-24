@@ -1,5 +1,16 @@
 import AppKit
 
+struct StrategyChartReadPacing {
+    // NativeMCPClient.call posts initialize and tools/call for each chart read.
+    static let httpPostsPerChartRead = 2
+    static let minimumInterval: TimeInterval = 0.2
+
+    static func delay(lastStartedAt: TimeInterval?, now: TimeInterval) -> TimeInterval {
+        guard let lastStartedAt else { return 0 }
+        return max(0, minimumInterval - (now - lastStartedAt))
+    }
+}
+
 /// Strategy-first performance browser. Policy identity is exact; runs and models are never merged.
 final class StrategyPerformanceView: NSView {
     private struct CardRecord {
@@ -8,12 +19,13 @@ final class StrategyPerformanceView: NSView {
     }
 
     private let reader: DatabaseReader
-    private let policies: [RealPolicy]
+    private var policies: [RealPolicy]
     private let runScopeIds: Set<String>?
     private let policyRevisionScopeId: String?
     private let ledgerReader = LedgerMCPReader()
     private let onOpenRun: (RealRun, String) -> Void
     private let onPolicyChange: (String?) -> Void
+    private let onRefreshCatalog: (() -> Void)?
     private let workQueue = DispatchQueue(label: "dev.skybackcraft.strategy-performance-reader")
 
     private let policyPopup = NSPopUpButton()
@@ -28,16 +40,25 @@ final class StrategyPerformanceView: NSView {
     private let exportButton = NSButton(title: "CSV", target: nil, action: nil)
     private let statusLabel = NSTextField(wrappingLabelWithString: "전략을 선택하면 관련 실행을 그래프로 비교할 수 있습니다.")
     private let unavailableControls = NSStackView()
+    private let unavailableDisclosure = NSButton(title: "성과 없는 실행", target: nil, action: nil)
     private let unavailablePopup = NSPopUpButton()
     private let unavailableButton = NSButton(title: "실행 근거", target: nil, action: nil)
-    private var unavailableHeight: NSLayoutConstraint?
+    private var unavailableExpanded = false
     private let pageLabel = NSTextField(labelWithString: "")
     private let previousButton = NSButton(title: "이전", target: nil, action: nil)
     private let nextButton = NSButton(title: "다음", target: nil, action: nil)
     private let scrollView = NSScrollView()
     private let gridView = StrategyCardGridView()
+    private let pagerRow = NSStackView()
+    private var pagerHeight: NSLayoutConstraint?
+    private let emptyState = TerminalEmptyStateView(
+        symbolName: "chart.xyaxis.line",
+        title: "전략을 선택하세요",
+        message: "정책을 고르면 실행·시장별 자산 곡선과 핵심 지표가 카드로 표시됩니다."
+    )
 
     private var selectedPolicyId: String?
+    private var loadedPolicyId: String?
     private var strategyRuns: [RealRun] = []
     private var unavailableRuns: [RealRun] = []
     private var allRecords: [CardRecord] = []
@@ -45,8 +66,17 @@ final class StrategyPerformanceView: NSView {
     private let pageSize = 12
     private var dataGeneration: UInt64 = 0
     private var generation: UInt64 = 0
+    private var workspaceVisible: Bool
+    private var needsDataReloadWhenVisible = false
+    private var needsRenderWhenVisible = false
+    private var dataLoadInFlight = false
+    private var dataReadRequest: NativeMCPRequest?
     private var chartQueue: [(StrategyPerformanceCard, CardRecord)] = []
     private var chartRequestActive = false
+    private var activeChartRequest: NativeMCPRequest?
+    private var activeChartItem: (StrategyPerformanceCard, CardRecord)?
+    private var chartStartWorkItem: DispatchWorkItem?
+    private var lastChartRequestStartedAt: TimeInterval?
 
     init(
         reader: DatabaseReader,
@@ -55,7 +85,9 @@ final class StrategyPerformanceView: NSView {
         runScopeIds: Set<String>? = nil,
         policyRevisionScopeId: String? = nil,
         onOpenRun: @escaping (RealRun, String) -> Void,
-        onPolicyChange: @escaping (String?) -> Void
+        onPolicyChange: @escaping (String?) -> Void,
+        onRefreshCatalog: (() -> Void)? = nil,
+        initiallyVisible: Bool = true
     ) {
         self.reader = reader
         self.policies = policies.sorted {
@@ -66,6 +98,8 @@ final class StrategyPerformanceView: NSView {
         self.policyRevisionScopeId = policyRevisionScopeId
         self.onOpenRun = onOpenRun
         self.onPolicyChange = onPolicyChange
+        self.onRefreshCatalog = onRefreshCatalog
+        self.workspaceVisible = initiallyVisible
         super.init(frame: .zero)
         buildView()
         populatePolicies()
@@ -73,15 +107,53 @@ final class StrategyPerformanceView: NSView {
         if let initialPolicyId,
            policies.contains(where: { $0.policyId == initialPolicyId }) {
             selectPolicy(id: initialPolicyId)
-            reloadStrategy()
+            if workspaceVisible {
+                reloadStrategy()
+            } else {
+                needsDataReloadWhenVisible = true
+            }
         } else {
             policyPopup.selectItem(at: 0)
             showEmptySelection()
         }
     }
 
+    deinit {
+        chartStartWorkItem?.cancel()
+        dataReadRequest?.cancel()
+        activeChartRequest?.cancel()
+    }
+
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) is unavailable") }
+
+    func setWorkspaceVisible(_ visible: Bool) {
+        guard workspaceVisible != visible else { return }
+        workspaceVisible = visible
+        if !visible {
+            generation &+= 1
+            pauseChartQueue()
+            if let request = dataReadRequest, request.isPending {
+                dataGeneration &+= 1
+                dataReadRequest = nil
+                dataLoadInFlight = false
+                needsDataReloadWhenVisible = selectedPolicyId != nil
+                request.cancel()
+                setLoading(false)
+            }
+            return
+        }
+
+        if needsDataReloadWhenVisible, selectedPolicyId != nil {
+            needsDataReloadWhenVisible = false
+            reloadStrategy()
+        } else if needsRenderWhenVisible {
+            needsRenderWhenVisible = false
+            renderCurrentPage()
+        } else {
+            loadNextChart(generation: generation)
+        }
+    }
 
     override func layout() {
         super.layout()
@@ -104,7 +176,7 @@ final class StrategyPerformanceView: NSView {
         let baseTitle = runScopeIds == nil ? "전략별 성과" : "선택 실행 비교"
         let titleText = policyRevisionScopeId.map { "\(baseTitle) · 리비전 \(Self.shortRevision($0))" } ?? baseTitle
         let title = NSTextField(labelWithString: titleText)
-        title.font = .systemFont(ofSize: 20, weight: .semibold)
+        title.font = TerminalTheme.screenTitle
         title.toolTip = policyRevisionScopeId.map { "고정 정책 리비전 ID \($0)" }
         let subtitleText: String
         if let runScopeIds {
@@ -139,36 +211,58 @@ final class StrategyPerformanceView: NSView {
 
         exportButton.target = self
         exportButton.action = #selector(exportSelectedStrategy)
+        exportButton.bezelStyle = .rounded
         exportButton.toolTip = "현재 전략과 시장 조건의 전체 성과를 내보냅니다. 화면 페이지에 한정하지 않으며 실패 실행은 미확인 값으로 구분합니다."
-        let controls = NSStackView(views: [policyPopup, marketPopup, modeControl, refreshButton, exportButton])
-        controls.orientation = .horizontal
-        controls.alignment = .centerY
-        controls.spacing = 10
-        policyPopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 260).isActive = true
-        marketPopup.widthAnchor.constraint(equalToConstant: 112).isActive = true
+        let combinedToolbar = TerminalTheme.textScale < 1.35
+        let policyMinWidth = policyPopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 260 * TerminalTheme.textScale)
+        policyMinWidth.priority = combinedToolbar ? .defaultHigh : .required
+        policyMinWidth.isActive = true
+        marketPopup.widthAnchor.constraint(equalToConstant: 112 * TerminalTheme.textScale).isActive = true
+        let identityControls = NSStackView(views: [policyPopup, marketPopup])
+        identityControls.orientation = TerminalTheme.textScale >= 1.5 ? .vertical : .horizontal
+        identityControls.alignment = TerminalTheme.textScale >= 1.5 ? .leading : .centerY
+        identityControls.spacing = 8
 
-        statusLabel.font = .systemFont(ofSize: 13)
-        statusLabel.textColor = TerminalTheme.secondaryText
-        statusLabel.maximumNumberOfLines = 2
+        let displayControls = NSStackView(views: [modeControl, refreshButton, exportButton])
+        displayControls.orientation = TerminalTheme.textScale >= 1.5 ? .vertical : .horizontal
+        displayControls.alignment = TerminalTheme.textScale >= 1.5 ? .leading : .centerY
+        displayControls.spacing = 8
+
+        let controls = NSStackView(views: [identityControls, displayControls])
+        controls.orientation = combinedToolbar ? .horizontal : .vertical
+        controls.alignment = combinedToolbar ? .centerY : .leading
+        controls.spacing = combinedToolbar ? 14 : 6
+
+        statusLabel.font = TerminalTheme.monospacedDigitFont(ofSize: 12)
+        statusLabel.textColor = .secondaryLabelColor
+        statusLabel.maximumNumberOfLines = 0
+        statusLabel.lineBreakMode = .byWordWrapping
         statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-        let unavailableLabel = NSTextField(labelWithString: "성과 없는 실행")
-        unavailableLabel.font = .systemFont(ofSize: 12, weight: .medium)
-        unavailableLabel.textColor = TerminalTheme.secondaryText
+        unavailableDisclosure.setButtonType(.pushOnPushOff)
+        unavailableDisclosure.bezelStyle = .rounded
+        unavailableDisclosure.font = TerminalTheme.systemFont(ofSize: 12, weight: .medium)
+        unavailableDisclosure.target = self
+        unavailableDisclosure.action = #selector(toggleUnavailableRuns(_:))
+        unavailableDisclosure.setAccessibilityLabel("성과 요약이 없는 실행 목록")
+        unavailableDisclosure.isHidden = true
         unavailablePopup.setAccessibilityLabel("실패 또는 성과 요약이 없는 실행")
-        unavailablePopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 360).isActive = true
+        unavailablePopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 360 * TerminalTheme.textScale).isActive = true
         unavailableButton.bezelStyle = .rounded
         unavailableButton.target = self
         unavailableButton.action = #selector(openUnavailableRun)
-        unavailableControls.orientation = .horizontal
-        unavailableControls.alignment = .centerY
+        unavailableControls.orientation = TerminalTheme.textScale >= 1.5 ? .vertical : .horizontal
+        unavailableControls.alignment = TerminalTheme.textScale >= 1.5 ? .leading : .centerY
         unavailableControls.spacing = 8
-        unavailableControls.addArrangedSubview(unavailableLabel)
         unavailableControls.addArrangedSubview(unavailablePopup)
         unavailableControls.addArrangedSubview(unavailableButton)
         unavailableControls.isHidden = true
-        unavailableHeight = unavailableControls.heightAnchor.constraint(equalToConstant: 0)
-        unavailableHeight?.isActive = true
+
+        let unavailableSection = NSStackView(views: [unavailableDisclosure, unavailableControls])
+        unavailableSection.orientation = .vertical
+        unavailableSection.alignment = .leading
+        unavailableSection.spacing = 6
+        unavailableSection.detachesHiddenViews = true
 
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = false
@@ -186,23 +280,30 @@ final class StrategyPerformanceView: NSView {
         previousButton.action = #selector(previousPage)
         nextButton.target = self
         nextButton.action = #selector(nextPage)
-        let pager = NSStackView(views: [previousButton, pageLabel, nextButton])
+        let pager = pagerRow
+        for button in [previousButton, nextButton] {
+            button.bezelStyle = .rounded
+            button.controlSize = .small
+        }
+        pager.setViews([previousButton, pageLabel, nextButton], in: .center)
         pager.orientation = .horizontal
         pager.alignment = .centerY
         pager.spacing = 10
         pageLabel.alignment = .center
-        pageLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        pageLabel.font = TerminalTheme.monospacedDigitFont(ofSize: 12, weight: .medium)
+        pageLabel.textColor = .secondaryLabelColor
+        emptyState.isHidden = true
 
-        for view in [title, subtitle, controls, statusLabel, unavailableControls, scrollView, pager] {
+        for view in [title, subtitle, controls, statusLabel, unavailableSection, scrollView, emptyState, pager] {
             view.translatesAutoresizingMaskIntoConstraints = false
             addSubview(view)
         }
         NSLayoutConstraint.activate([
-            title.topAnchor.constraint(equalTo: topAnchor, constant: 18),
+            title.topAnchor.constraint(equalTo: topAnchor, constant: 12),
             title.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 20),
             title.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -20),
 
-            subtitle.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 5),
+            subtitle.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 4),
             subtitle.leadingAnchor.constraint(equalTo: title.leadingAnchor),
             subtitle.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -20),
 
@@ -214,19 +315,35 @@ final class StrategyPerformanceView: NSView {
             statusLabel.leadingAnchor.constraint(equalTo: title.leadingAnchor),
             statusLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -20),
 
-            unavailableControls.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 8),
-            unavailableControls.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            unavailableControls.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -20),
+            unavailableSection.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 8),
+            unavailableSection.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            unavailableSection.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -20),
 
-            scrollView.topAnchor.constraint(equalTo: unavailableControls.bottomAnchor, constant: 10),
+            scrollView.topAnchor.constraint(equalTo: unavailableSection.bottomAnchor, constant: 10),
             scrollView.leadingAnchor.constraint(equalTo: title.leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -20),
             scrollView.bottomAnchor.constraint(equalTo: pager.topAnchor, constant: -10),
 
+            emptyState.leadingAnchor.constraint(equalTo: scrollView.leadingAnchor),
+            emptyState.trailingAnchor.constraint(equalTo: scrollView.trailingAnchor),
+            emptyState.topAnchor.constraint(equalTo: scrollView.topAnchor),
+            emptyState.bottomAnchor.constraint(equalTo: scrollView.bottomAnchor),
+
             pager.centerXAnchor.constraint(equalTo: scrollView.centerXAnchor),
-            pager.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -12),
-            pager.heightAnchor.constraint(equalToConstant: 26)
+            pager.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -12)
         ])
+        let height = pager.heightAnchor.constraint(equalToConstant: 0)
+        height.isActive = true
+        pagerHeight = height
+        pager.isHidden = true
+    }
+
+    /// Shows a centered explanation in place of the card grid; `nil` restores the grid.
+    private func setEmptyState(_ title: String?, message: String = "") {
+        emptyState.isHidden = title == nil
+        guard let title else { return }
+        emptyState.titleLabel.stringValue = title
+        emptyState.messageLabel.stringValue = message
     }
 
     private func populatePolicies() {
@@ -248,6 +365,9 @@ final class StrategyPerformanceView: NSView {
     }
 
     @objc private func policyChanged() {
+        if !workspaceVisible, window?.isVisible == true, window?.isMiniaturized == false {
+            workspaceVisible = true
+        }
         dataGeneration &+= 1
         generation &+= 1
         selectedPolicyId = policyPopup.selectedItem?.representedObject as? String
@@ -267,10 +387,38 @@ final class StrategyPerformanceView: NSView {
         gridView.cards.forEach { $0.setChartMode(mode) }
     }
 
+    func updatePolicies(_ newPolicies: [RealPolicy]) {
+        let sorted = newPolicies.sorted {
+            let comparison = $0.name.localizedStandardCompare($1.name)
+            return comparison == .orderedSame ? $0.policyId < $1.policyId : comparison == .orderedAscending
+        }
+        let previousSelected = selectedPolicyId
+        policies = sorted
+        populatePolicies()
+        if let previousSelected,
+           policies.contains(where: { $0.policyId == previousSelected }) {
+            selectPolicy(id: previousSelected)
+        } else {
+            selectedPolicyId = nil
+            policyPopup.selectItem(at: 0)
+            if loadedPolicyId != nil {
+                showEmptySelection()
+            }
+        }
+    }
+
     @objc private func refreshRequested() {
+        if !workspaceVisible, window?.isVisible == true, window?.isMiniaturized == false {
+            workspaceVisible = true
+        }
+        onRefreshCatalog?()
         dataGeneration &+= 1
         generation &+= 1
-        pageIndex = 0
+        pageIndex = Self.pagerPresentation(
+            currentPageIndex: pageIndex,
+            pageCount: pageCount,
+            resultCount: filteredRecords.count
+        ).pageIndex
         reloadStrategy()
     }
 
@@ -299,76 +447,164 @@ final class StrategyPerformanceView: NSView {
             showEmptySelection()
             return
         }
-        cancelChartQueue()
-        let requestDataGeneration = dataGeneration
-        setLoading(true)
-        strategyRuns = []
-        unavailableRuns = []
-        allRecords = []
-        updateUnavailableControls()
-        gridView.replaceCards([])
-        statusLabel.stringValue = "전략의 실행과 모델 원장을 조회하고 있습니다…"
+        guard workspaceVisible else {
+            needsDataReloadWhenVisible = true
+            return
+        }
 
-        workQueue.async { [weak self] in
+        let preservesReadyData = loadedPolicyId == policyId
+        dataReadRequest?.cancel()
+        dataReadRequest = nil
+        if preservesReadyData {
+            pauseChartQueue()
+        } else {
+            cancelChartQueue()
+            loadedPolicyId = nil
+            strategyRuns = []
+            unavailableRuns = []
+            allRecords = []
+            updateUnavailableControls()
+            gridView.replaceCards([])
+            setEmptyState(nil)
+        }
+
+        let requestDataGeneration = dataGeneration
+        let request = NativeMCPRequest()
+        dataReadRequest = request
+        dataLoadInFlight = true
+        setLoading(true)
+        let policyName = policies.first(where: { $0.policyId == policyId }).map(policyDisplayName) ?? "선택한 전략"
+        statusLabel.stringValue = preservesReadyData
+            ? "\(policyName) · 새로고침 중 · 이전에 확인한 결과를 유지합니다."
+            : "전략의 실행과 모델 원장을 조회하고 있습니다…"
+        let runScopeIds = self.runScopeIds
+        let pinnedRunIds = runScopeIds?.sorted()
+        let policyRevisionScopeId = self.policyRevisionScopeId
+        let reader = self.reader
+
+        workQueue.async { [weak self, request] in
             guard let self else { return }
             do {
                 var runs: [RealRun] = []
                 var cursor: RunHistoryCursor?
                 repeat {
-                    let page = try self.reader.fetchRunHistoryPage(
+                    guard request.isPending else { return }
+                    let page = try reader.fetchRunHistoryPage(
                         filter: RunHistoryFilter(
                             policyId: policyId,
-                            policyRevisionId: self.policyRevisionScopeId,
-                            pinnedRunIds: self.runScopeIds?.sorted()
+                            policyRevisionId: policyRevisionScopeId,
+                            pinnedRunIds: pinnedRunIds
                         ),
                         cursor: cursor,
                         limit: 100
                     )
+                    guard request.isPending else { return }
                     runs.append(contentsOf: page.items)
                     cursor = page.nextCursor
                 } while cursor != nil
-                if let runScopeIds = self.runScopeIds {
+                if let runScopeIds {
                     runs = runs.filter { runScopeIds.contains($0.id) }
                 }
-                if let policyRevisionScopeId = self.policyRevisionScopeId {
+                if let policyRevisionScopeId {
                     runs = runs.filter { $0.policyRevisionIds?.contains(policyRevisionScopeId) == true }
                 }
 
                 var records: [CardRecord] = []
-                for run in runs {
-                    let comparisons = try self.reader.fetchModelComparisons(for: run.id)
-                    records.append(contentsOf: comparisons
-                        .filter {
-                            $0.policyId == policyId &&
-                            (self.policyRevisionScopeId == nil || $0.policyRevisionId == self.policyRevisionScopeId)
-                        }
-                        .map { CardRecord(run: run, model: $0) })
+                var unavailableRuns: [RealRun] = []
+                var batchStart = 0
+                while batchStart < runs.count {
+                    guard request.isPending else { return }
+                    let batchEnd = min(batchStart + 100, runs.count)
+                    let batchRuns = Array(runs[batchStart..<batchEnd])
+                    let runIds = batchRuns.map(\.id)
+                    let batch = try autoreleasepool {
+                        let comparisons = try reader.fetchModelComparisons(for: runIds)
+                        return Self.assembleCardRecords(
+                            runs: batchRuns,
+                            comparisons: comparisons,
+                            policyId: policyId,
+                            policyRevisionScopeId: policyRevisionScopeId
+                        )
+                    }
+                    guard request.isPending else { return }
+                    records.append(contentsOf: batch.records.map { CardRecord(run: $0.run, model: $0.model) })
+                    unavailableRuns.append(contentsOf: batch.unavailableRuns)
+                    batchStart = batchEnd
                 }
+
+                guard request.complete() else { return }
                 DispatchQueue.main.async { [weak self] in
-                    guard let self, self.dataGeneration == requestDataGeneration,
+                    guard let self,
+                          self.dataReadRequest === request,
+                          self.dataGeneration == requestDataGeneration,
                           self.selectedPolicyId == policyId else { return }
-                    let runsWithResults = Set(records.map { $0.run.id })
+                    self.dataReadRequest = nil
+                    self.dataLoadInFlight = false
+                    self.generation &+= 1
+                    self.cancelChartQueue()
+                    self.loadedPolicyId = policyId
                     self.strategyRuns = runs
-                    self.unavailableRuns = runs.filter { !runsWithResults.contains($0.id) }
+                    self.unavailableRuns = unavailableRuns
                     self.allRecords = records
                     self.updateUnavailableControls()
                     self.setLoading(false)
-                    self.renderCurrentPage()
+                    if self.workspaceVisible {
+                        self.needsRenderWhenVisible = false
+                        self.renderCurrentPage()
+                    } else {
+                        self.needsRenderWhenVisible = true
+                    }
                 }
             } catch {
                 DispatchQueue.main.async { [weak self] in
-                    guard let self, self.dataGeneration == requestDataGeneration else { return }
-                    self.strategyRuns = []
-                    self.unavailableRuns = []
-                    self.allRecords = []
-                    self.updateUnavailableControls()
+                    guard request.complete(), let self,
+                          self.dataReadRequest === request,
+                          self.dataGeneration == requestDataGeneration,
+                          self.selectedPolicyId == policyId else { return }
+                    self.dataReadRequest = nil
+                    self.dataLoadInFlight = false
                     self.setLoading(false)
-                    self.gridView.replaceCards([])
-                    self.statusLabel.stringValue = error.localizedDescription
+                    if self.loadedPolicyId == policyId {
+                        self.statusLabel.stringValue = "\(self.summaryText(policyName: policyName, visibleResultCount: self.filteredRecords.count)) · 새로고침 실패 · 이전 결과 유지: \(error.localizedDescription)"
+                    } else {
+                        self.strategyRuns = []
+                        self.unavailableRuns = []
+                        self.allRecords = []
+                        self.loadedPolicyId = nil
+                        self.updateUnavailableControls()
+                        self.gridView.replaceCards([])
+                        self.setEmptyState("성과를 불러오지 못했습니다", message: error.localizedDescription)
+                        self.statusLabel.stringValue = error.localizedDescription
+                    }
                     self.updatePager()
+                    if self.workspaceVisible {
+                        self.loadNextChart(generation: self.generation)
+                    } else {
+                        self.needsRenderWhenVisible = true
+                    }
                 }
             }
         }
+    }
+
+    static func assembleCardRecords(
+        runs: [RealRun],
+        comparisons: [RealModelComparison],
+        policyId: String,
+        policyRevisionScopeId: String?
+    ) -> (records: [(run: RealRun, model: RealModelComparison)], unavailableRuns: [RealRun]) {
+        let comparisonsByRun = Dictionary(grouping: comparisons, by: \.runId)
+        var records: [(run: RealRun, model: RealModelComparison)] = []
+        var runIdsWithResults = Set<String>()
+        for run in runs {
+            for model in comparisonsByRun[run.id] ?? [] where
+                model.policyId == policyId &&
+                (policyRevisionScopeId == nil || model.policyRevisionId == policyRevisionScopeId) {
+                records.append((run: run, model: model))
+                runIdsWithResults.insert(run.id)
+            }
+        }
+        return (records, runs.filter { !runIdsWithResults.contains($0.id) })
     }
 
     private var filteredRecords: [CardRecord] {
@@ -403,14 +639,25 @@ final class StrategyPerformanceView: NSView {
         exportButton.isEnabled = !records.isEmpty || !unavailableRuns.isEmpty
         let policy = policies.first(where: { $0.policyId == policyId })
         let policyName = policy.map { policyDisplayName($0) } ?? "선택한 전략"
+        pageIndex = Self.pagerPresentation(
+            currentPageIndex: pageIndex,
+            pageCount: pageCount,
+            resultCount: records.count
+        ).pageIndex
         if records.isEmpty {
             gridView.replaceCards([])
             statusLabel.stringValue = summaryText(policyName: policyName, visibleResultCount: 0)
+            setEmptyState(
+                "표시할 성과가 없습니다",
+                message: unavailableRuns.isEmpty
+                    ? "이 조건에 해당하는 실행 결과가 아직 없습니다."
+                    : "성과 요약이 없는 실행만 있습니다. 위의 ‘성과 없는 실행’에서 근거를 확인하세요."
+            )
             updatePager()
             return
         }
+        setEmptyState(nil)
 
-        pageIndex = min(pageIndex, max(pageCount - 1, 0))
         let lower = pageIndex * pageSize
         let upper = min(lower + pageSize, records.count)
         let visible = Array(records[lower..<upper])
@@ -453,11 +700,15 @@ final class StrategyPerformanceView: NSView {
         if let market = selectedMarket {
             value += " · \(market) 표시 \(visibleResultCount)결과"
         }
+        if dataLoadInFlight {
+            value += loadedPolicyId == selectedPolicyId ? " · 저장된 결과 표시 · 새로고침 중" : " · 선택 정책 조회 중"
+        }
         return value
     }
 
     private func updateUnavailableControls() {
         unavailablePopup.removeAllItems()
+        if unavailableRuns.isEmpty { unavailableExpanded = false }
         for run in unavailableRuns {
             let state = run.state == "FAILED" ? "실패" : "\(TerminalPresentation.state(run.state)) · 성과 요약 없음"
             let markets = run.markets?.map(Self.shortMarket).joined(separator: "/") ?? "시장 미확인"
@@ -465,9 +716,17 @@ final class StrategyPerformanceView: NSView {
             unavailablePopup.addItem(withTitle: title)
             unavailablePopup.lastItem?.toolTip = "실행 ID \(run.id)\n\(run.windowStartUTC ?? "시작 미확인") → \(run.windowEndUTC ?? "종료 미확인") UTC"
         }
-        unavailableControls.isHidden = unavailableRuns.isEmpty
-        unavailableHeight?.constant = unavailableRuns.isEmpty ? 0 : 26
+        unavailableDisclosure.isHidden = unavailableRuns.isEmpty
+        unavailableDisclosure.title = "성과 없는 실행 · \(unavailableRuns.count)개"
+        unavailableDisclosure.state = unavailableExpanded ? .on : .off
+        unavailableDisclosure.setAccessibilityValue("\(unavailableRuns.count)개 · \(unavailableExpanded ? "펼쳐짐" : "접힘")")
+        unavailableControls.isHidden = unavailableRuns.isEmpty || !unavailableExpanded
         unavailableButton.isEnabled = !unavailableRuns.isEmpty
+    }
+
+    @objc private func toggleUnavailableRuns(_ sender: NSButton) {
+        unavailableExpanded = sender.state == .on
+        updateUnavailableControls()
     }
 
     private static func shortMarket(_ market: String) -> String {
@@ -496,12 +755,45 @@ final class StrategyPerformanceView: NSView {
 
     private func updatePager() {
         let pages = pageCount
-        pageLabel.stringValue = pages == 0 ? "표시할 결과 없음" : "\(pageIndex + 1) / \(pages) · 총 \(filteredRecords.count)개"
-        previousButton.isEnabled = pageIndex > 0
-        nextButton.isEnabled = pageIndex + 1 < pages
+        let presentation = Self.pagerPresentation(
+            currentPageIndex: pageIndex,
+            pageCount: pages,
+            resultCount: filteredRecords.count
+        )
+        pageIndex = presentation.pageIndex
+        pageLabel.stringValue = presentation.label
+        previousButton.isEnabled = presentation.previousEnabled
+        nextButton.isEnabled = presentation.nextEnabled
+        let showsPager = pages > 1
+        pagerRow.isHidden = !showsPager
+        pagerHeight?.constant = showsPager ? 26 : 0
+    }
+
+    static func pagerPresentation(
+        currentPageIndex: Int,
+        pageCount: Int,
+        resultCount: Int
+    ) -> (pageIndex: Int, label: String, previousEnabled: Bool, nextEnabled: Bool) {
+        let pages = max(pageCount, 0)
+        let pageIndex = min(max(currentPageIndex, 0), max(pages - 1, 0))
+        return (
+            pageIndex: pageIndex,
+            label: pages == 0 ? "표시할 결과 없음" : "\(pageIndex + 1) / \(pages) · 총 \(resultCount)개",
+            previousEnabled: pageIndex > 0,
+            nextEnabled: pageIndex + 1 < pages
+        )
     }
 
     private func showEmptySelection() {
+        if let request = dataReadRequest {
+            dataGeneration &+= 1
+            request.cancel()
+        }
+        dataReadRequest = nil
+        dataLoadInFlight = false
+        loadedPolicyId = nil
+        needsDataReloadWhenVisible = false
+        needsRenderWhenVisible = false
         cancelChartQueue()
         selectedPolicyId = nil
         strategyRuns = []
@@ -509,6 +801,10 @@ final class StrategyPerformanceView: NSView {
         allRecords = []
         updateUnavailableControls()
         gridView.replaceCards([])
+        setEmptyState(
+            "전략을 선택하세요",
+            message: "정책을 고르면 실행·시장별 자산 곡선과 핵심 지표가 카드로 표시됩니다."
+        )
         if let runScopeIds {
             let revision = policyRevisionScopeId.map { " 정책 리비전 \(Self.shortRevision($0)) 범위만 사용합니다." } ?? ""
             statusLabel.stringValue = "선택한 \(runScopeIds.count)개 실행에서 비교할 전략을 선택하세요.\(revision) 선택 범위 밖 실행은 조회하지 않습니다."
@@ -521,7 +817,7 @@ final class StrategyPerformanceView: NSView {
 
     private func setLoading(_ loading: Bool) {
         policyPopup.isEnabled = true
-        refreshButton.isEnabled = !loading && selectedPolicyId != nil
+        refreshButton.isEnabled = !loading
         exportButton.isEnabled = !loading && selectedPolicyId != nil && (!allRecords.isEmpty || !unavailableRuns.isEmpty)
         marketPopup.isEnabled = true
     }
@@ -533,34 +829,86 @@ final class StrategyPerformanceView: NSView {
     }
 
     private func cancelChartQueue() {
+        chartStartWorkItem?.cancel()
+        chartStartWorkItem = nil
         chartQueue.removeAll()
+        activeChartItem = nil
+        activeChartRequest?.cancel()
+    }
+
+    private func pauseChartQueue() {
+        chartStartWorkItem?.cancel()
+        chartStartWorkItem = nil
+        if let activeChartItem {
+            chartQueue.insert(activeChartItem, at: 0)
+            self.activeChartItem = nil
+        }
+        activeChartRequest?.cancel()
     }
 
     private func loadNextChart(generation requestGeneration: UInt64) {
-        guard !chartRequestActive, generation == requestGeneration,
+        guard workspaceVisible, !chartRequestActive, generation == requestGeneration,
               !chartQueue.isEmpty else { return }
+        if chartQueue[0].1.run.ledgerState == "COMPACTED" {
+            let now = ProcessInfo.processInfo.systemUptime
+            let delay = StrategyChartReadPacing.delay(lastStartedAt: lastChartRequestStartedAt, now: now)
+            if delay > 0 {
+                guard chartStartWorkItem == nil else { return }
+                let workItem = DispatchWorkItem { [weak self] in
+                    guard let self else { return }
+                    self.chartStartWorkItem = nil
+                    self.loadNextChart(generation: requestGeneration)
+                }
+                chartStartWorkItem = workItem
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+                return
+            }
+            lastChartRequestStartedAt = now
+        } else {
+            chartStartWorkItem?.cancel()
+            chartStartWorkItem = nil
+        }
         chartRequestActive = true
         let (card, record) = chartQueue.removeFirst()
+        activeChartItem = (card, record)
         card.showChartLoading()
+        let requestDataGeneration = dataGeneration
 
         if record.run.ledgerState == "COMPACTED" {
-            ledgerReader.marks(
+            activeChartRequest = ledgerReader.marks(
                 runId: record.run.id,
                 modelId: record.model.modelId,
                 expectedCount: record.model.accountMarkCount
             ) { [weak self, weak card] result in
                 DispatchQueue.main.async {
                     guard let self else { return }
-                    if self.generation == requestGeneration, let card {
-                        card.applyChartResult(result, totalCount: record.model.accountMarkCount)
-                    }
-                    self.chartRequestActive = false
-                    self.loadNextChart(generation: self.generation)
+                    self.finishChartRead(
+                        generation: requestGeneration,
+                        dataGeneration: requestDataGeneration,
+                        card: card,
+                        record: record,
+                        result: result
+                    )
                 }
             }
         } else {
+            let request = NativeMCPRequest()
+            activeChartRequest = request
+            request.setCancellationHandler { [weak self, weak card] in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.finishChartRead(
+                        generation: requestGeneration,
+                        dataGeneration: requestDataGeneration,
+                        card: card,
+                        record: record,
+                        result: .failure(NativeMCPError.cancelled)
+                    )
+                }
+            }
             workQueue.async { [weak self, weak card] in
                 guard let self else { return }
+                guard request.isPending else { return }
                 let result: Result<[RealAccountMark], Error>
                 do {
                     result = .success(try self.reader.fetchAccountMarks(
@@ -571,14 +919,38 @@ final class StrategyPerformanceView: NSView {
                 } catch {
                     result = .failure(error)
                 }
+                guard request.complete() else { return }
                 DispatchQueue.main.async {
-                    if self.generation == requestGeneration, let card {
-                        card.applyChartResult(result, totalCount: record.model.accountMarkCount)
-                    }
-                    self.chartRequestActive = false
-                    self.loadNextChart(generation: self.generation)
+                    self.finishChartRead(
+                        generation: requestGeneration,
+                        dataGeneration: requestDataGeneration,
+                        card: card,
+                        record: record,
+                        result: result
+                    )
                 }
             }
+        }
+    }
+
+    private func finishChartRead(
+        generation requestGeneration: UInt64,
+        dataGeneration requestDataGeneration: UInt64,
+        card: StrategyPerformanceCard?,
+        record: CardRecord,
+        result: Result<[RealAccountMark], Error>
+    ) {
+        activeChartRequest = nil
+        activeChartItem = nil
+        chartRequestActive = false
+        if workspaceVisible,
+           generation == requestGeneration,
+           dataGeneration == requestDataGeneration,
+           let card {
+            card.applyChartResult(result, totalCount: record.model.accountMarkCount)
+        }
+        if workspaceVisible {
+            loadNextChart(generation: generation)
         }
     }
 }
@@ -631,13 +1003,66 @@ private final class StrategyCardGridView: NSView {
     }
 }
 
+/// One KPI: small secondary label over a tabular-digit value. Unknown values stay textual, never zero.
+private final class StrategyMetricTile: NSView {
+    static var height: CGFloat { ceil(50 * TerminalTheme.textScale) }
+
+    init(title: String, value: String, tone: NSColor, toolTip: String?) {
+        super.init(frame: .zero)
+        let titleLabel = NSTextField(labelWithString: title)
+        titleLabel.font = TerminalTheme.systemFont(ofSize: 11, weight: .medium)
+        titleLabel.textColor = .secondaryLabelColor
+        let valueLabel = NSTextField(labelWithString: value)
+        valueLabel.font = TerminalTheme.monospacedDigitFont(ofSize: 15, weight: .semibold)
+        valueLabel.textColor = tone
+        valueLabel.lineBreakMode = .byTruncatingTail
+        valueLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let stack = NSStackView(views: [titleLabel, valueLabel])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 3
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            heightAnchor.constraint(equalToConstant: Self.height),
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+            stack.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -8),
+            stack.centerYAnchor.constraint(equalTo: centerYAnchor)
+        ])
+        self.toolTip = toolTip
+        setAccessibilityElement(false)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { nil }
+
+    override var wantsDefaultClipping: Bool { true }
+
+    override func draw(_ dirtyRect: NSRect) {
+        TerminalTheme.surface.setFill()
+        NSBezierPath(roundedRect: bounds, xRadius: 6, yRadius: 6).fill()
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+}
+
 private final class StrategyPerformanceCard: NSView {
     private let titleLabel: NSTextField
     private let periodLabel: NSTextField
-    private let metricsLabel: NSTextField
+    private let metricsGrid: NSStackView
+    private let detailButton: ClosureButton
     private let chartView = EquityChartView()
     private let chartStatus = NSTextField(labelWithString: "차트 대기")
     private let initialEquity: Double
+    private let onOpen: () -> Void
+
+    private static var metricRows: Int { TerminalTheme.textScale >= 1.5 ? 2 : 1 }
+    private static var metricsHeight: CGFloat {
+        CGFloat(metricRows) * StrategyMetricTile.height + CGFloat(metricRows - 1) * 8
+    }
 
     init(
         policyName: String,
@@ -646,21 +1071,58 @@ private final class StrategyPerformanceCard: NSView {
         chartMode: ChartMode,
         onOpen: @escaping () -> Void
     ) {
+        self.onOpen = onOpen
         initialEquity = model.initialEquity
         let title = NSTextField(labelWithString: "\(policyName) · \(Self.shortMarket(model.market))")
-        let period = NSTextField(wrappingLabelWithString: Self.periodText(run, model: model))
+        let period = NSTextField(wrappingLabelWithString:
+            "\(Self.periodText(run, model: model)) · 체결 \(model.fillCount)건 · 청산 \(model.closedEpisodes)건"
+        )
         let returnText = model.netReturnDecimal.map { Self.percent($0, signed: true) }
             ?? (model.netReturnNullReason.map { "산출 불가 · \($0)" } ?? "산출 불가")
         let mddText = model.maxDrawdownDecimal.map { Self.percent($0) }
             ?? (model.maxDrawdownNullReason.map { "산출 불가 · \($0)" } ?? "산출 불가")
         let pnlText = Formatters.money(model.netPnlDecimal, signed: true)
         let feesText = Formatters.money(model.cumulativeFeesDecimal)
-        let metrics = NSTextField(wrappingLabelWithString:
-            "수익률 \(returnText)   MDD \(mddText)   손익 \(pnlText)\n수수료 \(feesText)   체결 \(model.fillCount)건   청산 \(model.closedEpisodes)건"
-        )
+        let returnRaw = model.netReturnDecimal?.description ?? (model.netReturnNullReason.map { "null(\($0))" } ?? "null")
+        let mddRaw = model.maxDrawdownDecimal?.description ?? (model.maxDrawdownNullReason.map { "null(\($0))" } ?? "null")
+
+        func signTone(_ value: Decimal?) -> NSColor {
+            guard let value else { return .tertiaryLabelColor }
+            return value > 0 ? TerminalTheme.positive : (value < 0 ? TerminalTheme.negative : .labelColor)
+        }
+        let tiles = [
+            StrategyMetricTile(title: "수익률", value: model.netReturnDecimal == nil ? "산출 불가" : returnText,
+                               tone: signTone(model.netReturnDecimal), toolTip: "net_return=\(returnRaw)"),
+            StrategyMetricTile(title: "최대 낙폭", value: model.maxDrawdownDecimal == nil ? "산출 불가" : mddText,
+                               tone: model.maxDrawdownDecimal.map { $0 > 0 ? TerminalTheme.negative : .labelColor } ?? .tertiaryLabelColor,
+                               toolTip: "max_drawdown=\(mddRaw)"),
+            StrategyMetricTile(title: "순손익", value: pnlText, tone: signTone(model.netPnlDecimal),
+                               toolTip: "net_pnl=\(model.netPnlDecimal)"),
+            StrategyMetricTile(title: "수수료", value: feesText, tone: .labelColor,
+                               toolTip: "fees=\(model.cumulativeFeesDecimal)")
+        ]
+        func metricRow(_ items: [NSView]) -> NSStackView {
+            let row = NSStackView(views: items)
+            row.orientation = .horizontal
+            row.distribution = .fillEqually
+            row.spacing = 8
+            return row
+        }
+        let grid = Self.metricRows == 1
+            ? NSStackView(views: [metricRow(tiles)])
+            : NSStackView(views: [metricRow(Array(tiles.prefix(2))), metricRow(Array(tiles.suffix(2)))])
+        grid.orientation = .vertical
+        grid.alignment = .leading
+        grid.spacing = 8
+        for row in grid.arrangedSubviews {
+            row.widthAnchor.constraint(equalTo: grid.widthAnchor).isActive = true
+        }
+
+        let button = ClosureButton(title: "실행 상세", action: onOpen)
         titleLabel = title
         periodLabel = period
-        metricsLabel = metrics
+        metricsGrid = grid
+        detailButton = button
         super.init(frame: .zero)
         wantsLayer = true
         layer?.cornerRadius = 8
@@ -668,32 +1130,30 @@ private final class StrategyPerformanceCard: NSView {
         layer?.borderWidth = 1
         layer?.borderColor = TerminalTheme.border.cgColor
 
-        title.font = TerminalTheme.systemFont(ofSize: 15, weight: .semibold)
+        title.font = TerminalTheme.systemFont(ofSize: 14, weight: .semibold)
         title.lineBreakMode = .byTruncatingTail
         title.setContentCompressionResistancePriority(.required, for: .vertical)
         title.toolTip = "정책 ID \(model.policyId ?? "미확인") · 실행 ID \(run.id) · 모델 ID \(model.modelId)"
 
-        let detailButton = ClosureButton(title: "실행 상세", action: onOpen)
         detailButton.bezelStyle = .rounded
+        detailButton.controlSize = .small
+        detailButton.image = NSImage(systemSymbolName: "chevron.right", accessibilityDescription: nil)
+        detailButton.imagePosition = .imageTrailing
         detailButton.toolTip = "실행 \(run.id) · 모델 \(model.modelId)"
         detailButton.setAccessibilityLabel("실행 상세 · \(Self.shortMarket(model.market)) · \(run.id)")
 
-        period.font = TerminalTheme.systemFont(ofSize: 11)
-        period.textColor = TerminalTheme.secondaryText
+        let clickRecognizer = NSClickGestureRecognizer(target: self, action: #selector(handleCardClick(_:)))
+        clickRecognizer.delaysPrimaryMouseButtonEvents = false
+        addGestureRecognizer(clickRecognizer)
+
+        period.font = TerminalTheme.monospacedDigitFont(ofSize: 11)
+        period.textColor = .secondaryLabelColor
         period.maximumNumberOfLines = 0
         period.lineBreakMode = .byWordWrapping
         period.setContentCompressionResistancePriority(.required, for: .vertical)
         period.setContentHuggingPriority(.required, for: .vertical)
         period.toolTip = "실행 ID \(run.id)\n모델 ID \(model.modelId)\n정책 revision \(model.policyRevisionId ?? "미확인")"
 
-        metrics.font = TerminalTheme.monospacedDigitFont(ofSize: 12, weight: .medium)
-        metrics.maximumNumberOfLines = 0
-        metrics.lineBreakMode = .byWordWrapping
-        metrics.setContentCompressionResistancePriority(.required, for: .vertical)
-        metrics.setContentHuggingPriority(.required, for: .vertical)
-        let returnRaw = model.netReturnDecimal?.description ?? (model.netReturnNullReason.map { "null(\($0))" } ?? "null")
-        let mddRaw = model.maxDrawdownDecimal?.description ?? (model.maxDrawdownNullReason.map { "null(\($0))" } ?? "null")
-        metrics.toolTip = "net_return=\(returnRaw)\nmax_drawdown=\(mddRaw)\nnet_pnl=\(model.netPnlDecimal)\nfees=\(model.cumulativeFeesDecimal)"
         setAccessibilityElement(true)
         setAccessibilityRole(.group)
         setAccessibilityLabel("\(policyName) · \(Self.shortMarket(model.market)) · \(run.id)")
@@ -707,12 +1167,12 @@ private final class StrategyPerformanceCard: NSView {
         chartView.setPoints([], initialEquity: model.initialEquity)
 
         chartStatus.font = TerminalTheme.systemFont(ofSize: 11)
-        chartStatus.textColor = TerminalTheme.secondaryText
+        chartStatus.textColor = .tertiaryLabelColor
         chartStatus.maximumNumberOfLines = 0
         chartStatus.lineBreakMode = .byWordWrapping
         chartStatus.setContentCompressionResistancePriority(.required, for: .vertical)
 
-        for view in [title, detailButton, period, metrics, chartView, chartStatus] {
+        for view in [title, detailButton, period, grid, chartView, chartStatus] {
             view.translatesAutoresizingMaskIntoConstraints = false
             addSubview(view)
         }
@@ -724,18 +1184,19 @@ private final class StrategyPerformanceCard: NSView {
             detailButton.centerYAnchor.constraint(equalTo: title.centerYAnchor),
             detailButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
 
-            period.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 6),
+            period.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 4),
             period.leadingAnchor.constraint(equalTo: title.leadingAnchor),
             period.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
 
-            metrics.topAnchor.constraint(equalTo: period.bottomAnchor, constant: 8),
-            metrics.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            metrics.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+            grid.topAnchor.constraint(equalTo: period.bottomAnchor, constant: 10),
+            grid.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            grid.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+            grid.heightAnchor.constraint(equalToConstant: Self.metricsHeight),
 
-            chartView.topAnchor.constraint(equalTo: metrics.bottomAnchor, constant: 10),
-            chartView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+            chartView.topAnchor.constraint(equalTo: grid.bottomAnchor, constant: 8),
+            chartView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
             chartView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
-            chartView.bottomAnchor.constraint(equalTo: chartStatus.topAnchor, constant: -5),
+            chartView.bottomAnchor.constraint(equalTo: chartStatus.topAnchor, constant: -4),
 
             chartStatus.leadingAnchor.constraint(equalTo: title.leadingAnchor),
             chartStatus.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
@@ -748,6 +1209,13 @@ private final class StrategyPerformanceCard: NSView {
         super.setFrameSize(newSize)
     }
 
+    @objc private func handleCardClick(_ recognizer: NSClickGestureRecognizer) {
+        let location = recognizer.location(in: self)
+        if detailButton.frame.contains(location) { return }
+        if chartView.frame.contains(location) && (NSApp.currentEvent?.clickCount ?? 1) < 2 { return }
+        onOpen()
+    }
+
     override func layout() {
         updatePreferredTextWidths(for: bounds.width)
         super.layout()
@@ -756,7 +1224,7 @@ private final class StrategyPerformanceCard: NSView {
     private func updatePreferredTextWidths(for cardWidth: CGFloat) {
         guard cardWidth > 28 else { return }
         let textWidth = cardWidth - 28
-        for label in [periodLabel, metricsLabel, chartStatus] {
+        for label in [periodLabel, chartStatus] {
             if abs(label.preferredMaxLayoutWidth - textWidth) > 0.5 {
                 label.preferredMaxLayoutWidth = textWidth
                 label.invalidateIntrinsicContentSize()
@@ -771,10 +1239,9 @@ private final class StrategyPerformanceCard: NSView {
         let textWidth = width - 28
         let titleH = Self.measuredTextHeight(titleLabel.stringValue, font: titleLabel.font, width: max(80, textWidth - 96))
         let periodH = Self.measuredTextHeight(periodLabel.stringValue, font: periodLabel.font, width: textWidth)
-        let metricsH = Self.measuredTextHeight(metricsLabel.stringValue, font: metricsLabel.font, width: textWidth)
         let statusH = Self.measuredTextHeight(chartStatus.stringValue, font: chartStatus.font, width: textWidth)
         let minChartH = max(168, ceil(168 * TerminalTheme.textScale))
-        let needed = ceil(14 + titleH + 6 + periodH + 8 + metricsH + 10 + minChartH + 5 + statusH + 10)
+        let needed = ceil(14 + titleH + 4 + periodH + 10 + Self.metricsHeight + 8 + minChartH + 4 + statusH + 10)
         return max(baseHeight, needed)
     }
 

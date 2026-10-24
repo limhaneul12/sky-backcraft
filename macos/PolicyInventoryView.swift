@@ -15,12 +15,16 @@ final class PolicyInventoryView: NSView, NSTableViewDataSource, NSTableViewDeleg
     private let usagePopup = NSPopUpButton()
     private let marketPopup = NSPopUpButton()
     private let countLabel = NSTextField(labelWithString: "")
+    private let marketStatusLabel = NSTextField(wrappingLabelWithString: "")
     private let policyTable = NSTableView()
+    private let detailScroll = NSScrollView()
     private let detailTitle = NSTextField(labelWithString: "정책을 선택하세요")
+    private let detailIdentity = NSTextField(wrappingLabelWithString: "정책을 선택하면 정책 ID와 리비전 ID가 표시됩니다.")
     private let detailMeta = NSTextField(wrappingLabelWithString: "등록된 정책은 실행 중인 세션을 뜻하지 않습니다.")
     private let definitionText = NSTextView()
     private let revisionTable = NSTableView()
     private let runTable = NSTableView()
+    private let relatedRunStatusLabel = NSTextField(wrappingLabelWithString: "")
     private let openRunButton = NSButton(title: "선택 실행 열기", target: nil, action: nil)
     private let showStrategyButton = NSButton(title: "성과에서 보기", target: nil, action: nil)
     private var filteredPolicies: [RealPolicy] = []
@@ -30,10 +34,13 @@ final class PolicyInventoryView: NSView, NSTableViewDataSource, NSTableViewDeleg
     private var currentDetail: PolicyDetailSnapshot?
     private var allPolicyRuns: [RealRun] = []
     private var relatedRuns: [RealRun] = []
+    private var relatedRunsLoaded = false
+    private var relatedRunsError: String?
     private var generation: UInt64 = 0
     private var revisionGeneration: UInt64 = 0
     private var restoringSelection = false
     private var restoringRevisionSelection = false
+    private var lastInspectorViewportSize: NSSize?
 
     init(reader: DatabaseReader, policies: [RealPolicy],
          onOpenRun: @escaping (RealRun, String, String) -> Void,
@@ -54,6 +61,7 @@ final class PolicyInventoryView: NSView, NSTableViewDataSource, NSTableViewDeleg
         filteredPolicies = self.policies
         policyTable.reloadData()
         updateCount()
+        if self.policies.isEmpty { showEmptyDetail() }
         loadMarketIndex()
     }
 
@@ -64,9 +72,36 @@ final class PolicyInventoryView: NSView, NSTableViewDataSource, NSTableViewDeleg
     override func draw(_ dirtyRect: NSRect) { TerminalTheme.surface.setFill(); bounds.fill() }
     override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); needsDisplay = true }
 
+    override func layout() {
+        super.layout()
+        let viewportSize = detailScroll.contentView.bounds.size
+        guard viewportSize.width > 0, viewportSize.height > 0,
+              lastInspectorViewportSize != viewportSize else { return }
+        lastInspectorViewportSize = viewportSize
+        scrollInspectorToTop()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard window != nil else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.window != nil else { return }
+            self.scrollInspectorToTop()
+        }
+    }
+
+    private func scrollInspectorToTop() {
+        guard detailScroll.documentView != nil else { return }
+        detailScroll.layoutSubtreeIfNeeded()
+        detailScroll.contentView.scroll(to: .zero)
+        detailScroll.reflectScrolledClipView(detailScroll.contentView)
+    }
+
     private func buildView() {
         let title = NSTextField(labelWithString: "정책 카탈로그")
-        title.font = TerminalTheme.systemFont(ofSize: 20, weight: .semibold)
+        title.font = TerminalTheme.screenTitle
+        title.setAccessibilityLabel("정책 카탈로그")
+        title.setAccessibilityValue(title.stringValue)
         let subtitle = NSTextField(wrappingLabelWithString: "불변 정책과 리비전, 과거 원장 참조를 확인합니다. 과거 실행·일시중지 수집은 지속모의 또는 실거래 활성 상태가 아닙니다.")
         subtitle.font = TerminalTheme.body
         subtitle.textColor = TerminalTheme.secondaryText
@@ -87,9 +122,28 @@ final class PolicyInventoryView: NSView, NSTableViewDataSource, NSTableViewDeleg
         }
         countLabel.textColor = TerminalTheme.secondaryText
         countLabel.alignment = .right
-        let controls = NSStackView(views: [searchField, originPopup, usagePopup, marketPopup, countLabel])
-        controls.orientation = .horizontal; controls.alignment = .centerY; controls.spacing = 8
-        searchField.widthAnchor.constraint(greaterThanOrEqualToConstant: 230).isActive = true
+        countLabel.setAccessibilityLabel("정책 카탈로그 결과와 선택 수")
+        searchField.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let searchRow = NSStackView(views: [searchField, countLabel])
+        searchRow.orientation = .horizontal; searchRow.alignment = .centerY; searchRow.spacing = 8
+        let filters = NSStackView(views: [originPopup, usagePopup, marketPopup])
+        let filtersStackVertically = TerminalTheme.textScale >= 1.5
+        filters.orientation = filtersStackVertically ? .vertical : .horizontal
+        filters.alignment = filtersStackVertically ? .leading : .centerY
+        filters.spacing = 8
+        if filtersStackVertically {
+            for popup in [originPopup, usagePopup, marketPopup] {
+                popup.widthAnchor.constraint(equalTo: filters.widthAnchor).isActive = true
+            }
+        }
+        marketStatusLabel.stringValue = "정책별 관련 원장을 확인하는 중입니다."
+        marketStatusLabel.font = TerminalTheme.systemFont(ofSize: 12)
+        marketStatusLabel.textColor = TerminalTheme.secondaryText
+        marketStatusLabel.setAccessibilityLabel("정책 시장 필터 상태")
+        marketStatusLabel.setAccessibilityValue(marketStatusLabel.stringValue)
+        let controls = NSStackView(views: [searchRow, filters, marketStatusLabel])
+        controls.orientation = .vertical; controls.alignment = .leading; controls.spacing = 6
+        searchField.widthAnchor.constraint(greaterThanOrEqualToConstant: max(230, 230 * TerminalTheme.textScale)).isActive = true
         countLabel.setContentHuggingPriority(.required, for: .horizontal)
 
         configurePolicyTable()
@@ -98,41 +152,67 @@ final class PolicyInventoryView: NSView, NSTableViewDataSource, NSTableViewDeleg
         policyScroll.setAccessibilityLabel("정책 목록")
 
         detailTitle.font = TerminalTheme.systemFont(ofSize: 17, weight: .semibold)
+        detailTitle.setAccessibilityLabel("선택된 정책 이름")
+        detailTitle.setAccessibilityValue(detailTitle.stringValue)
+        detailIdentity.font = TerminalTheme.monospacedFont(ofSize: 10, weight: .regular)
+        detailIdentity.textColor = TerminalTheme.secondaryText
+        detailIdentity.setAccessibilityLabel("선택된 정책과 리비전의 불변 ID")
+        detailIdentity.setAccessibilityValue(detailIdentity.stringValue)
         detailMeta.font = TerminalTheme.systemFont(ofSize: 12)
         detailMeta.textColor = TerminalTheme.secondaryText
+        detailMeta.setAccessibilityLabel("선택 정책 분류와 상세 조회 상태")
+        detailMeta.setAccessibilityValue(detailMeta.stringValue)
         definitionText.isEditable = false
         definitionText.isSelectable = true
         definitionText.font = TerminalTheme.monospacedFont(ofSize: 11, weight: .regular)
         definitionText.textColor = .labelColor
         definitionText.backgroundColor = TerminalTheme.chart
-        definitionText.textContainerInset = NSSize(width: 10, height: 10)
         definitionText.setAccessibilityLabel("선택 정책 리비전 정의 JSON")
-        let definitionScroll = NSScrollView()
-        definitionScroll.hasVerticalScroller = true
-        definitionScroll.documentView = definitionText
+        let definitionScroll = TerminalWrappingTextScrollView()
+        definitionScroll.configureWrapping(textView: definitionText, inset: NSSize(width: 10, height: 10))
         definitionScroll.borderType = .bezelBorder
-        definitionScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 190).isActive = true
+        definitionScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: max(135, 135 * TerminalTheme.textScale)).isActive = true
 
         configureRevisionTable()
         configureRunTable()
         revisionTable.setAccessibilityLabel("정책 리비전 기록 테이블")
         runTable.setAccessibilityLabel("정책 관련 원장 실행 테이블")
-        let revisions = labeledSection("리비전 기록", content: scroll(for: revisionTable), minimumHeight: 112)
-        let runs = labeledSection("관련 원장 실행", content: scroll(for: runTable), minimumHeight: 145)
+        let revisionScroll = scroll(for: revisionTable)
+        revisionScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: max(68, TerminalTheme.tableRowHeight * 2)).isActive = true
+        let revisions = labeledSection("리비전 기록", content: revisionScroll, minimumHeight: 96)
+        relatedRunStatusLabel.font = TerminalTheme.systemFont(ofSize: 11)
+        relatedRunStatusLabel.textColor = TerminalTheme.secondaryText
+        relatedRunStatusLabel.setAccessibilityLabel("선택 리비전의 관련 실행 조회 상태")
+        relatedRunStatusLabel.stringValue = "정책을 선택하면 관련 실행을 확인할 수 있습니다."
+        relatedRunStatusLabel.setAccessibilityValue(relatedRunStatusLabel.stringValue)
+        let runScroll = scroll(for: runTable)
+        runScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: max(90, TerminalTheme.tableRowHeight * 2)).isActive = true
+        let runContent = NSStackView(views: [runScroll, relatedRunStatusLabel])
+        runContent.orientation = .vertical; runContent.alignment = .leading; runContent.spacing = 4
+        let runs = labeledSection("관련 원장 실행", content: runContent, minimumHeight: 145)
         openRunButton.target = self; openRunButton.action = #selector(openSelectedRun)
         openRunButton.setAccessibilityLabel("선택된 관련 원장 실행 열기")
         showStrategyButton.target = self; showStrategyButton.action = #selector(showSelectedStrategy)
         showStrategyButton.setAccessibilityLabel("선택된 정책을 전략별 성과에서 보기")
         openRunButton.isEnabled = false; showStrategyButton.isEnabled = false
         let actions = NSStackView(views: [showStrategyButton, openRunButton])
-        actions.orientation = .horizontal; actions.alignment = .centerY; actions.spacing = 8
+        actions.orientation = TerminalTheme.textScale >= 1.5 ? .vertical : .horizontal
+        actions.alignment = TerminalTheme.textScale >= 1.5 ? .leading : .centerY
+        actions.spacing = 8
+        if TerminalTheme.textScale >= 1.5 {
+            for button in [showStrategyButton, openRunButton] {
+                button.widthAnchor.constraint(equalTo: actions.widthAnchor).isActive = true
+            }
+        }
 
-        let detailStack = NSStackView(views: [detailTitle, detailMeta, definitionScroll, revisions, runs, actions])
+        let detailStack = NSStackView(views: [detailTitle, detailIdentity, detailMeta, definitionScroll, revisions, runs, actions])
         detailStack.orientation = .vertical; detailStack.alignment = .leading; detailStack.spacing = 10
-        for view in [detailTitle, detailMeta, definitionScroll, revisions, runs] {
+        for view in [detailTitle, detailIdentity, detailMeta, definitionScroll, revisions, runs, actions] {
             view.widthAnchor.constraint(equalTo: detailStack.widthAnchor).isActive = true
         }
-        let detailContainer = TerminalSurfaceView(); detailContainer.usesPanel = true
+        let detailContainer = TerminalFlippedDocumentView()
+        detailContainer.usesPanel = true
+        detailContainer.translatesAutoresizingMaskIntoConstraints = false
         detailStack.translatesAutoresizingMaskIntoConstraints = false; detailContainer.addSubview(detailStack)
         NSLayoutConstraint.activate([
             detailStack.leadingAnchor.constraint(equalTo: detailContainer.leadingAnchor, constant: 14),
@@ -141,16 +221,29 @@ final class PolicyInventoryView: NSView, NSTableViewDataSource, NSTableViewDeleg
             detailStack.bottomAnchor.constraint(equalTo: detailContainer.bottomAnchor, constant: -14)
         ])
 
+        detailScroll.documentView = detailContainer
+        detailScroll.hasVerticalScroller = true
+        detailScroll.hasHorizontalScroller = false
+        detailScroll.autohidesScrollers = true
+        detailScroll.drawsBackground = false
+        detailScroll.setAccessibilityLabel("선택 정책 상세 및 리비전 검사기")
+        detailContainer.widthAnchor.constraint(equalTo: detailScroll.contentView.widthAnchor).isActive = true
+
         let split = NSSplitView()
         split.isVertical = true; split.dividerStyle = .thin
-        split.addArrangedSubview(policyScroll); split.addArrangedSubview(detailContainer)
+        split.setAccessibilityLabel("정책 카탈로그 목록과 선택 상세 분할 보기")
+        split.addArrangedSubview(policyScroll); split.addArrangedSubview(detailScroll)
         policyScroll.widthAnchor.constraint(greaterThanOrEqualToConstant: 390).isActive = true
-        detailContainer.widthAnchor.constraint(greaterThanOrEqualToConstant: 470).isActive = true
+        detailScroll.widthAnchor.constraint(greaterThanOrEqualToConstant: 430).isActive = true
 
         let root = NSStackView(views: [title, subtitle, controls, split])
         root.orientation = .vertical; root.alignment = .leading; root.spacing = 10
         root.translatesAutoresizingMaskIntoConstraints = false; addSubview(root)
         for view in [title, subtitle, controls, split] { view.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true }
+        for view in [searchRow, filters, marketStatusLabel] {
+            view.widthAnchor.constraint(equalTo: controls.widthAnchor).isActive = true
+        }
+        searchField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         NSLayoutConstraint.activate([
             root.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 20),
             root.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -20),
@@ -161,14 +254,14 @@ final class PolicyInventoryView: NSView, NSTableViewDataSource, NSTableViewDeleg
 
     private func configurePolicyTable() {
         let columns: [(String, String, CGFloat)] = [
-            ("Name", "정책", 220), ("Origin", "출처", 70), ("Usage", "상태", 124)
+            ("Name", "정책", 210), ("PolicyID", "정책 ID", 220), ("Origin", "출처", 72), ("Usage", "상태", 118)
         ]
         for (id, title, width) in columns {
             let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(id))
             column.title = title
             column.width = width
             if id == "Name" {
-                column.minWidth = 220
+                column.minWidth = 175
                 column.resizingMask = .autoresizingMask
             } else {
                 column.minWidth = width
@@ -178,6 +271,8 @@ final class PolicyInventoryView: NSView, NSTableViewDataSource, NSTableViewDeleg
             policyTable.addTableColumn(column)
         }
         policyTable.dataSource = self; policyTable.delegate = self
+        policyTable.target = self
+        policyTable.doubleAction = #selector(showSelectedStrategy)
         policyTable.allowsMultipleSelection = true
         TerminalTheme.prepareTable(policyTable)
         policyTable.allowsMultipleSelection = true
@@ -208,14 +303,15 @@ final class PolicyInventoryView: NSView, NSTableViewDataSource, NSTableViewDeleg
 
     private func scroll(for table: NSTableView) -> NSScrollView {
         let scroll = NSScrollView(); scroll.hasVerticalScroller = true; scroll.hasHorizontalScroller = true
+        scroll.autohidesScrollers = true
         scroll.documentView = table; return scroll
     }
 
     private func labeledSection(_ title: String, content: NSView, minimumHeight: CGFloat) -> NSView {
-        let label = NSTextField(labelWithString: title); label.font = .systemFont(ofSize: 13, weight: .semibold)
+        let label = NSTextField(labelWithString: title); label.font = TerminalTheme.sectionHeading
         let stack = NSStackView(views: [label, content]); stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 5
         content.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-        stack.heightAnchor.constraint(greaterThanOrEqualToConstant: minimumHeight).isActive = true
+        stack.heightAnchor.constraint(greaterThanOrEqualToConstant: max(minimumHeight, TerminalTheme.tableRowHeight * 2 + 30)).isActive = true
         return stack
     }
 
@@ -248,7 +344,9 @@ final class PolicyInventoryView: NSView, NSTableViewDataSource, NSTableViewDeleg
                 generation &+= 1
                 revisionGeneration &+= 1
                 let message = selectedPolicyIds.isEmpty
-                    ? (filteredPolicies.isEmpty ? "현재 검색·필터와 일치하는 정책이 없습니다." : "정책을 선택하면 상세 정보가 표시됩니다.")
+                    ? (filteredPolicies.isEmpty
+                        ? (policies.isEmpty ? "등록된 정책이 없습니다." : "현재 검색·필터와 일치하는 정책이 없습니다.")
+                        : "정책을 선택하면 상세 정보가 표시됩니다.")
                     : "선택한 정책이 현재 검색·필터에서 숨겨졌습니다. 선택은 유지되며 필터를 해제하면 다시 표시됩니다."
                 showEmptyDetail(message: message)
             }
@@ -266,6 +364,7 @@ final class PolicyInventoryView: NSView, NSTableViewDataSource, NSTableViewDeleg
     private func updateCount() {
         let suffix = selectedPolicyIds.isEmpty ? "" : " · \(selectedPolicyIds.count)개 선택"
         countLabel.stringValue = "\(filteredPolicies.count) / \(policies.count)개\(suffix)"
+        countLabel.setAccessibilityValue(countLabel.stringValue)
     }
 
     private func loadMarketIndex() {
@@ -289,12 +388,20 @@ final class PolicyInventoryView: NSView, NSTableViewDataSource, NSTableViewDeleg
                     self?.marketsByPolicy = map
                     self?.marketPopup.isEnabled = true
                     self?.marketPopup.toolTip = "관련 원장의 시장을 기준으로 필터링합니다."
+                    self?.marketStatusLabel.stringValue = "정책별 관련 원장을 확인했습니다."
+                    self?.marketStatusLabel.textColor = TerminalTheme.secondaryText
+                    self?.marketStatusLabel.setAccessibilityValue(self?.marketStatusLabel.stringValue ?? "")
                     self?.applyFilters()
                 }
             } catch {
                 DispatchQueue.main.async { [weak self] in
                     self?.marketPopup.isEnabled = false
                     self?.marketPopup.toolTip = "시장 필터를 계산할 수 없습니다: \(error.localizedDescription)"
+                    let message = "시장 필터를 사용할 수 없습니다: \(error.localizedDescription)"
+                    self?.marketStatusLabel.stringValue = message
+                    self?.marketStatusLabel.toolTip = message
+                    self?.marketStatusLabel.textColor = .systemOrange
+                    self?.marketStatusLabel.setAccessibilityValue(message)
                 }
             }
         }
@@ -304,11 +411,25 @@ final class PolicyInventoryView: NSView, NSTableViewDataSource, NSTableViewDeleg
         generation &+= 1; let requestGeneration = generation
         revisionGeneration &+= 1
         currentDetail = nil; allPolicyRuns = []; relatedRuns = []
+        relatedRunsLoaded = false
+        relatedRunsError = nil
         detailTitle.stringValue = policy.name
+        detailTitle.setAccessibilityValue(detailTitle.stringValue)
+        detailIdentity.stringValue = "Policy ID: \(policy.policyId)\nHead revision ID: \(policy.headRevisionId)"
+        detailIdentity.toolTip = detailIdentity.stringValue
+        detailIdentity.setAccessibilityValue(detailIdentity.stringValue)
         detailMeta.stringValue = "정책 정의와 원장 참조를 읽는 중…"
+        detailMeta.textColor = TerminalTheme.secondaryText
+        detailMeta.toolTip = nil
+        detailMeta.setAccessibilityValue(detailMeta.stringValue)
         definitionText.string = "조회 중…"
+        relatedRunStatusLabel.stringValue = "관련 원장 실행을 확인하는 중입니다."
+        relatedRunStatusLabel.textColor = TerminalTheme.secondaryText
+        relatedRunStatusLabel.toolTip = nil
+        relatedRunStatusLabel.setAccessibilityValue(relatedRunStatusLabel.stringValue)
         revisionTable.reloadData(); runTable.reloadData()
         openRunButton.isEnabled = false; showStrategyButton.isEnabled = true
+        scrollInspectorToTop()
 
         detailReader.fetchDetail(for: policy) { [weak self] result in
             guard let self, requestGeneration == self.generation else { return }
@@ -325,6 +446,9 @@ final class PolicyInventoryView: NSView, NSTableViewDataSource, NSTableViewDeleg
                 self.updateRelatedRuns()
             case .failure(let error):
                 self.detailMeta.stringValue = "정책 Backend 상세를 확인할 수 없습니다. 로컬 원장 정보는 유지됩니다."
+                self.detailMeta.textColor = .systemOrange
+                self.detailMeta.setAccessibilityValue(self.detailMeta.stringValue)
+                self.detailMeta.toolTip = error.localizedDescription
                 self.definitionText.string = error.localizedDescription
                 self.relatedRuns = []
                 self.runTable.reloadData()
@@ -345,14 +469,19 @@ final class PolicyInventoryView: NSView, NSTableViewDataSource, NSTableViewDeleg
                 DispatchQueue.main.async { [weak self] in
                     guard let self, requestGeneration == self.generation else { return }
                     self.allPolicyRuns = runs
+                    self.relatedRunsLoaded = true
+                    self.relatedRunsError = nil
                     self.updateRelatedRuns()
                 }
             } catch {
                 DispatchQueue.main.async { [weak self] in
                     guard let self, requestGeneration == self.generation else { return }
+                    self.allPolicyRuns = []
+                    self.relatedRunsLoaded = true
+                    self.relatedRunsError = error.localizedDescription
                     self.relatedRuns = []; self.runTable.reloadData()
+                    self.updateRelatedRunStatus()
                     self.openRunButton.isEnabled = false
-                    self.detailMeta.toolTip = "관련 실행 조회 실패: \(error.localizedDescription)"
                 }
             }
         }
@@ -362,22 +491,54 @@ final class PolicyInventoryView: NSView, NSTableViewDataSource, NSTableViewDeleg
         guard let revisionId = currentDetail?.reference.revisionId else {
             relatedRuns = []
             runTable.reloadData()
+            updateRelatedRunStatus()
             openRunButton.isEnabled = false
             return
         }
         relatedRuns = allPolicyRuns.filter { $0.policyRevisionIds?.contains(revisionId) == true }
         runTable.reloadData()
+        if !relatedRuns.isEmpty && !relatedRuns.indices.contains(runTable.selectedRow) {
+            runTable.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        }
+        updateRelatedRunStatus()
         openRunButton.isEnabled = relatedRuns.indices.contains(runTable.selectedRow)
+    }
+
+    private func updateRelatedRunStatus() {
+        let message: String
+        if let relatedRunsError {
+            message = "관련 실행을 불러오지 못했습니다: \(relatedRunsError)"
+        } else if focusedPolicyId == nil {
+            message = "정책을 선택하면 관련 실행을 확인할 수 있습니다."
+        } else if currentDetail == nil {
+            message = "정책 리비전 identity 확인 전에는 관련 실행을 표시하지 않습니다."
+        } else if !relatedRunsLoaded {
+            message = "관련 원장 실행을 확인하는 중입니다."
+        } else if relatedRuns.isEmpty {
+            message = "선택한 리비전을 참조하는 과거 실행이 없습니다."
+        } else {
+            message = "선택한 리비전을 참조하는 과거 실행 \(relatedRuns.count)건입니다."
+        }
+        relatedRunStatusLabel.stringValue = message
+        relatedRunStatusLabel.textColor = relatedRunsError == nil ? TerminalTheme.secondaryText : .systemOrange
+        relatedRunStatusLabel.toolTip = message
+        relatedRunStatusLabel.setAccessibilityValue(message)
     }
 
     private func renderDetail(policy: RealPolicy, detail: PolicyDetailSnapshot) {
         let usage = policy.usageState == .historicalOnly ? "HISTORICAL_ONLY · 과거 \(policy.historicalRunCount)회 참조" : "UNUSED · 원장 참조 없음"
         let testHint = Self.testNameHint(policy) ? " · 이름 기반 TEST_ONLY 후보(명시 category 없음)" : ""
-        detailMeta.stringValue = "\(TerminalPresentation.state(detail.origin)) · 분류 \(Self.familyTitle(detail.family)) · \(usage)\(testHint)\n등록 \(detail.header.createdAt) · 현재 리비전 \(detail.revisionNumber)/\(detail.header.revisionCount)"
+        detailMeta.stringValue = "\(TerminalPresentation.state(detail.origin)) · 분류 \(Self.familyTitle(detail.family)) · \(usage)\(testHint)\n등록 \(detail.header.createdAt) · 선택 리비전 \(detail.revisionNumber)/\(detail.header.revisionCount)"
+        detailMeta.textColor = TerminalTheme.secondaryText
+        detailMeta.toolTip = nil
+        detailMeta.setAccessibilityValue(detailMeta.stringValue)
+        detailIdentity.stringValue = "Policy ID: \(policy.policyId)\nRevision ID: \(detail.reference.revisionId)\nDefinition digest: \(detail.reference.definitionDigest)"
+        detailIdentity.toolTip = detailIdentity.stringValue
+        detailIdentity.setAccessibilityValue(detailIdentity.stringValue)
         let d = detail.definition
         let structure: String
         if d.programKind == "RULES" {
-            structure = "규칙형 · indicators \(d.indicatorCount ?? 0) · states \(d.stateCount ?? 0) · rules \(d.ruleCount ?? 0) · expiry \(d.signalExpiry ?? "없음")"
+            structure = "규칙형 · indicators \(d.indicatorCount.map(String.init) ?? "미확인") · states \(d.stateCount.map(String.init) ?? "미확인") · rules \(d.ruleCount.map(String.init) ?? "미확인") · expiry \(d.signalExpiry ?? "미확인")"
         } else { structure = "내장형 · strategy \(d.strategyKind ?? "UNKNOWN")" }
         definitionText.string = """
         \(d.name)
@@ -434,6 +595,7 @@ final class PolicyInventoryView: NSView, NSTableViewDataSource, NSTableViewDeleg
                 value = duplicatePolicyNames.contains(policy.name)
                     ? "\(policy.name) · \(policy.policyId.suffix(8))"
                     : policy.name
+            case "PolicyID": value = policy.policyId
             case "Origin": value = TerminalPresentation.state(policy.origin)
             case "Usage": value = policy.usageState == .historicalOnly ? "과거 \(policy.historicalRunCount)회 참조" : "미사용"
             default: value = ""
@@ -468,6 +630,8 @@ final class PolicyInventoryView: NSView, NSTableViewDataSource, NSTableViewDeleg
         cell.textColor = .labelColor
         cell.lineBreakMode = .byTruncatingMiddle
         cell.toolTip = tooltip
+        cell.setAccessibilityLabel(value)
+        cell.setAccessibilityValue(value)
         return cell
     }
 
@@ -507,10 +671,19 @@ final class PolicyInventoryView: NSView, NSTableViewDataSource, NSTableViewDeleg
             revisionGeneration &+= 1
             let requestGeneration = revisionGeneration
             detailMeta.stringValue = "리비전 r\(item.revisionNumber)의 불변 정의를 읽는 중…"
+            detailMeta.textColor = TerminalTheme.secondaryText
+            detailMeta.toolTip = nil
+            detailMeta.setAccessibilityValue(detailMeta.stringValue)
+            detailIdentity.stringValue = "Policy ID: \(policy.policyId)\nRevision ID: \(item.reference.revisionId)\nDefinition digest: \(item.reference.definitionDigest)"
+            detailIdentity.toolTip = detailIdentity.stringValue
+            detailIdentity.setAccessibilityValue(detailIdentity.stringValue)
             definitionText.string = "조회 중…"
             relatedRuns = []
             runTable.reloadData()
+            relatedRunStatusLabel.stringValue = "선택 리비전의 identity를 확인하는 중입니다."
+            relatedRunStatusLabel.setAccessibilityValue(relatedRunStatusLabel.stringValue)
             openRunButton.isEnabled = false
+            scrollInspectorToTop()
             detailReader.fetchRevision(item, within: detail) { [weak self] result in
                 guard let self, requestGeneration == self.revisionGeneration,
                       policy.policyId == self.focusedPolicyId else { return }
@@ -521,9 +694,16 @@ final class PolicyInventoryView: NSView, NSTableViewDataSource, NSTableViewDeleg
                     self.updateRelatedRuns()
                 case .failure(let error):
                     self.detailMeta.stringValue = "선택한 리비전의 identity를 검증할 수 없습니다."
+                    self.detailMeta.textColor = .systemOrange
+                    self.detailMeta.setAccessibilityValue(self.detailMeta.stringValue)
+                    self.detailMeta.toolTip = error.localizedDescription
                     self.definitionText.string = error.localizedDescription
                     self.relatedRuns = []
                     self.runTable.reloadData()
+                    let message = "선택한 리비전 identity를 확인하지 못해 관련 실행을 표시하지 않습니다."
+                    self.relatedRunStatusLabel.stringValue = message
+                    self.relatedRunStatusLabel.toolTip = error.localizedDescription
+                    self.relatedRunStatusLabel.setAccessibilityValue(message)
                     self.openRunButton.isEnabled = false
                 }
             }
@@ -532,11 +712,28 @@ final class PolicyInventoryView: NSView, NSTableViewDataSource, NSTableViewDeleg
 
     private func showEmptyDetail(message: String? = nil) {
         currentDetail = nil; allPolicyRuns = []; relatedRuns = []
+        relatedRunsLoaded = false
+        relatedRunsError = nil
         detailTitle.stringValue = "정책을 선택하세요"
-        detailMeta.stringValue = message ?? (filteredPolicies.isEmpty ? "현재 검색·필터와 일치하는 정책이 없습니다." : "등록된 정책은 실행 중인 세션을 뜻하지 않습니다.")
+        detailTitle.setAccessibilityValue(detailTitle.stringValue)
+        detailIdentity.stringValue = selectedPolicyIds.isEmpty
+            ? (policies.isEmpty ? "등록된 정책이 없어 identity가 없습니다." : "정책을 선택하면 정책 ID와 리비전 ID가 표시됩니다.")
+            : "선택한 정책 ID는 현재 검색·필터에서 숨겨져 있습니다."
+        detailIdentity.setAccessibilityValue(detailIdentity.stringValue)
+        detailMeta.stringValue = message ?? (policies.isEmpty
+            ? "등록된 정책이 없습니다."
+            : (filteredPolicies.isEmpty ? "현재 검색·필터와 일치하는 정책이 없습니다." : "등록된 정책은 실행 중인 세션을 뜻하지 않습니다."))
+        detailMeta.textColor = TerminalTheme.secondaryText
+        detailMeta.toolTip = nil
+        detailMeta.setAccessibilityValue(detailMeta.stringValue)
         definitionText.string = ""
         revisionTable.reloadData(); runTable.reloadData()
+        relatedRunStatusLabel.stringValue = filteredPolicies.isEmpty ? "관련 실행이 없습니다." : "정책을 선택하면 관련 실행을 확인할 수 있습니다."
+        relatedRunStatusLabel.textColor = TerminalTheme.secondaryText
+        relatedRunStatusLabel.toolTip = nil
+        relatedRunStatusLabel.setAccessibilityValue(relatedRunStatusLabel.stringValue)
         openRunButton.isEnabled = false; showStrategyButton.isEnabled = false
+        scrollInspectorToTop()
     }
 
     @objc private func openSelectedRun() {

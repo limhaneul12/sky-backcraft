@@ -1,5 +1,8 @@
 import Foundation
 import AppKit
+import SQLite3
+
+private let dashboardHistorySQLiteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
 @main
 private enum AutomationProtocolRegression {
@@ -20,6 +23,8 @@ private enum AutomationProtocolRegression {
         try lifecycleAndQueryRequestsMatchFixture(fixture)
         try decodeFrozenReadProjections(fixture)
         try validatePaperSessionEvents(at: URL(fileURLWithPath: paperEventFixturePath))
+        try validatePaperReadOnlyReviewEvents()
+        try validatePaperReviewRetryCancellationAndTransportFence()
         try validateRiskInputBoundaries()
         try validateBaselineSourceChoices()
         try validateBaselineStatusConsistency(fixture)
@@ -27,6 +32,8 @@ private enum AutomationProtocolRegression {
         try validateAccountIdentityScopes()
         try validateEventDetailAmountMasking()
         try validateAutomationReviewContracts()
+        try validateRecordedDecisionPresentation()
+        try validatePaperRecordedDecisionReview()
         if let reviewWirePath = ProcessInfo.processInfo.environment["SKY_BACKCRAFT_AUTOMATION_REVIEW_RUST_WIRE_FIXTURE"] {
             try validateActualRustAutomationReviewWire(at: URL(fileURLWithPath: reviewWirePath))
         }
@@ -42,6 +49,10 @@ private enum AutomationProtocolRegression {
         try validateSettingsEmergencyStopGateAndControlRace()
         try validateSettingsAccountStrategyAdmission()
         try validateDashboardHistoryColumnsAndStatusLabels()
+        try validateStrategyChartReadPacing()
+        try validateStrategyBatchRecordAssembly()
+        try validateStrategyRefreshFailureRetainsCachedPage()
+        try validateLedgerMCPReaderCancellationOwnership()
         try validateExplicitPaperFeedGapRecoveryResume()
         guard let policyDeletionFixturePath = ProcessInfo.processInfo.environment["SKY_BACKCRAFT_POLICY_DELETION_WIRE_FIXTURE"] else {
             throw Failure.assertion("SKY_BACKCRAFT_POLICY_DELETION_WIRE_FIXTURE is required")
@@ -245,12 +256,59 @@ private enum AutomationProtocolRegression {
                 "kind": "INTENT_REJECTED",
                 "at_utc": "2026-10-14T01:00:02Z",
                 "detail": ["reason": "RISK_LIMIT", "intent_id": intentID]
-            ]]
+            ]],
+            "recorded_decision": [
+                "schema_version": "1.0",
+                "policy_ref": policyReference,
+                "decision_time": "2026-10-14T01:00:00Z",
+                "strategy_action": "BUY",
+                "constrained_action": "BUY",
+                "execution_state": "REJECTED",
+                "actual_weight_at_decision": "0.0000",
+                "raw_target_weight": "1.0000",
+                "constrained_target_weight": "0.0000",
+                "matched_rule_id": "entry_rule",
+                "condition_trace_capture": "CAPTURED",
+                "condition_trace": [[
+                    "scope": ["kind": "RULE_CONDITION", "rule_id": "entry_rule"],
+                    "ast_path": "rule:entry_rule:when",
+                    "role": "ENTRY_CONDITION",
+                    "outcome": ["kind": "FALSE"],
+                    "engine_result": false,
+                    "evidence": [
+                        "kind": "COMPARISON",
+                        "left": ["value": "1.12", "unit": "ratio"],
+                        "comparison": "GREATER_THAN",
+                        "right": ["value": "1.5", "unit": "ratio"]
+                    ]
+                ]],
+                "reasons": [["stage": "ADMISSION", "code": "RISK_LIMIT", "label_ko": "위험 한도 초과"]],
+                "orders": [["order_id": "review-order-001", "state": "REJECTED", "reason": "RISK_LIMIT"]],
+                "fills": []
+            ]
         ]
         let detail = try JSONDecoder().decode(
             AutomationReviewDecisionDetail.self,
             from: JSONSerialization.data(withJSONObject: detailObject)
         )
+        var oldDetailObject = detailObject
+        oldDetailObject.removeValue(forKey: "recorded_decision")
+        let oldDetail = try JSONDecoder().decode(
+            AutomationReviewDecisionDetail.self,
+            from: JSONSerialization.data(withJSONObject: oldDetailObject)
+        )
+        let recordedDecisionText = RecordedDecisionPresentation.lines(
+            for: detail.recorded_decision,
+            masked: false
+        ).joined(separator: "\n")
+        guard oldDetail.recorded_decision == nil,
+              recordedDecisionText.contains("매수 (BUY)"),
+              recordedDecisionText.contains("거부 (REJECTED)"),
+              recordedDecisionText.contains("불충족 (FALSE)"),
+              recordedDecisionText.contains("1.12"), recordedDecisionText.contains("1.5"),
+              recordedDecisionText.contains("위험 한도 초과") else {
+            throw Failure.assertion("automation decision wire did not preserve new captured evidence and old missing capture")
+        }
         let reference = AutomationPolicyRevisionReference(
             policy_id: "review-policy",
             revision_id: "review-revision-1",
@@ -292,6 +350,31 @@ private enum AutomationProtocolRegression {
                 expectedPolicyReference: reference
             )
         }
+        var mismatchedRecordedPolicyObject = detailObject
+        var mismatchedRecordedDecision = try object(
+            mismatchedRecordedPolicyObject["recorded_decision"],
+            field: "recorded decision"
+        )
+        var mismatchedRecordedReference = try object(
+            mismatchedRecordedDecision["policy_ref"],
+            field: "recorded decision policy reference"
+        )
+        mismatchedRecordedReference["revision_id"] = "another-revision"
+        mismatchedRecordedDecision["policy_ref"] = mismatchedRecordedReference
+        mismatchedRecordedPolicyObject["recorded_decision"] = mismatchedRecordedDecision
+        let mismatchedRecordedPolicy = try JSONDecoder().decode(
+            AutomationReviewDecisionDetail.self,
+            from: JSONSerialization.data(withJSONObject: mismatchedRecordedPolicyObject)
+        )
+        try expectReviewRejection("recorded decision from another policy revision was accepted") {
+            try AutomationSessionMCPService.validateReviewDecisionDetail(
+                mismatchedRecordedPolicy,
+                sessionID: sessionID,
+                intentID: intentID,
+                expectedMode: .mock,
+                expectedPolicyReference: reference
+            )
+        }
         let selectedSummary = page.items[0]
         let mismatchedSummary = AutomationReviewDecisionSummary(
             intent_id: selectedSummary.intent_id,
@@ -310,9 +393,14 @@ private enum AutomationProtocolRegression {
         let privateEvaluation = detail.decision.evaluation
         let maskedEvaluation = AutomationReviewPrivacyPresentation.evaluation(privateEvaluation, masked: true)
         let visibleEvaluation = AutomationReviewPrivacyPresentation.evaluation(privateEvaluation, masked: false)
+        let maskedRecordedDecision = RecordedDecisionPresentation.lines(
+            for: detail.recorded_decision,
+            masked: true
+        ).joined(separator: "\n")
         guard AutomationReviewPrivacyPresentation.identity(sessionID, masked: true) == AutomationReviewPrivacyPresentation.hiddenText,
               AutomationReviewPrivacyPresentation.exactValue("123.25", masked: true) == AutomationReviewPrivacyPresentation.hiddenText,
               !maskedEvaluation.contains("entry_rule"), !maskedEvaluation.contains("123.25"),
+              maskedRecordedDecision.contains("개인정보 숨김"), !maskedRecordedDecision.contains("review-order-001"),
               visibleEvaluation.contains("BAND_ENTRY"), visibleEvaluation.contains("122.75") else {
             throw Failure.assertion("privacy masking must hide identities, indicators, and raw evaluation while visible review preserves them")
         }
@@ -613,6 +701,311 @@ private enum AutomationProtocolRegression {
                   == Int(AutomationReviewExportStaging.filePermissions) else {
             throw Failure.assertion("published review files lost owner-only permissions after directory rename")
         }
+    }
+
+    private static func validateRecordedDecisionPresentation() throws {
+        func decode(_ value: [String: Any]) throws -> AutomationJSONValue {
+            try JSONDecoder().decode(
+                AutomationJSONValue.self,
+                from: JSONSerialization.data(withJSONObject: value, options: [.sortedKeys])
+            )
+        }
+
+        let unknown = try decode([
+            "schema_version": "1.0",
+            "strategy_action": "HOLD",
+            "constrained_action": "NOT_EVALUATED",
+            "execution_state": "REJECTED",
+            "actual_weight_at_decision": "0.0000",
+            "raw_target_weight": NSNull(),
+            "constrained_target_weight": "0.0000",
+            "matched_rule_id": NSNull(),
+            "condition_trace_capture": "PARTIAL_CAPTURE",
+            "condition_trace": [[
+                "scope": ["kind": "RULE_CONDITION", "rule_id": "entry"],
+                "ast_path": "rule:entry:when",
+                "role": "ENTRY_CONDITION",
+                "outcome": ["kind": "UNKNOWN", "value": "CROSS_HISTORY_UNAVAILABLE"],
+                "engine_result": true,
+                "evidence": [
+                    "kind": "COMPARISON",
+                    "left": ["value": "1.12", "unit": "ratio"],
+                    "comparison": "GREATER_THAN",
+                    "right": ["value": "1.5", "unit": "ratio"]
+                ]
+            ]],
+            "reasons": [[
+                "stage": "STRATEGY",
+                "code": "CROSS_HISTORY_UNAVAILABLE",
+                "label_ko": "교차 이력 부족"
+            ]],
+            "orders": [["order_id": "order-rejected", "state": "REJECTED", "reason": "RISK_LIMIT"]],
+            "fills": []
+        ])
+        let unknownLines = RecordedDecisionPresentation.lines(for: unknown, masked: false)
+        let unknownText = unknownLines.joined(separator: "\n")
+        guard unknownText.contains("HOLD"), unknownText.contains("NOT_EVALUATED"),
+              unknownText.contains("REJECTED"), unknownText.contains("CROSS_HISTORY_UNAVAILABLE"),
+              unknownText.contains("1.12"), unknownText.contains("1.5"),
+              unknownText.contains("교차 이력 부족"), unknownText.contains("0.0000"),
+              unknownText.contains("엔진 반환 true"), !unknownText.contains("불충족 (FALSE)") else {
+            throw Failure.assertion("recorded unknown/rejected decision lost its exact reason, evidence, zero, or tri-state distinction")
+        }
+
+        let legacyOutcome = try decode([
+            "condition_trace_capture": "CAPTURED",
+            "condition_trace": [[
+                "ast_path": "legacy-rule:when", "outcome": ["kind": "FALSE"],
+                "engine_result": false
+            ]]
+        ])
+        let legacyText = RecordedDecisionPresentation.lines(for: legacyOutcome, masked: false).joined(separator: "\n")
+        guard legacyText.contains("평가 결과 기록"), legacyText.contains("실제 비교 입력: 미기록"),
+              !legacyText.contains("전체 기록") else {
+            throw Failure.assertion("captured legacy outcomes must not imply captured comparison operands")
+        }
+
+        let skipped = try decode([
+            "schema_version": "1.0",
+            "strategy_action": "NOT_EVALUATED",
+            "constrained_action": "NOT_EVALUATED",
+            "execution_state": "NOT_EVALUATED",
+            "condition_trace_capture": "PARTIAL_CAPTURE",
+            "condition_trace": [[
+                "scope": ["kind": "RULE_CONDITION", "rule_id": "later"],
+                "ast_path": "rule:later:when",
+                "role": "ENTRY_CONDITION",
+                "outcome": ["kind": "NOT_EVALUATED", "value": "PRIOR_RULE_MATCHED"]
+            ]],
+            "reasons": [],
+            "orders": [],
+            "fills": []
+        ])
+        let skippedText = RecordedDecisionPresentation.lines(for: skipped, masked: false).joined(separator: "\n")
+        guard skippedText.contains("NOT_EVALUATED"), skippedText.contains("PRIOR_RULE_MATCHED"),
+              skippedText.contains("미평가"), !skippedText.contains("거짓") else {
+            throw Failure.assertion("a skipped condition was presented as false instead of not evaluated")
+        }
+
+        let uncaptured = try decode([
+            "schema_version": "1.0",
+            "strategy_action": "NOT_CAPTURED",
+            "constrained_action": "NOT_CAPTURED",
+            "execution_state": "NOT_CAPTURED",
+            "actual_weight_at_decision": NSNull(),
+            "condition_trace_capture": "NOT_CAPTURED",
+            "condition_trace": [],
+            "reasons": [],
+            "orders": [],
+            "fills": []
+        ])
+        let uncapturedText = RecordedDecisionPresentation.lines(for: uncaptured, masked: false).joined(separator: "\n")
+        guard uncapturedText.contains("NOT_CAPTURED"), uncapturedText.contains("미기록") else {
+            throw Failure.assertion("uncaptured decision values were hidden or converted to zero")
+        }
+
+        let filled = try decode([
+            "schema_version": "1.0",
+            "strategy_action": "BUY",
+            "constrained_action": "BUY",
+            "execution_state": "FILLED",
+            "actual_weight_at_decision": "0.0000",
+            "raw_target_weight": "1.0000",
+            "constrained_target_weight": "1.0000",
+            "matched_rule_id": "entry_rule",
+            "condition_trace_capture": "CAPTURED",
+            "condition_trace": [],
+            "reasons": [["stage": "EXECUTION", "code": "ORDER_FILLED", "label_ko": "가상 주문 체결"]],
+            "orders": [["order_id": "order-filled", "state": "FILLED", "reason": NSNull()]],
+            "fills": [["fill_id": "fill-001", "order_id": "order-filled"]]
+        ])
+        let filledText = RecordedDecisionPresentation.lines(for: filled, masked: false).joined(separator: "\n")
+        guard filledText.contains("BUY"), filledText.contains("FILLED"),
+              filledText.contains("fill-001"), filledText.contains("가상 주문 체결"),
+              filledText.contains("0.0000"), filledText.contains("1.0000") else {
+            throw Failure.assertion("filled decision did not preserve saved action, execution, fill identity, or exact weights")
+        }
+
+        let unavailable = RecordedDecisionPresentation.lines(for: nil, masked: false).joined(separator: "\n")
+        let masked = RecordedDecisionPresentation.lines(for: filled, masked: true).joined(separator: "\n")
+        guard unavailable.contains("저장된") && unavailable.contains("없"),
+              masked.contains("개인정보 숨김"), !masked.contains("fill-001"), !masked.contains("1.0000") else {
+            throw Failure.assertion("legacy missing capture or privacy masking was presented as a reconstructed decision")
+        }
+        let preparation = try decode([
+            "status": "DEFERRED",
+            "completed_bars_seen": 12,
+            "required_bars": 20,
+            "decision_time": "2026-10-23T01:00:00Z",
+            "observation_id": "observation-preparation-001"
+        ])
+        let preparationText = RecordedDecisionPresentation.preparationLines(
+            for: preparation,
+            masked: false
+        ).joined(separator: "\n")
+        guard preparationText.contains("DEFERRED"), preparationText.contains("12"),
+              preparationText.contains("20"), preparationText.contains("observation-preparation-001") else {
+            throw Failure.assertion("stored preparation status, counts, time, or observation identity were not shown as recorded")
+        }
+        print("PASS deterministic recorded decision labels preserve unknown, skipped, uncaptured, rejected, filled, zero and privacy states")
+    }
+
+    private static func validatePaperRecordedDecisionReview() throws {
+        let sessionID = "paper-decision-fixture"
+        let signalID = "paper-signal-decision-001"
+        let policyReference: [String: Any] = [
+            "policy_id": "paper-policy-decision",
+            "revision_id": "paper-revision-decision",
+            "definition_digest": String(repeating: "d", count: 64)
+        ]
+        let recordedDecision: [String: Any] = [
+            "schema_version": "1.0",
+            "policy_ref": policyReference,
+            "decision_time": "2026-10-23T01:00:00Z",
+            "strategy_action": "HOLD",
+            "constrained_action": "HOLD",
+            "execution_state": "NO_ORDER",
+            "actual_weight_at_decision": "0.0000",
+            "raw_target_weight": "0.0000",
+            "constrained_target_weight": "0.0000",
+            "matched_rule_id": NSNull(),
+            "condition_trace_capture": "CAPTURED",
+            "condition_trace": [],
+            "reasons": [["stage": "STRATEGY", "code": "NO_ENTRY", "label_ko": "매수 조건 불충족"]],
+            "orders": [],
+            "fills": []
+        ]
+        let response: [String: Any] = [
+            "schema_version": "1.0",
+            "selection": [
+                "session_id": sessionID,
+                "event_sequence": 42,
+                "as_of_sequence": 57,
+                "signal_id": signalID
+            ],
+            "configuration": ["policy_ref": policyReference],
+            "policy": ["reference": policyReference],
+            "event": [
+                "sequence": 42,
+                "kind": "CANDLE_PROCESSED",
+                "market": "KRW-BTC",
+                "preparation": [
+                    "status": "DEFERRED",
+                    "completed_bars_seen": 12,
+                    "required_bars": 20,
+                    "decision_time": "2026-10-23T01:00:00Z",
+                    "observation_id": "observation-preparation-001"
+                ],
+                "signals": [[
+                    "signal_id": signalID,
+                    "strategy": "fixture",
+                    "intended_side": NSNull(),
+                    "state_before": "CASH",
+                    "state_after": "CASH",
+                    "raw_target_weight": "0.0000",
+                    "constrained_target_weight": "0.0000",
+                    "reasons": ["NO_ENTRY"],
+                    "outcome": "HOLD"
+                ]],
+                "orders": [],
+                "order_events": [],
+                "fills": [],
+                "account_marks": [],
+                "episodes": []
+            ],
+            "original_event_digest": String(repeating: "e", count: 64),
+            "selected_signal_id": signalID,
+            "source_observations": [],
+            "data_quality": [:],
+            "non_entry_observations": NSNull(),
+            "recorded_decision": recordedDecision
+        ]
+        let recorder = PolicyDeletionTestRecorder()
+        PaperWriteRecoveryURLProtocol.install { request in
+            guard let body = PaperWriteRecoveryURLProtocol.requestBody(request),
+                  let envelope = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+                  let messageID = envelope["id"],
+                  let method = envelope["method"] as? String else {
+                recorder.recordUnexpected("invalid JSON-RPC request")
+                return nil
+            }
+            let result: [String: Any]
+            if method == "initialize" {
+                result = ["protocolVersion": "2025-03-26"]
+            } else if method == "tools/call",
+                      let params = envelope["params"] as? [String: Any],
+                      let tool = params["name"] as? String,
+                      let arguments = params["arguments"] as? [String: Any] {
+                recorder.record(tool: tool, arguments: arguments)
+                guard tool == "paper_review_query",
+                      arguments["selection"] as? [String: Any] != nil,
+                      let data = try? JSONSerialization.data(withJSONObject: response, options: [.sortedKeys]),
+                      let text = String(data: data, encoding: .utf8) else {
+                    recorder.recordUnexpected("unexpected decision review tool or arguments")
+                    result = ["isError": true, "content": []]
+                    return Self.paperReviewJSONRPCResponse(id: messageID, result: result)
+                }
+                result = ["isError": false, "content": [["type": "text", "text": text]]]
+            } else {
+                recorder.recordUnexpected("unexpected JSON-RPC method: \(method)")
+                result = ["isError": true, "content": []]
+            }
+            return Self.paperReviewJSONRPCResponse(id: messageID, result: result)
+        }
+        defer { PaperWriteRecoveryURLProtocol.clear() }
+
+        let urlConfiguration = URLSessionConfiguration.ephemeral
+        urlConfiguration.protocolClasses = [PaperWriteRecoveryURLProtocol.self]
+        let urlSession = URLSession(configuration: urlConfiguration)
+        defer { urlSession.invalidateAndCancel() }
+        let client = NativeMCPClient(session: urlSession)
+        guard client.configure(port: 65_433, token: String(repeating: "f", count: 64)) != nil else {
+            throw Failure.assertion("paper decision review mocked transport did not configure")
+        }
+        let service = PaperSessionMCPService(client: client)
+        var outcome: Result<PaperDecisionReviewResponse, Error>?
+        _ = service.reviewDecision(
+            sessionId: sessionID,
+            eventSequence: 42,
+            asOfSequence: 57,
+            signalID: signalID,
+            expectedPolicyReference: PaperPolicyRevisionReference(
+                policy_id: "paper-policy-decision",
+                revision_id: "paper-revision-decision",
+                definition_digest: String(repeating: "d", count: 64)
+            )
+        ) { outcome = $0 }
+        let deadline = Date().addingTimeInterval(5)
+        while outcome == nil, Date() < deadline {
+            _ = RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
+        }
+        guard let review = try outcome?.get() else {
+            throw Failure.assertion("paper decision review did not finish its bounded mocked read")
+        }
+        guard review.selection.event_sequence == 42,
+              review.selection.as_of_sequence == 57,
+              review.event.sequence == 42,
+              review.selected_signal_id == signalID,
+              review.recorded_decision != nil,
+              review.event.preparation != nil else {
+            throw Failure.assertion("paper decision review lost the selected saved signal, fixed cutoff, or recorded explanation")
+        }
+        let observed = recorder.snapshot()
+        guard observed.calls.count == 1,
+              observed.calls[0].tool == "paper_review_query",
+              observed.unexpectedRequests.isEmpty else {
+            throw Failure.assertion("paper decision explanation used a legacy event/get/poll route or another tool")
+        }
+        try assertJSONEqual(observed.calls[0].arguments, [
+            "action": "decision",
+            "selection": [
+                "session_id": sessionID,
+                "event_sequence": 42,
+                "as_of_sequence": 57,
+                "signal_id": signalID
+            ]
+        ], field: "paper decision review fixed saved selection")
+        print("PASS paper decision review reads the selected saved event at a fixed cutoff through paper_review_query only")
     }
 
     private static func validateActualRustAutomationReviewWire(at url: URL) throws {
@@ -1120,11 +1513,20 @@ private enum AutomationProtocolRegression {
         _ = NSApplication.shared
         let previousTextScale = TerminalTheme.textScale
         defer { TerminalTheme.setTextScale(previousTextScale) }
+        try validateVisibleHistorySelectionAtOneX()
         TerminalTheme.setTextScale(2.0)
         let base = FileManager.default.temporaryDirectory
             .appendingPathComponent("sky-backcraft-dashboard-history-scale-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: base) }
         let store = try ConfigurationStore(supportDirectory: base.appendingPathComponent("support", isDirectory: true))
+        let persistedRunID = "MOCK-GUI-RUN-001"
+        try createDashboardHistoryDatabase(at: store, runId: persistedRunID)
+        let historyStore = HistoryWorkspaceStore(rootDirectory: store.supportDirectory)
+        try historyStore.saveHistoryState(HistoryPresentationState(
+            search: persistedRunID,
+            pinnedRunIds: [persistedRunID],
+            selectedRunIds: [persistedRunID]
+        ))
         let testNow = Date()
         let timestamp = ISO8601DateFormatter().string(from: testNow)
         let session = URLSession(configuration: .ephemeral)
@@ -1141,17 +1543,130 @@ private enum AutomationProtocolRegression {
         func descendants(of view: NSView) -> [NSView] {
             [view] + view.subviews.flatMap(descendants)
         }
-        func selectSidebarRow(_ row: Int) throws {
-            guard let sidebar = descendants(of: content).compactMap({ $0 as? NSTableView })
-                .first(where: { $0.numberOfRows == 7 }) else {
-                throw Failure.assertion("production Dashboard sidebar was not available offscreen")
+        guard let sidebar = descendants(of: content).compactMap({ $0 as? NSTableView })
+            .first(where: { $0.identifier?.rawValue == "DashboardNavigationTable" }) else {
+            throw Failure.assertion("production Dashboard navigation table was not available offscreen")
+        }
+        let expectedRoutes: Set<String> = [
+            "성과 분석", "실행 이력", "정책 카탈로그", "지속 모의 · 작업",
+            "전략 자동화", "실계좌 및 주문 조회", "정책 삭제"
+        ]
+        var routeRows: [String: Int] = [:]
+        var groupRows: [Int] = []
+        for row in 0..<sidebar.numberOfRows {
+            if dashboard.tableView(sidebar, isGroupRow: row) {
+                groupRows.append(row)
+                guard !dashboard.tableView(sidebar, shouldSelectRow: row) else {
+                    throw Failure.assertion("Dashboard navigation group rows must not be selectable")
+                }
+            } else if let cell = sidebar.view(atColumn: 0, row: row, makeIfNecessary: true) as? NSTableCellView,
+                      let title = cell.textField?.stringValue {
+                routeRows[title] = row
+                guard dashboard.tableView(sidebar, shouldSelectRow: row) else {
+                    throw Failure.assertion("Dashboard route leaf \(title) must be selectable")
+                }
+            }
+        }
+        guard groupRows.count == 4,
+              sidebar.numberOfRows == expectedRoutes.count + groupRows.count,
+              Set(routeRows.keys) == expectedRoutes else {
+            throw Failure.assertion("Dashboard navigation must expose four structural groups and all seven real destinations")
+        }
+        func selectSidebarRoute(named title: String) throws {
+            guard let row = routeRows[title] else {
+                throw Failure.assertion("Dashboard route \(title) was not reachable by its leaf label")
             }
             sidebar.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
             dashboard.tableViewSelectionDidChange(Notification(name: Notification.Name("test"), object: sidebar))
             content.layoutSubtreeIfNeeded()
+            guard let selected = sidebar.view(atColumn: 0, row: sidebar.selectedRow, makeIfNecessary: true) as? NSTableCellView,
+                  selected.textField?.stringValue == title else {
+                throw Failure.assertion("Dashboard did not preserve selected route \(title)")
+            }
         }
 
-        try selectSidebarRow(1)
+        func assertVisibleHistoryLayout(_ stage: String) throws {
+            content.layoutSubtreeIfNeeded()
+            let views = descendants(of: content)
+            guard window.isVisible else { throw Failure.assertion("\(stage): Dashboard window was not shown") }
+            guard let workspace = views.first(where: { $0.accessibilityIdentifier() == "DashboardRunHistoryWorkspace" }) else {
+                throw Failure.assertion("\(stage): History workspace container was not installed")
+            }
+            guard let workbench = views.compactMap({ $0 as? NSSplitView })
+                .first(where: { $0.identifier?.rawValue == "DashboardRunHistoryWorkbench" }) else {
+                throw Failure.assertion("\(stage): History workbench was not installed")
+            }
+            guard let tablePane = views.first(where: { $0.accessibilityIdentifier() == "DashboardRunHistoryTablePane" }),
+                  let inspectorPane = views.first(where: { $0.accessibilityIdentifier() == "DashboardRunHistoryInspectorPane" }) else {
+                throw Failure.assertion("\(stage): History split panes were not installed")
+            }
+            guard let tableScroll = views.compactMap({ $0 as? NSScrollView })
+                .first(where: { $0.identifier?.rawValue == "DashboardRunHistoryTableScroll" }) else {
+                throw Failure.assertion("\(stage): History table scroll view was not installed")
+            }
+            guard let table = views.compactMap({ $0 as? NSTableView }).first(where: { table in
+                table.tableColumns.contains(where: { $0.identifier.rawValue == "Date" })
+                    && table.tableColumns.contains(where: { $0.identifier.rawValue == "Markets" })
+            }) else { throw Failure.assertion("\(stage): History table was not installed") }
+            guard let search = views.compactMap({ $0 as? NSSearchField })
+                .first(where: { $0.accessibilityLabel() == "실행 이력 검색" }),
+                  let appliedFilters = views.compactMap({ $0 as? NSTextField })
+                    .first(where: { $0.accessibilityIdentifier() == "DashboardRunHistoryAppliedFiltersSummary" }),
+                  let clearFilters = views.compactMap({ $0 as? NSButton })
+                    .first(where: { $0.accessibilityLabel() == "실행 이력 필터 모두 지우기" }),
+                  let csv = views.compactMap({ $0 as? NSButton }).first(where: { $0.title == "검색 결과 CSV" }),
+                  let inspector = views.first(where: { $0.accessibilityIdentifier() == "DashboardRunHistorySelectionInspector" }),
+                  let identityRows = views.compactMap({ $0 as? NSStackView })
+                    .first(where: { $0.accessibilityIdentifier() == "DashboardRunHistoryIdentity" }),
+                  let runIdentityValue = descendants(of: identityRows).compactMap({ $0 as? NSTextField })
+                    .first(where: { $0.stringValue == persistedRunID }),
+                  let feedback = views.compactMap({ $0 as? NSTextField })
+                    .first(where: { $0.accessibilityLabel() == "실행 이력 보기 상태 및 피드백" }) else {
+                throw Failure.assertion("\(stage): A History search, filter, CSV, inspector, or feedback control was not installed")
+            }
+            func hasVisibleRect(_ view: NSView) -> Bool {
+                view.visibleRect.width > 0 && view.visibleRect.height > 0
+            }
+            workbench.layoutSubtreeIfNeeded()
+            guard workspace.window === window,
+                  !workspace.isHidden,
+                  hasVisibleRect(workspace), hasVisibleRect(workbench),
+                  workbench.arrangedSubviews.count == 2,
+                  workbench.isVertical,
+                  workbench.frame.width > 600, workbench.frame.height > 200,
+                  tablePane.frame.width > 400, tablePane.frame.height > 100,
+                  inspectorPane.frame.width > 200, inspectorPane.frame.height > 100,
+                  tableScroll.frame.width > 400, tableScroll.frame.height > 80,
+                  hasVisibleRect(tablePane), hasVisibleRect(inspectorPane), hasVisibleRect(tableScroll),
+                  table.window === window,
+                  hasVisibleRect(table), hasVisibleRect(search), hasVisibleRect(appliedFilters),
+                  hasVisibleRect(clearFilters), hasVisibleRect(csv), hasVisibleRect(inspector),
+                  hasVisibleRect(identityRows), hasVisibleRect(runIdentityValue), hasVisibleRect(feedback),
+                  table.numberOfRows == 1, table.selectedRow >= 0,
+                  identityRows.arrangedSubviews.count == 8,
+                  identityRows.arrangedSubviews.first.map({ ($0 as? NSStackView)?.orientation == .vertical }) == true,
+                  search.stringValue == persistedRunID,
+                  appliedFilters.stringValue.contains("검색 \(persistedRunID)"),
+                  clearFilters.isEnabled,
+                  csv.window === window, inspector.window === window, feedback.window === window,
+                  feedback.stringValue.contains("필터·고정·선택은 이 기기에 저장됩니다.") else {
+                throw Failure.assertion("\(stage): History panes collapsed or restored selection state was lost")
+            }
+            let restored = try historyStore.loadHistoryState()
+            guard restored?.selectedRunIds == [persistedRunID], restored?.pinnedRunIds == [persistedRunID] else {
+                throw Failure.assertion("\(stage): History replaced the persisted selection or pinned ID")
+            }
+        }
+
+        try selectSidebarRoute(named: "전략 자동화")
+        guard descendants(of: content).contains(where: { $0 is AutomationWorkspaceView }) else {
+            throw Failure.assertion("selecting the automation route did not mount its existing workspace")
+        }
+        window.setContentSize(NSSize(width: 1200, height: 800))
+        window.makeKeyAndOrderFront(nil)
+        content.layoutSubtreeIfNeeded()
+        try selectSidebarRoute(named: "실행 이력")
+        try assertVisibleHistoryLayout("initial selection")
         guard let historyTable = descendants(of: content).compactMap({ $0 as? NSTableView }).first(where: { table in
             table.tableColumns.contains(where: { $0.identifier.rawValue == "Date" })
                 && table.tableColumns.contains(where: { $0.identifier.rawValue == "Markets" })
@@ -1165,9 +1680,34 @@ private enum AutomationProtocolRegression {
             throw Failure.assertion("Dashboard history columns and row height did not scale with 2x text")
         }
 
-        try selectSidebarRow(5)
+        try selectSidebarRoute(named: "정책 카탈로그")
+        window.setContentSize(NSSize(width: 1320, height: 840))
+        try selectSidebarRoute(named: "실행 이력")
+        try assertVisibleHistoryLayout("reselection after resize")
+
+        try selectSidebarRoute(named: "실계좌 및 주문 조회")
         func labels() -> [String] { descendants(of: content).compactMap { ($0 as? NSTextField)?.stringValue } }
+        guard let contextHost = descendants(of: content).first(where: {
+            $0.identifier?.rawValue == "DashboardGlobalContextStrip"
+        }), let contextContainer = contextHost.superview,
+        let realtimeDisclosure = descendants(of: content).compactMap({ $0 as? NSButton })
+            .first(where: { $0.accessibilityLabel() == "실시간 피드 상세 상태" }) else {
+            throw Failure.assertion("Dashboard context host or downstream realtime disclosure was not mounted")
+        }
+        func hasContextDisclosureAnchor() -> Bool {
+            contextContainer.constraints.contains { constraint in
+                (constraint.firstItem as? NSView) === realtimeDisclosure
+                    && (constraint.secondItem as? NSView) === contextHost
+                    && constraint.firstAttribute == .top
+                    && constraint.secondAttribute == .bottom
+            }
+        }
+        guard hasContextDisclosureAnchor() else {
+            throw Failure.assertion("Dashboard realtime disclosure was not anchored below the mounted context host")
+        }
         let unknownLabels = labels()
+        let initialLiveContext = descendants(of: contextHost).compactMap { $0 as? NSTextField }
+            .first(where: { $0.accessibilityLabel() == "실거래" })?.stringValue
         guard unknownLabels.contains("잔고·주문 조회: 상태 미확인"),
               unknownLabels.contains("실주문 자동매매 상태 미확인 · 주문 기능 사용 불가"),
               !unknownLabels.contains(where: { $0.contains("실주문 자동매매: 꺼짐") }) else {
@@ -1186,6 +1726,20 @@ private enum AutomationProtocolRegression {
             receipt: nil
         )
         dashboard.updateControlSnapshot(disabled)
+        content.layoutSubtreeIfNeeded()
+        let updatedContextHost = descendants(of: content).first(where: {
+            $0.identifier?.rawValue == "DashboardGlobalContextStrip"
+        })
+        let updatedLiveContext = updatedContextHost.map { host in
+            descendants(of: host).compactMap { $0 as? NSTextField }
+                .first(where: { $0.accessibilityLabel() == "실거래" })?.stringValue
+        } ?? nil
+        guard updatedContextHost === contextHost,
+              updatedLiveContext != initialLiveContext,
+              updatedLiveContext?.contains("실주문 자동매매: 꺼짐") == true,
+              hasContextDisclosureAnchor() else {
+            throw Failure.assertion("Dashboard context update replaced the host or detached the realtime disclosure constraint")
+        }
         let disabledLabels = labels()
         guard disabledLabels.contains("잔고·주문 조회: 상태 미확인"),
               disabledLabels.contains("실주문 자동매매: 꺼짐 — 실제 주문 전송 안 함") else {
@@ -1211,7 +1765,145 @@ private enum AutomationProtocolRegression {
         }
 
         window.close()
-        print("PASS Dashboard 2x history widths and separate UNKNOWN/OFF/enabled status labels")
+        print("PASS visible History workbench at 1200x800 and after resize/reselection, saved selection preserved, plus separate UNKNOWN/OFF/enabled status labels")
+    }
+
+    private static func validateVisibleHistorySelectionAtOneX() throws {
+        TerminalTheme.setTextScale(1.0)
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent("sky-backcraft-dashboard-history-1x-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let store = try ConfigurationStore(supportDirectory: base.appendingPathComponent("support", isDirectory: true))
+        let persistedRunID = "MOCK-GUI-RUN-001"
+        try createDashboardHistoryDatabase(at: store, runId: persistedRunID)
+        let historyStore = HistoryWorkspaceStore(rootDirectory: store.supportDirectory)
+        try historyStore.saveHistoryState(HistoryPresentationState(
+            search: persistedRunID,
+            pinnedRunIds: [persistedRunID],
+            selectedRunIds: [persistedRunID]
+        ))
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let dashboard = DashboardWindowController(
+            store: store,
+            liveService: UpbitLiveService(client: NativeMCPClient(session: session))
+        )
+        guard let window = dashboard.window, let content = window.contentView else {
+            throw Failure.assertion("1x production Dashboard did not create its window")
+        }
+        func descendants(of view: NSView) -> [NSView] {
+            [view] + view.subviews.flatMap(descendants)
+        }
+        guard let sidebar = descendants(of: content).compactMap({ $0 as? NSTableView })
+            .first(where: { $0.identifier?.rawValue == "DashboardNavigationTable" }) else {
+            throw Failure.assertion("1x Dashboard navigation table was not installed")
+        }
+        window.setContentSize(NSSize(width: 1200, height: 800))
+        window.makeKeyAndOrderFront(nil)
+        content.layoutSubtreeIfNeeded()
+        guard let historyRow = (0..<sidebar.numberOfRows).first(where: { row in
+            (sidebar.view(atColumn: 0, row: row, makeIfNecessary: true) as? NSTableCellView)?.textField?.stringValue == "실행 이력"
+        }) else {
+            throw Failure.assertion("1x History destination was not present in the real sidebar")
+        }
+        sidebar.selectRowIndexes(IndexSet(integer: historyRow), byExtendingSelection: false)
+        dashboard.tableViewSelectionDidChange(Notification(name: Notification.Name("test-history-route"), object: sidebar))
+        content.layoutSubtreeIfNeeded()
+        let views = descendants(of: content)
+        guard let workspace = views.first(where: { $0.accessibilityIdentifier() == "DashboardRunHistoryWorkspace" }),
+              let workbench = views.compactMap({ $0 as? NSSplitView })
+                .first(where: { $0.identifier?.rawValue == "DashboardRunHistoryWorkbench" }),
+              let historyTable = views.compactMap({ $0 as? NSTableView }).first(where: { table in
+                  table.tableColumns.contains(where: { $0.identifier.rawValue == "Date" })
+                      && table.tableColumns.contains(where: { $0.identifier.rawValue == "Markets" })
+              }),
+              let search = views.compactMap({ $0 as? NSSearchField })
+                .first(where: { $0.accessibilityLabel() == "실행 이력 검색" }),
+              let appliedFilters = views.compactMap({ $0 as? NSTextField })
+                .first(where: { $0.accessibilityIdentifier() == "DashboardRunHistoryAppliedFiltersSummary" }),
+              let clearFilters = views.compactMap({ $0 as? NSButton })
+                .first(where: { $0.accessibilityLabel() == "실행 이력 필터 모두 지우기" }),
+              let inspector = views.first(where: { $0.accessibilityIdentifier() == "DashboardRunHistorySelectionInspector" }),
+              let identityRows = views.compactMap({ $0 as? NSStackView })
+                .first(where: { $0.accessibilityIdentifier() == "DashboardRunHistoryIdentity" }),
+              let runIdentityValue = descendants(of: identityRows).compactMap({ $0 as? NSTextField })
+                .first(where: { $0.stringValue == persistedRunID }),
+              let csv = views.compactMap({ $0 as? NSButton }).first(where: { $0.title == "검색 결과 CSV" }),
+              workspace.window === window, !workspace.isHidden,
+              workspace.visibleRect.width > 0, workspace.visibleRect.height > 0,
+              workbench.visibleRect.width > 0, workbench.visibleRect.height > 0,
+              workbench.arrangedSubviews.count == 2, workbench.isVertical,
+              workbench.frame.width > 600, workbench.frame.height > 200,
+              historyTable.window === window, historyTable.numberOfRows == 1, historyTable.selectedRow >= 0,
+              historyTable.visibleRect.width > 0, historyTable.visibleRect.height > 0,
+              search.stringValue == persistedRunID,
+              search.visibleRect.width > 0, search.visibleRect.height > 0,
+              appliedFilters.stringValue.contains("검색 \(persistedRunID)"),
+              appliedFilters.visibleRect.width > 0, appliedFilters.visibleRect.height > 0,
+              clearFilters.isEnabled, clearFilters.visibleRect.width > 0, clearFilters.visibleRect.height > 0,
+              identityRows.arrangedSubviews.count == 8,
+              identityRows.arrangedSubviews.first.map({ $0.frame.width > 0 && $0.frame.height > 0 }) == true,
+              identityRows.visibleRect.width > 0, identityRows.visibleRect.height > 0,
+              runIdentityValue.visibleRect.width > 0, runIdentityValue.visibleRect.height > 0,
+              inspector.window === window, inspector.visibleRect.width > 0, inspector.visibleRect.height > 0,
+              csv.window === window, csv.visibleRect.width > 0, csv.visibleRect.height > 0 else {
+            throw Failure.assertion("1x sidebar navigation failed to install visible History controls and the restored run identity")
+        }
+        let restored = try historyStore.loadHistoryState()
+        guard restored?.selectedRunIds == [persistedRunID], restored?.pinnedRunIds == [persistedRunID] else {
+            throw Failure.assertion("1x History route changed the persisted selected or pinned run ID")
+        }
+        window.close()
+        print("PASS 1x visible History body and persisted selected-run identity after native sidebar navigation")
+    }
+
+    private static func createDashboardHistoryDatabase(at store: ConfigurationStore, runId: String) throws {
+        let research = store.dataDirectory(for: .none)
+        try FileManager.default.createDirectory(at: research, withIntermediateDirectories: true)
+        let databaseURL = research.appendingPathComponent("lab.sqlite")
+        var optionalDB: OpaquePointer?
+        let openResult = sqlite3_open_v2(
+            databaseURL.path, &optionalDB,
+            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, nil
+        )
+        guard openResult == SQLITE_OK, let db = optionalDB else {
+            throw Failure.assertion("Dashboard History SQLite fixture open returned \(openResult)")
+        }
+        defer { sqlite3_close(db) }
+        let planID = "MOCK-PLAN-001"
+        let policyID = "MOCK-POLICY-001"
+        let revisionID = "MOCK-REVISION-001"
+        let digest = String(repeating: "a", count: 64)
+        let manifest = #"{"created_at":"2025-01-02T03:04:05Z","code_revision":"mock-revision","engine_version":"mock-engine","mode":"BACKTEST"}"#
+        let plan = #"{"spec":{"dataset_ids":["MOCK-DATASET-001"],"markets":["BTC"],"range":{"start":"2025-01-01T00:00:00Z","end":"2025-01-03T00:00:00Z"},"policy_selections":[{"revision_id":"MOCK-REVISION-001"}],"capital_mode":"VIRTUAL","initial_cash":"10000","costs":{"assumption_label":"MOCK-COSTS"}}}"#
+        let sql = """
+        CREATE TABLE runs (id TEXT PRIMARY KEY, state TEXT NOT NULL, created_at_ms INTEGER NOT NULL, plan_id TEXT NOT NULL, ledger_state TEXT NOT NULL, manifest_json TEXT NOT NULL);
+        CREATE TABLE plans (id TEXT PRIMARY KEY, resolved_plan_json TEXT NOT NULL);
+        CREATE TABLE run_models (run_id TEXT NOT NULL, model_id TEXT NOT NULL, market TEXT NOT NULL, policy_id TEXT, policy_revision_id TEXT);
+        CREATE TABLE plan_datasets (plan_id TEXT NOT NULL, dataset_id TEXT NOT NULL);
+        CREATE TABLE policies (policy_id TEXT PRIMARY KEY, family TEXT NOT NULL, origin TEXT NOT NULL, name TEXT NOT NULL, head_revision_id TEXT NOT NULL, revision_count INTEGER NOT NULL);
+        CREATE TABLE policy_revisions (revision_id TEXT PRIMARY KEY, policy_id TEXT NOT NULL, revision_number INTEGER NOT NULL, name TEXT NOT NULL, definition_digest TEXT NOT NULL);
+        CREATE TABLE validation_results (run_id TEXT NOT NULL, check_id TEXT NOT NULL, status TEXT NOT NULL, report_json TEXT NOT NULL);
+        CREATE TABLE jobs (id TEXT NOT NULL, request_id TEXT NOT NULL, payload_kind TEXT NOT NULL, current_status TEXT NOT NULL, created_at_ms INTEGER NOT NULL);
+        CREATE TABLE collection_schedules (id TEXT NOT NULL, status TEXT NOT NULL, created_at_ms INTEGER NOT NULL, next_action_at_ms INTEGER, last_success_dataset_id TEXT, last_success_boundary_ms INTEGER, failure_json TEXT);
+        INSERT INTO plans (id, resolved_plan_json) VALUES ('\(planID)', '\(plan)');
+        INSERT INTO runs (id, state, created_at_ms, plan_id, ledger_state, manifest_json)
+          VALUES ('\(runId)', 'COMPLETED', 1735796405000, '\(planID)', 'CANONICAL', '\(manifest)');
+        INSERT INTO run_models (run_id, model_id, market, policy_id, policy_revision_id)
+          VALUES ('\(runId)', 'MOCK-MODEL-001', 'BTC', '\(policyID)', '\(revisionID)');
+        INSERT INTO plan_datasets (plan_id, dataset_id) VALUES ('\(planID)', 'MOCK-DATASET-001');
+        INSERT INTO policies (policy_id, family, origin, name, head_revision_id, revision_count)
+          VALUES ('\(policyID)', 'MOCK', 'USER', 'Mock policy', '\(revisionID)', 1);
+        INSERT INTO policy_revisions (revision_id, policy_id, revision_number, name, definition_digest)
+          VALUES ('\(revisionID)', '\(policyID)', 1, 'Mock revision', '\(digest)');
+        """
+        var errorPointer: UnsafeMutablePointer<CChar>?
+        let result = sqlite3_exec(db, sql, nil, nil, &errorPointer)
+        guard result == SQLITE_OK else {
+            let detail = errorPointer.map { String(cString: $0) } ?? String(cString: sqlite3_errmsg(db))
+            if let errorPointer { sqlite3_free(errorPointer) }
+            throw Failure.assertion("Dashboard History SQLite fixture failed: \(detail)")
+        }
     }
 
     private static func validateExplicitPaperFeedGapRecoveryResume() throws {
@@ -1354,6 +2046,183 @@ private enum AutomationProtocolRegression {
             throw Failure.assertion("Resume was resent while its prior write outcome remained unknown")
         }
         print("PASS paper FEED_GAP explicit Resume, unknown-cause fence, and ordinary PAUSED Resume")
+    }
+
+    private static func validateStrategyChartReadPacing() throws {
+        let spacing = StrategyChartReadPacing.minimumInterval
+        var currentTime: TimeInterval = 100
+        var lastStartedAt: TimeInterval?
+        var starts: [TimeInterval] = []
+
+        for _ in 0..<12 {
+            currentTime += StrategyChartReadPacing.delay(lastStartedAt: lastStartedAt, now: currentTime)
+            let earlyWakeDelay = StrategyChartReadPacing.delay(lastStartedAt: lastStartedAt, now: currentTime)
+            guard earlyWakeDelay <= 0.000_001 else {
+                throw Failure.assertion("chart read pacing did not become ready at its monotonic deadline")
+            }
+            starts.append(currentTime)
+            lastStartedAt = currentTime
+            currentTime += 0.005 // Simulate a fast response to expose queue-drain bursts.
+        }
+
+        for (earlier, later) in zip(starts, starts.dropFirst()) {
+            guard later - earlier >= spacing - 0.000_001 else {
+                throw Failure.assertion("compacted chart calls started less than 200 ms apart")
+            }
+        }
+
+        let postsPerChartRead = StrategyChartReadPacing.httpPostsPerChartRead
+        let worstOneSecondPostCount = starts.map { windowEnd in
+            starts.filter { $0 > windowEnd - 1 && $0 <= windowEnd }.count * postsPerChartRead
+        }.max() ?? 0
+        guard worstOneSecondPostCount <= 12, worstOneSecondPostCount < 20 else {
+            throw Failure.assertion("compacted chart reads can consume the backend's 20 POST/s budget")
+        }
+
+        let firstPendingDelay = StrategyChartReadPacing.delay(lastStartedAt: 200, now: 200.05)
+        let pendingDelayAfterCancellation = StrategyChartReadPacing.delay(lastStartedAt: 200, now: 200.10)
+        guard abs(firstPendingDelay - 0.15) <= 0.000_001,
+              abs(pendingDelayAfterCancellation - 0.10) <= 0.000_001 else {
+            throw Failure.assertion("cancelled chart start wait consumed a pacing slot or changed queue order")
+        }
+        print("PASS strategy chart read pacing: 12 fast cards, two POSTs per call, cancellable wait and ordered start budget")
+    }
+
+    private static func validateStrategyBatchRecordAssembly() throws {
+        let policyId = "policy-target"
+        let revisionId = "policy-revision-target"
+        let runs = [
+            makeStrategyRun("run-z"),
+            makeStrategyRun("run-a"),
+            makeStrategyRun("run-empty"),
+            makeStrategyRun("run-filtered")
+        ]
+        // Batch DatabaseReader rows arrive ordered by run ID, then market/model.
+        let comparisons = [
+            makeStrategyComparison("run-a", "model-a-btc", "KRW-BTC", policyId, revisionId),
+            makeStrategyComparison("run-a", "model-a-eth", "KRW-ETH", policyId, revisionId),
+            makeStrategyComparison("run-a", "model-a-old-revision", "KRW-XRP", policyId, "policy-revision-old"),
+            makeStrategyComparison("run-filtered", "model-wrong-policy", "KRW-BTC", "policy-other", revisionId),
+            makeStrategyComparison("run-z", "model-z-btc", "KRW-BTC", policyId, revisionId),
+            makeStrategyComparison("run-z", "model-z-eth", "KRW-ETH", policyId, revisionId)
+        ]
+
+        let assembled = StrategyPerformanceView.assembleCardRecords(
+            runs: runs,
+            comparisons: comparisons,
+            policyId: policyId,
+            policyRevisionScopeId: revisionId
+        )
+        guard assembled.records.map({ $0.run.id }) == ["run-z", "run-z", "run-a", "run-a"],
+              assembled.records.map({ $0.model.modelId }) == [
+                "model-z-btc", "model-z-eth", "model-a-btc", "model-a-eth"
+              ],
+              assembled.unavailableRuns.map(\.id) == ["run-empty", "run-filtered"] else {
+            throw Failure.assertion("batched strategy comparisons changed run order, per-run order, scope filters, or unavailable runs")
+        }
+        print("PASS strategy batch assembly: history order, per-run order, exact policy/revision filter, unavailable runs")
+    }
+
+    private static func validateStrategyRefreshFailureRetainsCachedPage() throws {
+        let retainedPage = StrategyPerformanceView.pagerPresentation(
+            currentPageIndex: 2,
+            pageCount: 5,
+            resultCount: 49
+        )
+        guard retainedPage.pageIndex == 2,
+              retainedPage.label == "3 / 5 · 총 49개",
+              retainedPage.previousEnabled,
+              retainedPage.nextEnabled else {
+            throw Failure.assertion("same-policy refresh failure moved cached page three or disabled its pager controls")
+        }
+
+        let pageSelectedWhileRefreshing = StrategyPerformanceView.pagerPresentation(
+            currentPageIndex: 3,
+            pageCount: 5,
+            resultCount: 49
+        )
+        guard pageSelectedWhileRefreshing.pageIndex == 3,
+              pageSelectedWhileRefreshing.label == "4 / 5 · 총 49개",
+              pageSelectedWhileRefreshing.previousEnabled,
+              pageSelectedWhileRefreshing.nextEnabled else {
+            throw Failure.assertion("refresh completion did not preserve the page selected while the request was in flight")
+        }
+        print("PASS strategy refresh failure pager: cached non-first page and in-flight user page changes remain coherent")
+    }
+
+    private static func validateLedgerMCPReaderCancellationOwnership() throws {
+        let reader = LedgerMCPReader(client: NativeMCPClient())
+        var returned = false
+        var callbackWasSynchronous = false
+        var callbackCount = 0
+        var succeeded = false
+        let request = reader.marks(runId: "run-unconfigured", modelId: "model-unconfigured", expectedCount: 0) { result in
+            callbackCount += 1
+            callbackWasSynchronous = !returned
+            if case .success = result { succeeded = true }
+        }
+        returned = true
+        guard callbackWasSynchronous, callbackCount == 1, !succeeded, !request.isPending else {
+            throw Failure.assertion("synchronous ledger read failure lost callback or returned a pending request")
+        }
+        print("PASS ledger chart read cancellation ownership: synchronous failure completes returned request once")
+    }
+
+    private static func makeStrategyRun(_ id: String) -> RealRun {
+        RealRun(
+            id: id,
+            state: "COMPLETED",
+            createdDateStr: "2026-10-21 00:00:00",
+            createdAtMilliseconds: 1,
+            createdAtUTC: nil,
+            planId: "plan-\(id)",
+            ledgerState: "CANONICAL",
+            mode: "BACKTEST",
+            engineVersion: nil,
+            codeRevision: nil,
+            datasetIds: nil,
+            policyRevisionIds: nil,
+            markets: ["KRW-BTC"],
+            windowStartUTC: nil,
+            windowEndUTC: nil,
+            capitalMode: nil,
+            initialCashDecimal: nil,
+            costAssumptionLabel: nil,
+            terminalPolicy: nil,
+            f08Status: nil,
+            f08CheckedFills: nil,
+            f08CheckedMarks: nil,
+            f08FindingsCount: nil
+        )
+    }
+
+    private static func makeStrategyComparison(
+        _ runId: String,
+        _ modelId: String,
+        _ market: String,
+        _ policyId: String?,
+        _ policyRevisionId: String?
+    ) -> RealModelComparison {
+        RealModelComparison(
+            runId: runId,
+            modelId: modelId,
+            market: market,
+            status: "COMPLETED",
+            policyId: policyId,
+            policyRevisionId: policyRevisionId,
+            initialEquityDecimal: Decimal(100),
+            finalEquityDecimal: Decimal(110),
+            netPnlDecimal: Decimal(10),
+            netReturnDecimal: Decimal(string: "0.1"),
+            maxDrawdownDecimal: Decimal.zero,
+            turnoverDecimal: Decimal.zero,
+            cumulativeFeesDecimal: Decimal.zero,
+            fillCount: 0,
+            accountMarkCount: 1,
+            episodeCount: 0,
+            closedEpisodes: 0,
+            f08Status: nil
+        )
     }
 #endif
 
@@ -3814,6 +4683,582 @@ private enum AutomationProtocolRegression {
                 throw Failure.assertion("malformed paper event failed at an unexpected coding path")
             }
         }
+    }
+
+    private static func validatePaperReadOnlyReviewEvents() throws {
+        let sessionID = "paper-review-fixture"
+        let policyReference: [String: Any] = [
+            "policy_id": "paper-policy-fixture",
+            "revision_id": "paper-revision-fixture",
+            "definition_digest": String(repeating: "a", count: 64)
+        ]
+        let configuration: [String: Any] = [
+            "request_id": "paper-request-fixture",
+            "policy_ref": policyReference,
+            "decision_interval": "M1",
+            "execution_resolution": "M1",
+            "latency_ms": 150,
+            "execution": [
+                "kind": "MARKET",
+                "participation_cap": "0.1000",
+                "offset_bps": NSNull(),
+                "ttl_bars": NSNull()
+            ],
+            "markets": [[
+                "market": "KRW-BTC",
+                "initial_cash": "100000.0000",
+                "costs": [
+                    "buy_fee_bps": "0.0000",
+                    "sell_fee_bps": "0.0000",
+                    "maker_fee_bps": "0.0000",
+                    "half_spread_bps": "0.0000",
+                    "slippage_bps": "0.0000",
+                    "impact_bps": "0.0000",
+                    "assumption_label": "fixture",
+                    "dynamic": NSNull()
+                ],
+                "market_rules": [
+                    "kind": "SYNTHETIC",
+                    "min_notional": "5000.0000",
+                    "quantity_step": "0.00000001",
+                    "ticks": [["lower_bound": "0", "tick": "0.0001"]],
+                    "assumption_label": "fixture"
+                ]
+            ]]
+        ]
+
+        func event(_ sequence: UInt64) -> [String: Any] {
+            let event: [String: Any] = [
+                "sequence": sequence,
+                "kind": "CANDLE_PROCESSED",
+                "market": "KRW-BTC",
+                "candle": NSNull(),
+                "source_event_at": NSNull(),
+                "finalized_at": NSNull(),
+                "control": NSNull(),
+                "provider_recovery": NSNull(),
+                "signals": [[
+                    "signal_id": "paper-signal-fixture",
+                    "strategy": "fixture",
+                    "intended_side": NSNull(),
+                    "state_before": "CASH",
+                    "state_after": "CASH",
+                    "raw_target_weight": "0.0000",
+                    "constrained_target_weight": "0.0000",
+                    "reasons": [],
+                    "outcome": "HOLD",
+                    "trace": [
+                        "matched_rule_id": NSNull(),
+                        "state_before": [],
+                        "state_after": [],
+                        "evidence": NSNull(),
+                        "future_optional_trace_field": "additive"
+                    ]
+                ]],
+                "orders": [],
+                "order_events": [],
+                "fills": [],
+                "account_marks": [],
+                "episodes": []
+            ]
+            return event
+        }
+
+        func response(
+            sessionID: String = sessionID,
+            asOfSequence: UInt64,
+            afterSequence: UInt64,
+            eventSequences: [UInt64],
+            totalCount: UInt64,
+            nextCursor: UInt64?,
+            returnedCount: UInt64? = nil,
+            configuration: [String: Any] = configuration
+        ) -> [String: Any] {
+            let items = eventSequences.map(event)
+            let cursor: Any = nextCursor.map { ["sequence": $0] as [String: Any] } ?? NSNull()
+            return [
+                "schema_version": "1.0",
+                "mode": "SIMULATED",
+                "configuration": configuration,
+                "as_of_sequence": asOfSequence,
+                "after_sequence": afterSequence,
+                "page": [
+                    "session_id": sessionID,
+                    "items": items,
+                    "returned_count": returnedCount ?? UInt64(items.count),
+                    "total_count": totalCount,
+                    "next_cursor": cursor
+                ]
+            ]
+        }
+
+        let validFirstPage = response(
+            asOfSequence: 2,
+            afterSequence: 0,
+            eventSequences: [1],
+            totalCount: 2,
+            nextCursor: 1
+        )
+        let validSecondPage = response(
+            asOfSequence: 2,
+            afterSequence: 1,
+            eventSequences: [2],
+            totalCount: 2,
+            nextCursor: nil
+        )
+        let mismatchedSessionPage = response(
+            sessionID: "paper-other-session",
+            asOfSequence: 2,
+            afterSequence: 0,
+            eventSequences: [1],
+            totalCount: 2,
+            nextCursor: 1
+        )
+        let mismatchedCutoffPage = response(
+            asOfSequence: 3,
+            afterSequence: 0,
+            eventSequences: [1],
+            totalCount: 3,
+            nextCursor: 1
+        )
+        let mismatchedCursorPage = response(
+            asOfSequence: 2,
+            afterSequence: 0,
+            eventSequences: [1],
+            totalCount: 2,
+            nextCursor: 2
+        )
+        let mismatchedCountPage = response(
+            asOfSequence: 2,
+            afterSequence: 0,
+            eventSequences: [1],
+            totalCount: 1,
+            nextCursor: 1
+        )
+        let mismatchedReturnedCountPage = response(
+            asOfSequence: 2,
+            afterSequence: 0,
+            eventSequences: [1],
+            totalCount: 2,
+            nextCursor: 1,
+            returnedCount: 0
+        )
+        var invalidPolicyConfiguration = configuration
+        invalidPolicyConfiguration["policy_ref"] = [
+            "policy_id": "paper-policy-fixture",
+            "revision_id": "paper-revision-fixture",
+            "definition_digest": "not-a-content-hash"
+        ]
+        let invalidPolicyPage = response(
+            asOfSequence: 2,
+            afterSequence: 0,
+            eventSequences: [1],
+            totalCount: 2,
+            nextCursor: 1,
+            configuration: invalidPolicyConfiguration
+        )
+        let retrySuccessPage = response(
+            asOfSequence: 5,
+            afterSequence: 0,
+            eventSequences: [1, 2, 3],
+            totalCount: 5,
+            nextCursor: 3
+        )
+        let retryContinuationPage = response(
+            asOfSequence: 5,
+            afterSequence: 3,
+            eventSequences: [4, 5],
+            totalCount: 5,
+            nextCursor: nil
+        )
+        let byteBudgetError: [String: Any] = [
+            "isError": true,
+            "content": [[
+                "type": "text",
+                "text": "RESOURCE_LIMIT: paper event page exceeds byte budget; request a smaller limit"
+            ]]
+        ]
+        let authorizationError: [String: Any] = [
+            "isError": true,
+            "content": [["type": "text", "text": "UNAUTHORIZED: review is unavailable"]]
+        ]
+        let payloads: [[String: Any]] = [
+            validFirstPage,
+            validSecondPage,
+            mismatchedSessionPage,
+            mismatchedCutoffPage,
+            mismatchedCursorPage,
+            mismatchedCountPage,
+            mismatchedReturnedCountPage,
+            invalidPolicyPage,
+            byteBudgetError,
+            byteBudgetError,
+            byteBudgetError,
+            byteBudgetError,
+            retrySuccessPage,
+            authorizationError,
+            byteBudgetError,
+            byteBudgetError,
+            byteBudgetError,
+            byteBudgetError,
+            byteBudgetError,
+            retryContinuationPage
+        ] + Array(repeating: byteBudgetError, count: 7)
+
+        let recorder = PolicyDeletionTestRecorder()
+        var responseIndex = 0
+        PaperWriteRecoveryURLProtocol.install { request in
+            guard let body = PaperWriteRecoveryURLProtocol.requestBody(request),
+                  let envelope = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+                  let messageID = envelope["id"],
+                  let method = envelope["method"] as? String else {
+                recorder.recordUnexpected("invalid JSON-RPC request")
+                return nil
+            }
+
+            let result: [String: Any]
+            if method == "initialize" {
+                result = ["protocolVersion": "2025-03-26"]
+            } else if method == "tools/call",
+                      let params = envelope["params"] as? [String: Any],
+                      let tool = params["name"] as? String,
+                      let arguments = params["arguments"] as? [String: Any] {
+                recorder.record(tool: tool, arguments: arguments)
+                guard tool == "paper_session_query",
+                      arguments["action"] as? String == "review_events",
+                      responseIndex < payloads.count else {
+                    recorder.recordUnexpected("\(tool):\(arguments["action"] as? String ?? "missing-action")")
+                    result = ["isError": true, "content": []]
+                    return Self.paperReviewJSONRPCResponse(id: messageID, result: result)
+                }
+                let payload = payloads[responseIndex]
+                responseIndex += 1
+                if payload["isError"] as? Bool == true {
+                    result = payload
+                    return Self.paperReviewJSONRPCResponse(id: messageID, result: result)
+                }
+                guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
+                      let text = String(data: data, encoding: .utf8) else {
+                    recorder.recordUnexpected("review fixture JSON encoding failed")
+                    result = ["isError": true, "content": []]
+                    return Self.paperReviewJSONRPCResponse(id: messageID, result: result)
+                }
+                result = ["isError": false, "content": [["type": "text", "text": text]]]
+            } else {
+                recorder.recordUnexpected("unexpected JSON-RPC method: \(method)")
+                result = ["isError": true, "content": []]
+            }
+            return Self.paperReviewJSONRPCResponse(id: messageID, result: result)
+        }
+        defer { PaperWriteRecoveryURLProtocol.clear() }
+
+        let urlConfiguration = URLSessionConfiguration.ephemeral
+        urlConfiguration.protocolClasses = [PaperWriteRecoveryURLProtocol.self]
+        let urlSession = URLSession(configuration: urlConfiguration)
+        defer { urlSession.invalidateAndCancel() }
+        let client = NativeMCPClient(session: urlSession)
+        guard client.configure(port: 65_432, token: String(repeating: "c", count: 64)) != nil else {
+            throw Failure.assertion("paper review mocked transport did not configure")
+        }
+        let service = PaperSessionMCPService(client: client)
+
+        func query(
+            sessionId: String = sessionID,
+            asOfSequence: UInt64 = 2,
+            afterSequence: UInt64? = nil,
+            limit: Int = 1
+        ) throws -> Result<PaperSessionReviewResponse, Error> {
+            var outcome: Result<PaperSessionReviewResponse, Error>?
+            _ = service.reviewEvents(
+                sessionId: sessionId,
+                asOfSequence: asOfSequence,
+                afterSequence: afterSequence,
+                limit: limit
+            ) { outcome = $0 }
+            let deadline = Date().addingTimeInterval(5)
+            while outcome == nil, Date() < deadline {
+                _ = RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
+            }
+            guard let outcome else {
+                throw Failure.assertion("paper review query did not finish its bounded mocked read")
+            }
+            return outcome
+        }
+
+        let first = try query().get()
+        guard first.schema_version == "1.0",
+              first.mode == .simulated,
+              first.as_of_sequence == 2,
+              first.after_sequence == 0,
+              first.page.session_id == sessionID,
+              first.page.next_cursor?.sequence == 1,
+              first.configuration.policy_ref.definition_digest == policyReference["definition_digest"] as? String,
+              first.configuration.markets.first?.initialCash == "100000.0000",
+              first.page.items.first?.signals.first?.outcome == "HOLD" else {
+            throw Failure.assertion("paper review did not preserve fixed identity, exact configuration amounts and old signal DTO fields")
+        }
+
+        let second = try query(
+            asOfSequence: first.as_of_sequence,
+            afterSequence: first.page.next_cursor?.sequence
+        ).get()
+        guard second.as_of_sequence == first.as_of_sequence,
+              second.after_sequence == 1,
+              second.page.items.map(\.sequence) == [2],
+              second.page.next_cursor == nil,
+              second.configuration == first.configuration else {
+            throw Failure.assertion("paper review continuation did not retain its fixed cutoff, keyset, or immutable configuration")
+        }
+
+        for label in [
+            "mismatched session identity",
+            "mismatched fixed cutoff",
+            "mismatched keyset cursor",
+            "mismatched prefix event count",
+            "mismatched returned event count",
+            "invalid frozen policy reference"
+        ] {
+            guard case .failure = try query(asOfSequence: 2) else {
+                throw Failure.assertion("paper review accepted \(label)")
+            }
+        }
+        let invalidQueries: [(String, String, UInt64?, UInt64, Int)] = [
+            ("invalid session ID", "../paper", nil, 2, 1),
+            ("zero page limit", sessionID, nil, 2, 0),
+            ("cursor beyond cutoff", sessionID, 3, 2, 1)
+        ]
+        for (label, invalidSessionID, invalidAfter, invalidCutoff, invalidLimit) in invalidQueries {
+            guard case .failure = try query(
+                sessionId: invalidSessionID,
+                asOfSequence: invalidCutoff,
+                afterSequence: invalidAfter,
+                limit: invalidLimit
+            ) else {
+                throw Failure.assertion("paper review accepted \(label)")
+            }
+        }
+
+        let retried = try query(asOfSequence: 5, limit: 50).get()
+        guard retried.as_of_sequence == 5,
+              retried.after_sequence == 0,
+              retried.page.items.map(\.sequence) == [1, 2, 3],
+              retried.page.returned_count == 3,
+              retried.page.total_count == 5,
+              retried.page.next_cursor?.sequence == 3 else {
+            throw Failure.assertion("reduced paper review page did not preserve fixed prefix, returned count, total, and cursor")
+        }
+        guard case .failure(let authorizationFailure as NativeMCPError) = try query(asOfSequence: 5, limit: 50),
+              case .toolRejected = authorizationFailure else {
+            throw Failure.assertion("paper review retried or reclassified a non-budget tool rejection")
+        }
+        guard case .failure(let singleEventFailure as NativeMCPError) = try query(asOfSequence: 5, limit: 1),
+              singleEventFailure.localizedDescription.contains("단일 이벤트") else {
+            throw Failure.assertion("single-event paper review budget failure was not surfaced explicitly")
+        }
+        let retriedContinuation = try query(asOfSequence: 5, afterSequence: 3, limit: 50).get()
+        guard retriedContinuation.page.session_id == sessionID,
+              retriedContinuation.as_of_sequence == 5,
+              retriedContinuation.after_sequence == 3,
+              retriedContinuation.page.items.map(\.sequence) == [4, 5],
+              retriedContinuation.page.items.allSatisfy({
+                  $0.signals.first?.signal_id == "paper-signal-fixture"
+              }),
+              retriedContinuation.page.returned_count == 2,
+              retriedContinuation.page.total_count == 5,
+              retriedContinuation.page.next_cursor == nil,
+              retriedContinuation.configuration == retried.configuration else {
+            throw Failure.assertion("reduced continuation changed its session, signal, cutoff, saved configuration, or cursor")
+        }
+        guard case .failure(let boundedFailure as NativeMCPError) = try query(asOfSequence: 5, limit: 100),
+              boundedFailure.localizedDescription.contains("단일 이벤트") else {
+            throw Failure.assertion("paper review did not stop after its finite minimum-size attempt")
+        }
+
+        let observed = recorder.snapshot()
+        guard observed.calls.count == payloads.count,
+              observed.calls.allSatisfy({
+                  $0.tool == "paper_session_query" && $0.arguments["action"] as? String == "review_events"
+              }),
+              observed.unexpectedRequests.isEmpty else {
+            throw Failure.assertion("passive paper review used a mutation, poll fallback, or unexpected MCP route")
+        }
+        try assertJSONEqual(observed.calls[0].arguments, [
+            "action": "review_events",
+            "session_id": sessionID,
+            "after_sequence": NSNull(),
+            "as_of_sequence": 2,
+            "limit": 1
+        ], field: "paper review first page")
+        try assertJSONEqual(observed.calls[1].arguments, [
+            "action": "review_events",
+            "session_id": sessionID,
+            "after_sequence": 1,
+            "as_of_sequence": 2,
+            "limit": 1
+        ], field: "paper review fixed-cutoff continuation")
+        guard observed.calls[8...12].map({ $0.arguments["limit"] as? Int ?? 0 }) == [50, 25, 12, 6, 3],
+              observed.calls[8...12].allSatisfy({
+                  $0.tool == "paper_session_query"
+                      && $0.arguments["action"] as? String == "review_events"
+                      && $0.arguments["session_id"] as? String == sessionID
+                      && ($0.arguments["after_sequence"] as? NSNull) != nil
+                      && $0.arguments["as_of_sequence"] as? Int == 5
+              }),
+              observed.calls[13].arguments["limit"] as? Int == 50,
+              observed.calls[14].arguments["limit"] as? Int == 1,
+              observed.calls[15...19].map({ $0.arguments["limit"] as? Int ?? 0 }) == [50, 25, 12, 6, 3],
+              observed.calls[15...19].allSatisfy({
+                  $0.tool == "paper_session_query"
+                      && $0.arguments["action"] as? String == "review_events"
+                      && $0.arguments["session_id"] as? String == sessionID
+                      && $0.arguments["after_sequence"] as? Int == 3
+                      && $0.arguments["as_of_sequence"] as? Int == 5
+              }),
+              observed.calls[20...26].map({ $0.arguments["limit"] as? Int ?? 0 }) == [100, 50, 25, 12, 6, 3, 1],
+              observed.calls[20...26].allSatisfy({
+                  $0.tool == "paper_session_query"
+                      && $0.arguments["action"] as? String == "review_events"
+                      && $0.arguments["session_id"] as? String == sessionID
+                      && ($0.arguments["after_sequence"] as? NSNull) != nil
+                      && $0.arguments["as_of_sequence"] as? Int == 5
+              }) else {
+            throw Failure.assertion("paper review byte-budget retries changed the request identity, cutoff, or bounded limits")
+        }
+        print("PASS passive paper review fixed-cutoff wire, keyset continuation, boundary validation and query-only route")
+    }
+
+    private static func validatePaperReviewRetryCancellationAndTransportFence() throws {
+        let sessionID = "paper-review-retry-fence"
+        let byteBudgetError: [String: Any] = [
+            "isError": true,
+            "content": [[
+                "type": "text",
+                "text": "RESOURCE_LIMIT: paper event page exceeds byte budget; request a smaller limit"
+            ]]
+        ]
+        let recorder = PolicyDeletionTestRecorder()
+        let requestObserved = DispatchSemaphore(value: 0)
+        var cancellationRequest: NativeMCPRequest?
+        let urlConfiguration = URLSessionConfiguration.ephemeral
+        urlConfiguration.protocolClasses = [PaperWriteRecoveryURLProtocol.self]
+        let urlSession = URLSession(configuration: urlConfiguration)
+        defer { urlSession.invalidateAndCancel() }
+        let client = NativeMCPClient(session: urlSession)
+        guard client.configure(port: 65_432, token: String(repeating: "d", count: 64)) != nil else {
+            throw Failure.assertion("paper review retry fence mocked transport did not configure")
+        }
+
+        PaperWriteRecoveryURLProtocol.install { request in
+            guard let body = PaperWriteRecoveryURLProtocol.requestBody(request),
+                  let envelope = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+                  let messageID = envelope["id"],
+                  let method = envelope["method"] as? String else {
+                recorder.recordUnexpected("invalid JSON-RPC request")
+                return nil
+            }
+            if method == "initialize" {
+                return Self.paperReviewJSONRPCResponse(
+                    id: messageID,
+                    result: ["protocolVersion": "2025-03-26"]
+                )
+            }
+            guard method == "tools/call",
+                  let params = envelope["params"] as? [String: Any],
+                  let tool = params["name"] as? String,
+                  let arguments = params["arguments"] as? [String: Any] else {
+                recorder.recordUnexpected("unexpected JSON-RPC method: \(method)")
+                return nil
+            }
+            recorder.record(tool: tool, arguments: arguments)
+            DispatchQueue.main.async { cancellationRequest?.cancel() }
+            requestObserved.signal()
+            return Self.paperReviewJSONRPCResponse(id: messageID, result: byteBudgetError)
+        }
+        defer { PaperWriteRecoveryURLProtocol.clear() }
+
+        let service = PaperSessionMCPService(client: client)
+        let request = service.reviewEvents(
+            sessionId: sessionID,
+            asOfSequence: 3,
+            afterSequence: nil,
+            limit: 50
+        ) { _ in }
+        cancellationRequest = request
+        guard requestObserved.wait(timeout: .now() + 5) == .success else {
+            throw Failure.assertion("paper review cancellation fixture did not observe its first bounded request")
+        }
+        let cancelDeadline = Date().addingTimeInterval(5)
+        while request.isPending, Date() < cancelDeadline {
+            _ = RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
+        }
+        guard !request.isPending, recorder.snapshot().calls.count == 1 else {
+            throw Failure.assertion("cancelled paper review continued into a reduced-page retry")
+        }
+
+        let transportRecorder = PolicyDeletionTestRecorder()
+        PaperWriteRecoveryURLProtocol.install { request in
+            guard let body = PaperWriteRecoveryURLProtocol.requestBody(request),
+                  let envelope = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+                  let messageID = envelope["id"],
+                  let method = envelope["method"] as? String else {
+                transportRecorder.recordUnexpected("invalid JSON-RPC request")
+                return nil
+            }
+            if method == "initialize" {
+                return Self.paperReviewJSONRPCResponse(
+                    id: messageID,
+                    result: ["protocolVersion": "2025-03-26"]
+                )
+            }
+            guard method == "tools/call",
+                  let params = envelope["params"] as? [String: Any],
+                  let tool = params["name"] as? String,
+                  let arguments = params["arguments"] as? [String: Any] else {
+                transportRecorder.recordUnexpected("unexpected JSON-RPC method: \(method)")
+                return nil
+            }
+            transportRecorder.record(tool: tool, arguments: arguments)
+            _ = client.configure(port: 65_433, token: String(repeating: "d", count: 64))
+            return Self.paperReviewJSONRPCResponse(id: messageID, result: byteBudgetError)
+        }
+        let transportOutcome = try awaitPaperReviewResult {
+            service.reviewEvents(
+                sessionId: sessionID,
+                asOfSequence: 3,
+                afterSequence: nil,
+                limit: 50,
+                completion: $0
+            )
+        }
+        guard case .failure(let transportFailure as NativeMCPError) = transportOutcome,
+              case .unavailable = transportFailure,
+              transportRecorder.snapshot().calls.count == 1 else {
+            throw Failure.assertion("paper review retried after its native transport context changed")
+        }
+        print("PASS paper review cancellation and transport-context retry fences")
+    }
+
+    private static func awaitPaperReviewResult(
+        _ start: (@escaping (Result<PaperSessionReviewResponse, Error>) -> Void) -> NativeMCPRequest
+    ) throws -> Result<PaperSessionReviewResponse, Error> {
+        var outcome: Result<PaperSessionReviewResponse, Error>?
+        _ = start { outcome = $0 }
+        let deadline = Date().addingTimeInterval(5)
+        while outcome == nil, Date() < deadline {
+            _ = RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
+        }
+        guard let outcome else {
+            throw Failure.assertion("paper review retry boundary query did not finish its bounded mocked read")
+        }
+        return outcome
+    }
+
+    private static func paperReviewJSONRPCResponse(id: Any, result: [String: Any]) -> Data? {
+        try? JSONSerialization.data(withJSONObject: [
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result
+        ])
     }
 
     private static func assertJSONEqual(_ actual: [String: Any], _ expected: [String: Any], field: String) throws {

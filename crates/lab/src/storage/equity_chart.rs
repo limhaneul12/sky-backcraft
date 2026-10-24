@@ -143,7 +143,8 @@ impl Store {
                 (line_count, sampler.finish())
             }
         } else {
-            let marks = load_detail_marks(self, run_id, model_id)?;
+            let expected_capacity = usize::try_from(expected_count).unwrap_or(0).min(100_000);
+            let marks = load_detail_marks(self, run_id, model_id, expected_capacity)?;
             let total_count = u64::try_from(marks.len())
                 .map_err(|_| LabError::ResourceLimit("account mark count exceeds u64".into()))?;
             if total_count != expected_count {
@@ -155,7 +156,7 @@ impl Store {
         };
         let sample_count = u64::try_from(records.len())
             .map_err(|_| LabError::ResourceLimit("equity sample count exceeds u64".into()))?;
-        let projection = EquityChartProjection {
+        let mut projection = EquityChartProjection {
             run_id: run_id.clone(),
             model_id: model_id.clone(),
             total_count,
@@ -163,7 +164,20 @@ impl Store {
             sample_count,
             records,
         };
-        let encoded = serde_json::to_vec(&projection).map_err(json_error)?;
+        let mut encoded = serde_json::to_vec(&projection).map_err(json_error)?;
+        while encoded.len() > MAX_SERIALIZED_PROJECTION_BYTES
+            && projection.records.len() > MIN_POINTS as usize
+        {
+            let current_len = projection.records.len();
+            let target_points =
+                current_len.saturating_mul(MAX_SERIALIZED_PROJECTION_BYTES) / encoded.len();
+            let next_cap = target_points.min(current_len - 1).max(MIN_POINTS as usize);
+            projection.records = sample_extrema(std::mem::take(&mut projection.records), next_cap);
+            projection.sample_count = u64::try_from(projection.records.len())
+                .map_err(|_| LabError::ResourceLimit("equity sample count exceeds u64".into()))?;
+            projection.sampled = projection.sample_count < projection.total_count;
+            encoded = serde_json::to_vec(&projection).map_err(json_error)?;
+        }
         if encoded.len() > MAX_SERIALIZED_PROJECTION_BYTES {
             return Err(LabError::ResourceLimit(format!(
                 "equity chart projection exceeds {MAX_SERIALIZED_PROJECTION_BYTES} bytes"
@@ -173,10 +187,20 @@ impl Store {
     }
 }
 
+fn column_text<'a>(row: &'a rusqlite::Row<'_>, index: usize) -> Result<&'a str, LabError> {
+    row.get_ref(index)
+        .map_err(sql_error)?
+        .as_str()
+        .map_err(|error| {
+            LabError::DataCorrupt(format!("account mark column {index} is not text: {error}"))
+        })
+}
+
 fn load_detail_marks(
     store: &Store,
     run_id: &RunId,
     model_id: &ModelId,
+    expected_capacity: usize,
 ) -> Result<Vec<AccountMark>, LabError> {
     let mut statement = store
         .connection
@@ -185,22 +209,17 @@ fn load_detail_marks(
              FROM account_marks WHERE run_id=?1 AND model_id=?2 ORDER BY event_seq",
         )
         .map_err(sql_error)?;
-    let rows = statement
-        .query_map(params![run_id.as_str(), model_id.as_str()], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-            ))
-        })
+    let mut rows = statement
+        .query(params![run_id.as_str(), model_id.as_str()])
         .map_err(sql_error)?;
-    let mut marks = Vec::new();
-    for row in rows {
-        let (indexed_run, indexed_model, indexed_seq, indexed_bar, json) =
-            row.map_err(sql_error)?;
-        let mark: AccountMark = serde_json::from_str(&json).map_err(|error| {
+    let mut marks = Vec::with_capacity(expected_capacity);
+    while let Some(row) = rows.next().map_err(sql_error)? {
+        let indexed_run = column_text(row, 0)?;
+        let indexed_model = column_text(row, 1)?;
+        let indexed_seq: i64 = row.get(2).map_err(sql_error)?;
+        let indexed_bar = column_text(row, 3)?;
+        let json = column_text(row, 4)?;
+        let mark: AccountMark = serde_json::from_str(json).map_err(|error| {
             LabError::DataCorrupt(format!("malformed account mark record: {error}"))
         })?;
         let indexed_seq = u64::try_from(indexed_seq)
@@ -840,5 +859,96 @@ mod tests {
             Err(LabError::DataCorrupt(_))
         ));
         hidden_model_guard.restore(&store, &seeded.run_id);
+    }
+
+    #[test]
+    fn projection_downsamples_large_serialized_records_within_byte_cap() {
+        let root = TempRoot::new();
+        let store = Store::open(&root.0).expect("open fixture store");
+        store
+            .connection
+            .execute_batch("PRAGMA foreign_keys=OFF;")
+            .expect("disable fixture foreign keys");
+        let run_id_str = "run-93ef30183010e08749cce18d1478db8659db68fb808a1f4b4a2ea8ad46833340";
+        let model_id_str = "model-2a7dce758f6b98a549a02ae7fd3a0e321f6aede74df554f34d4509213185d7d1";
+        let run_id = RunId::new(run_id_str).expect("run id");
+        let model_id = ModelId::new(model_id_str).expect("model id");
+        let total_marks = 1_012_u64;
+        store
+            .connection
+            .execute(
+                "INSERT INTO runs(id,job_id,attempt_id,plan_id,state,created_at_ms,\
+                 last_committed_event_seq,semantic_digest,manifest_json) \
+                 VALUES (?1,'job-fixture','attempt-fixture','plan-fixture','COMPLETED',0,1012,NULL,'{}')",
+                [run_id_str],
+            )
+            .expect("insert fixture run");
+        store
+            .connection
+            .execute(
+                "INSERT INTO run_models(run_id,model_id,market,strategy_kind,strategy_json,\
+                 status,last_committed_event_seq,account_mark_count) \
+                 VALUES (?1,?2,'KRW-BTC','BUY_HOLD','{}','COMPLETED',1012,?3)",
+                params![
+                    run_id_str,
+                    model_id_str,
+                    i64::try_from(total_marks).expect("mark count")
+                ],
+            )
+            .expect("insert fixture model");
+        for seq in 1..=total_marks {
+            let mut record = mark_for(
+                model_id_str,
+                seq,
+                "299850.074962518740629685",
+                "0.012345678901234567",
+            );
+            record.context.run_id = run_id.clone();
+            record.source_bar_id =
+                ObservationId::new(format!("obs-{seq:064x}")).expect("long observation id");
+            record.mark_price = PriceKrw::new(decimal("111635000.12345678")).expect("price");
+            record.position_value =
+                QuoteAmount::new(decimal("299850.074962518740629685")).expect("position");
+            record.state.qty = AssetQuantity::new(decimal("0.00268599")).expect("qty");
+            record.state.price_basis =
+                QuoteAmount::new(decimal("299850.074962518740629685")).expect("basis");
+            store
+                .connection
+                .execute(
+                    "INSERT INTO account_marks(run_id,model_id,event_seq,kind,\
+                     cash_total_decimal,cash_free_decimal,cash_reserved_decimal,qty_decimal,\
+                     price_basis_decimal,cumulative_fees_decimal,equity_decimal,source_bar_id,record_json) \
+                     VALUES (?1,?2,?3,'EXECUTION_CLOSE','100','100','0','0','0','0',?4,?5,?6)",
+                    params![
+                        run_id_str,
+                        model_id_str,
+                        i64::try_from(seq).expect("seq"),
+                        record.equity.get().to_string(),
+                        record.source_bar_id.as_str(),
+                        serde_json::to_string(&record).expect("serialize mark")
+                    ],
+                )
+                .expect("insert mark");
+        }
+
+        let projection = store
+            .equity_chart_projection(&run_id, &model_id, 512)
+            .expect("project large marks within byte cap");
+        let encoded = serde_json::to_vec(&projection).expect("encode projection");
+        assert!(encoded.len() <= MAX_SERIALIZED_PROJECTION_BYTES);
+        assert_eq!(projection.total_count, total_marks);
+        assert_eq!(
+            projection.sample_count,
+            u64::try_from(projection.records.len()).expect("sample count")
+        );
+        assert!(projection.sampled);
+        assert_eq!(
+            projection.records.first().expect("first").context.event_seq,
+            1
+        );
+        assert_eq!(
+            projection.records.last().expect("last").context.event_seq,
+            total_marks
+        );
     }
 }
