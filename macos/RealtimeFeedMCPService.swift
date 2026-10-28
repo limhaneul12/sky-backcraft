@@ -480,7 +480,7 @@ final class RealtimeFeedMCPService {
         generation expectedGeneration: UInt64,
         force: Bool
     ) {
-        guard statusRequest == nil || !statusRequest!.isPending else { return }
+        guard statusRequest?.isPending != true else { return }
         let now = Date()
         if !force, let lastFallbackStartedAt,
            now.timeIntervalSince(lastFallbackStartedAt) < Self.minimumFallbackInterval { return }

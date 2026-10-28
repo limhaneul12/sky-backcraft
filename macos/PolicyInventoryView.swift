@@ -154,7 +154,7 @@ final class PolicyInventoryView: NSView, NSTableViewDataSource, NSTableViewDeleg
         detailTitle.font = TerminalTheme.systemFont(ofSize: 17, weight: .semibold)
         detailTitle.setAccessibilityLabel("선택된 정책 이름")
         detailTitle.setAccessibilityValue(detailTitle.stringValue)
-        detailIdentity.font = TerminalTheme.monospacedFont(ofSize: 10, weight: .regular)
+        detailIdentity.font = TerminalTheme.monospacedDigitFont(ofSize: 10, weight: .regular)
         detailIdentity.textColor = TerminalTheme.secondaryText
         detailIdentity.setAccessibilityLabel("선택된 정책과 리비전의 불변 ID")
         detailIdentity.setAccessibilityValue(detailIdentity.stringValue)
@@ -164,13 +164,13 @@ final class PolicyInventoryView: NSView, NSTableViewDataSource, NSTableViewDeleg
         detailMeta.setAccessibilityValue(detailMeta.stringValue)
         definitionText.isEditable = false
         definitionText.isSelectable = true
-        definitionText.font = TerminalTheme.monospacedFont(ofSize: 11, weight: .regular)
+        definitionText.font = TerminalTheme.monospacedDigitFont(ofSize: 11, weight: .regular)
         definitionText.textColor = .labelColor
         definitionText.backgroundColor = TerminalTheme.chart
         definitionText.setAccessibilityLabel("선택 정책 리비전 정의 JSON")
         let definitionScroll = TerminalWrappingTextScrollView()
         definitionScroll.configureWrapping(textView: definitionText, inset: NSSize(width: 10, height: 10))
-        definitionScroll.borderType = .bezelBorder
+        definitionScroll.borderType = .lineBorder
         definitionScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: max(135, 135 * TerminalTheme.textScale)).isActive = true
 
         configureRevisionTable()
@@ -212,6 +212,8 @@ final class PolicyInventoryView: NSView, NSTableViewDataSource, NSTableViewDeleg
         }
         let detailContainer = TerminalFlippedDocumentView()
         detailContainer.usesPanel = true
+        detailContainer.drawsBorder = true
+        detailContainer.cornerRadius = 8
         detailContainer.translatesAutoresizingMaskIntoConstraints = false
         detailStack.translatesAutoresizingMaskIntoConstraints = false; detailContainer.addSubview(detailStack)
         NSLayoutConstraint.activate([

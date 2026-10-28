@@ -190,7 +190,7 @@ impl CollectRequest {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RawObjectRef {
     pub id: RawObjectId,
@@ -212,7 +212,7 @@ pub struct RawObjectRef {
     pub transport: Option<super::RawWebSocketTransport>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CandleObservation {
     pub id: ObservationId,
@@ -258,7 +258,7 @@ pub enum QualitySeverity {
     Error,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct QualityIssue {
     pub kind: QualityKind,

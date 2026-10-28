@@ -140,7 +140,6 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     var configurationDidSave: ((AppConfiguration) -> Void)?
     var onOpenDashboard: (() -> Void)?
     var onOpenAutomationWorkspace: (() -> Void)?
-    var onTradingStateChanged: ((LiveTradingState) -> Void)?
     var onControlSnapshot: ((TradingControlSnapshot) -> Void)?
 
     init(
@@ -487,11 +486,26 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         return age >= 0 && age <= 30
     }
 
+    private static let isoFractionalFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+    private static let isoStandardFormatter = ISO8601DateFormatter()
+    private static let krwCurrencyFormatter: NumberFormatter = {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .currency
+        formatter.currencyCode = "KRW"
+        formatter.currencySymbol = "₩"
+        formatter.locale = Locale(identifier: "ko_KR")
+        formatter.minimumFractionDigits = 2
+        formatter.maximumFractionDigits = 2
+        return formatter
+    }()
+
     private static func parseTimestamp(_ timestamp: String) -> Date? {
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let parsed = fractional.date(from: timestamp) { return parsed }
-        return ISO8601DateFormatter().date(from: timestamp)
+        if let parsed = isoFractionalFormatter.date(from: timestamp) { return parsed }
+        return isoStandardFormatter.date(from: timestamp)
     }
 
     private static func liveOrderControlTimestamp(_ timestamp: String) -> Date? {
@@ -960,9 +974,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private static func utcTimestamp(_ date: Date) -> String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.string(from: date)
+        isoFractionalFormatter.string(from: date)
     }
 
     @objc private func enableLiveOrderControlPressed() {
@@ -1377,7 +1389,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
         tradingStateLabel.font = .systemFont(ofSize: 12, weight: .semibold)
         tradingStateLabel.textColor = .secondaryLabelColor
-        strategyAdmissionStatusLabel.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
+        strategyAdmissionStatusLabel.font = TerminalTheme.monospacedDigitFont(ofSize: 10, weight: .regular)
         strategyAdmissionStatusLabel.textColor = .secondaryLabelColor
         strategyAdmissionStatusLabel.maximumNumberOfLines = 4
 
@@ -1704,14 +1716,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     private static func formatKRW(_ raw: String) -> String? {
         guard let value = Decimal(string: raw, locale: Locale(identifier: "en_US_POSIX")) else { return nil }
-        let formatter = NumberFormatter()
-        formatter.numberStyle = .currency
-        formatter.currencyCode = "KRW"
-        formatter.currencySymbol = "₩"
-        formatter.locale = Locale(identifier: "ko_KR")
-        formatter.minimumFractionDigits = 2
-        formatter.maximumFractionDigits = 2
-        return formatter.string(from: value as NSDecimalNumber)
+        return krwCurrencyFormatter.string(from: value as NSDecimalNumber)
     }
 
     private static func balanceDetail(available: String?, locked: String?) -> String {

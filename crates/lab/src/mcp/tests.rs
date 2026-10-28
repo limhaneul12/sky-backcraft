@@ -716,10 +716,10 @@ fn full_tool_catalog_and_malformed_inputs_use_protocol_contract()
             assert_eq!(
                 status["policy_deletion"],
                 serde_json::json!({
-                    "mode": if matches!(exposure, McpExposure::Desktop) {
-                        "POLICY_ONLY_CONFIRMED"
+                    "mode": if public {
+                        "DISABLED_IN_PUBLIC_NO_AUTH"
                     } else {
-                        "UNAVAILABLE"
+                        "POLICY_ONLY_CONFIRMED"
                     },
                     "max_items": 100,
                     "archive_available": false,
@@ -852,26 +852,31 @@ fn full_tool_catalog_and_malformed_inputs_use_protocol_contract()
             .map_err(|error| LabError::Internal(format!("local automation query: {error:?}")))?;
         assert_eq!(local_automation.is_error, Some(true));
         assert!(result_text(local_automation).contains("require the native desktop capability"));
+        let mut public_service = service.clone();
+        public_service.exposure = McpExposure::PublicNoAuth;
+        let public_write = public_service
+            .policy_delete_write(object(serde_json::json!({})))
+            .await
+            .map_err(|error| LabError::Internal(format!("public policy delete write: {error:?}")))?;
+        assert_eq!(public_write.is_error, Some(true));
+        assert!(result_text(public_write).contains("destructive operations are disabled when public_no_auth is enabled"));
         for exposure in [
             McpExposure::Local,
             McpExposure::PublicNoAuth,
             McpExposure::Bearer,
             McpExposure::OAuth,
         ] {
-            let mut protected = service.clone();
-            protected.exposure = exposure;
-            let write = protected
-                .policy_delete_write(object(serde_json::json!({})))
+            let mut exposed = service.clone();
+            exposed.exposure = exposure;
+            let query = exposed
+                .policy_delete_query(object(serde_json::json!({
+                    "request_id": "policy-delete-missing-query"
+                })))
                 .await
-                .map_err(|error| LabError::Internal(format!("protected policy delete write: {error:?}")))?;
-            assert_eq!(write.is_error, Some(true));
-            assert!(result_text(write).contains("require the native desktop capability"));
-            let query = protected
-                .policy_delete_query(object(serde_json::json!({})))
-                .await
-                .map_err(|error| LabError::Internal(format!("protected policy delete query: {error:?}")))?;
-            assert_eq!(query.is_error, Some(true));
-            assert!(result_text(query).contains("require the native desktop capability"));
+                .map_err(|error| LabError::Internal(format!("policy delete query: {error:?}")))?;
+            assert_ne!(query.is_error, Some(true));
+            let query: serde_json::Value = serde_json::from_str(&result_text(query))?;
+            assert_eq!(query["found"], false);
         }
         let missing_policy_delete = desktop
             .policy_delete_query(object(serde_json::json!({
@@ -999,6 +1004,8 @@ fn full_tool_catalog_and_malformed_inputs_use_protocol_contract()
                 "paper_session_query",
                 "paper_session_write",
                 "plan_backtest",
+                "policy_delete_query",
+                "policy_delete_write",
                 "policy_query",
                 "policy_write",
                 "portfolio_backtest",
@@ -1173,6 +1180,7 @@ fn full_tool_catalog_and_malformed_inputs_use_protocol_contract()
                     | "decision_analysis_query"
                     | "history_query"
                     | "policy_query"
+                    | "policy_delete_query"
                     | "paper_review_query"
                     | "result_query"
                     | "artifact_query"
@@ -1185,7 +1193,10 @@ fn full_tool_catalog_and_malformed_inputs_use_protocol_contract()
                     | "upbit_order_preview"
                     | "upbit_order_reconcile"
             );
-            let expected_destructive = tool.name.as_ref() == "resource_hard_delete";
+            let expected_destructive = matches!(
+                tool.name.as_ref(),
+                "resource_hard_delete" | "policy_delete_write"
+            );
             assert_eq!(annotations.read_only_hint, Some(expected_read_only));
             assert_eq!(annotations.destructive_hint, Some(expected_destructive));
             assert_eq!(

@@ -8,8 +8,7 @@ use crate::contracts::{
     MAX_SUITE_FOLDS, MAX_SUITE_RUNS, MAX_SUITE_SCENARIOS, ModelStatus, ObservationId,
     PolicyRevisionRef, ResearchDesign, ResearchSuiteRequest, ResolvedPlan, RunId,
     RunModelComparison, SuiteCase, SuiteCaseId, SuiteCaseStatus, SuiteId, SuitePhase, SuiteRecord,
-    SuiteSummary, UtcRange, Weight, experiment_config_digest, strategy_binding,
-    validate_frozen_policy,
+    SuiteSummary, UtcRange, Weight, strategy_binding, validate_frozen_policy,
 };
 use crate::evidence::EvidenceEvaluator;
 use chrono::Duration;
@@ -663,7 +662,6 @@ pub fn freeze(
     policy_revisions: Vec<FrozenPolicyRevision>,
 ) -> Result<FrozenResearchSuite, LabError> {
     let geometry = expand_geometry(&request)?;
-    let _config_digest = experiment_config_digest(&request.template, &policy_revisions)?;
     if policy_revisions.len() != request.template.policy_selections.len() {
         return Err(LabError::InputHashMismatch(
             "suite policy body count differs from candidate count".into(),
@@ -1115,7 +1113,125 @@ pub fn summarize(record: &SuiteRecord) -> SuiteSummary {
             .filter(|fold| fold.selection_digest.is_some())
             .cloned()
             .collect(),
+        winner_consistency_ratio: fold_winner_consistency(&record.folds),
         unused_tail: record.frozen.unused_tail,
+    }
+}
+
+fn fold_winner_consistency(folds: &[crate::contracts::WalkForwardFold]) -> Option<f64> {
+    let mut counts = BTreeMap::<&PolicyRevisionRef, usize>::new();
+    let mut decided = 0_usize;
+    for winner in folds.iter().filter_map(|fold| fold.winner.as_ref()) {
+        *counts.entry(winner).or_insert(0) += 1;
+        decided += 1;
+    }
+    let max_count = counts.into_values().max()?;
+    let ratio = f64::from(u32::try_from(max_count).ok()?) / f64::from(u32::try_from(decided).ok()?);
+    ratio.is_finite().then_some(ratio)
+}
+
+/// Compute overfitting-defense and cross-scenario stability metrics from a
+/// suite record and its published comparison rows.
+#[must_use]
+pub fn evaluate_suite_stability(
+    record: &SuiteRecord,
+    comparisons: &[crate::contracts::SuiteComparisonRow],
+) -> crate::contracts::SuiteStabilityMetrics {
+    use crate::contracts::{MetricValue, NullReason, SuiteStabilityMetrics};
+    use rust_decimal::prelude::ToPrimitive;
+
+    let winner_consistency_ratio = fold_winner_consistency(&record.folds).map_or_else(
+        || MetricValue::null(NullReason::InsufficientSamples),
+        MetricValue::value,
+    );
+
+    let mut is_returns = Vec::<f64>::new();
+    let mut oos_returns = Vec::<f64>::new();
+    for fold in &record.folds {
+        let Some(winner) = fold.winner.as_ref() else {
+            continue;
+        };
+        for row in comparisons {
+            if row.fold_index != Some(fold.index)
+                || row.comparison.status != ModelStatus::Completed
+                || row.comparison.policy_ref.as_ref() != Some(winner)
+            {
+                continue;
+            }
+            let Some(ret) = row.comparison.net_return.value.filter(|v| v.is_finite()) else {
+                continue;
+            };
+            match row.phase {
+                SuitePhase::Selection => is_returns.push(ret),
+                SuitePhase::Evaluation => oos_returns.push(ret),
+                SuitePhase::Batch => {}
+            }
+        }
+    }
+
+    let count_f64 = |len: usize| f64::from(u32::try_from(len).unwrap_or(1));
+    let oos_retention_ratio = if is_returns.is_empty() || oos_returns.is_empty() {
+        MetricValue::null(NullReason::InsufficientSamples)
+    } else {
+        let is_mean = is_returns.iter().sum::<f64>() / count_f64(is_returns.len());
+        let oos_mean = oos_returns.iter().sum::<f64>() / count_f64(oos_returns.len());
+        if is_mean.abs() <= f64::EPSILON {
+            MetricValue::null(NullReason::ZeroDenominator)
+        } else {
+            MetricValue::value(oos_mean / is_mean)
+        }
+    };
+
+    let oos_return_std_dev = if oos_returns.len() < 2 {
+        MetricValue::null(NullReason::InsufficientSamples)
+    } else {
+        let mean = oos_returns.iter().sum::<f64>() / count_f64(oos_returns.len());
+        let variance = oos_returns
+            .iter()
+            .map(|value| (value - mean) * (value - mean))
+            .sum::<f64>()
+            / count_f64(oos_returns.len() - 1);
+        MetricValue::value(variance.max(0.0).sqrt())
+    };
+
+    let mut cost_buckets = BTreeMap::<u32, (f64, Vec<f64>)>::new();
+    for row in comparisons {
+        if row.comparison.status != ModelStatus::Completed {
+            continue;
+        }
+        let Some(ret) = row.comparison.net_return.value.filter(|v| v.is_finite()) else {
+            continue;
+        };
+        let total_bps = (row.costs.buy_fee_bps.get()
+            + row.costs.sell_fee_bps.get()
+            + Decimal::from(2_u32) * row.costs.slippage_bps.get())
+        .to_f64()
+        .unwrap_or(0.0);
+        let entry = cost_buckets
+            .entry(row.scenario_index)
+            .or_insert_with(|| (total_bps, Vec::new()));
+        entry.1.push(ret);
+    }
+    let mut scenario_means: Vec<(f64, f64)> = cost_buckets
+        .into_values()
+        .filter(|(_, vals)| !vals.is_empty())
+        .map(|(bps, vals)| (bps, vals.iter().sum::<f64>() / count_f64(vals.len())))
+        .collect();
+    scenario_means.sort_by(|left, right| left.0.total_cmp(&right.0));
+    let cost_drag_per_bps = match (scenario_means.first(), scenario_means.last()) {
+        (Some((low_bps, low_ret)), Some((high_bps, high_ret)))
+            if (high_bps - low_bps) > f64::EPSILON =>
+        {
+            MetricValue::value((low_ret - high_ret) / (high_bps - low_bps))
+        }
+        _ => MetricValue::null(NullReason::InsufficientSamples),
+    };
+
+    SuiteStabilityMetrics {
+        winner_consistency_ratio,
+        oos_retention_ratio,
+        oos_return_std_dev,
+        cost_drag_per_bps,
     }
 }
 

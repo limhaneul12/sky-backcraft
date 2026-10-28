@@ -500,9 +500,7 @@ impl RawObjectStore {
             &fs::read(directory.join(META_FILE)).map_err(io_error("read raw metadata"))?,
         )
         .map_err(json_error)?;
-        if serde_json::to_vec(&stored).map_err(json_error)?
-            != serde_json::to_vec(object).map_err(json_error)?
-        {
+        if &stored != object {
             return Err(LabError::DataCorrupt(format!(
                 "raw object metadata mismatch: {}",
                 object.id
@@ -778,6 +776,11 @@ impl Store {
         request: &RequestId,
         market: &MarketId,
     ) -> Result<Vec<CollectionPage>, LabError> {
+        #[derive(Deserialize)]
+        struct StoredPageFormatProbe {
+            #[serde(default)]
+            format: Option<String>,
+        }
         let mut statement = self.connection.prepare(
             "SELECT page_index,page_json FROM collection_pages WHERE request_id=?1 AND market=?2 ORDER BY page_index LIMIT ?3",
         ).map_err(sql_error)?;
@@ -795,9 +798,11 @@ impl Store {
         let mut slim_pages = Vec::new();
         for row in rows {
             let (page_index, page_json) = row.map_err(sql_error)?;
-            let value: serde_json::Value = serde_json::from_str(&page_json).map_err(json_error)?;
-            if value.get("format").and_then(|format| format.as_str()) == Some("slim_v1") {
-                let slim: SlimCollectionPage = serde_json::from_value(value).map_err(json_error)?;
+            let probe: StoredPageFormatProbe =
+                serde_json::from_str(&page_json).map_err(json_error)?;
+            if probe.format.as_deref() == Some("slim_v1") {
+                let slim: SlimCollectionPage =
+                    serde_json::from_str(&page_json).map_err(json_error)?;
                 if page_index != slim.page_index {
                     return Err(LabError::DataCorrupt(
                         "slim collection page index disagrees with its row".into(),
@@ -806,7 +811,7 @@ impl Store {
                 self.raw.verify(&slim.raw_object)?;
                 slim_pages.push((page_index, slim));
             } else {
-                let page: CollectionPage = serde_json::from_value(value).map_err(json_error)?;
+                let page: CollectionPage = serde_json::from_str(&page_json).map_err(json_error)?;
                 if page.page_index != page_index {
                     return Err(LabError::DataCorrupt(
                         "collection page index disagrees with its row".into(),
@@ -1787,9 +1792,7 @@ fn validate_derived_snapshot(
             "derived warmup/coverage is not the complete target-grid floor".into(),
         ));
     }
-    if serde_json::to_vec(&derived.manifest.raw_objects).map_err(json_error)?
-        != serde_json::to_vec(&source.manifest.raw_objects).map_err(json_error)?
-    {
+    if derived.manifest.raw_objects != source.manifest.raw_objects {
         return Err(LabError::Conflict(
             "derived snapshot must preserve the full ordered source raw catalog".into(),
         ));
@@ -1830,8 +1833,7 @@ fn validate_derived_closure(
         .cloned()
         .collect::<Vec<_>>();
     let expected_rows = crate::collection::resample(&source_rows, target)?;
-    if serde_json::to_vec(&expected_rows).map_err(json_error)?
-        != serde_json::to_vec(&derived.observations).map_err(json_error)?
+    if expected_rows != derived.observations
         || derived.manifest.row_count != derived.observations.len() as u64
     {
         return Err(LabError::InputHashMismatch(
@@ -1849,9 +1851,7 @@ fn validate_derived_closure(
         })
         .cloned()
         .collect::<Vec<_>>();
-    if serde_json::to_vec(&expected_quality).map_err(json_error)?
-        != serde_json::to_vec(&derived.manifest.quality_issues).map_err(json_error)?
-    {
+    if expected_quality != derived.manifest.quality_issues {
         return Err(LabError::Conflict(
             "derived quality provenance does not match overlapping source issues".into(),
         ));
@@ -2945,6 +2945,21 @@ fn sql_error(error: rusqlite::Error) -> LabError {
 #[allow(clippy::needless_pass_by_value)]
 fn json_error(error: serde_json::Error) -> LabError {
     LabError::Internal(format!("storage json: {error}"))
+}
+fn serialized_json_len(value: &impl Serialize) -> Result<usize, serde_json::Error> {
+    struct ByteCountWriter(usize);
+    impl Write for ByteCountWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(buf.len());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = ByteCountWriter(0);
+    serde_json::to_writer(&mut writer, value)?;
+    Ok(writer.0)
 }
 fn io_error(context: &'static str) -> impl FnOnce(std::io::Error) -> LabError {
     move |error| LabError::Internal(format!("{context}: {error}"))

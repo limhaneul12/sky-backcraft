@@ -204,11 +204,15 @@ final class RealtimeConnectionStatusView: NSView {
         return "\(name) · state \(feed.state.rawValue)\(diagnostic) · connection_count \(feed.connection_count) · subscription_count \(feed.subscription_count) · last_received_at_utc \(feed.last_received_at_utc ?? "미확인") · last_reconciled_at_utc \(feed.last_reconciled_at_utc ?? "미확인") · reconnect_count \(feed.reconnect_count) · dropped_messages \(feed.dropped_messages) · ready_for_decisions \(feed.ready_for_decisions)"
     }
 
-    private static func localClock(_ date: Date) -> String {
+    private static let localClockFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "ko_KR")
-        formatter.timeZone = TimeZone(identifier: "Asia/Seoul")
+        formatter.timeZone = TimeZone(identifier: "Asia/Seoul") ?? TimeZone(secondsFromGMT: 9 * 3_600) ?? .current
         formatter.dateFormat = "yyyy-MM-dd HH:mm:ss 'KST'"
-        return formatter.string(from: date)
+        return formatter
+    }()
+
+    private static func localClock(_ date: Date) -> String {
+        localClockFormatter.string(from: date)
     }
 }

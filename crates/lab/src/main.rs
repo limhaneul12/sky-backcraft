@@ -1818,7 +1818,7 @@ async fn run_mcp_serve(
                         .get(axum::http::header::ORIGIN)
                         .and_then(|value| value.to_str().ok());
 
-                    let host_matches = |candidate: &str, allowed: &str| {
+                    let authority_matches = |candidate: &str, allowed: &str| {
                         candidate == allowed
                             || candidate.strip_suffix(":443").is_some_and(|h| h == allowed)
                             || candidate.strip_suffix(":80").is_some_and(|h| h == allowed)
@@ -1827,16 +1827,10 @@ async fn run_mcp_serve(
                     };
 
                     let host_ok = host.is_some_and(|h| {
-                        allowed_hosts.iter().any(|allowed| host_matches(h, allowed))
+                        allowed_hosts
+                            .iter()
+                            .any(|allowed| authority_matches(h, allowed))
                     });
-
-                    let origin_matches = |candidate: &str, allowed: &str| {
-                        candidate == allowed
-                            || candidate.strip_suffix(":443").is_some_and(|o| o == allowed)
-                            || candidate.strip_suffix(":80").is_some_and(|o| o == allowed)
-                            || allowed.strip_suffix(":443").is_some_and(|o| o == candidate)
-                            || allowed.strip_suffix(":80").is_some_and(|o| o == candidate)
-                    };
 
                     let path = request.uri().path();
                     let is_oauth_form = path == "/authorize/approve" || path == "/authorize";
@@ -1846,7 +1840,7 @@ async fn run_mcp_serve(
                             || is_oauth_form
                             || allowed_origins
                                 .iter()
-                                .any(|allowed| origin_matches(orig, allowed))
+                                .any(|allowed| authority_matches(orig, allowed))
                     });
 
                     if host_ok && origin_ok {

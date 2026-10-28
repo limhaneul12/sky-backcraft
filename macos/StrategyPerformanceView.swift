@@ -1006,17 +1006,27 @@ private final class StrategyCardGridView: NSView {
 /// One KPI: small secondary label over a tabular-digit value. Unknown values stay textual, never zero.
 private final class StrategyMetricTile: NSView {
     static var height: CGFloat { ceil(50 * TerminalTheme.textScale) }
+    static let leadingPadding: CGFloat = 8
+    static let trailingPadding: CGFloat = 6
 
     init(title: String, value: String, tone: NSColor, toolTip: String?) {
         super.init(frame: .zero)
         let titleLabel = NSTextField(labelWithString: title)
         titleLabel.font = TerminalTheme.systemFont(ofSize: 11, weight: .medium)
         titleLabel.textColor = .secondaryLabelColor
+        titleLabel.lineBreakMode = .byTruncatingTail
+        titleLabel.maximumNumberOfLines = 1
+        titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
         let valueLabel = NSTextField(labelWithString: value)
-        valueLabel.font = TerminalTheme.monospacedDigitFont(ofSize: 15, weight: .semibold)
+        valueLabel.font = TerminalTheme.monospacedDigitFont(ofSize: 13.5, weight: .semibold)
         valueLabel.textColor = tone
         valueLabel.lineBreakMode = .byTruncatingTail
+        valueLabel.usesSingleLineMode = true
+        valueLabel.maximumNumberOfLines = 1
+        valueLabel.allowsDefaultTighteningForTruncation = true
         valueLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
         let stack = NSStackView(views: [titleLabel, valueLabel])
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -1025,8 +1035,8 @@ private final class StrategyMetricTile: NSView {
         addSubview(stack)
         NSLayoutConstraint.activate([
             heightAnchor.constraint(equalToConstant: Self.height),
-            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
-            stack.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -8),
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: Self.leadingPadding),
+            stack.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -Self.trailingPadding),
             stack.centerYAnchor.constraint(equalTo: centerYAnchor)
         ])
         self.toolTip = toolTip
@@ -1036,6 +1046,7 @@ private final class StrategyMetricTile: NSView {
     @available(*, unavailable)
     required init?(coder: NSCoder) { nil }
 
+    override var isOpaque: Bool { false }
     override var wantsDefaultClipping: Bool { true }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -1313,18 +1324,45 @@ private final class StrategyPerformanceCard: NSView {
         return "\(revision) · 실행 \(created)\n\(start) → \(end)\n\(run.costAssumptionLabel ?? "비용 조건 미확인") · \(capital)"
     }
 
-    private static func displayKST(_ raw: String?) -> String? {
-        guard let raw else { return nil }
-        let precise = ISO8601DateFormatter()
-        precise.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let ordinary = ISO8601DateFormatter()
-        ordinary.formatOptions = [.withInternetDateTime]
-        guard let date = precise.date(from: raw) ?? ordinary.date(from: raw) else { return nil }
+    private static let isoFractionalFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+    private static let isoStandardFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter
+    }()
+    private static let displayKSTFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "ko_KR")
-        formatter.timeZone = TimeZone(identifier: "Asia/Seoul")
+        formatter.timeZone = TimeZone(identifier: "Asia/Seoul") ?? TimeZone(secondsFromGMT: 9 * 3_600) ?? .current
         formatter.dateFormat = "yyyy-MM-dd HH:mm 'KST'"
-        return formatter.string(from: date)
+        return formatter
+    }()
+    private static let unsignedPercentFormatter: NumberFormatter = {
+        let formatter = NumberFormatter()
+        formatter.locale = Locale(identifier: "ko_KR")
+        formatter.numberStyle = .decimal
+        formatter.minimumFractionDigits = 2
+        formatter.maximumFractionDigits = 4
+        return formatter
+    }()
+    private static let signedPercentFormatter: NumberFormatter = {
+        let formatter = NumberFormatter()
+        formatter.locale = Locale(identifier: "ko_KR")
+        formatter.numberStyle = .decimal
+        formatter.minimumFractionDigits = 2
+        formatter.maximumFractionDigits = 4
+        formatter.positivePrefix = "+"
+        return formatter
+    }()
+
+    private static func displayKST(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        guard let date = isoFractionalFormatter.date(from: raw) ?? isoStandardFormatter.date(from: raw) else { return nil }
+        return displayKSTFormatter.string(from: date)
     }
 
     private static func shortRevision(_ raw: String) -> String {
@@ -1334,12 +1372,7 @@ private final class StrategyPerformanceCard: NSView {
     }
 
     private static func percent(_ value: Decimal, signed: Bool = false) -> String {
-        let formatter = NumberFormatter()
-        formatter.locale = Locale(identifier: "ko_KR")
-        formatter.numberStyle = .decimal
-        formatter.minimumFractionDigits = 2
-        formatter.maximumFractionDigits = 4
-        if signed { formatter.positivePrefix = "+" }
+        let formatter = signed ? signedPercentFormatter : unsignedPercentFormatter
         let scaled = NSDecimalNumber(decimal: value).multiplying(by: 100)
         return (formatter.string(from: scaled) ?? scaled.stringValue) + "%"
     }

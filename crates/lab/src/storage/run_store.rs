@@ -62,7 +62,7 @@ impl Store {
         let plan = self.load_plan(&header.plan_id)?.ok_or_else(|| {
             LabError::InvalidConfig(format!("unknown run plan {}", header.plan_id))
         })?;
-        let attempt = self.load_attempt_for_run(&header.manifest.attempt_id)?;
+        let attempt = self.load_attempt(&header.manifest.attempt_id)?;
         if attempt.job_id != header.manifest.job_id
             || !matches!(
                 attempt.state,
@@ -226,29 +226,13 @@ impl Store {
             stored.last_seq
         };
         let terminal_sections = [
-            (
-                "signals",
-                serde_json::to_value(&stored.signals).map_err(json_error)?,
-                serde_json::to_value(&ledger.signals).map_err(json_error)?,
-            ),
-            (
-                "order_events",
-                serde_json::to_value(&stored.order_events).map_err(json_error)?,
-                serde_json::to_value(&ledger.order_events).map_err(json_error)?,
-            ),
-            (
-                "fills",
-                serde_json::to_value(&stored.fills).map_err(json_error)?,
-                serde_json::to_value(&ledger.fills).map_err(json_error)?,
-            ),
-            (
-                "account_marks",
-                serde_json::to_value(&stored.marks).map_err(json_error)?,
-                serde_json::to_value(&ledger.account_marks).map_err(json_error)?,
-            ),
+            ("signals", stored.signals != ledger.signals),
+            ("order_events", stored.order_events != ledger.order_events),
+            ("fills", stored.fills != ledger.fills),
+            ("account_marks", stored.marks != ledger.account_marks),
         ];
-        for (section, stored_section, terminal_section) in terminal_sections {
-            if stored_section != terminal_section {
+        for (section, mismatched) in terminal_sections {
+            if mismatched {
                 return Err(LabError::InputHashMismatch(format!(
                     "model terminal {section} do not match committed sequenced facts"
                 )));
@@ -1064,7 +1048,7 @@ impl Store {
         &self,
         attempt_id: &crate::contracts::AttemptId,
     ) -> Result<(), LabError> {
-        let attempt = self.load_attempt_for_run(attempt_id)?;
+        let attempt = self.load_attempt(attempt_id)?;
         match attempt.state {
             AttemptState::Running {
                 cancel_requested_at: None,
@@ -1080,13 +1064,6 @@ impl Store {
                 "run attempt is no longer RUNNING".into(),
             )),
         }
-    }
-
-    fn load_attempt_for_run(
-        &self,
-        attempt_id: &crate::contracts::AttemptId,
-    ) -> Result<crate::contracts::JobAttempt, LabError> {
-        self.load_attempt(attempt_id)
     }
 
     fn finished_model_ids(&self, run_id: &RunId) -> Result<BTreeSet<String>, LabError> {
@@ -1117,8 +1094,9 @@ fn validate_final_projections(ledger: &ModelLedger) -> Result<(), LabError> {
             .ok_or_else(|| {
                 LabError::Conflict("final order projection lacks lifecycle event".into())
             })?;
-        if serde_json::to_vec(projection).map_err(json_error)?
-            != serde_json::to_vec(*event).map_err(json_error)?
+        if projection != *event
+            || serde_json::to_vec(projection).map_err(json_error)?
+                != serde_json::to_vec(event).map_err(json_error)?
         {
             return Err(LabError::Conflict(
                 "final order projection is not final lifecycle event".into(),

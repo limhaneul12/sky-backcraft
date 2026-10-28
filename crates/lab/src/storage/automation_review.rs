@@ -462,11 +462,10 @@ fn load_review_snapshot(
         opening_inventory,
     };
     validate_snapshot_fact_limit(&snapshot)?;
-    let encoded = serde_json::to_vec(&snapshot).map_err(super::json_error)?;
-    if encoded.len() > crate::contracts::MAX_AUTOMATION_REVIEW_BYTES {
+    let encoded_len = super::serialized_json_len(&snapshot).map_err(super::json_error)?;
+    if encoded_len > crate::contracts::MAX_AUTOMATION_REVIEW_BYTES {
         return Err(LabError::ResourceLimit(format!(
-            "automation review snapshot is {} bytes; limit is {}",
-            encoded.len(),
+            "automation review snapshot is {encoded_len} bytes; limit is {}",
             crate::contracts::MAX_AUTOMATION_REVIEW_BYTES
         )));
     }

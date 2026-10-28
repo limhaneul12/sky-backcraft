@@ -1691,10 +1691,9 @@ fn validate_admission(plan: &ResolvedPlan, admission: &ModelAdmission) -> Result
     Ok(())
 }
 
-fn validate_frozen_inputs(
+pub(crate) fn validate_frozen_datasets(
     plan: &ResolvedPlan,
     datasets: &[DatasetSnapshot],
-    evidence: Option<&EvidenceSnapshot>,
 ) -> Result<(), LabError> {
     if datasets.len() != plan.spec.dataset_ids.len()
         || datasets.len() != plan.dataset_digests.len()
@@ -1717,6 +1716,15 @@ fn validate_frozen_inputs(
             )));
         }
     }
+    Ok(())
+}
+
+fn validate_frozen_inputs(
+    plan: &ResolvedPlan,
+    datasets: &[DatasetSnapshot],
+    evidence: Option<&EvidenceSnapshot>,
+) -> Result<(), LabError> {
+    validate_frozen_datasets(plan, datasets)?;
     match (&plan.evidence_digest, evidence) {
         (Some(expected), Some(snapshot)) if expected == &snapshot.digest => {}
         (None, None) => {}
@@ -1881,7 +1889,7 @@ fn effective_costs(
     Ok((costs, Some(provenance)))
 }
 
-fn check_cancelled(cancelled: &dyn Fn() -> bool) -> Result<(), LabError> {
+pub(crate) fn check_cancelled(cancelled: &dyn Fn() -> bool) -> Result<(), LabError> {
     if cancelled() {
         Err(LabError::Cancelled(
             "model execution cancelled at deterministic checkpoint".into(),

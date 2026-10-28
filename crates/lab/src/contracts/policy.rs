@@ -105,13 +105,73 @@ pub enum PolicyIndicatorKind {
     Close,
     Volume,
     QuoteTurnover,
-    Sma { window: usize },
-    Ema { window: usize },
-    Rsi { window: usize },
-    SampleVol { window: usize },
-    AnnualVol { window: usize },
-    PriorHigh { window: usize },
-    PriorLow { window: usize },
+    Sma {
+        window: usize,
+    },
+    Ema {
+        window: usize,
+    },
+    Rsi {
+        window: usize,
+    },
+    SampleVol {
+        window: usize,
+    },
+    AnnualVol {
+        window: usize,
+    },
+    PriorHigh {
+        window: usize,
+    },
+    PriorLow {
+        window: usize,
+    },
+    Atr {
+        window: usize,
+    },
+    BollingerUpper {
+        window: usize,
+        #[serde(deserialize_with = "finite_statistic")]
+        multiplier: f64,
+    },
+    BollingerLower {
+        window: usize,
+        #[serde(deserialize_with = "finite_statistic")]
+        multiplier: f64,
+    },
+    BollingerBandwidth {
+        window: usize,
+        #[serde(deserialize_with = "finite_statistic")]
+        multiplier: f64,
+    },
+    BollingerPercentB {
+        window: usize,
+        #[serde(deserialize_with = "finite_statistic")]
+        multiplier: f64,
+    },
+    MacdLine {
+        fast_window: usize,
+        slow_window: usize,
+    },
+    MacdSignal {
+        fast_window: usize,
+        slow_window: usize,
+        signal_window: usize,
+    },
+    MacdHistogram {
+        fast_window: usize,
+        slow_window: usize,
+        signal_window: usize,
+    },
+    ZScore {
+        window: usize,
+    },
+    Roc {
+        window: usize,
+    },
+    DrawdownFromHigh {
+        window: usize,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -261,7 +321,7 @@ pub enum PolicySignalExpiry {
     DecisionBars { bars: u32 },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NamedPolicyValue {
     pub id: String,
@@ -269,7 +329,7 @@ pub struct NamedPolicyValue {
     pub value: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyEvidenceTrace {
     pub policy: PitPolicy,
@@ -280,7 +340,7 @@ pub struct PolicyEvidenceTrace {
     pub multiplier: Weight,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyTrace {
     pub matched_rule_id: Option<String>,
@@ -593,16 +653,10 @@ impl RulesProgram {
 
         let mut window_slots = 0_usize;
         for indicator in &self.indicators {
-            if let Some(window) = indicator.indicator.window() {
-                if !(1..=MAX_WINDOW).contains(&window) {
-                    return Err(LabError::InvalidConfig(
-                        "indicator window must be in 1..=5000".into(),
-                    ));
-                }
-                window_slots = window_slots.checked_add(window).ok_or_else(|| {
-                    LabError::ResourceLimit("aggregate policy window slots overflow".into())
-                })?;
-            }
+            let slots = indicator.indicator.validate_and_window_slots()?;
+            window_slots = window_slots.checked_add(slots).ok_or_else(|| {
+                LabError::ResourceLimit("aggregate policy window slots overflow".into())
+            })?;
         }
         if window_slots > MAX_WINDOW_SLOTS {
             return Err(LabError::ResourceLimit(
@@ -814,7 +868,16 @@ fn collect_numeric_condition_paths(expr: &NumericExpr, path: &str, output: &mut 
 }
 
 impl PolicyIndicatorKind {
-    fn window(&self) -> Option<usize> {
+    fn validate_and_window_slots(&self) -> Result<usize, LabError> {
+        let check_window = |window: usize| -> Result<usize, LabError> {
+            if (1..=MAX_WINDOW).contains(&window) {
+                Ok(window)
+            } else {
+                Err(LabError::InvalidConfig(
+                    "indicator window must be in 1..=5000".into(),
+                ))
+            }
+        };
         match self {
             Self::Sma { window }
             | Self::Ema { window }
@@ -822,24 +885,107 @@ impl PolicyIndicatorKind {
             | Self::SampleVol { window }
             | Self::AnnualVol { window }
             | Self::PriorHigh { window }
-            | Self::PriorLow { window } => Some(*window),
+            | Self::PriorLow { window }
+            | Self::Atr { window }
+            | Self::Roc { window }
+            | Self::DrawdownFromHigh { window } => check_window(*window),
+            Self::ZScore { window } => {
+                if (2..=MAX_WINDOW).contains(window) {
+                    Ok(*window)
+                } else {
+                    Err(LabError::InvalidConfig(
+                        "z_score indicator window must be in 2..=5000".into(),
+                    ))
+                }
+            }
+            Self::BollingerUpper { window, multiplier }
+            | Self::BollingerLower { window, multiplier }
+            | Self::BollingerBandwidth { window, multiplier }
+            | Self::BollingerPercentB { window, multiplier } => {
+                let slots = check_window(*window)?;
+                if !multiplier.is_finite() || *multiplier <= 0.0 || *multiplier > 100.0 {
+                    return Err(LabError::InvalidConfig(
+                        "bollinger multiplier must be in (0, 100]".into(),
+                    ));
+                }
+                Ok(slots)
+            }
+            Self::MacdLine {
+                fast_window,
+                slow_window,
+            } => {
+                let fast = check_window(*fast_window)?;
+                let slow = check_window(*slow_window)?;
+                if fast >= slow {
+                    return Err(LabError::InvalidConfig(
+                        "macd fast_window must be strictly less than slow_window".into(),
+                    ));
+                }
+                fast.checked_add(slow).ok_or_else(|| {
+                    LabError::ResourceLimit("aggregate policy window slots overflow".into())
+                })
+            }
+            Self::MacdSignal {
+                fast_window,
+                slow_window,
+                signal_window,
+            }
+            | Self::MacdHistogram {
+                fast_window,
+                slow_window,
+                signal_window,
+            } => {
+                let fast = check_window(*fast_window)?;
+                let slow = check_window(*slow_window)?;
+                let signal = check_window(*signal_window)?;
+                if fast >= slow {
+                    return Err(LabError::InvalidConfig(
+                        "macd fast_window must be strictly less than slow_window".into(),
+                    ));
+                }
+                fast.checked_add(slow)
+                    .and_then(|sum| sum.checked_add(signal))
+                    .ok_or_else(|| {
+                        LabError::ResourceLimit("aggregate policy window slots overflow".into())
+                    })
+            }
             Self::Open
             | Self::High
             | Self::Low
             | Self::Close
             | Self::Volume
-            | Self::QuoteTurnover => None,
+            | Self::QuoteTurnover => Ok(0),
         }
     }
 
     pub(crate) fn warmup_bars(&self) -> usize {
         match self {
-            Self::Sma { window } | Self::Ema { window } => *window,
+            Self::Sma { window }
+            | Self::Ema { window }
+            | Self::BollingerUpper { window, .. }
+            | Self::BollingerLower { window, .. }
+            | Self::BollingerBandwidth { window, .. }
+            | Self::BollingerPercentB { window, .. }
+            | Self::ZScore { window }
+            | Self::DrawdownFromHigh { window } => *window,
             Self::Rsi { window }
             | Self::SampleVol { window }
             | Self::AnnualVol { window }
             | Self::PriorHigh { window }
-            | Self::PriorLow { window } => window + 1,
+            | Self::PriorLow { window }
+            | Self::Atr { window }
+            | Self::Roc { window } => window.saturating_add(1),
+            Self::MacdLine { slow_window, .. } => *slow_window,
+            Self::MacdSignal {
+                slow_window,
+                signal_window,
+                ..
+            }
+            | Self::MacdHistogram {
+                slow_window,
+                signal_window,
+                ..
+            } => slow_window.saturating_add(signal_window.saturating_sub(1)),
             Self::Open
             | Self::High
             | Self::Low

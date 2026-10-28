@@ -76,14 +76,21 @@ private final class HistoryWorkbenchSplitView: NSSplitView {
 }
 
 enum Formatters {
+    static let kstTimeZone: TimeZone = TimeZone(identifier: "Asia/Seoul") ?? TimeZone(secondsFromGMT: 9 * 3_600) ?? .current
+    private static let formatterLock = NSLock()
+
     static func percent(_ value: Decimal, signed: Bool = false) -> String {
         let magnitude = value < 0 ? -value : value
+        formatterLock.lock()
         let digits = feeFormatter.string(from: NSDecimalNumber(decimal: magnitude * 100)) ?? "—"
+        formatterLock.unlock()
         return (value < 0 ? "−" : (signed ? "+" : "")) + digits + "%"
     }
     static func money(_ value: Decimal, signed: Bool = false) -> String {
         let magnitude = value < 0 ? -value : value
+        formatterLock.lock()
         let digits = feeFormatter.string(from: NSDecimalNumber(decimal: magnitude)) ?? "—"
+        formatterLock.unlock()
         return (value < 0 ? "−" : (signed ? "+" : "")) + "₩" + digits
     }
     static let pnlFormatter: NumberFormatter = {
@@ -113,14 +120,20 @@ enum Formatters {
     }()
 
     static func pnl(_ val: Double) -> String {
+        formatterLock.lock()
+        defer { formatterLock.unlock() }
         return pnlFormatter.string(from: NSNumber(value: val)) ?? String(format: "%+.2f", val)
     }
 
     static func fee(_ val: Double) -> String {
+        formatterLock.lock()
+        defer { formatterLock.unlock() }
         return feeFormatter.string(from: NSNumber(value: val)) ?? String(format: "%.2f", val)
     }
 
     static func intVal(_ val: Double) -> String {
+        formatterLock.lock()
+        defer { formatterLock.unlock() }
         return integerFormatter.string(from: NSNumber(value: val)) ?? String(format: "%.0f", val)
     }
 }
@@ -161,10 +174,15 @@ final class EquityChartView: NSView {
         let base = mode == .equity ? title : title.replacingOccurrences(of: "계좌 평가액 KRW", with: "낙폭 (%)")
         return base + (points.count < fullPoints.count ? " · 확대 · 지표는 전체 구간" : "")
     }
+    private var ulcerIndexPercent: Double {
+        guard !fullDrawdowns.isEmpty else { return 0 }
+        let sqSum = fullDrawdowns.reduce(0.0) { $0 + $1 * $1 }
+        return (sqSum / Double(fullDrawdowns.count)).squareRoot() * 100.0
+    }
     private func pointValue(at index: Int) -> String {
         if mode == .equity { return "평가액 \(Formatters.money(points[index].equityDecimal))" }
         let drawdown = fullDrawdowns[visibleBounds.lowerBound + index]
-        return "낙폭 \(String(format: "%.2f%%", -drawdown * 100))"
+        return "낙폭 \(String(format: "%.2f%%", -drawdown * 100)) · Ulcer \(String(format: "%.2f%%", ulcerIndexPercent))"
     }
 
     override var acceptsFirstResponder: Bool { true }
@@ -240,15 +258,26 @@ final class EquityChartView: NSView {
         needsDisplay = true
     }
 
+    private static let pointSummaryClockFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.timeZone = Formatters.kstTimeZone
+        formatter.dateFormat = "yyyy-MM-dd HH:mm"
+        return formatter
+    }()
+
+    private static let axisClockFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.timeZone = Formatters.kstTimeZone
+        formatter.dateFormat = "MM-dd HH:mm"
+        return formatter
+    }()
+
     private func updatePointSummary() {
         guard let focusedPoint, points.indices.contains(focusedPoint) else { return }
         let point = points[focusedPoint]
-        let clock = DateFormatter()
-        clock.timeZone = TimeZone(identifier: "Asia/Seoul")
-        clock.dateFormat = "yyyy-MM-dd HH:mm"
         let nearby = fillMarkers.filter { abs($0.timestamp.timeIntervalSince(point.timestamp)) <= 60 }
         let event = nearby.first.map { " · \($0.simulated ? "가상" : "관측") \($0.side == "BUY" ? "매수" : "매도") 체결 \($0.fillId)" } ?? ""
-        let value = "\(clock.string(from: point.timestamp)) KST · \(pointValue(at: focusedPoint)) · 원장 순번 \(point.seq)" + event
+        let value = "\(Self.pointSummaryClockFormatter.string(from: point.timestamp)) KST · \(pointValue(at: focusedPoint)) · 원장 순번 \(point.seq)" + event
         toolTip = value
         setAccessibilityElement(true)
         setAccessibilityRole(.image)
@@ -340,16 +369,10 @@ final class EquityChartView: NSView {
         (displayTitle as NSString).draw(at: NSPoint(x: insetRect.minX, y: bounds.height - 24), withAttributes: titleAttrs)
         if let focusedPoint, points.indices.contains(focusedPoint) {
             let point = points[focusedPoint]
-            let clock = DateFormatter()
-            clock.timeZone = TimeZone(identifier: "Asia/Seoul")
-            clock.dateFormat = "MM-dd HH:mm"
-            let info = "\(clock.string(from: point.timestamp)) KST · \(pointValue(at: focusedPoint))"
+            let info = "\(Self.axisClockFormatter.string(from: point.timestamp)) KST · \(pointValue(at: focusedPoint))"
             (info as NSString).draw(at: NSPoint(x: insetRect.minX, y: 10), withAttributes: titleAttrs)
         } else if let first = points.first, let last = points.last {
-            let clock = DateFormatter()
-            clock.timeZone = TimeZone(identifier: "Asia/Seoul")
-            clock.dateFormat = "MM-dd HH:mm"
-            let range = "\(clock.string(from: first.timestamp)) → \(clock.string(from: last.timestamp)) KST"
+            let range = "\(Self.axisClockFormatter.string(from: first.timestamp)) → \(Self.axisClockFormatter.string(from: last.timestamp)) KST"
             (range as NSString).draw(at: NSPoint(x: insetRect.minX, y: 10), withAttributes: titleAttrs)
         }
     }
@@ -432,14 +455,39 @@ final class EquityChartView: NSView {
         baseLine.lineWidth = 1.0
         baseLine.stroke()
 
-        // Build curve path
+        // Build curve path and high-water mark path
         let path = NSBezierPath()
-        for (i, p) in points.enumerated() {
-            let xRatio = timeRatio(at: i)
-            let yRatio = CGFloat((p.equity - minVal) / valRange)
-            let pt = NSPoint(x: insetRect.minX + xRatio * insetRect.width, y: insetRect.minY + yRatio * insetRect.height)
-            if i == 0 { path.move(to: pt) } else { path.line(to: pt) }
+        let hwmPath = NSBezierPath()
+        var runningPeak = initialEquity
+        for i in 0..<visibleBounds.lowerBound {
+            runningPeak = max(runningPeak, fullPoints[i].equity)
         }
+        var focusedCanvasPoint: NSPoint?
+        for (i, p) in points.enumerated() {
+            runningPeak = max(runningPeak, p.equity)
+            let xRatio = timeRatio(at: i)
+            let x = insetRect.minX + xRatio * insetRect.width
+            let yRatio = CGFloat((p.equity - minVal) / valRange)
+            let hwmRatio = CGFloat((runningPeak - minVal) / valRange)
+            let pt = NSPoint(x: x, y: insetRect.minY + yRatio * insetRect.height)
+            let hwmPt = NSPoint(x: x, y: insetRect.minY + hwmRatio * insetRect.height)
+            if i == 0 {
+                path.move(to: pt)
+                hwmPath.move(to: hwmPt)
+            } else {
+                path.line(to: pt)
+                hwmPath.line(to: hwmPt)
+            }
+            if focusedPoint == i {
+                focusedCanvasPoint = pt
+            }
+        }
+
+        let hwmDash: [CGFloat] = [2, 3]
+        hwmPath.setLineDash(hwmDash, count: 2, phase: 0)
+        TerminalTheme.secondaryText.withAlphaComponent(0.35).setStroke()
+        hwmPath.lineWidth = 1.0
+        hwmPath.stroke()
 
         // A neutral canvas and explicit line preserve readability in both appearances.
         let terminal = points.last?.equity ?? initialEquity
@@ -448,6 +496,26 @@ final class EquityChartView: NSView {
         curveColor.setStroke()
         path.lineWidth = 2.0
         path.stroke()
+
+        if let focusedCanvasPoint {
+            drawFocusedCrosshair(at: focusedCanvasPoint, in: insetRect, color: curveColor)
+        }
+    }
+
+    private func drawFocusedCrosshair(at point: NSPoint, in insetRect: NSRect, color: NSColor) {
+        let guide = NSBezierPath()
+        guide.move(to: NSPoint(x: point.x, y: insetRect.minY))
+        guide.line(to: NSPoint(x: point.x, y: insetRect.maxY))
+        let dash: [CGFloat] = [2, 2]
+        guide.setLineDash(dash, count: 2, phase: 0)
+        TerminalTheme.secondaryText.withAlphaComponent(0.55).setStroke()
+        guide.lineWidth = 1.0
+        guide.stroke()
+
+        let dotRect = NSRect(x: point.x - 3.5, y: point.y - 3.5, width: 7, height: 7)
+        let dot = NSBezierPath(ovalIn: dotRect)
+        color.setFill()
+        dot.fill()
     }
 
     private func drawDrawdownCurve(in insetRect: NSRect, context: CGContext) {
@@ -543,7 +611,6 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
     private let sidebarTable = NSTableView()
     private let detailContainer = TerminalSurfaceView()
     private var databaseStatusFooter: NSTextField?
-    private var databaseStatusFooterIcon: NSImageView?
     private var paperSummaryText = "지속 모의: 조회 전"
     private var automationSummaryText = "전략 자동화: 조회 전"
     private struct GlobalContextFact: Equatable {
@@ -631,16 +698,6 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
         }
     }
 
-    private enum HistoryFilterTokenKind: Int {
-        case search
-        case status
-        case market
-        case policy
-        case revision
-        case cost
-        case date
-        case pinned
-    }
     private var currentSection: Section = .backtestAnalysis
     private var synchronizingSidebarSelection = false
 
@@ -678,6 +735,7 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
     private let runSelector = NSPopUpButton()
     private let chartModeControl = NSSegmentedControl(labels: ["자산 곡선", "낙폭"], trackingMode: .selectOne, target: nil, action: nil)
     private let chartView = EquityChartView()
+    private var chartViewHeightConstraintsConfigured = false
     private let returnMetricLabel = NSTextField(labelWithString: "0.00%")
     private let mddMetricLabel = NSTextField(labelWithString: "0.00%")
     private let pnlMetricLabel = NSTextField(labelWithString: "0 KRW")
@@ -801,7 +859,6 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
     private var userPolicies: [RealPolicy] = []
     private var policyDeletionWorkspace: PolicyDeletionWorkspace?
 
-    var onStateChange: ((LiveTradingState) -> Void)?
     var onOpenSettings: (() -> Void)?
     private let orderScope = NSSegmentedControl(labels: ["미체결", "완료"], trackingMode: .selectOne, target: nil, action: nil)
     private let orderReadStatus = NSTextField(wrappingLabelWithString: "주문 조회 전 · 0건과 조회 실패는 다른 상태입니다.")
@@ -937,8 +994,9 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
             else { clearRunMetrics(message: "실행을 선택하면 해당 모델의 원장과 성과를 표시합니다.") }
         } catch {
             logFixtureDatabaseReadResult(policyCount: allPolicies.count, error: error)
-            dataError = "원장 조회 실패 · 저장소 연결 및 스키마를 확인하세요."
-            clearRunMetrics(message: dataError!)
+            let message = "원장 조회 실패 · 저장소 연결 및 스키마를 확인하세요."
+            dataError = message
+            clearRunMetrics(message: message)
         }
     }
 
@@ -949,7 +1007,7 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
 
         let database = root.appendingPathComponent("research/lab.sqlite").path
         let log = root.appendingPathComponent("automation-gui-database-read.log")
-        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let timestamp = Self.isoStandardFormatter.string(from: Date())
         let errorText = error?.localizedDescription ?? "none"
         let entry = "\(timestamp)\nsupport_root=\(root.path)\nresearch_database=\(database)\npolicy_count=\(policyCount)\nerror=\(errorText)\n\n"
         do {
@@ -1102,24 +1160,61 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
         return allPolicies.first(where: { $0.policyId == id })?.name ?? id
     }
 
-    private func displayKST(_ value: String?) -> String {
-        guard let value else { return "시각 미확인" }
-        let parser = ISO8601DateFormatter()
-        parser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        guard let date = parser.date(from: value) ?? ISO8601DateFormatter().date(from: value) else { return value }
+    private static let isoFractionalFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+    private static let isoStandardFormatter = ISO8601DateFormatter()
+    private static let displayKSTMinuteFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "ko_KR")
-        formatter.timeZone = TimeZone(identifier: "Asia/Seoul")
+        formatter.timeZone = Formatters.kstTimeZone
         formatter.dateFormat = "yyyy-MM-dd HH:mm"
-        return formatter.string(from: date)
+        return formatter
+    }()
+    private static let displayKSTSecondFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "ko_KR")
+        formatter.timeZone = Formatters.kstTimeZone
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return formatter
+    }()
+    private static let historyDayDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = Formatters.kstTimeZone
+        formatter.dateFormat = "yyyy-MM-dd"
+        formatter.isLenient = false
+        return formatter
+    }()
+    private static let krwLiveAmountThreshold = Decimal(sign: .plus, exponent: -2, significand: 1)
+    private static let cryptoLiveAmountThreshold = Decimal(sign: .plus, exponent: -8, significand: 1)
+    private static let krwLiveAmountFormatter: NumberFormatter = {
+        let formatter = NumberFormatter()
+        formatter.locale = Locale(identifier: "ko_KR")
+        formatter.numberStyle = .decimal
+        formatter.minimumFractionDigits = 2
+        formatter.maximumFractionDigits = 2
+        return formatter
+    }()
+    private static let cryptoLiveAmountFormatter: NumberFormatter = {
+        let formatter = NumberFormatter()
+        formatter.locale = Locale(identifier: "ko_KR")
+        formatter.numberStyle = .decimal
+        formatter.minimumFractionDigits = 0
+        formatter.maximumFractionDigits = 8
+        return formatter
+    }()
+
+    private func displayKST(_ value: String?) -> String {
+        guard let value else { return "시각 미확인" }
+        guard let date = Self.isoFractionalFormatter.date(from: value) ?? Self.isoStandardFormatter.date(from: value) else { return value }
+        return Self.displayKSTMinuteFormatter.string(from: date)
     }
 
     private func displayKST(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "ko_KR")
-        formatter.timeZone = TimeZone(identifier: "Asia/Seoul")
-        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
-        return formatter.string(from: date)
+        Self.displayKSTSecondFormatter.string(from: date)
     }
 
     @objc private func showStrategyOverview() {
@@ -1328,7 +1423,6 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
             footerIcon.widthAnchor.constraint(equalToConstant: TerminalTheme.navigationIconSize),
             footerIcon.heightAnchor.constraint(equalToConstant: TerminalTheme.navigationIconSize)
         ])
-        databaseStatusFooterIcon = footerIcon
         let footerRow = NSStackView(views: [footerIcon, footer])
         footerRow.orientation = .horizontal
         footerRow.alignment = .centerY
@@ -1710,9 +1804,13 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
 
         // Chart View
         chartView.translatesAutoresizingMaskIntoConstraints = false
-        let chartHeight = chartView.heightAnchor.constraint(equalToConstant: 240)
-        chartHeight.priority = .defaultHigh
-        chartHeight.isActive = true
+        if !chartViewHeightConstraintsConfigured {
+            chartViewHeightConstraintsConfigured = true
+            let chartHeight = chartView.heightAnchor.constraint(equalToConstant: 240)
+            chartHeight.priority = .defaultHigh
+            chartHeight.isActive = true
+            chartView.heightAnchor.constraint(greaterThanOrEqualToConstant: 128).isActive = true
+        }
 
         // Model Comparisons Table
         setupComparisonsTable()
@@ -1802,7 +1900,6 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
             contextLabel.heightAnchor.constraint(greaterThanOrEqualToConstant: contextMinimumHeight),
             metricsGrid.heightAnchor.constraint(greaterThanOrEqualToConstant: 58),
             secondaryMetrics.heightAnchor.constraint(greaterThanOrEqualToConstant: 28),
-            chartView.heightAnchor.constraint(greaterThanOrEqualToConstant: 128),
             tableHeader.heightAnchor.constraint(greaterThanOrEqualToConstant: 20),
             tableScroll.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -16)
         ])
@@ -2041,7 +2138,6 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
         runsSearchField.action = #selector(runsSearchChanged)
         runsSearchField.font = TerminalTheme.systemFont(ofSize: 12)
         runsSearchField.setAccessibilityLabel("실행 이력 검색")
-        runsSearchField.widthAnchor.constraint(greaterThanOrEqualToConstant: 220 * TerminalTheme.textScale).isActive = true
 
         let exportButton = NSButton(title: "검색 결과 CSV", target: self, action: #selector(exportHistory))
         let searchRow = NSStackView(views: [runsSearchField, exportButton])
@@ -2209,14 +2305,9 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
         selectedContent.spacing = 8
         selectedContent.translatesAutoresizingMaskIntoConstraints = false
         historyDetail.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        let selectionPanel = NSBox()
-        selectionPanel.boxType = .custom
-        selectionPanel.cornerRadius = 8
+        let selectionPanel = TerminalTheme.makePanelBox()
         selectionPanel.title = "선택 상세"
         selectionPanel.titleFont = TerminalTheme.sectionHeading
-        selectionPanel.borderWidth = 1
-        selectionPanel.borderColor = TerminalTheme.border
-        selectionPanel.fillColor = TerminalTheme.panel
         selectionPanel.contentViewMargins = NSSize(width: 12, height: 8)
         let selectionContent = NSView(frame: .zero)
         selectionPanel.setAccessibilityIdentifier("DashboardRunHistorySelectionInspector")
@@ -2393,6 +2484,7 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
     private func configureHistoryFilters() {
         guard !historyFiltersConfigured else { return }
         historyFiltersConfigured = true
+        runsSearchField.widthAnchor.constraint(greaterThanOrEqualToConstant: 220 * TerminalTheme.textScale).isActive = true
         historyStatus.addItems(withTitles: ["모든 상태", "완료", "실패", "차단", "중단", "실행 중"])
         historyMarket.addItems(withTitles: ["모든 시장", "KRW-BTC", "KRW-ETH", "KRW-XRP"])
         historyPolicy.addItem(withTitle: "모든 정책")
@@ -2423,7 +2515,7 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
         historyCost.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         historyDateEnabled.target = self; historyDateEnabled.action = #selector(runsSearchChanged)
         var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = TimeZone(identifier: "Asia/Seoul")!
+        calendar.timeZone = Formatters.kstTimeZone
         for (picker, label) in [(historyFromDate, "기록 시작일 KST"), (historyThroughDate, "기록 마지막 날 KST")] {
             picker.datePickerStyle = .textFieldAndStepper
             picker.datePickerElements = .yearMonthDay
@@ -2475,12 +2567,7 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
     }
 
     private static func historyDayFormatter() -> DateFormatter {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone(identifier: "Asia/Seoul")
-        formatter.dateFormat = "yyyy-MM-dd"
-        formatter.isLenient = false
-        return formatter
+        historyDayDateFormatter
     }
 
     private func applyRestoredHistoryState() {
@@ -2768,7 +2855,7 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
             label.textColor = TerminalTheme.secondaryText
             label.setAccessibilityElement(false)
             let value = NSTextField(wrappingLabelWithString: valueText)
-            value.font = TerminalTheme.monospacedFont(ofSize: 10)
+            value.font = TerminalTheme.monospacedDigitFont(ofSize: 10, weight: .regular)
             value.textColor = .labelColor
             value.isSelectable = true
             value.lineBreakMode = .byTruncatingMiddle
@@ -2841,10 +2928,11 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
 
     private func currentHistoryFilter() -> RunHistoryFilter {
         var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = TimeZone(identifier: "Asia/Seoul")!
+        calendar.timeZone = Formatters.kstTimeZone
         let dateActive = historyDateEnabled.state == .on
         let from = calendar.startOfDay(for: historyFromDate.dateValue)
-        let through = calendar.date(byAdding: .day, value: 1, to: calendar.startOfDay(for: historyThroughDate.dateValue))!
+        let throughStart = calendar.startOfDay(for: historyThroughDate.dateValue)
+        let through = calendar.date(byAdding: .day, value: 1, to: throughStart) ?? throughStart.addingTimeInterval(86_400)
         return RunHistoryFilter(search: runsSearchField.stringValue,
             status: historyStatus.indexOfSelectedItem > 0 ? ["완료": "COMPLETED", "실패": "FAILED", "차단": "BLOCKED", "중단": "CANCELLED", "실행 중": "RUNNING"][historyStatus.titleOfSelectedItem ?? ""] ?? historyStatus.titleOfSelectedItem : nil,
             market: historyMarket.indexOfSelectedItem > 0 ? historyMarket.titleOfSelectedItem : nil,
@@ -3280,8 +3368,8 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
         let safetyBox = NSBox()
         safetyBox.boxType = .custom
         safetyBox.cornerRadius = 8
-        safetyBox.borderWidth = 1.5
-        safetyBox.borderColor = NSColor.systemRed.withAlphaComponent(0.6)
+        safetyBox.borderWidth = 1
+        safetyBox.borderColor = TerminalTheme.border
         safetyBox.fillColor = TerminalTheme.panel
 
         let reviewQualifier = CommandLine.arguments.contains("--gui-review")
@@ -3336,7 +3424,7 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
         let balanceHeading = NSTextField(labelWithString: "Upbit 실계좌 · 읽기 전용")
         balanceHeading.font = TerminalTheme.sectionHeading
 
-        upbitBalanceLabel.font = TerminalTheme.monospacedFont(ofSize: 13, weight: .medium)
+        upbitBalanceLabel.font = TerminalTheme.monospacedDigitFont(ofSize: 13, weight: .medium)
         upbitBalanceLabel.textColor = .labelColor
         balanceReadStatus.font = TerminalTheme.systemFont(ofSize: 11)
         balanceReadStatus.textColor = TerminalTheme.secondaryText
@@ -3396,7 +3484,7 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
         copyOrderIdButton.target = self
         copyOrderIdButton.action = #selector(copySelectedOrderId)
         copyOrderIdButton.isEnabled = false
-        orderDetailLabel.font = TerminalTheme.monospacedFont(ofSize: 11, weight: .regular)
+        orderDetailLabel.font = TerminalTheme.monospacedDigitFont(ofSize: 11, weight: .regular)
         orderDetailLabel.textColor = TerminalTheme.secondaryText
         let orderButtons = NSStackView(views: [nextOrderPageButton, copyOrderIdButton])
         orderButtons.orientation = .horizontal
@@ -3426,7 +3514,7 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
         let auditorTitle = NSTextField(labelWithString: "계좌·주문 데이터 근거")
         auditorTitle.font = TerminalTheme.sectionHeading
 
-        liveAuditLabel.font = TerminalTheme.monospacedFont(ofSize: 11, weight: .regular)
+        liveAuditLabel.font = TerminalTheme.monospacedDigitFont(ofSize: 11, weight: .regular)
         liveAuditLabel.textColor = TerminalTheme.secondaryText
 
         let auditorStack = NSStackView(views: [auditorTitle, liveAuditLabel])
@@ -3990,8 +4078,9 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
             liveExchangeLabel.textColor = hasReadFailure ? TerminalTheme.negative : TerminalTheme.secondaryText
         }
         guard let snapshot = controlFreshness.lastSuccess?.value else {
+            let initialControlState = controlFreshness.freshness(clock: clock)
             liveTradeLockLabel.stringValue = "실주문 자동매매 상태 미확인 · 주문 기능 사용 불가"
-            liveTradeLockLabel.textColor = TerminalTheme.negative
+            liveTradeLockLabel.textColor = initialControlState == .offline ? TerminalTheme.negative : TerminalTheme.warning
             liveStateLabel.stringValue = "서버 제어 상태 미확인"
             liveStateLabel.textColor = TerminalTheme.secondaryText
             updateGlobalContextText()
@@ -4091,16 +4180,12 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
 
     private func liveAmount(_ amount: Decimal, currency: String) -> String {
         let magnitude = amount < 0 ? -amount : amount
-        let threshold = currency == "KRW" ? Decimal(string: "0.01")! : Decimal(string: "0.00000001")!
+        let threshold = currency == "KRW" ? Self.krwLiveAmountThreshold : Self.cryptoLiveAmountThreshold
         if magnitude > 0, magnitude < threshold {
             let boundary = currency == "KRW" ? "₩0.01" : "0.00000001 \(currency)"
             return amount < 0 ? "−<\(boundary)" : "<\(boundary)"
         }
-        let formatter = NumberFormatter()
-        formatter.locale = Locale(identifier: "ko_KR")
-        formatter.numberStyle = .decimal
-        formatter.minimumFractionDigits = currency == "KRW" ? 2 : 0
-        formatter.maximumFractionDigits = currency == "KRW" ? 2 : 8
+        let formatter = currency == "KRW" ? Self.krwLiveAmountFormatter : Self.cryptoLiveAmountFormatter
         let value = formatter.string(from: NSDecimalNumber(decimal: amount))
             ?? NSDecimalNumber(decimal: amount).stringValue
         return currency == "KRW" ? "₩\(value)" : "\(value) \(currency)"
@@ -4579,9 +4664,9 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate, NST
                 case "Return", "MDD":
                     let left = key == "Return" ? lhs.netReturnDecimal : lhs.maxDrawdownDecimal
                     let right = key == "Return" ? rhs.netReturnDecimal : rhs.maxDrawdownDecimal
-                    if left == nil { return false }
-                    if right == nil { return true }
-                    comparison = NSDecimalNumber(decimal: left!).compare(NSDecimalNumber(decimal: right!))
+                    guard let left else { return false }
+                    guard let right else { return true }
+                    comparison = NSDecimalNumber(decimal: left).compare(NSDecimalNumber(decimal: right))
                 case "PnL": comparison = NSDecimalNumber(decimal: lhs.netPnlDecimal).compare(NSDecimalNumber(decimal: rhs.netPnlDecimal))
                 case "Fees": comparison = NSDecimalNumber(decimal: lhs.cumulativeFeesDecimal).compare(NSDecimalNumber(decimal: rhs.cumulativeFeesDecimal))
                 case "Trades": comparison = NSNumber(value: lhs.fillCount).compare(NSNumber(value: rhs.fillCount))

@@ -14,6 +14,7 @@ const MAX_PENDING_CANDIDATES_PER_SUBSCRIPTION: usize = 2;
 const MIN_REST_TIP_CONFIRMATION_SECONDS: i64 = 1;
 const MIN_REST_RETRY_SECONDS: u64 = 1;
 const MAX_REST_RETRY_SECONDS: u64 = 30;
+pub(super) const MAX_PROVIDER_CLOCK_SKEW_SECONDS: i64 = 30;
 
 #[derive(Debug, Clone)]
 struct PendingRestTipVerification {
@@ -212,6 +213,7 @@ impl FeedCache {
                 .is_none_or(|confirmed| candidate.frame.candle.open_time_utc > confirmed)
         });
 
+        let stream_kind = frame.stream_kind;
         let incoming = PendingCandle {
             frame,
             raw_frame,
@@ -219,8 +221,8 @@ impl FeedCache {
         };
         let disposition = match cache.current.as_ref() {
             None => {
-                cache.current = Some(incoming.clone());
-                cache.stream_live = confirms_subscription(incoming.frame.stream_kind);
+                cache.current = Some(incoming);
+                cache.stream_live = confirms_subscription(stream_kind);
                 FrameDisposition::New
             }
             Some(current)
@@ -232,12 +234,12 @@ impl FeedCache {
                     FrameDisposition::OutOfOrder
                 } else if incoming.frame.candle == current.frame.candle {
                     // Duplicate economic state may carry a later receive timestamp.
-                    cache.current = Some(incoming.clone());
-                    cache.stream_live = confirms_subscription(incoming.frame.stream_kind);
+                    cache.current = Some(incoming);
+                    cache.stream_live = confirms_subscription(stream_kind);
                     FrameDisposition::Duplicate
                 } else if is_monotonic_candle_update(&current.frame, &incoming.frame) {
-                    cache.current = Some(incoming.clone());
-                    cache.stream_live = confirms_subscription(incoming.frame.stream_kind);
+                    cache.current = Some(incoming);
+                    cache.stream_live = confirms_subscription(stream_kind);
                     FrameDisposition::Updated
                 } else {
                     cache.recovery_required = true;
@@ -269,8 +271,8 @@ impl FeedCache {
                 if previous_is_unconfirmed {
                     cache.closed_candidates.push_back(previous);
                 }
-                cache.current = Some(incoming.clone());
-                cache.stream_live = confirms_subscription(incoming.frame.stream_kind);
+                cache.current = Some(incoming);
+                cache.stream_live = confirms_subscription(stream_kind);
                 if contiguous && !saturated {
                     FrameDisposition::New
                 } else {
@@ -1228,6 +1230,7 @@ impl FeedCache {
                 )
             })
             .unwrap_or_default();
+        let clock_skew_tolerance = chrono::Duration::seconds(MAX_PROVIDER_CLOCK_SKEW_SECONDS);
         let (websocket_is_fresh, provider_clock_valid) =
             current.map_or((false, false), |current| {
                 let age = now.0.signed_duration_since(current.frame.received_at.0);
@@ -1241,8 +1244,8 @@ impl FeedCache {
                     .duration()
                     .max(chrono::Duration::minutes(1));
                 (
-                    age >= chrono::Duration::zero() && age <= freshness_limit,
-                    provider_lag >= chrono::Duration::zero()
+                    age >= -clock_skew_tolerance && age <= freshness_limit,
+                    provider_lag >= -clock_skew_tolerance
                         && provider_lag <= subscription.interval.duration(),
                 )
             });
@@ -1252,7 +1255,7 @@ impl FeedCache {
                 .interval
                 .duration()
                 .max(chrono::Duration::minutes(1));
-            rest_age >= chrono::Duration::zero() && rest_age <= freshness_limit
+            rest_age >= -clock_skew_tolerance && rest_age <= freshness_limit
         });
         let rest_confirms_accepted_tip = cache.confirmed_open_time.is_some_and(|confirmed_open| {
             cache

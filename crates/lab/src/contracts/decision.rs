@@ -41,7 +41,7 @@ pub enum RecordedExecutionState {
     NotCaptured,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RecordedDecisionReason {
     pub stage: RecordedDecisionStage,
@@ -51,7 +51,7 @@ pub struct RecordedDecisionReason {
     pub label_ko: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RecordedDecisionOrder {
     pub order_id: String,
@@ -59,7 +59,7 @@ pub struct RecordedDecisionOrder {
     pub reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RecordedDecisionFill {
     pub fill_id: String,
@@ -68,7 +68,7 @@ pub struct RecordedDecisionFill {
 
 /// A projection of saved engine and linked lifecycle facts. No policy is replayed.
 /// Parent responses own session/intent/signal identities and the selected cutoff.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RecordedDecisionExplanation {
     pub schema_version: String,

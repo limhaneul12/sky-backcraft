@@ -133,6 +133,10 @@ pub struct EpisodeMetrics {
     pub longest_losing_streak: u64,
 }
 
+fn default_legacy_metric_value() -> MetricValue {
+    MetricValue::null(NullReason::DataNotCaptured)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EquityMetrics {
@@ -143,6 +147,10 @@ pub struct EquityMetrics {
     pub sharpe: MetricValue,
     pub sortino: MetricValue,
     pub max_drawdown: MetricValue,
+    #[serde(default = "default_legacy_metric_value")]
+    pub calmar: MetricValue,
+    #[serde(default = "default_legacy_metric_value")]
+    pub ulcer_index: MetricValue,
     pub exposure: MetricValue,
     pub turnover: MetricValue,
 }
@@ -370,6 +378,8 @@ fn definitions() -> Vec<MetricDefinition> {
         ("sharpe", "mean mark-to-mark return minus periodized configured risk-free rate, divided by sample standard deviation and annualized", "ratio"),
         ("sortino", "mean mark-to-mark excess return divided by root-mean-square negative return and annualized", "ratio"),
         ("max_drawdown", "largest peak-to-later-trough loss on the sampled account-equity path", "fraction"),
+        ("calmar", "annualized CAGR divided by maximum drawdown; null when CAGR is unavailable or maximum drawdown is zero", "ratio"),
+        ("ulcer_index", "root-mean-square fractional drawdown from running peak across sampled account-equity marks", "fraction"),
         ("profit_factor", "sum positive CLOSED episode net realized / absolute sum negative CLOSED episode net realized", "ratio"),
         ("win_rate", "positive-net CLOSED episodes / all CLOSED episodes; break-even remains in denominator", "fraction"),
         ("exposure", "time-weighted sampled position value / equity", "fraction"),
@@ -395,6 +405,8 @@ fn equity_metrics(bundle: &RunBundle, model: &ModelLedger) -> EquityMetrics {
             sharpe: MetricValue::null(NullReason::NoAccountMarks),
             sortino: MetricValue::null(NullReason::NoAccountMarks),
             max_drawdown: MetricValue::null(NullReason::NoAccountMarks),
+            calmar: MetricValue::null(NullReason::NoAccountMarks),
+            ulcer_index: MetricValue::null(NullReason::NoAccountMarks),
             exposure: MetricValue::null(NullReason::NoAccountMarks),
             turnover: MetricValue::null(NullReason::NoAccountMarks),
         };
@@ -423,6 +435,20 @@ fn equity_metrics(bundle: &RunBundle, model: &ModelLedger) -> EquityMetrics {
         bundle.plan.spec.report_clock.risk_free_annual / periods_per_year.unwrap_or(1.0);
     let sharpe = risk_ratio(&returns, rf_period, periods_per_year, false);
     let sortino = risk_ratio(&returns, rf_period, periods_per_year, true);
+    let max_drawdown = maximum_drawdown(model);
+    let calmar = match (cagr.value, max_drawdown.value) {
+        (Some(cagr_val), Some(mdd_val)) if mdd_val > 0.0 => MetricValue::value(cagr_val / mdd_val),
+        (Some(_), Some(_)) => MetricValue::null(NullReason::ZeroDenominator),
+        (None, _) => MetricValue::null(
+            cagr.null_reason
+                .unwrap_or(NullReason::InsufficientCalendarDuration),
+        ),
+        (_, None) => MetricValue::null(
+            max_drawdown
+                .null_reason
+                .unwrap_or(NullReason::NoAccountMarks),
+        ),
+    };
     EquityMetrics {
         initial_equity: Some(first.equity),
         final_equity: Some(last.equity),
@@ -430,7 +456,9 @@ fn equity_metrics(bundle: &RunBundle, model: &ModelLedger) -> EquityMetrics {
         cagr,
         sharpe,
         sortino,
-        max_drawdown: maximum_drawdown(model),
+        max_drawdown,
+        calmar,
+        ulcer_index: ulcer_index(model),
         exposure: exposure(model),
         turnover: turnover(model),
     }
@@ -511,6 +539,33 @@ fn maximum_drawdown(model: &ModelLedger) -> MetricValue {
         MetricValue::null(NullReason::NoAccountMarks)
     } else {
         MetricValue::value(maximum)
+    }
+}
+
+fn ulcer_index(model: &ModelLedger) -> MetricValue {
+    if model.account_marks.is_empty() {
+        return MetricValue::null(NullReason::NoAccountMarks);
+    }
+    let mut peak = None::<f64>;
+    let mut sq_drawdown_sum = 0.0_f64;
+    let mut count = 0_usize;
+    for mark in &model.account_marks {
+        let Some(equity) = decimal_f64(mark.equity.get()) else {
+            return MetricValue::null(NullReason::NonFiniteResult);
+        };
+        peak = Some(peak.map_or(equity, |value| value.max(equity)));
+        if let Some(high) = peak.filter(|value| *value > 0.0) {
+            let drawdown = ((high - equity) / high).max(0.0);
+            sq_drawdown_sum += drawdown * drawdown;
+            count += 1;
+        } else {
+            return MetricValue::null(NullReason::ZeroDenominator);
+        }
+    }
+    if count == 0 {
+        MetricValue::null(NullReason::NoAccountMarks)
+    } else {
+        MetricValue::value((sq_drawdown_sum / count as f64).sqrt())
     }
 }
 

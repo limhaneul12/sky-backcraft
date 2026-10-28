@@ -3417,3 +3417,87 @@ fn dataset_identity_canonical_quality_and_source_order_goldens() {
         assert_eq!(digests.provenance.as_str(), provenance);
     }
 }
+
+#[test]
+fn hard_delete_and_batch_cascade_runs_with_comparisons_attempt_outputs_and_portfolio_runs() {
+    let root = TempRoot::new("hard-delete-closure-fk");
+    let mut store = Store::open(&root.0).expect("open store");
+    store
+        .connection
+        .execute_batch(
+            r#"
+            INSERT INTO policies VALUES ('policy-del-a','RULES','USER',0,'rev-del-a',1,'Delete Policy A'),('policy-del-b','RULES','USER',0,'rev-del-b',1,'Delete Policy B');
+            INSERT INTO policy_revisions VALUES ('policy-del-a','rev-del-a',1,NULL,'req-pol-a','1111111111111111111111111111111111111111111111111111111111111111','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',0,'Delete Policy A','{}'),('policy-del-b','rev-del-b',1,NULL,'req-pol-b','2222222222222222222222222222222222222222222222222222222222222222','bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',0,'Delete Policy B','{}');
+            INSERT INTO plans(id,request_id,config_digest,input_digest,original_request_json,resolved_plan_json) VALUES ('plan-del-a','req-plan-a','4444444444444444444444444444444444444444444444444444444444444444','5555555555555555555555555555555555555555555555555555555555555555','{}','{}'),('plan-del-b','req-plan-b','6666666666666666666666666666666666666666666666666666666666666666','7777777777777777777777777777777777777777777777777777777777777777','{}','{}');
+            INSERT INTO plan_policy_revisions VALUES ('plan-del-a',0,'policy-del-a','rev-del-a','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','{}'),('plan-del-b',0,'policy-del-b','rev-del-b','bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb','{}');
+            INSERT INTO jobs VALUES ('job-del-a','req-job-a','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','BACKTEST','{}',1,'COMPLETED',0),('job-del-export-a','req-job-exp-a','bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb','EXPORT','{}',1,'COMPLETED',0),('job-del-b','req-job-b','cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc','PORTFOLIO_BACKTEST','{}',1,'COMPLETED',0),('job-del-failed-b','req-job-fail-b','dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd','BACKTEST','{}',1,'FAILED',0);
+            INSERT INTO job_attempts(id,job_id,attempt_number,input_digest,status,state_json,progress_stage,committed_records,last_committed_event_seq,queued_at_ms,started_at_ms) VALUES ('att-del-a','job-del-a',1,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','COMPLETED','{"status":"COMPLETED","output":{"kind":"RUN","run_id":"run-del-a","completed_models":1,"blocked_models":0}}','done',0,0,0,0),('att-del-exp-a','job-del-export-a',1,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb','COMPLETED','{"status":"COMPLETED","output":{"kind":"ARTIFACTS","artifact_ids":["art-del-a"]}}','done',0,0,0,0),('att-del-b','job-del-b',1,'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc','COMPLETED','{"status":"COMPLETED","output":{"kind":"PORTFOLIO","run_id":"port-run-b"}}','done',0,0,0,0),('att-del-failed-b','job-del-failed-b',1,'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd','FAILED','{"status":"FAILED"}','failed',0,0,0,0);
+            INSERT INTO runs(id,job_id,attempt_id,plan_id,state,created_at_ms,last_committed_event_seq,manifest_json,ledger_state) VALUES ('run-del-a','job-del-a','att-del-a','plan-del-a','COMPLETED',0,0,'{}','DETAIL'),('run-failed-b','job-del-failed-b','att-del-failed-b','plan-del-b','FAILED',0,0,'{}','DETAIL');
+            INSERT INTO job_attempt_run_outputs VALUES ('att-del-a','run-del-a',1,0);
+            INSERT INTO run_models(run_id,model_id,market,strategy_kind,strategy_json,status,last_committed_event_seq,policy_id,policy_revision_id,policy_definition_digest) VALUES ('run-del-a','model-del-a','KRW-BTC','POLICY','{}','COMPLETED',0,'policy-del-a','rev-del-a','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+            INSERT INTO run_model_comparisons VALUES ('run-del-a','model-del-a','{}');
+            INSERT INTO run_artifacts VALUES ('art-del-a','run-del-a','exports/run-del-a/summary.json','application/json',2,'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',NULL,NULL,1,'{}');
+            INSERT INTO job_attempt_artifact_outputs VALUES ('att-del-exp-a','art-del-a',0);
+            INSERT INTO portfolio_runs VALUES ('port-run-b','req-port-b','plan-del-b','7777777777777777777777777777777777777777777777777777777777777777','{}','completed',0,0,NULL,'{}','[]');
+            INSERT INTO portfolio_facts VALUES ('port-run-b',1,'mark','{}');
+            INSERT INTO portfolio_projection_meta VALUES ('port-run-b','req-dig','led-dig','ben-dig','{}','{}',0,NULL);
+            INSERT INTO portfolio_projection_rows VALUES ('port-run-b','equity',0,'{}');
+            "#,
+        )
+        .expect("seed hard-delete FK closure fixture");
+    let export_dir = root.0.join("exports/run-del-a");
+    std::fs::create_dir_all(&export_dir).expect("create export dir");
+    std::fs::write(export_dir.join("summary.json"), b"{}").expect("write export file");
+
+    let now = time("2025-01-02T00:00:00Z");
+    let preview = |store: &Store, id: &str| {
+        let policy_id = crate::contracts::PolicyId::new(id).expect("policy id");
+        store
+            .delete_preview(&DeleteResource::Policy { policy_id }, now)
+            .expect("preview policy")
+    };
+    let (preview_a, preview_b) = (
+        preview(&store, "policy-del-a"),
+        preview(&store, "policy-del-b"),
+    );
+    assert!(preview_a.cascade_required && preview_b.cascade_required);
+    let outcomes = store
+        .execute_hard_delete_batch(
+            &[
+                HardDeleteRequest {
+                    preview: preview_a,
+                    cascade: true,
+                },
+                HardDeleteRequest {
+                    preview: preview_b,
+                    cascade: true,
+                },
+            ],
+            time("2025-01-02T00:01:00Z"),
+        )
+        .expect("batch cascade hard delete must succeed without FK errors");
+    assert!(outcomes.iter().all(|o| o.deleted_db_rows > 0 && o.vacuumed));
+    for sql in [
+        "SELECT COUNT(*) FROM policies WHERE origin='USER'",
+        "SELECT COUNT(*) FROM plans",
+        "SELECT COUNT(*) FROM runs",
+        "SELECT COUNT(*) FROM run_models",
+        "SELECT COUNT(*) FROM run_model_comparisons",
+        "SELECT COUNT(*) FROM run_artifacts",
+        "SELECT COUNT(*) FROM job_attempt_run_outputs",
+        "SELECT COUNT(*) FROM job_attempt_artifact_outputs",
+        "SELECT COUNT(*) FROM portfolio_runs",
+        "SELECT COUNT(*) FROM portfolio_facts",
+        "SELECT COUNT(*) FROM portfolio_projection_meta",
+        "SELECT COUNT(*) FROM portfolio_projection_rows",
+        "SELECT COUNT(*) FROM jobs",
+        "SELECT COUNT(*) FROM job_attempts",
+    ] {
+        let count: i64 = store
+            .connection
+            .query_row(sql, [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(count, 0, "expected 0 for {sql}");
+    }
+    store.close().expect("close store");
+}

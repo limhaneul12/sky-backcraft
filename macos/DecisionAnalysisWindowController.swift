@@ -757,7 +757,7 @@ final class DecisionAnalysisWindowController: NSWindowController, NSWindowDelega
         title.textColor = .labelColor
         title.setAccessibilityLabel("저장된 판단 분석")
 
-        identityLabel.font = TerminalTheme.monospacedFont(ofSize: 11)
+        identityLabel.font = TerminalTheme.monospacedDigitFont(ofSize: 11, weight: .regular)
         identityLabel.textColor = TerminalTheme.secondaryText
         identityLabel.maximumNumberOfLines = 0
         identityLabel.lineBreakMode = .byWordWrapping
@@ -778,7 +778,7 @@ final class DecisionAnalysisWindowController: NSWindowController, NSWindowDelega
         overviewLabel.maximumNumberOfLines = 0
         overviewLabel.lineBreakMode = .byWordWrapping
         overviewLabel.setAccessibilityLabel("선택 기간 내 판단 총계와 미배치 판단 수")
-        overviewDetailLabel.font = TerminalTheme.monospacedFont(ofSize: 11)
+        overviewDetailLabel.font = TerminalTheme.monospacedDigitFont(ofSize: 11, weight: .regular)
         overviewDetailLabel.textColor = TerminalTheme.secondaryText
         overviewDetailLabel.maximumNumberOfLines = 0
         overviewDetailLabel.lineBreakMode = .byWordWrapping
@@ -872,7 +872,7 @@ final class DecisionAnalysisWindowController: NSWindowController, NSWindowDelega
     private func configureTextViews() {
         explanationText.isEditable = false
         explanationText.isSelectable = true
-        explanationText.font = TerminalTheme.monospacedFont(ofSize: 11)
+        explanationText.font = TerminalTheme.monospacedDigitFont(ofSize: 11, weight: .regular)
         explanationText.textColor = .labelColor
         explanationText.backgroundColor = TerminalTheme.chart
         explanationText.setAccessibilityLabel("저장된 판단 행동, 조건 평가, 이유, 주문과 체결")
@@ -883,7 +883,7 @@ final class DecisionAnalysisWindowController: NSWindowController, NSWindowDelega
 
         comparisonText.isEditable = false
         comparisonText.isSelectable = true
-        comparisonText.font = TerminalTheme.monospacedFont(ofSize: 11)
+        comparisonText.font = TerminalTheme.monospacedDigitFont(ofSize: 11, weight: .regular)
         comparisonText.textColor = .labelColor
         comparisonText.backgroundColor = TerminalTheme.chart
         comparisonText.setAccessibilityLabel("이전 또는 고정 판단과의 저장 사실 비교")
@@ -1001,12 +1001,7 @@ final class DecisionAnalysisWindowController: NSWindowController, NSWindowDelega
     }
 
     private func panelStack(_ views: [NSView]) -> NSView {
-        let panel = NSBox()
-        panel.boxType = .custom
-        panel.cornerRadius = 8
-        panel.borderWidth = 1
-        panel.borderColor = TerminalTheme.border
-        panel.fillColor = TerminalTheme.panel
+        let panel = TerminalTheme.makePanelBox()
         let stack = NSStackView(views: views)
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -1571,18 +1566,26 @@ final class DecisionAnalysisWindowController: NSWindowController, NSWindowDelega
         return DecisionAnalysisPeriod(start: utcLabel(start), end: utcLabel(end))
     }
 
-    private static func utcLabel(_ date: Date) -> String {
+    private static let utcLabelFormatter: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         formatter.timeZone = TimeZone(secondsFromGMT: 0)
-        return formatter.string(from: date)
-    }
+        return formatter
+    }()
 
-    private static func compactUTCLabel(_ date: Date) -> String {
+    private static let compactUTCLabelFormatter: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime]
         formatter.timeZone = TimeZone(secondsFromGMT: 0)
-        return formatter.string(from: date)
+        return formatter
+    }()
+
+    private static func utcLabel(_ date: Date) -> String {
+        utcLabelFormatter.string(from: date)
+    }
+
+    private static func compactUTCLabel(_ date: Date) -> String {
+        compactUTCLabelFormatter.string(from: date)
     }
 
     private static func compactIdentity(_ value: String, masked: Bool) -> String {

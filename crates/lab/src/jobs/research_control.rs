@@ -689,96 +689,68 @@ impl JobService {
     /// Propagates unknown session IDs, invalid pagination limits, or SQLite errors.
     pub async fn paper_session_query(&self, query: PaperSessionQuery) -> Result<Value, LabError> {
         let now = UtcTimestamp::now();
-        if matches!(
+        let needs_poll = matches!(
             query,
             PaperSessionQuery::List { .. }
                 | PaperSessionQuery::Get { .. }
                 | PaperSessionQuery::Events { .. }
-        ) {
-            self.poll_due_paper_markets(now).await;
-        }
-        match query {
-            PaperSessionQuery::StartOptions => {
-                self.inner
-                    .database
-                    .call("paper_start_options", |store| {
+        );
+        let reconciled = needs_poll && self.poll_due_paper_markets(now).await;
+        let op = match &query {
+            PaperSessionQuery::StartOptions => "paper_start_options",
+            PaperSessionQuery::List { .. } => "paper_list_sessions",
+            PaperSessionQuery::Get { .. } => "paper_get_session",
+            PaperSessionQuery::Events { .. } => "paper_list_events",
+            PaperSessionQuery::ReviewEvents { .. } => "paper_review_events",
+            PaperSessionQuery::Request { .. } => "paper_readback_request",
+        };
+        self.inner
+            .database
+            .call(op, move |store| {
+                if needs_poll && !reconciled {
+                    let _ = store.reconcile_running_paper_sessions(&[], now);
+                }
+                match query {
+                    PaperSessionQuery::StartOptions => {
                         Ok(serde_json::to_value(store.paper_start_options()?)?)
-                    })
-                    .await
-            }
-            PaperSessionQuery::List {
-                after_session_id,
-                limit,
-            } => {
-                self.inner
-                    .database
-                    .call("paper_list_sessions", move |store| {
-                        let _ = store.reconcile_running_paper_sessions(&[], now);
-                        Ok(serde_json::to_value(store.paper_list_sessions(
-                            after_session_id.as_ref(),
-                            limit,
-                            now,
-                        )?)?)
-                    })
-                    .await
-            }
-            PaperSessionQuery::Get { session_id } => {
-                self.inner
-                    .database
-                    .call("paper_get_session", move |store| {
-                        let _ = store.reconcile_running_paper_sessions(&[], now);
-                        Ok(serde_json::to_value(
-                            store.paper_get_session(&session_id, now)?,
-                        )?)
-                    })
-                    .await
-            }
-            PaperSessionQuery::Events {
-                session_id,
-                after_sequence,
-                limit,
-            } => {
-                self.inner
-                    .database
-                    .call("paper_list_events", move |store| {
-                        let _ = store.reconcile_running_paper_sessions(&[], now);
-                        Ok(serde_json::to_value(store.paper_list_events(
-                            &session_id,
-                            after_sequence,
-                            limit,
-                        )?)?)
-                    })
-                    .await
-            }
-            PaperSessionQuery::ReviewEvents {
-                session_id,
-                after_sequence,
-                as_of_sequence,
-                limit,
-            } => {
-                self.inner
-                    .database
-                    .call("paper_review_events", move |store| {
-                        Ok(serde_json::to_value(store.paper_review_events(
-                            &session_id,
-                            after_sequence,
-                            as_of_sequence,
-                            limit,
-                        )?)?)
-                    })
-                    .await
-            }
-            PaperSessionQuery::Request { request_id } => {
-                self.inner
-                    .database
-                    .call("paper_readback_request", move |store| {
-                        Ok(serde_json::to_value(
-                            store.paper_readback_request(&request_id, now)?,
-                        )?)
-                    })
-                    .await
-            }
-        }
+                    }
+                    PaperSessionQuery::List {
+                        after_session_id,
+                        limit,
+                    } => Ok(serde_json::to_value(store.paper_list_sessions(
+                        after_session_id.as_ref(),
+                        limit,
+                        now,
+                    )?)?),
+                    PaperSessionQuery::Get { session_id } => Ok(serde_json::to_value(
+                        store.paper_get_session(&session_id, now)?,
+                    )?),
+                    PaperSessionQuery::Events {
+                        session_id,
+                        after_sequence,
+                        limit,
+                    } => Ok(serde_json::to_value(store.paper_list_events(
+                        &session_id,
+                        after_sequence,
+                        limit,
+                    )?)?),
+                    PaperSessionQuery::ReviewEvents {
+                        session_id,
+                        after_sequence,
+                        as_of_sequence,
+                        limit,
+                    } => Ok(serde_json::to_value(store.paper_review_events(
+                        &session_id,
+                        after_sequence,
+                        as_of_sequence,
+                        limit,
+                    )?)?),
+                    PaperSessionQuery::Request { request_id } => Ok(serde_json::to_value(
+                        store.paper_readback_request(&request_id, now)?,
+                    )?),
+                }
+            })
+            .await
     }
 
     /// Query private strategy-automation projections without venue or lifecycle effects.
@@ -880,7 +852,7 @@ impl JobService {
 
     /// Best-effort completed-candle poll for `RUNNING` paper sessions whose latest boundary
     /// is not yet present in `candle_observations`.
-    pub(super) async fn poll_due_paper_markets(&self, now: UtcTimestamp) {
+    pub(super) async fn poll_due_paper_markets(&self, now: UtcTimestamp) -> bool {
         let due = match self
             .inner
             .database
@@ -893,19 +865,19 @@ impl JobService {
             Ok(due) => due,
             Err(error) => {
                 tracing::warn!(reason = %bounded_note(&error), "paper completed-candle polling could not inspect durable state");
-                return;
+                return false;
             }
         };
         if due.is_empty() {
-            return;
+            return true;
         }
         let Ok(count) = ProbeCount::try_from(crate::paper::MAX_PAPER_RECOVERY_BARS) else {
-            return;
+            return true;
         };
         let mut batches = Vec::new();
         for req in due {
             if self.inner.stop.is_cancelled() {
-                return;
+                return true;
             }
             let batch = if let Some(feed) = &self.inner.public_market_feed {
                 match feed
@@ -939,17 +911,21 @@ impl JobService {
                 batches.push(batch);
             }
         }
-        if !batches.is_empty()
-            && let Err(error) = self
-                .inner
-                .database
-                .call("reconcile_running_paper_sessions", move |store| {
-                    store.reconcile_running_paper_sessions(&batches, now)
-                })
-                .await
+        if batches.is_empty() {
+            return true;
+        }
+        if let Err(error) = self
+            .inner
+            .database
+            .call("reconcile_running_paper_sessions", move |store| {
+                store.reconcile_running_paper_sessions(&batches, now)
+            })
+            .await
         {
             tracing::warn!(reason = %bounded_note(&error), "paper completed-candle persistence or policy evaluation failed");
+            return false;
         }
+        true
     }
 }
 

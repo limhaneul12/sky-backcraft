@@ -208,77 +208,8 @@ struct LedgerDetailPage {
 
 /// Read-only bounded adapter for immutable result_query projections.
 final class LedgerDetailMCPReader {
-    private let client: NativeMCPClient
+    let client: NativeMCPClient
     init(client: NativeMCPClient = .shared) { self.client = client }
-
-    func costs(
-        runId: String,
-        modelId: String,
-        expectedFillCount: Int,
-        expectedTerminalEquity: Decimal?,
-        expectedPolicyId: String?,
-        expectedPolicyRevisionId: String?,
-        expectedPolicyDefinitionDigest: String?,
-        completion: @escaping (Result<ModelLedgerCostDetail, Error>) -> Void
-    ) {
-        guard let expectedPolicyId, let expectedPolicyRevisionId, let expectedPolicyDefinitionDigest,
-              Self.isLowerHex64(expectedPolicyDefinitionDigest) else {
-            completion(.failure(LedgerDetailError.identityMismatch("선택 모델의 정책 ID/리비전/정의 digest를 확인할 수 없음")))
-            return
-        }
-        client.call("result_query", arguments: [
-            "action": "costs", "run_id": runId, "model_id": modelId
-        ]) { result in
-            do {
-                let value = try Self.decodeCosts(data: result.get(), runId: runId, modelId: modelId,
-                                                 expectedPolicyId: expectedPolicyId,
-                                                 expectedPolicyRevisionId: expectedPolicyRevisionId,
-                                                 expectedPolicyDefinitionDigest: expectedPolicyDefinitionDigest)
-                guard value.fillCount == expectedFillCount else {
-                    throw LedgerDetailError.countMismatch("비용 체결 \(value.fillCount)건 / 실행 요약 \(expectedFillCount)건")
-                }
-                if let expected = expectedTerminalEquity {
-                    guard value.terminalEquity == expected else {
-                        throw LedgerDetailError.countMismatch("최종 평가액이 실행 요약과 다릅니다")
-                    }
-                }
-                completion(.success(value))
-            } catch { completion(.failure(error)) }
-        }
-    }
-
-    func page(
-        runId: String,
-        modelId: String,
-        section: LedgerDetailSection,
-        cursor: LedgerDetailCursor? = nil,
-        expectedTotalCount: Int? = nil,
-        expectedMarket: String? = nil,
-        completion: @escaping (Result<LedgerDetailPage, Error>) -> Void
-    ) {
-        guard cursor == nil || cursor?.modelId == modelId else {
-            completion(.failure(LedgerDetailError.identityMismatch("cursor model_id"))); return
-        }
-        var query: [String: Any] = [
-            "run_id": runId, "model_id": modelId, "section": section.rawValue, "limit": 100
-        ]
-        if let cursor {
-            query["cursor"] = ["model_id": cursor.modelId, "offset": cursor.offset]
-        }
-        client.call("result_query", arguments: ["action": "ledger", "query": query]) { result in
-            do {
-                let page = try Self.decodePage(data: result.get(), runId: runId, modelId: modelId,
-                                               section: section, requestedCursor: cursor)
-                if let expectedTotalCount, page.totalCount != expectedTotalCount {
-                    throw LedgerDetailError.countMismatch("\(section.title) \(page.totalCount)건 / 실행 요약 \(expectedTotalCount)건")
-                }
-                if let expectedMarket, page.records.contains(where: { $0.market != expectedMarket }) {
-                    throw LedgerDetailError.identityMismatch("market")
-                }
-                completion(.success(page))
-            } catch { completion(.failure(error)) }
-        }
-    }
 
     static func decodeCosts(data: Data, runId: String, modelId: String,
                             expectedPolicyId: String? = nil,
@@ -592,7 +523,7 @@ final class LedgerDetailMCPReader {
         }
         return number
     }
-    private static func isLowerHex64(_ value: String) -> Bool {
+    static func isLowerHex64(_ value: String) -> Bool {
         value.count == 64 && value.utf8.allSatisfy { byte in
             (48...57).contains(byte) || (97...102).contains(byte)
         }

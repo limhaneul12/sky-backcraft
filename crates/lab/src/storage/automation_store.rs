@@ -426,8 +426,16 @@ impl Store {
         })?;
         validate_account_identity(mode, account_identity)?;
         let risk_json = serde_json::to_string(risk).map_err(json_error)?;
-        let conflicting_profile = self
-            .connection
+        let policy_ref_json = serde_json::to_string(policy_ref).map_err(json_error)?;
+        let frozen_policy_json = serde_json::to_string(&frozen_policy).map_err(json_error)?;
+        let checkpoint_json = "{}";
+        let session_id = crate::contracts::AutomationSessionId::from_seed(&format!(
+            "automation-session:{}:{}",
+            request_id.as_str(),
+            request_digest.as_str()
+        ));
+        let transaction = self.connection.transaction().map_err(sql_error)?;
+        let conflicting_profile = transaction
             .query_row(
                 "SELECT 1 FROM automation_sessions WHERE account_identity=?1 \
                  AND state IN ('RUNNING','PAUSED','NEEDS_RECONCILIATION') AND risk_json!=?2 LIMIT 1",
@@ -444,8 +452,7 @@ impl Store {
             ));
         }
 
-        let conflicting_market = self
-            .connection
+        let conflicting_market = transaction
             .query_row(
                 "SELECT 1 FROM automation_sessions WHERE account_identity=?1 AND market=?2 \
                  AND state IN ('RUNNING','PAUSED','NEEDS_RECONCILIATION') LIMIT 1",
@@ -462,34 +469,30 @@ impl Store {
             )));
         }
 
-        let active_count: u32 = self
-            .connection
+        let active_count_raw: i64 = transaction
             .query_row(
                 "SELECT COUNT(*) FROM automation_sessions WHERE state IN ('RUNNING','PAUSED','NEEDS_RECONCILIATION')",
                 [],
                 |row| row.get(0),
             )
             .map_err(sql_error)?;
+        let active_count = u32::try_from(active_count_raw).map_err(|_| {
+            LabError::DataCorrupt(
+                "automation active session count is negative or out of u32 range".into(),
+            )
+        })?;
         if active_count >= MAX_AUTOMATION_SESSIONS {
             return Err(LabError::CapacityExceeded(format!(
                 "automation session limit {MAX_AUTOMATION_SESSIONS} reached"
             )));
         }
 
-        let session_id = crate::contracts::AutomationSessionId::from_seed(&format!(
-            "automation-session:{}:{}",
-            request_id.as_str(),
-            request_digest.as_str()
-        ));
-        let policy_ref_json = serde_json::to_string(policy_ref).map_err(json_error)?;
-        let frozen_policy_json = serde_json::to_string(&frozen_policy).map_err(json_error)?;
-        let checkpoint_json = "{}";
         let live_approval_active =
             if mode == AutomationSessionMode::Live && live_execution_policy.is_enabled() {
-                self.connection
+                transaction
                 .query_row(
                     "SELECT state='RUNNING' AND order_admission_blocked=0 AND emergency_latched=0 \
-                     FROM trading_control_state WHERE singleton=1",
+                         FROM trading_control_state WHERE singleton=1",
                     [],
                     |row| row.get::<_, bool>(0),
                 )
@@ -520,7 +523,6 @@ impl Store {
             )
         };
         let sequence = 1_u64;
-        let transaction = self.connection.transaction().map_err(sql_error)?;
         if mode == AutomationSessionMode::Live {
             ensure_live_account_identity_history(&transaction, account_identity)?;
         }

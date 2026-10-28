@@ -13,7 +13,6 @@ use crate::contracts::{
     RecordedDecisionAction, RecordedDecisionStage, RecordedExecutionState, SavedFactCaptureStatus,
 };
 use crate::storage::{DecisionAnalysisReadSnapshot, DecisionAnalysisSourceData};
-use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -477,7 +476,7 @@ fn compare(
             &selected,
             compared_source,
             compared,
-        )?,
+        ),
         (Some(_), None) => {
             return Err(LabError::Internal(
                 "compared record has no source snapshot".into(),
@@ -608,10 +607,10 @@ fn changed_fields(
     selected: &DecisionAnalysisDecisionDetail,
     compared_source: &DecisionAnalysisSourceSnapshot,
     compared: &DecisionAnalysisDecisionDetail,
-) -> Result<Vec<DecisionAnalysisChangedField>, LabError> {
+) -> Vec<DecisionAnalysisChangedField> {
     let mut changes = context_changed_fields(selected_source, selected, compared_source, compared);
-    append_explanation_changed_fields(&mut changes, &selected.explanation, &compared.explanation)?;
-    Ok(changes)
+    append_explanation_changed_fields(&mut changes, &selected.explanation, &compared.explanation);
+    changes
 }
 
 fn context_changed_fields(
@@ -649,86 +648,85 @@ fn append_explanation_changed_fields(
     changes: &mut Vec<DecisionAnalysisChangedField>,
     left: &crate::contracts::RecordedDecisionExplanation,
     right: &crate::contracts::RecordedDecisionExplanation,
-) -> Result<(), LabError> {
+) {
     push_if_different(
         changes,
         DecisionAnalysisChangedField::DecisionTime,
         &left.decision_time,
         &right.decision_time,
-    )?;
+    );
     push_if_different(
         changes,
         DecisionAnalysisChangedField::StrategyAction,
         &left.strategy_action,
         &right.strategy_action,
-    )?;
+    );
     push_if_different(
         changes,
         DecisionAnalysisChangedField::ConstrainedAction,
         &left.constrained_action,
         &right.constrained_action,
-    )?;
+    );
     push_if_different(
         changes,
         DecisionAnalysisChangedField::ExecutionState,
         &left.execution_state,
         &right.execution_state,
-    )?;
+    );
     push_if_different(
         changes,
         DecisionAnalysisChangedField::ActualWeightAtDecision,
         &left.actual_weight_at_decision,
         &right.actual_weight_at_decision,
-    )?;
+    );
     push_if_different(
         changes,
         DecisionAnalysisChangedField::RawTargetWeight,
         &left.raw_target_weight,
         &right.raw_target_weight,
-    )?;
+    );
     push_if_different(
         changes,
         DecisionAnalysisChangedField::ConstrainedTargetWeight,
         &left.constrained_target_weight,
         &right.constrained_target_weight,
-    )?;
+    );
     push_if_different(
         changes,
         DecisionAnalysisChangedField::MatchedRuleId,
         &left.matched_rule_id,
         &right.matched_rule_id,
-    )?;
+    );
     push_if_different(
         changes,
         DecisionAnalysisChangedField::ConditionTraceCapture,
         &left.condition_trace_capture,
         &right.condition_trace_capture,
-    )?;
+    );
     push_if_different(
         changes,
         DecisionAnalysisChangedField::ConditionTrace,
         &left.condition_trace,
         &right.condition_trace,
-    )?;
+    );
     push_if_different(
         changes,
         DecisionAnalysisChangedField::Reasons,
         &left.reasons,
         &right.reasons,
-    )?;
+    );
     push_if_different(
         changes,
         DecisionAnalysisChangedField::Orders,
         &left.orders,
         &right.orders,
-    )?;
+    );
     push_if_different(
         changes,
         DecisionAnalysisChangedField::Fills,
         &left.fills,
         &right.fills,
-    )?;
-    Ok(())
+    );
 }
 
 fn source_family(source: &crate::contracts::DecisionAnalysisSource) -> &'static str {
@@ -745,16 +743,15 @@ fn source_session_id(source: &crate::contracts::DecisionAnalysisSource) -> &str 
     }
 }
 
-fn push_if_different<T: Serialize>(
+fn push_if_different<T: PartialEq>(
     fields: &mut Vec<DecisionAnalysisChangedField>,
     field: DecisionAnalysisChangedField,
     left: &T,
     right: &T,
-) -> Result<(), LabError> {
-    if serde_json::to_value(left)? != serde_json::to_value(right)? {
+) {
+    if left != right {
         fields.push(field);
     }
-    Ok(())
 }
 
 fn count_action(counts: &mut DecisionAnalysisActionCounts, action: RecordedDecisionAction) {

@@ -179,6 +179,8 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
         }
         pollTimer?.invalidate()
         activeReadRequest?.cancel()
+        activeWriteRequest?.cancel()
+        reviewWindowController?.close()
         closeDecisionAnalysisWindow()
     }
 
@@ -241,7 +243,7 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
         header.alignment = .centerY
         header.spacing = 10
 
-        statusBanner.font = TerminalTheme.monospacedFont(ofSize: 12, weight: .medium)
+        statusBanner.font = TerminalTheme.monospacedDigitFont(ofSize: 12, weight: .medium)
         statusBanner.textColor = TerminalTheme.secondaryText
         statusBanner.maximumNumberOfLines = 3
         statusBanner.lineBreakMode = .byWordWrapping
@@ -280,7 +282,7 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
         sessionControls.orientation = TerminalTheme.textScale >= 1.5 ? .vertical : .horizontal
         sessionControls.alignment = TerminalTheme.textScale >= 1.5 ? .leading : .centerY
         sessionControls.spacing = 8
-        sessionSummaryLabel.font = TerminalTheme.monospacedFont(ofSize: 12, weight: .regular)
+        sessionSummaryLabel.font = TerminalTheme.monospacedDigitFont(ofSize: 12, weight: .regular)
         sessionSummaryLabel.textColor = .labelColor
         sessionSummaryLabel.maximumNumberOfLines = 0
         sessionSummaryLabel.lineBreakMode = .byWordWrapping
@@ -288,7 +290,7 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
         let sessionListContent = verticalStack([sessionScroll, nextSessionsButton], spacing: 8)
         let sessionBox = makePanelBox(title: "세션 목록 · 모드, 서버 승인과 요청 순서", content: sessionListContent)
 
-        modeBadge.font = TerminalTheme.monospacedFont(ofSize: 12, weight: .bold)
+        modeBadge.font = TerminalTheme.systemFont(ofSize: 12, weight: .semibold)
         modeBadge.textColor = TerminalTheme.accent
         modeBadge.maximumNumberOfLines = 0
         modeBadge.lineBreakMode = .byWordWrapping
@@ -298,7 +300,7 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
             content: verticalStack([modeBadge], spacing: 4)
         )
 
-        admissionBlockReasonLabel.font = TerminalTheme.monospacedFont(ofSize: 11, weight: .medium)
+        admissionBlockReasonLabel.font = TerminalTheme.monospacedDigitFont(ofSize: 11, weight: .medium)
         admissionBlockReasonLabel.maximumNumberOfLines = 0
         admissionBlockReasonLabel.setAccessibilityLabel("서버가 제공한 주문 승인 차단 사유")
         lifecycleAvailabilityLabel.font = TerminalTheme.systemFont(ofSize: 12, weight: .medium)
@@ -321,13 +323,13 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
         riskUsageLabel.maximumNumberOfLines = 7
         feedFreshnessLabel.font = TerminalTheme.table
         feedFreshnessLabel.maximumNumberOfLines = 4
-        capabilityLabel.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        capabilityLabel.font = TerminalTheme.monospacedDigitFont(ofSize: 12, weight: .regular)
         capabilityLabel.maximumNumberOfLines = 5
-        mockAssumptionLabel.font = .systemFont(ofSize: 12)
+        mockAssumptionLabel.font = TerminalTheme.systemFont(ofSize: 12)
         mockAssumptionLabel.maximumNumberOfLines = 4
-        riskIdentityLabel.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        riskIdentityLabel.font = TerminalTheme.monospacedDigitFont(ofSize: 12, weight: .regular)
         riskIdentityLabel.maximumNumberOfLines = 8
-        receivedAtLabel.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
+        receivedAtLabel.font = TerminalTheme.monospacedDigitFont(ofSize: 10, weight: .regular)
         receivedAtLabel.textColor = TerminalTheme.secondaryText
         let accountContent = verticalStack([
             riskIdentityLabel, accountBalanceLabel, baselineStatusLabel,
@@ -588,7 +590,7 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
         row3.alignment = stacksVertically ? .leading : .bottom
         row3.spacing = 12
 
-        baselineQueryResultLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        baselineQueryResultLabel.font = TerminalTheme.monospacedDigitFont(ofSize: 11, weight: .regular)
         baselineQueryResultLabel.textColor = TerminalTheme.secondaryText
         baselineQueryResultLabel.maximumNumberOfLines = 5
 
@@ -684,7 +686,7 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
         var rows: [NSView] = []
         for pair in riskRows {
             let row = NSStackView(views: pair.map { key, title, _ in
-                labeledControl(title, riskFields[key]!)
+                labeledControl(title, riskFields[key] ?? NSTextField(string: ""))
             })
             row.orientation = TerminalTheme.textScale >= 1.5 ? .vertical : .horizontal
             row.alignment = TerminalTheme.textScale >= 1.5 ? .leading : .top
@@ -771,7 +773,6 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
         table.dataSource = self
         table.headerView = NSTableHeaderView()
         table.rowHeight = 30
-        table.usesAlternatingRowBackgroundColors = true
         table.allowsMultipleSelection = false
         table.setAccessibilityLabel(accessibilityLabel)
         for (identifier, title, width) in columns {
@@ -795,14 +796,9 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
     }
 
     private func makePanelBox(title: String, content: NSView) -> NSBox {
-        let box = NSBox()
-        box.boxType = .custom
-        box.cornerRadius = 6
-        box.borderWidth = 1
-        box.borderColor = TerminalTheme.border
-        box.fillColor = TerminalTheme.panel
+        let box = TerminalTheme.makePanelBox()
         let heading = label(title)
-        heading.font = .systemFont(ofSize: 13, weight: .semibold)
+        heading.font = TerminalTheme.sectionHeading
         let stack = verticalStack([heading, content], spacing: 8)
         stack.translatesAutoresizingMaskIntoConstraints = false
         box.addSubview(stack)
@@ -2107,11 +2103,15 @@ final class AutomationWorkspaceView: NSView, NSTableViewDataSource, NSTableViewD
         }
     }
 
-    private func utcString(_ date: Date) -> String {
+    private static let utcFormatter: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         formatter.timeZone = TimeZone(secondsFromGMT: 0)
-        return formatter.string(from: date)
+        return formatter
+    }()
+
+    private func utcString(_ date: Date) -> String {
+        Self.utcFormatter.string(from: date)
     }
 
     private func publishSummary() {

@@ -101,10 +101,6 @@ private final class AutomationReviewCandleChartView: NSView {
     }
 }
 
-private final class AutomationReviewFlippedView: NSView {
-    override var isFlipped: Bool { true }
-}
-
 /// Read-only AppKit review of the original persisted strategy decision and its report.
 final class AutomationReviewWindowController: NSWindowController, NSWindowDelegate,
     NSTableViewDataSource, NSTableViewDelegate {
@@ -343,7 +339,7 @@ final class AutomationReviewWindowController: NSWindowController, NSWindowDelega
         let titleLineHeight = titleFont.ascender - titleFont.descender + titleFont.leading
         title.heightAnchor.constraint(greaterThanOrEqualToConstant: ceil(titleLineHeight + 4)).isActive = true
         title.setAccessibilityLabel("전략 자동매매 복기와 성과 보고서")
-        modeBadge.font = TerminalTheme.monospacedFont(ofSize: 12, weight: .bold)
+        modeBadge.font = TerminalTheme.systemFont(ofSize: 12, weight: .semibold)
         modeBadge.wantsLayer = true
         modeBadge.layer?.cornerRadius = 4
         modeBadge.layer?.borderWidth = 1
@@ -490,7 +486,7 @@ final class AutomationReviewWindowController: NSWindowController, NSWindowDelega
         detailScroll.hasHorizontalScroller = false
         detailScroll.drawsBackground = false
         detailScroll.translatesAutoresizingMaskIntoConstraints = false
-        let detailDocument = AutomationReviewFlippedView()
+        let detailDocument = TerminalFlippedDocumentView()
         detailDocument.translatesAutoresizingMaskIntoConstraints = false
         detailScroll.documentView = detailDocument
         detailContent.translatesAutoresizingMaskIntoConstraints = false
@@ -1166,12 +1162,7 @@ final class AutomationReviewWindowController: NSWindowController, NSWindowDelega
     }
 
     private func makePanel(title: String, content: NSView) -> NSBox {
-        let box = NSBox()
-        box.boxType = .custom
-        box.cornerRadius = 6
-        box.borderWidth = 1
-        box.borderColor = TerminalTheme.border
-        box.fillColor = TerminalTheme.panel
+        let box = TerminalTheme.makePanelBox(cornerRadius: 6)
         let heading = label(title)
         heading.font = TerminalTheme.systemFont(ofSize: 14, weight: .semibold)
         let stack = verticalStack([heading, content], spacing: 8)

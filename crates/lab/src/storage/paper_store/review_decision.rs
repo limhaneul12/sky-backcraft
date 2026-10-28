@@ -15,7 +15,7 @@ const MAX_LINKED_PAPER_ORDER_BYTES: usize = 512 * 1024;
 const MAX_LINKED_PAPER_FILL_FACTS: usize = 512;
 const MAX_LINKED_PAPER_FILL_BYTES: usize = 512 * 1024;
 const MAX_LINKED_PAPER_SCAN_EVENTS: usize = 50_000;
-const MAX_LINKED_PAPER_SCAN_BYTES: usize = 32 * 1024 * 1024;
+const MAX_LINKED_PAPER_SCAN_BYTES: usize = 512 * 1024 * 1024;
 
 struct LinkedOrderHistory {
     creation_by_id: BTreeMap<String, OrderRecord>,
@@ -222,7 +222,8 @@ fn paper_source_observations(
         ));
     }
     let mut sources = Vec::new();
-    for id in &signal.source_bar_ids {
+    let mut completed = None;
+    for (index, id) in signal.source_bar_ids.iter().enumerate() {
         if sources
             .iter()
             .any(|source: &PaperObservationProvenance| &source.observation_id == id)
@@ -230,6 +231,12 @@ fn paper_source_observations(
             continue;
         }
         let observation = load_observation(connection, id)?;
+        if index == 0 {
+            completed = observation.as_ref().map(|observation| {
+                observation.candle.completed
+                    && observation.candle.close_time_utc <= signal.decision_available_at
+            });
+        }
         sources.push(provenance(
             connection,
             id,
@@ -238,16 +245,6 @@ fn paper_source_observations(
             source_event_at,
         )?);
     }
-    let completed = signal
-        .source_bar_ids
-        .first()
-        .map(|id| load_observation(connection, id))
-        .transpose()?
-        .flatten()
-        .map(|observation| {
-            observation.candle.completed
-                && observation.candle.close_time_utc <= signal.decision_available_at
-        });
     Ok((sources, completed))
 }
 
@@ -555,17 +552,24 @@ fn validate_linked_paper_event_documents(
     connection: &rusqlite::Connection,
     selection: &PaperReviewSelection,
 ) -> Result<(), LabError> {
-    let malformed: bool = connection
+    let event_byte_limit = i64::try_from(crate::contracts::MAX_PAPER_REVIEW_EVENT_BYTES)
+        .map_err(|_| LabError::ResourceLimit("paper review event byte cap overflow".into()))?;
+    let (malformed, oversized_event): (bool, bool) = connection
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM paper_session_events \
-             WHERE session_id=?1 AND sequence BETWEEN ?2 AND ?3 \
-               AND json_valid(event_json)=0 LIMIT 1)",
+            "SELECT \
+               EXISTS(SELECT 1 FROM paper_session_events \
+                WHERE session_id=?1 AND sequence BETWEEN ?2 AND ?3 \
+                  AND json_valid(event_json)=0 LIMIT 1), \
+               EXISTS(SELECT 1 FROM paper_session_events \
+                WHERE session_id=?1 AND sequence BETWEEN ?2 AND ?3 \
+                  AND length(CAST(event_json AS BLOB))>?4 LIMIT 1)",
             params![
                 selection.session_id.as_str(),
                 u64_to_i64(selection.event_sequence)?,
                 u64_to_i64(selection.as_of_sequence)?,
+                event_byte_limit,
             ],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(sql_error)?;
     if malformed {
@@ -573,22 +577,6 @@ fn validate_linked_paper_event_documents(
             "paper event prefix contains invalid JSON".into(),
         ));
     }
-    let event_byte_limit = i64::try_from(crate::contracts::MAX_PAPER_REVIEW_EVENT_BYTES)
-        .map_err(|_| LabError::ResourceLimit("paper review event byte cap overflow".into()))?;
-    let oversized_event: bool = connection
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM paper_session_events \
-             WHERE session_id=?1 AND sequence BETWEEN ?2 AND ?3 \
-               AND length(CAST(event_json AS BLOB))>?4 LIMIT 1)",
-            params![
-                selection.session_id.as_str(),
-                u64_to_i64(selection.event_sequence)?,
-                u64_to_i64(selection.as_of_sequence)?,
-                event_byte_limit,
-            ],
-            |row| row.get(0),
-        )
-        .map_err(sql_error)?;
     if oversized_event {
         return Err(LabError::ResourceLimit(
             "paper lifecycle event exceeds review byte limit".into(),
@@ -812,27 +800,25 @@ pub(super) fn load_observation(
     connection: &rusqlite::Connection,
     id: &ObservationId,
 ) -> Result<Option<CandleObservation>, LabError> {
-    let size: Option<i64> = connection
+    let row: Option<(i64, Option<String>)> = connection
         .query_row(
-            "SELECT length(CAST(observation_json AS BLOB)) FROM candle_observations WHERE id=?1",
+            "SELECT length(CAST(observation_json AS BLOB)), \
+                    CASE WHEN length(CAST(observation_json AS BLOB)) BETWEEN 0 AND 131072 \
+                         THEN observation_json END \
+             FROM candle_observations WHERE id=?1",
             [id.as_str()],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
         .map_err(sql_error)?;
-    let Some(size) = size else { return Ok(None) };
-    if !(0..=131_072).contains(&size) {
+    let Some((size, raw)) = row else {
+        return Ok(None);
+    };
+    let Some(raw) = raw.filter(|_| (0..=131_072).contains(&size)) else {
         return Err(LabError::ResourceLimit(
             "saved source observation exceeds review byte budget".into(),
         ));
-    }
-    let raw: String = connection
-        .query_row(
-            "SELECT observation_json FROM candle_observations WHERE id=?1",
-            [id.as_str()],
-            |row| row.get(0),
-        )
-        .map_err(sql_error)?;
+    };
     let observation: CandleObservation = serde_json::from_str(&raw).map_err(json_error)?;
     if &observation.id != id {
         return Err(LabError::DataCorrupt(

@@ -205,7 +205,20 @@ pub struct SuiteSummary {
     pub completed_runs: u32,
     pub blocked_or_failed_runs: u32,
     pub selected_folds: Vec<WalkForwardFold>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub winner_consistency_ratio: Option<f64>,
     pub unused_tail: Option<UtcRange>,
+}
+
+/// Overfitting-defense and cross-scenario stability metrics computed from
+/// completed suite comparison rows.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SuiteStabilityMetrics {
+    pub winner_consistency_ratio: MetricValue,
+    pub oos_retention_ratio: MetricValue,
+    pub oos_return_std_dev: MetricValue,
+    pub cost_drag_per_bps: MetricValue,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

@@ -29,6 +29,7 @@ pub(super) fn deferred_event(
         .query_row(
             "SELECT json_extract(event_json,'$.preparation') FROM paper_session_events \
          WHERE session_id=?1 AND kind='DECISION_DEFERRED' \
+         AND (market=?2 OR (market IS NULL AND json_extract(event_json,'$.preparation.market')=?2)) \
          AND json_extract(event_json,'$.preparation.market')=?2 \
          ORDER BY sequence DESC LIMIT 1",
             params![session_id.as_str(), preparation.market.code()],

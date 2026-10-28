@@ -20,9 +20,9 @@ use super::PaperMarketCheckpoint;
 
 pub(crate) const MAX_PAPER_SESSION_VERIFICATION_EVENTS: usize = 20_000;
 pub(crate) const MAX_PAPER_SESSION_VERIFICATION_OBSERVATIONS: usize = 40_000;
-pub(crate) const MAX_PAPER_SESSION_VERIFICATION_EVENT_BYTES: usize = 64 * 1024 * 1024;
-pub(crate) const MAX_PAPER_SESSION_VERIFICATION_OBSERVATION_BYTES: usize = 64 * 1024 * 1024;
-pub(crate) const MAX_PAPER_SESSION_VERIFICATION_JSON_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_PAPER_SESSION_VERIFICATION_EVENT_BYTES: usize = 512 * 1024 * 1024;
+pub(crate) const MAX_PAPER_SESSION_VERIFICATION_OBSERVATION_BYTES: usize = 128 * 1024 * 1024;
+pub(crate) const MAX_PAPER_SESSION_VERIFICATION_JSON_BYTES: usize = 512 * 1024 * 1024;
 const MAX_FINDINGS: usize = 8;
 const VERIFICATION_SCOPE: &str = "SCOPE=ACCOUNTING+EVENT+REFERENCES+FACT_IDEMPOTENCE; NOT_VERIFIED=STRATEGY_LOGIC,PROVIDER_FIRST_SEEN,DYNAMIC_COST_PROVENANCE,BENCHMARK_ACCOUNTING,EVENT_HASH_CHAIN,REQUEST_RECEIPT_REPLAY,EPISODE_ANALYTICS";
 
@@ -250,21 +250,75 @@ pub(crate) fn verify_paper_session(
         &mut global,
     );
 
+    let validated_observations = prevalidate_observations(observations);
     verify_market_snapshots(
         session,
         &checkpoint_by_market,
         event_rows,
-        observations,
+        &validated_observations,
         provider_coverage,
         &global,
     )
+}
+
+#[derive(Clone, Copy)]
+struct ValidatedObservation<'a> {
+    observation: &'a CandleObservation,
+    digest_serializable: bool,
+    id_and_digest_valid: bool,
+    boundary_valid: bool,
+}
+
+type ValidatedObservations<'a> = BTreeMap<ObservationId, ValidatedObservation<'a>>;
+
+fn prevalidate_observations(
+    observations: &BTreeMap<ObservationId, CandleObservation>,
+) -> ValidatedObservations<'_> {
+    observations
+        .iter()
+        .map(|(key, observation)| {
+            let (digest_serializable, id_and_digest_valid) =
+                match observation_digest(&observation.candle) {
+                    Ok(digest) => (
+                        true,
+                        &observation.id == key
+                            && observation.id == ObservationId::from_seed(digest.as_str())
+                            && observation.content_digest == digest,
+                    ),
+                    Err(_) => (false, false),
+                };
+            let interval = observation.candle.interval;
+            let expected_close = observation
+                .candle
+                .open_time_utc
+                .0
+                .checked_add_signed(interval.duration())
+                .map(UtcTimestamp);
+            let boundary_valid = expected_close == Some(observation.candle.close_time_utc)
+                && crate::scheduling::latest_completed_boundary(
+                    observation.candle.close_time_utc,
+                    interval,
+                )
+                .ok()
+                    == Some(observation.candle.close_time_utc);
+            (
+                key.clone(),
+                ValidatedObservation {
+                    observation,
+                    digest_serializable,
+                    id_and_digest_valid,
+                    boundary_valid,
+                },
+            )
+        })
+        .collect()
 }
 
 fn verify_market_snapshots(
     session: &PaperSessionView,
     checkpoint_by_market: &BTreeMap<MarketId, &PaperMarketCheckpoint>,
     event_rows: &[StoredEventRow],
-    observations: &BTreeMap<ObservationId, CandleObservation>,
+    observations: &ValidatedObservations<'_>,
     provider_coverage: &VerifiedProviderCoverage,
     global: &Findings,
 ) -> BTreeMap<MarketId, PaperVerification> {
@@ -774,7 +828,7 @@ fn verify_market(
     snapshot: &crate::contracts::PaperMarketSnapshot,
     checkpoint: &PaperMarketCheckpoint,
     event_rows: &[StoredEventRow],
-    observations: &BTreeMap<ObservationId, CandleObservation>,
+    observations: &ValidatedObservations<'_>,
     provider_coverage: &VerifiedProviderCoverage,
     findings: &mut Findings,
 ) {
@@ -879,7 +933,7 @@ fn collect_market_facts<'a>(
     snapshot: &crate::contracts::PaperMarketSnapshot,
     checkpoint: &'a PaperMarketCheckpoint,
     event_rows: &'a [StoredEventRow],
-    observations: &BTreeMap<ObservationId, CandleObservation>,
+    observations: &ValidatedObservations<'_>,
     provider_coverage: &VerifiedProviderCoverage,
     findings: &mut Findings,
 ) -> MarketFacts<'a> {
@@ -936,7 +990,7 @@ fn collect_event_facts<'a>(
     session: &PaperSessionView,
     snapshot: &crate::contracts::PaperMarketSnapshot,
     checkpoint: &PaperMarketCheckpoint,
-    observations: &BTreeMap<ObservationId, CandleObservation>,
+    observations: &ValidatedObservations<'_>,
     facts: &mut MarketFacts<'a>,
     findings: &mut Findings,
 ) {
@@ -958,7 +1012,7 @@ fn collect_signals_and_orders<'a>(
     session: &PaperSessionView,
     snapshot: &crate::contracts::PaperMarketSnapshot,
     checkpoint: &PaperMarketCheckpoint,
-    observations: &BTreeMap<ObservationId, CandleObservation>,
+    observations: &ValidatedObservations<'_>,
     facts: &mut MarketFacts<'a>,
     findings: &mut Findings,
 ) {
@@ -1082,7 +1136,7 @@ fn verify_event_episode_control(
 fn replay_market_facts(
     snapshot: &crate::contracts::PaperMarketSnapshot,
     checkpoint: &PaperMarketCheckpoint,
-    observations: &BTreeMap<ObservationId, CandleObservation>,
+    observations: &ValidatedObservations<'_>,
     facts: &mut MarketFacts<'_>,
     findings: &mut Findings,
 ) -> Replay {
@@ -1224,7 +1278,7 @@ fn verify_event_shape(
     event: &PaperSessionEvent,
     session: &PaperSessionView,
     snapshot: &crate::contracts::PaperMarketSnapshot,
-    observations: &BTreeMap<ObservationId, CandleObservation>,
+    observations: &ValidatedObservations<'_>,
     provider_coverage: &VerifiedProviderCoverage,
     sequence: &mut CandleSequence,
     findings: &mut Findings,
@@ -1288,7 +1342,7 @@ fn verify_candle_processed_event_shape(
     event: &PaperSessionEvent,
     session: &PaperSessionView,
     snapshot: &crate::contracts::PaperMarketSnapshot,
-    observations: &BTreeMap<ObservationId, CandleObservation>,
+    observations: &ValidatedObservations<'_>,
     provider_coverage: &VerifiedProviderCoverage,
     sequence: &mut CandleSequence,
     findings: &mut Findings,
@@ -1394,7 +1448,7 @@ fn verify_recovery_required_event_shape(
     event: &PaperSessionEvent,
     session: &PaperSessionView,
     snapshot: &crate::contracts::PaperMarketSnapshot,
-    observations: &BTreeMap<ObservationId, CandleObservation>,
+    observations: &ValidatedObservations<'_>,
     findings: &mut Findings,
 ) {
     if !event.signals.is_empty()
@@ -1495,24 +1549,25 @@ fn validate_candle_reference(
     market: &MarketId,
     expected_interval: CandleInterval,
     decision_boundary: Option<UtcTimestamp>,
-    observations: &BTreeMap<ObservationId, CandleObservation>,
+    observations: &ValidatedObservations<'_>,
     findings: &mut Findings,
 ) {
     if reference.interval != expected_interval {
         findings.fail("CANDLE_REFERENCE_INTERVAL");
     }
-    let Some(observation) = observations.get(&reference.observation_id) else {
+    let Some(validated) = observations.get(&reference.observation_id) else {
         findings.unavailable("CANDLE_OBSERVATION_NOT_CAPTURED");
         return;
     };
     verify_observation(
-        observation,
+        validated,
         &reference.observation_id,
         market,
         Some(expected_interval),
         decision_boundary,
         findings,
     );
+    let observation = validated.observation;
     if observation.candle.open_time_utc != reference.open_time
         || observation.candle.close_time_utc != reference.close_time
         || observation.content_digest != reference.content_digest
@@ -1524,7 +1579,7 @@ fn validate_candle_reference(
 fn verify_signal(
     signal: &SignalRecord,
     session: &PaperSessionView,
-    observations: &BTreeMap<ObservationId, CandleObservation>,
+    observations: &ValidatedObservations<'_>,
     findings: &mut Findings,
 ) {
     if signal.policy_ref.as_ref() != Some(&session.policy_ref)
@@ -1540,9 +1595,9 @@ fn verify_signal(
         if !seen.insert(source_id) {
             findings.fail("DUPLICATE_SIGNAL_SOURCE");
         }
-        if let Some(observation) = observations.get(source_id) {
+        if let Some(validated) = observations.get(source_id) {
             verify_observation(
-                observation,
+                validated,
                 source_id,
                 &signal.context.market,
                 None,
@@ -1555,29 +1610,27 @@ fn verify_signal(
     }
     if let Some(decision_id) = signal.source_bar_ids.last()
         && let Some(decision) = observations.get(decision_id)
-        && (decision.candle.interval != session.decision_interval
-            || decision.candle.close_time_utc != signal.decision_available_at)
+        && (decision.observation.candle.interval != session.decision_interval
+            || decision.observation.candle.close_time_utc != signal.decision_available_at)
     {
         findings.fail("SIGNAL_DECISION_REFERENCE");
     }
 }
 
 fn verify_observation(
-    observation: &CandleObservation,
+    validated: &ValidatedObservation<'_>,
     expected_id: &ObservationId,
     market: &MarketId,
     expected_interval: Option<CandleInterval>,
     latest_close: Option<UtcTimestamp>,
     findings: &mut Findings,
 ) {
-    let Ok(digest) = observation_digest(&observation.candle) else {
+    if !validated.digest_serializable {
         findings.fail("OBSERVATION_DIGEST_SERIALIZATION");
         return;
-    };
-    if &observation.id != expected_id
-        || observation.id != ObservationId::from_seed(digest.as_str())
-        || observation.content_digest != digest
-    {
+    }
+    let observation = validated.observation;
+    if &observation.id != expected_id || !validated.id_and_digest_valid {
         findings.fail("OBSERVATION_ID_OR_DIGEST");
     }
     if observation.candle.market != market.code()
@@ -1586,18 +1639,7 @@ fn verify_observation(
     {
         findings.fail("OBSERVATION_MARKET_INTERVAL_OR_COMPLETION");
     }
-    let interval = observation.candle.interval;
-    let expected_close = observation
-        .candle
-        .open_time_utc
-        .0
-        .checked_add_signed(interval.duration())
-        .map(UtcTimestamp);
-    if expected_close != Some(observation.candle.close_time_utc)
-        || crate::scheduling::latest_completed_boundary(observation.candle.close_time_utc, interval)
-            .ok()
-            != Some(observation.candle.close_time_utc)
-    {
+    if !validated.boundary_valid {
         findings.fail("OBSERVATION_CANDLE_BOUNDARY");
     }
     if latest_close.is_some_and(|at| observation.candle.close_time_utc > at) {
@@ -1624,7 +1666,7 @@ fn verify_fill_references(
     fill: &FillRecord,
     order: &OrderRecord,
     signals: &BTreeMap<SignalId, &SignalRecord>,
-    observations: &BTreeMap<ObservationId, CandleObservation>,
+    observations: &ValidatedObservations<'_>,
     checkpoint: &PaperMarketCheckpoint,
     findings: &mut Findings,
 ) {
@@ -1657,7 +1699,7 @@ fn verify_fill_references(
     let decision = signal
         .source_bar_ids
         .last()
-        .and_then(|id| observations.get(id));
+        .and_then(|id| observations.get(id).map(|validated| validated.observation));
     if decision.is_none() {
         findings.unavailable("FILL_DECISION_SOURCE_NOT_CAPTURED");
     }
@@ -1726,22 +1768,22 @@ fn observation_for<'a>(
     market: &MarketId,
     interval: Option<CandleInterval>,
     latest_close: Option<UtcTimestamp>,
-    observations: &'a BTreeMap<ObservationId, CandleObservation>,
+    observations: &'a ValidatedObservations<'a>,
     findings: &mut Findings,
     missing_code: &'static str,
 ) -> Option<&'a CandleObservation> {
-    let Some(observation) = observations.get(id) else {
+    let Some(validated) = observations.get(id) else {
         findings.unavailable(missing_code);
         return None;
     };
-    verify_observation(observation, id, market, interval, latest_close, findings);
-    Some(observation)
+    verify_observation(validated, id, market, interval, latest_close, findings);
+    Some(validated.observation)
 }
 
 fn verify_mark_reference(
     mark: &AccountMark,
     checkpoint: &PaperMarketCheckpoint,
-    observations: &BTreeMap<ObservationId, CandleObservation>,
+    observations: &ValidatedObservations<'_>,
     fill_by_mark_sequence: &BTreeMap<u64, &FillRecord>,
     findings: &mut Findings,
 ) {
@@ -2267,7 +2309,7 @@ impl Replay {
         fill: &FillRecord,
         signals: &BTreeMap<SignalId, &SignalRecord>,
         checkpoint: &PaperMarketCheckpoint,
-        observations: &BTreeMap<ObservationId, CandleObservation>,
+        observations: &ValidatedObservations<'_>,
         findings: &mut Findings,
     ) -> Result<(), &'static str> {
         let (pending, created_order, latest_episode, order_filled) = {
@@ -2453,7 +2495,7 @@ impl Replay {
         &mut self,
         mark: &AccountMark,
         checkpoint: &PaperMarketCheckpoint,
-        observations: &BTreeMap<ObservationId, CandleObservation>,
+        observations: &ValidatedObservations<'_>,
         fill_by_mark_sequence: &BTreeMap<u64, &FillRecord>,
         findings: &mut Findings,
     ) -> Result<(), &'static str> {

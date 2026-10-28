@@ -28,6 +28,13 @@ enum TerminalTheme {
                 : NSColor(srgbRed: 0.7, green: 0.14, blue: 0.09, alpha: 1)
         }
     }
+    static var warning: NSColor {
+        NSColor(name: nil) { appearance in
+            appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+                ? NSColor(srgbRed: 0.96, green: 0.72, blue: 0.25, alpha: 1)
+                : NSColor(srgbRed: 0.65, green: 0.36, blue: 0.0, alpha: 1)
+        }
+    }
     private static var configuredTextScale: CGFloat = {
         if let raw = ProcessInfo.processInfo.environment["SERVICE_TEXT_SCALE"],
            let value = Double(raw), value >= 1.0, value <= 2.5 {
@@ -91,16 +98,40 @@ enum TerminalTheme {
     }
 
     /// The one card style used by every workspace: 8pt radius, hairline border, panel fill.
-    static func makePanelBox() -> NSBox {
+    static func makePanelBox(cornerRadius: CGFloat = 8) -> NSBox {
         let box = NSBox()
         box.boxType = .custom
         box.titlePosition = .noTitle
-        box.cornerRadius = 8
+        box.cornerRadius = cornerRadius
         box.borderWidth = 1
         box.borderColor = border
         box.fillColor = panel
         box.contentViewMargins = .zero
         return box
+    }
+
+    static func drawSurface(
+        in bounds: NSRect,
+        fill: NSColor,
+        cornerRadius: CGFloat,
+        drawsBorder: Bool
+    ) {
+        if cornerRadius > 0 || drawsBorder {
+            let rect = bounds.insetBy(dx: 0.5, dy: 0.5)
+            guard rect.width > 0, rect.height > 0 else { return }
+            let clampedRadius = min(max(0, cornerRadius), min(rect.width, rect.height) * 0.5)
+            let path = NSBezierPath(roundedRect: rect, xRadius: clampedRadius, yRadius: clampedRadius)
+            fill.setFill()
+            path.fill()
+            if drawsBorder {
+                border.setStroke()
+                path.lineWidth = 1
+                path.stroke()
+            }
+        } else {
+            fill.setFill()
+            bounds.fill()
+        }
     }
 }
 
@@ -279,11 +310,18 @@ enum TerminalPresentation {
 
 /// Draw inside the effective appearance so a live mode switch never freezes a CGColor.
 final class TerminalSurfaceView: NSView {
-    var usesPanel = false
+    var usesPanel = false { didSet { needsDisplay = true } }
+    var drawsBorder = false { didSet { needsDisplay = true } }
+    var cornerRadius: CGFloat = 0 { didSet { needsDisplay = true } }
     override var wantsDefaultClipping: Bool { true }
     override func draw(_ dirtyRect: NSRect) {
-        (usesPanel ? TerminalTheme.panel : TerminalTheme.surface).setFill()
-        bounds.fill()
+        let fill = usesPanel ? TerminalTheme.panel : TerminalTheme.surface
+        TerminalTheme.drawSurface(
+            in: bounds,
+            fill: fill,
+            cornerRadius: cornerRadius,
+            drawsBorder: drawsBorder
+        )
     }
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
@@ -302,7 +340,9 @@ final class TerminalTableHeaderCell: NSTableHeaderCell {
 /// Canonical flipped document container that keeps initial scroll pinned to `.zero`
 /// across multi-pass Auto Layout growth while preserving manual user scrolling.
 final class TerminalFlippedDocumentView: NSView {
-    var usesPanel = false
+    var usesPanel = false { didSet { needsDisplay = true } }
+    var drawsBorder = false { didSet { needsDisplay = true } }
+    var cornerRadius: CGFloat = 0 { didSet { needsDisplay = true } }
     private var didPinOverflowScroll = false
 
     override var isFlipped: Bool { true }
@@ -310,13 +350,17 @@ final class TerminalFlippedDocumentView: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         guard usesPanel else { return }
-        TerminalTheme.panel.setFill()
-        bounds.fill()
+        TerminalTheme.drawSurface(
+            in: bounds,
+            fill: TerminalTheme.panel,
+            cornerRadius: cornerRadius,
+            drawsBorder: drawsBorder
+        )
     }
 
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
-        if usesPanel {
+        if usesPanel || drawsBorder {
             needsDisplay = true
         }
     }

@@ -33,12 +33,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         dashboard.onOpenSettings = { [weak self] in self?.openSettings() }
         settings.onControlSnapshot = { [weak self] snapshot in self?.dashboard.updateControlSnapshot(snapshot) }
-        settings.onTradingStateChanged = { [weak self] state in
-            self?.dashboard.updateTradingState(state)
-        }
-        dashboard.onStateChange = { [weak self] state in
-            self?.settings.updateTradingState(state)
-        }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {

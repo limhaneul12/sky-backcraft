@@ -972,3 +972,132 @@ fn serialized_bound_is_strict_and_preserves_serialization_error_precedence() {
             if message.contains("intentional failure after oversized element")
     ));
 }
+
+fn advanced_indicator_specs() -> Vec<PolicyIndicator> {
+    vec![
+        indicator("atr", PolicyIndicatorKind::Atr { window: 2 }, None),
+        indicator(
+            "bb_u",
+            PolicyIndicatorKind::BollingerUpper {
+                window: 2,
+                multiplier: 2.0,
+            },
+            None,
+        ),
+        indicator(
+            "bb_l",
+            PolicyIndicatorKind::BollingerLower {
+                window: 2,
+                multiplier: 2.0,
+            },
+            None,
+        ),
+        indicator(
+            "bb_bw",
+            PolicyIndicatorKind::BollingerBandwidth {
+                window: 2,
+                multiplier: 2.0,
+            },
+            None,
+        ),
+        indicator(
+            "bb_pb",
+            PolicyIndicatorKind::BollingerPercentB {
+                window: 2,
+                multiplier: 2.0,
+            },
+            None,
+        ),
+        indicator(
+            "macd_line",
+            PolicyIndicatorKind::MacdLine {
+                fast_window: 2,
+                slow_window: 3,
+            },
+            None,
+        ),
+        indicator(
+            "macd_sig",
+            PolicyIndicatorKind::MacdSignal {
+                fast_window: 2,
+                slow_window: 3,
+                signal_window: 2,
+            },
+            None,
+        ),
+        indicator(
+            "macd_hist",
+            PolicyIndicatorKind::MacdHistogram {
+                fast_window: 2,
+                slow_window: 3,
+                signal_window: 2,
+            },
+            None,
+        ),
+        indicator("z", PolicyIndicatorKind::ZScore { window: 2 }, None),
+        indicator("roc", PolicyIndicatorKind::Roc { window: 2 }, None),
+        indicator(
+            "dd",
+            PolicyIndicatorKind::DrawdownFromHigh { window: 2 },
+            None,
+        ),
+    ]
+}
+
+#[test]
+fn advanced_indicators_recompute_identically_in_source_audit() -> Result<(), LabError> {
+    let observations = vec![
+        observation(CandleInterval::H1, 0, 10, 12, 9),
+        observation(CandleInterval::H1, 1, 12, 14, 10),
+        observation(CandleInterval::H1, 2, 15, 16, 11),
+        observation(CandleInterval::H1, 3, 12, 18, 12),
+    ];
+    let reference = IndicatorSourceReference::CapturedWindow {
+        first_observation_id: observations[0].id.clone(),
+        evidence_digest: ContentHash::of_value(&observations).expect("window digest"),
+        observation_count: 4,
+        capture_origin: SourceCaptureOrigin::SavedObservationWindow,
+    };
+    let policy = frozen(rule_definition(advanced_indicator_specs()));
+    let input = SourceIndicatorAuditInput {
+        saved_policy_ref: policy.reference.clone(),
+        market: market(),
+        decision_interval: CandleInterval::H1,
+        cutoff_utc: observations[3].candle.close_time_utc,
+        decision_observation: observations[3].clone(),
+        source_series: vec![IndicatorSourceSeries {
+            interval: CandleInterval::H1,
+            observations: observations.clone(),
+            seed: IndicatorSeedEvidence {
+                source: reference,
+                original_seed_observation_id: Some(observations[0].id.clone()),
+                history_scope: SourceHistoryScope::CompleteFromSeed,
+                bars_through_cutoff: 4,
+                required_warmup_bars: 4,
+            },
+            closure: None,
+        }],
+        saved_values: vec![
+            named("atr", 5.5),
+            named("bb_u", 16.5),
+            named("bb_l", 10.5),
+            named("bb_bw", 6.0 / 13.5),
+            named("bb_pb", 0.25),
+            named("macd_line", 7.0 / 18.0),
+            named("macd_sig", 31.0 / 36.0),
+            named("macd_hist", -17.0 / 36.0),
+            named("z", -(0.5_f64.sqrt())),
+            named("roc", 0.0),
+            named("dd", 0.2),
+        ],
+        policy,
+    };
+    let report = audit_source_indicators(&input)?;
+    assert_eq!(
+        report.status,
+        ReviewAuditStatus::Verified,
+        "{:?}",
+        report.diagnostics
+    );
+    Ok(())
+}

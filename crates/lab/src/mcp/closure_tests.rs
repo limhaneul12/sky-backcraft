@@ -399,8 +399,8 @@ async fn real_http_mcp_closes_research_runtime_contracts() -> Result<(), Box<dyn
             "public catalog omitted {expected}"
         );
     }
-    assert!(!names.contains("policy_delete_write"));
-    assert!(!names.contains("policy_delete_query"));
+    assert!(names.contains("policy_delete_write"));
+    assert!(names.contains("policy_delete_query"));
     let status = call(&client, "lab_status", serde_json::json!({})).await?;
     let revision = status["code_revision"]
         .as_str()
@@ -414,7 +414,7 @@ async fn real_http_mcp_closes_research_runtime_contracts() -> Result<(), Box<dyn
             status["scope"]["private_api"],
             "UNAVAILABLE_ON_THIS_EXPOSURE"
         );
-        assert_eq!(status["policy_deletion"]["mode"], "UNAVAILABLE");
+        assert_eq!(status["policy_deletion"]["mode"], "POLICY_ONLY_CONFIRMED");
         assert_eq!(status["implementation_status"], "IMPLEMENTED_UNVERIFIED");
         assert!(status["verification_receipt"].is_null());
     for digest in ["source_digest", "lockfile_digest"] {

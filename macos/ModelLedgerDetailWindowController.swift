@@ -6,6 +6,80 @@ private struct LedgerColumn {
     let width: CGFloat
 }
 
+extension LedgerDetailMCPReader {
+    @discardableResult
+    func costs(
+        runId: String,
+        modelId: String,
+        expectedFillCount: Int,
+        expectedTerminalEquity: Decimal?,
+        expectedPolicyId: String?,
+        expectedPolicyRevisionId: String?,
+        expectedPolicyDefinitionDigest: String?,
+        completion: @escaping (Result<ModelLedgerCostDetail, Error>) -> Void
+    ) -> NativeMCPRequest? {
+        guard let expectedPolicyId, let expectedPolicyRevisionId, let expectedPolicyDefinitionDigest,
+              Self.isLowerHex64(expectedPolicyDefinitionDigest) else {
+            completion(.failure(LedgerDetailError.identityMismatch("선택 모델의 정책 ID/리비전/정의 digest를 확인할 수 없음")))
+            return nil
+        }
+        return client.call("result_query", arguments: [
+            "action": "costs", "run_id": runId, "model_id": modelId
+        ]) { result in
+            do {
+                let value = try Self.decodeCosts(data: result.get(), runId: runId, modelId: modelId,
+                                                 expectedPolicyId: expectedPolicyId,
+                                                 expectedPolicyRevisionId: expectedPolicyRevisionId,
+                                                 expectedPolicyDefinitionDigest: expectedPolicyDefinitionDigest)
+                guard value.fillCount == expectedFillCount else {
+                    throw LedgerDetailError.countMismatch("비용 체결 \(value.fillCount)건 / 실행 요약 \(expectedFillCount)건")
+                }
+                if let expected = expectedTerminalEquity {
+                    guard value.terminalEquity == expected else {
+                        throw LedgerDetailError.countMismatch("최종 평가액이 실행 요약과 다릅니다")
+                    }
+                }
+                completion(.success(value))
+            } catch { completion(.failure(error)) }
+        }
+    }
+
+    @discardableResult
+    func page(
+        runId: String,
+        modelId: String,
+        section: LedgerDetailSection,
+        cursor: LedgerDetailCursor? = nil,
+        expectedTotalCount: Int? = nil,
+        expectedMarket: String? = nil,
+        completion: @escaping (Result<LedgerDetailPage, Error>) -> Void
+    ) -> NativeMCPRequest? {
+        guard cursor == nil || cursor?.modelId == modelId else {
+            completion(.failure(LedgerDetailError.identityMismatch("cursor model_id")))
+            return nil
+        }
+        var query: [String: Any] = [
+            "run_id": runId, "model_id": modelId, "section": section.rawValue, "limit": 100
+        ]
+        if let cursor {
+            query["cursor"] = ["model_id": cursor.modelId, "offset": cursor.offset]
+        }
+        return client.call("result_query", arguments: ["action": "ledger", "query": query]) { result in
+            do {
+                let page = try Self.decodePage(data: result.get(), runId: runId, modelId: modelId,
+                                               section: section, requestedCursor: cursor)
+                if let expectedTotalCount, page.totalCount != expectedTotalCount {
+                    throw LedgerDetailError.countMismatch("\(section.title) \(page.totalCount)건 / 실행 요약 \(expectedTotalCount)건")
+                }
+                if let expectedMarket, page.records.contains(where: { $0.market != expectedMarket }) {
+                    throw LedgerDetailError.identityMismatch("market")
+                }
+                completion(.success(page))
+            } catch { completion(.failure(error)) }
+        }
+    }
+}
+
 /// Read-only cost and immutable ledger drill-down for one selected run/model.
 final class ModelLedgerDetailWindowController: NSWindowController, NSWindowDelegate,
     NSTableViewDataSource, NSTableViewDelegate {
@@ -33,6 +107,8 @@ final class ModelLedgerDetailWindowController: NSWindowController, NSWindowDeleg
     private var nextCursor: LedgerDetailCursor?
     private var sectionGeneration: UInt64 = 0
     private var costGeneration: UInt64 = 0
+    private var costRequest: NativeMCPRequest?
+    private var pageRequest: NativeMCPRequest?
     private var sectionLoading = false
     private var currentTruncatedReason: String?
     private var columns: [LedgerColumn] = []
@@ -51,6 +127,11 @@ final class ModelLedgerDetailWindowController: NSWindowController, NSWindowDeleg
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    deinit {
+        costRequest?.cancel()
+        pageRequest?.cancel()
+    }
 
     func showLedgerDetails() {
         showWindow(nil)
@@ -91,9 +172,11 @@ final class ModelLedgerDetailWindowController: NSWindowController, NSWindowDeleg
 
         let costPanel = TerminalSurfaceView()
         costPanel.usesPanel = true
+        costPanel.drawsBorder = true
+        costPanel.cornerRadius = 8
         costPanel.translatesAutoresizingMaskIntoConstraints = false
         let costTitle = NSTextField(labelWithString: "비용과 종결 상태")
-        costTitle.font = .systemFont(ofSize: 14, weight: .semibold)
+        costTitle.font = TerminalTheme.sectionHeading
         costLabel.font = TerminalTheme.table
         costLabel.maximumNumberOfLines = 3
         costLabel.textColor = .labelColor
@@ -140,7 +223,7 @@ final class ModelLedgerDetailWindowController: NSWindowController, NSWindowDeleg
         detailText.drawsBackground = true
         detailText.backgroundColor = TerminalTheme.panel
         detailText.textColor = .labelColor
-        detailText.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        detailText.font = TerminalTheme.monospacedDigitFont(ofSize: 12, weight: .regular)
         detailText.textContainerInset = NSSize(width: 12, height: 12)
         detailText.string = "표에서 행을 선택하면 읽기 쉬운 요약과 정확한 원본 필드를 확인할 수 있습니다."
         let detailScroll = NSScrollView()
@@ -201,15 +284,17 @@ final class ModelLedgerDetailWindowController: NSWindowController, NSWindowDeleg
     }
 
     private func loadCosts() {
+        costRequest?.cancel()
         costGeneration &+= 1
         let generation = costGeneration
         costProgress.isHidden = false
-        reader.costs(runId: run.id, modelId: model.modelId, expectedFillCount: model.fillCount,
-                     expectedTerminalEquity: model.finalEquityDecimal,
-                     expectedPolicyId: model.policyId,
-                     expectedPolicyRevisionId: model.policyRevisionId,
-                     expectedPolicyDefinitionDigest: model.policyDefinitionDigest) { [weak self] result in
+        costRequest = reader.costs(runId: run.id, modelId: model.modelId, expectedFillCount: model.fillCount,
+                                   expectedTerminalEquity: model.finalEquityDecimal,
+                                   expectedPolicyId: model.policyId,
+                                   expectedPolicyRevisionId: model.policyRevisionId,
+                                   expectedPolicyDefinitionDigest: model.policyDefinitionDigest) { [weak self] result in
             guard let self, generation == self.costGeneration, self.window != nil else { return }
+            self.costRequest = nil
             self.costProgress.stopAnimation(nil); self.costProgress.isHidden = true
             switch result {
             case .success(let cost):
@@ -226,6 +311,7 @@ final class ModelLedgerDetailWindowController: NSWindowController, NSWindowDeleg
 
     private func loadSection(reset: Bool) {
         guard !sectionLoading else { return }
+        pageRequest?.cancel()
         sectionLoading = true
         sectionGeneration &+= 1
         let generation = sectionGeneration
@@ -245,10 +331,11 @@ final class ModelLedgerDetailWindowController: NSWindowController, NSWindowDeleg
         moreButton.isEnabled = false
         statusLabel.stringValue = "\(section.title) 원장을 읽는 중…"
         let expected: Int? = section == .fills ? model.fillCount : (section == .episodes ? model.episodeCount : nil)
-        reader.page(runId: run.id, modelId: model.modelId, section: section,
-                    cursor: requestedCursor, expectedTotalCount: expected,
-                    expectedMarket: model.market) { [weak self] result in
+        pageRequest = reader.page(runId: run.id, modelId: model.modelId, section: section,
+                                  cursor: requestedCursor, expectedTotalCount: expected,
+                                  expectedMarket: model.market) { [weak self] result in
             guard let self, generation == self.sectionGeneration, self.window != nil else { return }
+            self.pageRequest = nil
             self.sectionLoading = false
             self.pageProgress.stopAnimation(nil); self.pageProgress.isHidden = true
             switch result {
@@ -289,6 +376,8 @@ final class ModelLedgerDetailWindowController: NSWindowController, NSWindowDeleg
     }
 
     @objc private func sectionChanged() {
+        pageRequest?.cancel()
+        pageRequest = nil
         sectionGeneration &+= 1
         sectionLoading = false
         section = LedgerDetailSection.allCases[sectionControl.selectedSegment]
@@ -375,6 +464,10 @@ final class ModelLedgerDetailWindowController: NSWindowController, NSWindowDeleg
         costGeneration &+= 1
         sectionGeneration &+= 1
         sectionLoading = false
+        costRequest?.cancel()
+        costRequest = nil
+        pageRequest?.cancel()
+        pageRequest = nil
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int { records.count }
@@ -566,6 +659,59 @@ final class ModelLedgerDetailWindowController: NSWindowController, NSWindowDeleg
         }
     }
 
+    private static let numberFormatter12: NumberFormatter = {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        formatter.locale = Locale(identifier: "ko_KR")
+        formatter.minimumFractionDigits = 0
+        formatter.maximumFractionDigits = 12
+        return formatter
+    }()
+    private static let numberFormatter8: NumberFormatter = {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        formatter.locale = Locale(identifier: "ko_KR")
+        formatter.minimumFractionDigits = 0
+        formatter.maximumFractionDigits = 8
+        return formatter
+    }()
+    private static let numberFormatter2: NumberFormatter = {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        formatter.locale = Locale(identifier: "ko_KR")
+        formatter.minimumFractionDigits = 0
+        formatter.maximumFractionDigits = 2
+        return formatter
+    }()
+    private static let money2Formatter: NumberFormatter = {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        formatter.locale = Locale(identifier: "ko_KR")
+        formatter.minimumFractionDigits = 2
+        formatter.maximumFractionDigits = 2
+        return formatter
+    }()
+    private static let isoFractionalFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+    private static let isoStandardFormatter = ISO8601DateFormatter()
+    private static let kstFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "ko_KR")
+        formatter.timeZone = TimeZone(identifier: "Asia/Seoul") ?? TimeZone(secondsFromGMT: 9 * 3_600) ?? .current
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return formatter
+    }()
+    private static let shortKSTFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "ko_KR")
+        formatter.timeZone = TimeZone(identifier: "Asia/Seoul") ?? TimeZone(secondsFromGMT: 9 * 3_600) ?? .current
+        formatter.dateFormat = "MM-dd HH:mm:ss"
+        return formatter
+    }()
+
     private static func short(_ value: String) -> String {
         value.count <= 18 ? value : "\(value.prefix(10))…\(value.suffix(6))"
     }
@@ -573,13 +719,22 @@ final class ModelLedgerDetailWindowController: NSWindowController, NSWindowDeleg
         NSDecimalNumber(decimal: value).stringValue
     }
     private static func number(_ value: Decimal) -> String {
-        let formatter = NumberFormatter(); formatter.numberStyle = .decimal; formatter.locale = Locale(identifier: "ko_KR")
-        formatter.minimumFractionDigits = 0; formatter.maximumFractionDigits = 12
-        return formatter.string(from: NSDecimalNumber(decimal: value)) ?? value.description
+        numberFormatter12.string(from: NSDecimalNumber(decimal: value)) ?? value.description
     }
     private static func numberLimited(_ value: Decimal, decimals: Int) -> String {
-        let formatter = NumberFormatter(); formatter.numberStyle = .decimal; formatter.locale = Locale(identifier: "ko_KR")
-        formatter.minimumFractionDigits = 0; formatter.maximumFractionDigits = decimals
+        let formatter: NumberFormatter
+        switch decimals {
+        case 8: formatter = numberFormatter8
+        case 2: formatter = numberFormatter2
+        case 12: formatter = numberFormatter12
+        default:
+            let custom = NumberFormatter()
+            custom.numberStyle = .decimal
+            custom.locale = Locale(identifier: "ko_KR")
+            custom.minimumFractionDigits = 0
+            custom.maximumFractionDigits = decimals
+            formatter = custom
+        }
         return formatter.string(from: NSDecimalNumber(decimal: value)) ?? value.description
     }
     private static func money(_ value: Decimal, signed: Bool = false) -> String {
@@ -590,9 +745,7 @@ final class ModelLedgerDetailWindowController: NSWindowController, NSWindowDeleg
     private static func money2(_ value: Decimal, signed: Bool = false) -> String {
         let magnitude = value < 0 ? -value : value
         let prefix = value < 0 ? "−" : (signed ? "+" : "")
-        let formatter = NumberFormatter(); formatter.numberStyle = .decimal; formatter.locale = Locale(identifier: "ko_KR")
-        formatter.minimumFractionDigits = 2; formatter.maximumFractionDigits = 2
-        let digits = formatter.string(from: NSDecimalNumber(decimal: magnitude)) ?? magnitude.description
+        let digits = money2Formatter.string(from: NSDecimalNumber(decimal: magnitude)) ?? magnitude.description
         return prefix + "₩" + digits
     }
     private static func percent(_ value: Decimal) -> String {
@@ -641,20 +794,13 @@ final class ModelLedgerDetailWindowController: NSWindowController, NSWindowDeleg
     }
     private static func kst(_ value: String?) -> String {
         guard let value else { return "산출 불가" }
-        let precise = ISO8601DateFormatter(); precise.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        guard let date = precise.date(from: value) ?? ISO8601DateFormatter().date(from: value) else { return value }
+        guard let date = isoFractionalFormatter.date(from: value) ?? isoStandardFormatter.date(from: value) else { return value }
         return kst(date)
     }
     private static func kst(_ date: Date) -> String {
-        let formatter = DateFormatter(); formatter.locale = Locale(identifier: "ko_KR")
-        formatter.timeZone = TimeZone(identifier: "Asia/Seoul")
-        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
-        return formatter.string(from: date) + " KST"
+        kstFormatter.string(from: date) + " KST"
     }
     private static func shortKST(_ date: Date) -> String {
-        let formatter = DateFormatter(); formatter.locale = Locale(identifier: "ko_KR")
-        formatter.timeZone = TimeZone(identifier: "Asia/Seoul")
-        formatter.dateFormat = "MM-dd HH:mm:ss"
-        return formatter.string(from: date)
+        shortKSTFormatter.string(from: date)
     }
 }

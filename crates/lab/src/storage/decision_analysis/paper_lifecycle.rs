@@ -114,7 +114,7 @@ impl<'a> PaperLifecycleIndex<'a> {
             LabError::DataCorrupt("selected signal is absent from its indexed paper prefix".into())
         })?;
         // The index owns the immutable source references; do not project a caller's altered copy.
-        if serde_json::to_vec(saved_signal)? != serde_json::to_vec(signal)? {
+        if *saved_signal != signal {
             return Err(LabError::DataCorrupt(
                 "selected signal differs from its indexed original fact".into(),
             ));

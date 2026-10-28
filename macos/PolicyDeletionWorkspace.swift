@@ -192,6 +192,7 @@ final class PolicyDeletionWorkspace: NSView, NSTableViewDataSource, NSTableViewD
     deinit {
         expiryTimer?.invalidate()
         capabilityRequest?.cancel()
+        queryRequest?.cancel()
         previewRequest?.cancel()
         if let helperExitObserver {
             NotificationCenter.default.removeObserver(helperExitObserver)
@@ -380,7 +381,7 @@ final class PolicyDeletionWorkspace: NSView, NSTableViewDataSource, NSTableViewD
             }
         }
 
-        selectionLabel.font = TerminalTheme.monospacedFont(ofSize: 12)
+        selectionLabel.font = TerminalTheme.monospacedDigitFont(ofSize: 12, weight: .regular)
         selectionLabel.textColor = TerminalTheme.secondaryText
         selectionLabel.setAccessibilityLabel("정책 선택 범위와 페이지 상태")
         listEmptyLabel.font = TerminalTheme.body
@@ -437,6 +438,7 @@ final class PolicyDeletionWorkspace: NSView, NSTableViewDataSource, NSTableViewD
         detailsText.setAccessibilityLabel("선택한 정책의 삭제 영향과 요청 결과")
         let detailsScroll = TerminalWrappingTextScrollView()
         detailsScroll.configureWrapping(textView: detailsText, inset: NSSize(width: 10, height: 10))
+        detailsScroll.borderType = .lineBorder
         detailsScroll.setAccessibilityLabel("정책 선택 범위, 서버 삭제 영향, 요청 결과")
         detailsScroll.heightAnchor.constraint(equalToConstant: max(220, 220 * TerminalTheme.textScale)).isActive = true
 
@@ -460,6 +462,8 @@ final class PolicyDeletionWorkspace: NSView, NSTableViewDataSource, NSTableViewD
         listStack.spacing = 10
         let listPanel = TerminalSurfaceView()
         listPanel.usesPanel = true
+        listPanel.drawsBorder = true
+        listPanel.cornerRadius = 8
         listPanel.setAccessibilityLabel("사용자 정책 검색, 선택, 페이지 목록")
         listStack.translatesAutoresizingMaskIntoConstraints = false
         listPanel.addSubview(listStack)
@@ -486,6 +490,8 @@ final class PolicyDeletionWorkspace: NSView, NSTableViewDataSource, NSTableViewD
         inspectorStack.translatesAutoresizingMaskIntoConstraints = false
         let inspectorPanel = TerminalSurfaceView()
         inspectorPanel.usesPanel = true
+        inspectorPanel.drawsBorder = true
+        inspectorPanel.cornerRadius = 8
         inspectorPanel.setAccessibilityLabel("선택 정책 삭제 영향과 요청 상태 검사기")
         inspectorStack.translatesAutoresizingMaskIntoConstraints = false
         inspectorPanel.addSubview(inspectorStack)

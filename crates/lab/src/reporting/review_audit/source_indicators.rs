@@ -610,13 +610,35 @@ fn same_observation(left: &CandleObservation, right: &CandleObservation) -> bool
 
 fn indicator_warmup(kind: &PolicyIndicatorKind) -> Result<usize, LabError> {
     Ok(match kind {
-        PolicyIndicatorKind::Sma { window } | PolicyIndicatorKind::Ema { window } => *window,
+        PolicyIndicatorKind::Sma { window }
+        | PolicyIndicatorKind::Ema { window }
+        | PolicyIndicatorKind::BollingerUpper { window, .. }
+        | PolicyIndicatorKind::BollingerLower { window, .. }
+        | PolicyIndicatorKind::BollingerBandwidth { window, .. }
+        | PolicyIndicatorKind::BollingerPercentB { window, .. }
+        | PolicyIndicatorKind::ZScore { window }
+        | PolicyIndicatorKind::DrawdownFromHigh { window } => *window,
         PolicyIndicatorKind::Rsi { window }
         | PolicyIndicatorKind::SampleVol { window }
         | PolicyIndicatorKind::AnnualVol { window }
         | PolicyIndicatorKind::PriorHigh { window }
-        | PolicyIndicatorKind::PriorLow { window } => window
+        | PolicyIndicatorKind::PriorLow { window }
+        | PolicyIndicatorKind::Atr { window }
+        | PolicyIndicatorKind::Roc { window } => window
             .checked_add(1)
+            .ok_or_else(|| LabError::ResourceLimit("source indicator warmup overflow".into()))?,
+        PolicyIndicatorKind::MacdLine { slow_window, .. } => *slow_window,
+        PolicyIndicatorKind::MacdSignal {
+            slow_window,
+            signal_window,
+            ..
+        }
+        | PolicyIndicatorKind::MacdHistogram {
+            slow_window,
+            signal_window,
+            ..
+        } => slow_window
+            .checked_add(signal_window.saturating_sub(1))
             .ok_or_else(|| LabError::ResourceLimit("source indicator warmup overflow".into()))?,
         PolicyIndicatorKind::Open
         | PolicyIndicatorKind::High
@@ -669,30 +691,16 @@ fn recompute_indicator(
     }
     if matches!(
         &indicator.indicator,
-        PolicyIndicatorKind::SampleVol { window: 1 } | PolicyIndicatorKind::AnnualVol { window: 1 }
+        PolicyIndicatorKind::SampleVol { window: 1 }
+            | PolicyIndicatorKind::AnnualVol { window: 1 }
+            | PolicyIndicatorKind::ZScore { window: 0 | 1 }
     ) {
         return IndicatorResult::Unsupported(format!(
             "indicators.{}.sample_variance_requires_two_returns",
             indicator.id
         ));
     }
-    let values = match &indicator.indicator {
-        PolicyIndicatorKind::Open => current_field(series, "open"),
-        PolicyIndicatorKind::High => current_field(series, "high"),
-        PolicyIndicatorKind::Low => current_field(series, "low"),
-        PolicyIndicatorKind::Close => current_field(series, "close"),
-        PolicyIndicatorKind::Volume => current_field(series, "volume"),
-        PolicyIndicatorKind::QuoteTurnover => current_field(series, "quote_turnover"),
-        PolicyIndicatorKind::Sma { window } => sma(series, *window),
-        PolicyIndicatorKind::Ema { window } => ema(series, *window),
-        PolicyIndicatorKind::Rsi { window } => rsi(series, *window),
-        PolicyIndicatorKind::SampleVol { window } => sample_vol(series, *window),
-        PolicyIndicatorKind::AnnualVol { window } => {
-            sample_vol(series, *window).and_then(|value| annualize(value, interval))
-        }
-        PolicyIndicatorKind::PriorHigh { window } => prior_extreme(series, *window, true),
-        PolicyIndicatorKind::PriorLow { window } => prior_extreme(series, *window, false),
-    };
+    let values = recompute_indicator_value(&indicator.indicator, series, interval);
     match values {
         Some(value) if value.is_finite() => IndicatorResult::Value(value),
         Some(_) => IndicatorResult::Unsupported(format!("indicators.{}.nonfinite", indicator.id)),
@@ -717,10 +725,98 @@ fn recompute_indicator(
     }
 }
 
+fn recompute_indicator_value(
+    kind: &PolicyIndicatorKind,
+    series: &PreparedSeries<'_>,
+    interval: CandleInterval,
+) -> Option<f64> {
+    match kind {
+        PolicyIndicatorKind::Open => current_field(series, "open"),
+        PolicyIndicatorKind::High => current_field(series, "high"),
+        PolicyIndicatorKind::Low => current_field(series, "low"),
+        PolicyIndicatorKind::Close => current_field(series, "close"),
+        PolicyIndicatorKind::Volume => current_field(series, "volume"),
+        PolicyIndicatorKind::QuoteTurnover => current_field(series, "quote_turnover"),
+        PolicyIndicatorKind::Sma { window } => sma(series, *window),
+        PolicyIndicatorKind::Ema { window } => ema(series, *window),
+        PolicyIndicatorKind::Rsi { window } => rsi(series, *window),
+        PolicyIndicatorKind::SampleVol { window } => sample_vol(series, *window),
+        PolicyIndicatorKind::AnnualVol { window } => {
+            sample_vol(series, *window).and_then(|value| annualize(value, interval))
+        }
+        PolicyIndicatorKind::PriorHigh { window } => prior_extreme(series, *window, true),
+        PolicyIndicatorKind::PriorLow { window } => prior_extreme(series, *window, false),
+        PolicyIndicatorKind::Atr { window } => atr(series, *window),
+        PolicyIndicatorKind::BollingerUpper { window, multiplier } => bollinger(
+            series,
+            *window,
+            *multiplier,
+            crate::strategy::indicators::BollingerOutput::Upper,
+        ),
+        PolicyIndicatorKind::BollingerLower { window, multiplier } => bollinger(
+            series,
+            *window,
+            *multiplier,
+            crate::strategy::indicators::BollingerOutput::Lower,
+        ),
+        PolicyIndicatorKind::BollingerBandwidth { window, multiplier } => bollinger(
+            series,
+            *window,
+            *multiplier,
+            crate::strategy::indicators::BollingerOutput::Bandwidth,
+        ),
+        PolicyIndicatorKind::BollingerPercentB { window, multiplier } => bollinger(
+            series,
+            *window,
+            *multiplier,
+            crate::strategy::indicators::BollingerOutput::PercentB,
+        ),
+        PolicyIndicatorKind::MacdLine {
+            fast_window,
+            slow_window,
+        } => macd(
+            series,
+            *fast_window,
+            *slow_window,
+            None,
+            crate::strategy::indicators::MacdOutput::Line,
+        ),
+        PolicyIndicatorKind::MacdSignal {
+            fast_window,
+            slow_window,
+            signal_window,
+        } => macd(
+            series,
+            *fast_window,
+            *slow_window,
+            Some(*signal_window),
+            crate::strategy::indicators::MacdOutput::Signal,
+        ),
+        PolicyIndicatorKind::MacdHistogram {
+            fast_window,
+            slow_window,
+            signal_window,
+        } => macd(
+            series,
+            *fast_window,
+            *slow_window,
+            Some(*signal_window),
+            crate::strategy::indicators::MacdOutput::Histogram,
+        ),
+        PolicyIndicatorKind::ZScore { window } => z_score(series, *window),
+        PolicyIndicatorKind::Roc { window } => roc(series, *window),
+        PolicyIndicatorKind::DrawdownFromHigh { window } => drawdown_from_high(series, *window),
+    }
+}
+
 fn uses_first_seed(kind: &PolicyIndicatorKind) -> bool {
     matches!(
         kind,
-        PolicyIndicatorKind::Ema { .. } | PolicyIndicatorKind::Rsi { .. }
+        PolicyIndicatorKind::Ema { .. }
+            | PolicyIndicatorKind::Rsi { .. }
+            | PolicyIndicatorKind::MacdLine { .. }
+            | PolicyIndicatorKind::MacdSignal { .. }
+            | PolicyIndicatorKind::MacdHistogram { .. }
     )
 }
 
@@ -880,6 +976,108 @@ fn prior_extreme(series: &PreparedSeries<'_>, window: usize, maximum: bool) -> O
     } else {
         values.into_iter().reduce(f64::min)
     }
+}
+
+fn atr(series: &PreparedSeries<'_>, window: usize) -> Option<f64> {
+    let required = window.checked_add(1)?;
+    let start = series.bars.len().checked_sub(required)?;
+    if !tail_is_contiguous(series, required) {
+        return None;
+    }
+    let mut sum = 0.0;
+    for pair in series.bars[start..].windows(2) {
+        let prev_close = decimal_to_f64(pair[0].candle.close.get(), "atr prev close").ok()?;
+        let high = decimal_to_f64(pair[1].candle.high.get(), "atr high").ok()?;
+        let low = decimal_to_f64(pair[1].candle.low.get(), "atr low").ok()?;
+        let tr = (high - low)
+            .max((high - prev_close).abs())
+            .max((low - prev_close).abs());
+        sum += tr;
+    }
+    let average = sum / f64::from(u32::try_from(window).ok()?);
+    average.is_finite().then_some(average)
+}
+
+fn bollinger(
+    series: &PreparedSeries<'_>,
+    window: usize,
+    multiplier: f64,
+    output: crate::strategy::indicators::BollingerOutput,
+) -> Option<f64> {
+    let data = closes(series)?;
+    let tail = data.get(data.len().checked_sub(window)?..)?;
+    if !tail_is_contiguous(series, window) {
+        return None;
+    }
+    let mut state = crate::strategy::indicators::Bollinger::new(window, multiplier, output);
+    let mut last = None;
+    for close in tail {
+        last = state.update(*close).ok()?;
+    }
+    last
+}
+
+fn macd(
+    series: &PreparedSeries<'_>,
+    fast_window: usize,
+    slow_window: usize,
+    signal_window: Option<usize>,
+    output: crate::strategy::indicators::MacdOutput,
+) -> Option<f64> {
+    if series.source.seed.history_scope != SourceHistoryScope::CompleteFromSeed
+        || series.source.seed.original_seed_observation_id.as_ref()
+            != series.bars.first().map(|bar| &bar.id)
+        || !series.gap_free
+    {
+        return None;
+    }
+    let data = closes(series)?;
+    let mut state =
+        crate::strategy::indicators::Macd::new(fast_window, slow_window, signal_window, output);
+    let mut last = None;
+    for close in data {
+        last = state.update(close).ok()?;
+    }
+    last
+}
+
+fn z_score(series: &PreparedSeries<'_>, window: usize) -> Option<f64> {
+    let data = closes(series)?;
+    let tail = data.get(data.len().checked_sub(window)?..)?;
+    if !tail_is_contiguous(series, window) {
+        return None;
+    }
+    let mut state = crate::strategy::indicators::ZScore::new(window);
+    let mut last = None;
+    for close in tail {
+        last = state.update(*close).ok()?;
+    }
+    last
+}
+
+fn roc(series: &PreparedSeries<'_>, window: usize) -> Option<f64> {
+    let data = closes(series)?;
+    let required = window.checked_add(1)?;
+    let tail = data.get(data.len().checked_sub(required)?..)?;
+    if !tail_is_contiguous(series, required) {
+        return None;
+    }
+    let prior = *tail.first()?;
+    let close = *tail.last()?;
+    let value = (close - prior) / prior;
+    value.is_finite().then_some(value)
+}
+
+fn drawdown_from_high(series: &PreparedSeries<'_>, window: usize) -> Option<f64> {
+    let data = closes(series)?;
+    let tail = data.get(data.len().checked_sub(window)?..)?;
+    if !tail_is_contiguous(series, window) {
+        return None;
+    }
+    let close = *tail.last()?;
+    let peak = tail.iter().copied().fold(close, f64::max);
+    let value = (peak - close) / peak;
+    value.is_finite().then_some(value)
 }
 
 fn tail_is_contiguous(series: &PreparedSeries<'_>, count: usize) -> bool {

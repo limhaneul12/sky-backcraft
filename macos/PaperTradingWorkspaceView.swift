@@ -257,17 +257,13 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
         titleLabel.setAccessibilityLabel("지속 모의투자 세션")
 
         let virtualBadge = NSTextField(wrappingLabelWithString: "VIRTUAL / SIMULATED · 실주문 없음 · 확정 봉 폴링")
-        let badgeFont = TerminalTheme.monospacedFont(ofSize: 11, weight: .bold)
+        let badgeFont = TerminalTheme.systemFont(ofSize: 11, weight: .semibold)
         virtualBadge.font = badgeFont
         let badgeLineHeight = badgeFont.ascender - badgeFont.descender + badgeFont.leading
         virtualBadge.heightAnchor.constraint(greaterThanOrEqualToConstant: ceil(badgeLineHeight + 4)).isActive = true
         virtualBadge.maximumNumberOfLines = 0
         virtualBadge.lineBreakMode = .byWordWrapping
         virtualBadge.textColor = TerminalTheme.accent
-        virtualBadge.wantsLayer = true
-        virtualBadge.layer?.cornerRadius = 4
-        virtualBadge.layer?.borderWidth = 1
-        virtualBadge.layer?.borderColor = TerminalTheme.accent.cgColor
         virtualBadge.setAccessibilityLabel("VIRTUAL / SIMULATED · 실제 주문 없음 · 확정 봉 폴링")
 
         let headerRow = NSStackView(views: [titleLabel, virtualBadge])
@@ -280,13 +276,13 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
             virtualBadge.widthAnchor.constraint(equalTo: headerRow.widthAnchor).isActive = true
         }
 
-        sessionSummaryLabel.font = TerminalTheme.monospacedFont(ofSize: 11)
+        sessionSummaryLabel.font = TerminalTheme.monospacedDigitFont(ofSize: 11, weight: .regular)
         sessionSummaryLabel.textColor = TerminalTheme.secondaryText
         sessionSummaryLabel.maximumNumberOfLines = 0
         sessionSummaryLabel.lineBreakMode = .byWordWrapping
         sessionSummaryLabel.setAccessibilityLabel("선택한 지속 모의 세션과 동결 정책 identity")
 
-        statusBanner.font = TerminalTheme.monospacedFont(ofSize: 11, weight: .medium)
+        statusBanner.font = TerminalTheme.monospacedDigitFont(ofSize: 11, weight: .medium)
         statusBanner.textColor = TerminalTheme.secondaryText
         statusBanner.maximumNumberOfLines = 4
         statusBanner.lineBreakMode = .byWordWrapping
@@ -311,7 +307,7 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
         // 1. Creation box
         let createBox = makePanelBox()
         let createTitle = NSTextField(labelWithString: "1. 새 지속 모의 세션 생성 및 시작 (동결 정책 리비전 · 시장별 독립 가상 계좌)")
-        createTitle.font = .systemFont(ofSize: 13, weight: .semibold)
+        createTitle.font = TerminalTheme.sectionHeading
 
         policyPopup.setAccessibilityLabel("지속 모의 정책 리비전 선택")
         policyPopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 320).isActive = true
@@ -388,7 +384,7 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
         // 2. Session selector & lifecycle control bar
         let controlBox = makePanelBox()
         let controlTitle = NSTextField(labelWithString: "2. 세션 선택 및 상태 제어 (CAS Sequence · Idempotent Receipt)")
-        controlTitle.font = .systemFont(ofSize: 13, weight: .semibold)
+        controlTitle.font = TerminalTheme.sectionHeading
 
         sessionPopup.target = self
         sessionPopup.action = #selector(handleSessionSelectionChanged)
@@ -437,7 +433,7 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
         let marketsHeader = NSTextField(
             labelWithString: "3. 시장별 독립 가상 계좌 상태 (시장 간 합산 곡선 없음 · 각 시장 독립 원장)"
         )
-        marketsHeader.font = .systemFont(ofSize: 13, weight: .semibold)
+        marketsHeader.font = TerminalTheme.sectionHeading
 
         setupMarketsTable()
         let marketsScroll = NSScrollView()
@@ -449,9 +445,9 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
         let timingHeader = NSTextField(
             labelWithString: "4. 시장별 데이터 시각 (각 원천 UTC 시각과 화면 표시 시점 기준 경과)"
         )
-        timingHeader.font = .systemFont(ofSize: 13, weight: .semibold)
+        timingHeader.font = TerminalTheme.sectionHeading
 
-        marketTimingStatusLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        marketTimingStatusLabel.font = TerminalTheme.monospacedDigitFont(ofSize: 11, weight: .regular)
         marketTimingStatusLabel.textColor = TerminalTheme.secondaryText
         marketTimingStatusLabel.lineBreakMode = .byWordWrapping
 
@@ -464,9 +460,9 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
 
         // 5. Paged session events log
         let eventsTitle = NSTextField(labelWithString: "5. 지속 모의 세션 원장 이벤트 (확정 봉 처리 · 신호 · 가상 주문 예약/취소/체결 · 상태 전이)")
-        eventsTitle.font = .systemFont(ofSize: 13, weight: .semibold)
+        eventsTitle.font = TerminalTheme.sectionHeading
 
-        eventsPageLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        eventsPageLabel.font = TerminalTheme.monospacedDigitFont(ofSize: 12, weight: .regular)
         eventsPageLabel.textColor = TerminalTheme.secondaryText
 
         eventsFirstPageButton.bezelStyle = .rounded
@@ -512,7 +508,7 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
         decisionReviewStatusLabel.setAccessibilityLabel("선택 판단 기록의 session, 이벤트, cutoff identity와 조회 상태")
         decisionReviewText.isEditable = false
         decisionReviewText.isSelectable = true
-        decisionReviewText.font = TerminalTheme.monospacedFont(ofSize: 11)
+        decisionReviewText.font = TerminalTheme.monospacedDigitFont(ofSize: 11, weight: .regular)
         decisionReviewText.textColor = .labelColor
         decisionReviewText.backgroundColor = TerminalTheme.chart
         decisionReviewText.setAccessibilityLabel("엔진이 저장한 결정 행동, 조건 평가, 이유, 주문과 체결")
@@ -606,13 +602,7 @@ final class PaperTradingWorkspaceView: NSView, NSTableViewDataSource, NSTableVie
     }
 
     private func makePanelBox() -> NSBox {
-        let box = NSBox()
-        box.boxType = .custom
-        box.cornerRadius = 8
-        box.borderWidth = 1
-        box.borderColor = TerminalTheme.border
-        box.fillColor = TerminalTheme.panel
-        return box
+        TerminalTheme.makePanelBox()
     }
 
     private func embedInBox(_ stack: NSStackView, into box: NSBox) {

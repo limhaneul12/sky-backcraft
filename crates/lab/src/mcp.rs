@@ -43,7 +43,6 @@ const MAX_DATASET_PAGE_RECORDS: u32 = 100;
 const MAX_PUBLIC_JOB_ATTEMPTS: usize = 32;
 // Reserve framing space after measuring the real JSON-RPC id and encoded result.
 const MAX_DECISION_ANALYSIS_ENCODED_BYTES: usize = crate::transport::MAX_RESPONSE_BYTES - 1_024;
-const POLICY_DELETE_TOOL_NAMES: &[&str] = &["policy_delete_write", "policy_delete_query"];
 const TRADING_READ_TOOL_NAMES: &[&str] = &[
     "upbit_account_balances",
     "upbit_order_chance",
@@ -1278,10 +1277,6 @@ impl LabMcpService {
             tool_router
                 .map
                 .retain(|name, _route| DESKTOP_TOOL_NAMES.contains(&name.as_ref()));
-        } else {
-            tool_router
-                .map
-                .retain(|name, _route| !POLICY_DELETE_TOOL_NAMES.contains(&name.as_ref()));
         }
         if matches!(exposure, McpExposure::OAuth) {
             for route in tool_router.map.values_mut() {
@@ -1558,10 +1553,10 @@ impl LabMcpService {
                 },
             },
             "policy_deletion": {
-                "mode": if matches!(self.exposure, McpExposure::Desktop) {
-                    "POLICY_ONLY_CONFIRMED"
+                "mode": if self.exposure.public_no_auth() {
+                    "DISABLED_IN_PUBLIC_NO_AUTH"
                 } else {
-                    "UNAVAILABLE"
+                    "POLICY_ONLY_CONFIRMED"
                 },
                 "max_items": crate::contracts::MAX_POLICY_DELETE_ITEMS,
                 "archive_available": false,
@@ -1761,48 +1756,39 @@ impl LabMcpService {
                     request_id: request.request_id.clone(),
                     payload: JobPayload::PortfolioBacktest { request },
                 };
-                let job = self
-                    .jobs
-                    .submit(submission)
-                    .await
-                    .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-                result_or_error(Ok(job))
+                result_or_error(
+                    self.jobs
+                        .submit(submission)
+                        .await
+                        .and_then(|job| Ok(public_job(job)?.job)),
+                )
             }
-            crate::contracts::PortfolioAction::Get { run_id } => {
-                let summary = self
-                    .database
+            crate::contracts::PortfolioAction::Get { run_id } => result_or_error(
+                self.database
                     .call("portfolio_summary", move |store| {
                         store.portfolio_run_summary(&run_id)
                     })
-                    .await
-                    .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-                result_or_error(Ok(summary))
-            }
+                    .await,
+            ),
             crate::contracts::PortfolioAction::Facts {
                 run_id,
                 kind,
                 offset,
                 limit,
-            } => {
-                let facts = self
-                    .database
+            } => result_or_error(
+                self.database
                     .call("portfolio_facts", move |store| {
                         store.portfolio_facts(&run_id, kind, offset, limit)
                     })
-                    .await
-                    .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-                result_or_error(Ok(facts))
-            }
-            crate::contracts::PortfolioAction::List { offset, limit } => {
-                let runs = self
-                    .database
+                    .await,
+            ),
+            crate::contracts::PortfolioAction::List { offset, limit } => result_or_error(
+                self.database
                     .call("portfolio_list", move |store| {
                         store.list_portfolio_runs(offset, limit)
                     })
-                    .await
-                    .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-                result_or_error(Ok(runs))
-            }
+                    .await,
+            ),
         }
     }
 
@@ -1938,9 +1924,9 @@ impl LabMcpService {
         )
     )]
     async fn policy_delete_write(&self, arguments: JsonObject) -> Result<CallToolResult, McpError> {
-        if !matches!(self.exposure, McpExposure::Desktop) {
+        if self.exposure.public_no_auth() {
             return result_or_error::<()>(Err(LabError::Conflict(
-                "policy deletion tools require the native desktop capability".into(),
+                "destructive operations are disabled when public_no_auth is enabled; authenticated local or bearer access required".into(),
             )));
         }
         let request: PolicyDeleteWriteRequest = parse_arguments(arguments)?;
@@ -2013,11 +1999,6 @@ impl LabMcpService {
         )
     )]
     async fn policy_delete_query(&self, arguments: JsonObject) -> Result<CallToolResult, McpError> {
-        if !matches!(self.exposure, McpExposure::Desktop) {
-            return result_or_error::<()>(Err(LabError::Conflict(
-                "policy deletion tools require the native desktop capability".into(),
-            )));
-        }
         let request: PolicyDeleteQueryRequest = parse_arguments(arguments)?;
         let readback = self
             .database
@@ -2893,48 +2874,14 @@ impl LabMcpService {
         arguments: JsonObject,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let started_at = std::time::Instant::now();
-        let shape = PaperQueryDiagnosticShape::from_arguments(
+        let (query, shape, started_at) = parse_and_validate_paper_query::<PaperSessionQuery>(
             PaperQueryDiagnosticTool::Session,
-            &arguments,
-        );
-        record_paper_query_entry(&context, shape);
-        let query: PaperSessionQuery = match parse_arguments(arguments) {
-            Ok(query) => query,
-            Err(error) => {
-                record_paper_query_completion(
-                    &context,
-                    shape,
-                    PaperQueryDiagnosticStage::ParseError,
-                    PaperQueryDiagnosticOutcome::InvalidParams,
-                    started_at,
-                );
-                return Err(error);
-            }
-        };
-        if let Err(error) = validate_paper_session_query(&query) {
-            record_paper_query_completion(
-                &context,
-                shape,
-                PaperQueryDiagnosticStage::ValidationError,
-                PaperQueryDiagnosticOutcome::InvalidParams,
-                started_at,
-            );
-            return Err(invalid_params(&error));
-        }
-        let response = result_or_error(self.jobs.paper_session_query(query).await);
-        let outcome = match &response {
-            Ok(result) if result.is_error == Some(true) => PaperQueryDiagnosticOutcome::ToolError,
-            Ok(_) => PaperQueryDiagnosticOutcome::Success,
-            Err(_) => PaperQueryDiagnosticOutcome::RpcError,
-        };
-        record_paper_query_completion(
+            arguments,
             &context,
-            shape,
-            PaperQueryDiagnosticStage::Dispatch,
-            outcome,
-            started_at,
-        );
+            validate_paper_session_query,
+        )?;
+        let response = result_or_error(self.jobs.paper_session_query(query).await);
+        complete_paper_query_dispatch(&context, shape, started_at, &response);
         response
     }
 
@@ -2954,46 +2901,14 @@ impl LabMcpService {
         arguments: JsonObject,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let started_at = std::time::Instant::now();
-        let shape =
-            PaperQueryDiagnosticShape::from_arguments(PaperQueryDiagnosticTool::Review, &arguments);
-        record_paper_query_entry(&context, shape);
-        let query: PaperReviewQuery = match parse_arguments(arguments) {
-            Ok(query) => query,
-            Err(error) => {
-                record_paper_query_completion(
-                    &context,
-                    shape,
-                    PaperQueryDiagnosticStage::ParseError,
-                    PaperQueryDiagnosticOutcome::InvalidParams,
-                    started_at,
-                );
-                return Err(error);
-            }
-        };
-        if let Err(error) = query.validate() {
-            record_paper_query_completion(
-                &context,
-                shape,
-                PaperQueryDiagnosticStage::ValidationError,
-                PaperQueryDiagnosticOutcome::InvalidParams,
-                started_at,
-            );
-            return Err(invalid_params(&error));
-        }
-        let response = result_or_error(self.jobs.paper_review_query(query).await);
-        let outcome = match &response {
-            Ok(result) if result.is_error == Some(true) => PaperQueryDiagnosticOutcome::ToolError,
-            Ok(_) => PaperQueryDiagnosticOutcome::Success,
-            Err(_) => PaperQueryDiagnosticOutcome::RpcError,
-        };
-        record_paper_query_completion(
+        let (query, shape, started_at) = parse_and_validate_paper_query::<PaperReviewQuery>(
+            PaperQueryDiagnosticTool::Review,
+            arguments,
             &context,
-            shape,
-            PaperQueryDiagnosticStage::Dispatch,
-            outcome,
-            started_at,
-        );
+            PaperReviewQuery::validate,
+        )?;
+        let response = result_or_error(self.jobs.paper_review_query(query).await);
+        complete_paper_query_dispatch(&context, shape, started_at, &response);
         response
     }
 
@@ -3209,6 +3124,64 @@ fn validate_paper_session_query(query: &PaperSessionQuery) -> Result<(), LabErro
         | PaperSessionQuery::Get { .. }
         | PaperSessionQuery::Request { .. } => Ok(()),
     }
+}
+
+fn parse_and_validate_paper_query<T>(
+    tool: PaperQueryDiagnosticTool,
+    arguments: JsonObject,
+    context: &RequestContext<RoleServer>,
+    validate: fn(&T) -> Result<(), LabError>,
+) -> Result<(T, PaperQueryDiagnosticShape, std::time::Instant), McpError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let started_at = std::time::Instant::now();
+    let shape = PaperQueryDiagnosticShape::from_arguments(tool, &arguments);
+    record_paper_query_entry(context, shape);
+    let query: T = match parse_arguments(arguments) {
+        Ok(query) => query,
+        Err(error) => {
+            record_paper_query_completion(
+                context,
+                shape,
+                PaperQueryDiagnosticStage::ParseError,
+                PaperQueryDiagnosticOutcome::InvalidParams,
+                started_at,
+            );
+            return Err(error);
+        }
+    };
+    if let Err(error) = validate(&query) {
+        record_paper_query_completion(
+            context,
+            shape,
+            PaperQueryDiagnosticStage::ValidationError,
+            PaperQueryDiagnosticOutcome::InvalidParams,
+            started_at,
+        );
+        return Err(invalid_params(&error));
+    }
+    Ok((query, shape, started_at))
+}
+
+fn complete_paper_query_dispatch(
+    context: &RequestContext<RoleServer>,
+    shape: PaperQueryDiagnosticShape,
+    started_at: std::time::Instant,
+    response: &Result<CallToolResult, McpError>,
+) {
+    let outcome = match response {
+        Ok(result) if result.is_error == Some(true) => PaperQueryDiagnosticOutcome::ToolError,
+        Ok(_) => PaperQueryDiagnosticOutcome::Success,
+        Err(_) => PaperQueryDiagnosticOutcome::RpcError,
+    };
+    record_paper_query_completion(
+        context,
+        shape,
+        PaperQueryDiagnosticStage::Dispatch,
+        outcome,
+        started_at,
+    );
 }
 
 fn validate_automation_query(query: &AutomationSessionQuery) -> Result<(), LabError> {

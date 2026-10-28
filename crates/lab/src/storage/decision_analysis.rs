@@ -394,7 +394,10 @@ impl Store {
             budget,
         )?;
         let mut input_bytes = event_bytes;
-        add_input_bytes(&mut input_bytes, serde_json::to_vec(&configuration)?.len())?;
+        add_input_bytes(
+            &mut input_bytes,
+            super::serialized_json_len(&configuration)?,
+        )?;
         input_bytes = input_bytes.saturating_add(projection.explanation_bytes);
         let fact_count = prefix.source_facts.saturating_add(projection.linked_facts);
         if input_bytes > MAX_DECISION_ANALYSIS_INPUT_BYTES
@@ -612,21 +615,7 @@ impl Store {
             automation_decisions(&snapshot, population, include_predecessor_context, budget)?;
         budget.check_elapsed()?;
         let mut observations = projection.observations;
-        for event in &snapshot.events {
-            if is_automation_observation(event.kind) {
-                observations.push(DecisionAnalysisObservation {
-                    kind: serde_json::to_value(event.kind)?
-                        .as_str()
-                        .ok_or_else(|| {
-                            LabError::DataCorrupt("automation event kind is not a string".into())
-                        })?
-                        .to_owned(),
-                    basis_time: DecisionAnalysisObservationClock::AutomationEventTime,
-                    scope: automation_observation_scope(event, &snapshot)?,
-                    at: Some(event.at_utc),
-                });
-            }
-        }
+        append_automation_event_observations(&mut observations, &snapshot)?;
         let fact_count = projection.fact_count.saturating_add(observations.len());
         let decoded_bytes = encoded_bytes.saturating_add(projection.explanation_bytes);
         if fact_count > MAX_DECISION_ANALYSIS_FACTS
@@ -657,7 +646,7 @@ fn validate_automation_source_bounds(
     if fact_count > MAX_DECISION_ANALYSIS_FACTS {
         return Err(analysis_limit("automation source fact count"));
     }
-    let encoded_bytes = serde_json::to_vec(snapshot)?.len();
+    let encoded_bytes = super::serialized_json_len(snapshot)?;
     if encoded_bytes > MAX_DECISION_ANALYSIS_INPUT_BYTES {
         return Err(analysis_limit("automation decoded source bytes"));
     }
@@ -808,7 +797,7 @@ fn project_paper_prefix(
                 .saturating_add(detail.explanation.fills.len());
             add_input_bytes(
                 &mut explanation_bytes,
-                serde_json::to_vec(&detail.explanation)?.len(),
+                super::serialized_json_len(&detail.explanation)?,
             )?;
             decisions.push(detail);
         }
@@ -845,7 +834,7 @@ fn project_paper_prefix(
             .saturating_add(detail.explanation.fills.len());
         add_input_bytes(
             &mut explanation_bytes,
-            serde_json::to_vec(&detail.explanation)?.len(),
+            super::serialized_json_len(&detail.explanation)?,
         )?;
         predecessors.push(detail);
     }
@@ -1182,7 +1171,7 @@ fn project_automation_record(
         &fills,
         &events,
     )?;
-    let explanation_bytes = serde_json::to_vec(&explanation)?.len();
+    let explanation_bytes = super::serialized_json_len(&explanation)?;
     if explanation.condition_trace_capture == SavedFactCaptureStatus::NotDecisionEvent {
         if !orders.is_empty() || !fills.is_empty() {
             return Err(LabError::DataCorrupt(
@@ -1286,9 +1275,66 @@ fn is_automation_observation(kind: AutomationEventKind) -> bool {
     )
 }
 
+fn append_automation_event_observations(
+    observations: &mut Vec<DecisionAnalysisObservation>,
+    snapshot: &AutomationReviewSnapshot,
+) -> Result<(), LabError> {
+    let candles_by_id: BTreeMap<&str, &crate::contracts::CandleObservation> = snapshot
+        .candles
+        .iter()
+        .map(|candle| (candle.id.as_str(), candle))
+        .collect();
+    let orders_by_client_id: BTreeMap<&str, &crate::contracts::AutomationOrderView> = snapshot
+        .orders
+        .iter()
+        .map(|order| (order.order.client_identifier.as_str(), &order.order))
+        .collect();
+    for event in &snapshot.events {
+        if is_automation_observation(event.kind) {
+            observations.push(DecisionAnalysisObservation {
+                kind: serde_json::to_value(event.kind)?
+                    .as_str()
+                    .ok_or_else(|| {
+                        LabError::DataCorrupt("automation event kind is not a string".into())
+                    })?
+                    .to_owned(),
+                basis_time: DecisionAnalysisObservationClock::AutomationEventTime,
+                scope: automation_observation_scope_indexed(
+                    event,
+                    snapshot,
+                    &candles_by_id,
+                    &orders_by_client_id,
+                )?,
+                at: Some(event.at_utc),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn automation_observation_scope(
     event: &AutomationEvent,
     snapshot: &AutomationReviewSnapshot,
+) -> Result<DecisionAnalysisObservationScope, LabError> {
+    let candles_by_id: BTreeMap<&str, &crate::contracts::CandleObservation> = snapshot
+        .candles
+        .iter()
+        .map(|candle| (candle.id.as_str(), candle))
+        .collect();
+    let orders_by_client_id: BTreeMap<&str, &crate::contracts::AutomationOrderView> = snapshot
+        .orders
+        .iter()
+        .map(|order| (order.order.client_identifier.as_str(), &order.order))
+        .collect();
+    automation_observation_scope_indexed(event, snapshot, &candles_by_id, &orders_by_client_id)
+}
+
+fn automation_observation_scope_indexed(
+    event: &AutomationEvent,
+    snapshot: &AutomationReviewSnapshot,
+    candles_by_id: &BTreeMap<&str, &crate::contracts::CandleObservation>,
+    orders_by_client_id: &BTreeMap<&str, &crate::contracts::AutomationOrderView>,
 ) -> Result<DecisionAnalysisObservationScope, LabError> {
     let direct_market = if let Some(value) = event.detail.get("market") {
         let code = value.as_str().ok_or_else(|| {
@@ -1321,10 +1367,7 @@ fn automation_observation_scope(
         .detail
         .get("observation_id")
         .and_then(serde_json::Value::as_str)
-        && let Some(candle) = snapshot
-            .candles
-            .iter()
-            .find(|candle| candle.id.as_str() == observation_id)
+        && let Some(candle) = candles_by_id.get(observation_id)
     {
         markets.insert(crate::contracts::MarketId::parse_upbit(
             &candle.candle.market,
@@ -1334,12 +1377,9 @@ fn automation_observation_scope(
         .detail
         .get("client_identifier")
         .and_then(serde_json::Value::as_str)
-        && let Some(order) = snapshot
-            .orders
-            .iter()
-            .find(|order| order.order.client_identifier.as_str() == client_identifier)
+        && let Some(order) = orders_by_client_id.get(client_identifier)
     {
-        markets.insert(order.order.market.clone());
+        markets.insert(order.market.clone());
     }
     if markets.len() > 1
         || markets

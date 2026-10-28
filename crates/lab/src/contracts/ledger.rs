@@ -57,7 +57,7 @@ pub enum ReasonCode {
     PolicyFallback,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct IndicatorSnapshot {
     pub version: String,
@@ -72,7 +72,7 @@ pub struct IndicatorSnapshot {
     pub policy_values: Vec<super::NamedPolicyValue>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EventContext {
     pub run_id: RunId,
@@ -95,7 +95,7 @@ pub enum SignalOutcome {
     SignalExpired,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SignalRecord {
     pub context: EventContext,
@@ -146,7 +146,7 @@ pub enum OrderStatus {
     Expired,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OrderRecord {
     pub context: EventContext,
@@ -169,7 +169,7 @@ pub struct OrderRecord {
     pub order_origin: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
 pub enum FillTiming {
     Exact {
@@ -182,7 +182,7 @@ pub enum FillTiming {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FillRecord {
     pub context: EventContext,
@@ -220,7 +220,7 @@ pub struct FillRecord {
     pub accounting_mark_seq: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AccountState {
     pub cash_total: QuoteAmount,
@@ -241,7 +241,7 @@ pub enum MarkKind {
     Terminal,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AccountMark {
     pub context: EventContext,

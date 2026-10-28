@@ -305,7 +305,7 @@ pub fn run_portfolio(
                 .into(),
         ));
     }
-    validate_frozen_inputs(plan, datasets)?;
+    crate::engine::validate_frozen_datasets(plan, datasets)?;
     let participation_cap = match plan.spec.execution {
         crate::contracts::ExecutionPolicy::NextBarOpen { participation_cap }
         | crate::contracts::ExecutionPolicy::PassiveBuy {
@@ -359,7 +359,7 @@ pub fn run_portfolio(
         portfolio_exposure_seconds: 0,
     };
     for (step_index, time) in timeline.iter().enumerate() {
-        check_cancelled(cancelled)?;
+        crate::engine::check_cancelled(cancelled)?;
         let marked = mark_state(&slots, cash.total, *time)?;
         state.push_mark(&marked, &slots, &cash, *time)?;
         let mut signals = Vec::new();
@@ -574,39 +574,6 @@ pub fn run_portfolio(
     })
 }
 
-fn check_cancelled(cancelled: &dyn Fn() -> bool) -> Result<(), LabError> {
-    if cancelled() {
-        Err(LabError::Cancelled(
-            "portfolio execution cancelled at a deterministic checkpoint".into(),
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-fn validate_frozen_inputs(
-    plan: &ResolvedPlan,
-    datasets: &[DatasetSnapshot],
-) -> Result<(), LabError> {
-    if datasets.len() != plan.spec.dataset_ids.len() {
-        return Err(LabError::ResourceLimit(
-            "dataset inputs differ from the bounded frozen plan".into(),
-        ));
-    }
-    for (dataset_id, digest) in &plan.dataset_digests {
-        let snapshot = datasets
-            .iter()
-            .find(|candidate| &candidate.manifest.id == dataset_id)
-            .ok_or_else(|| LabError::InputHashMismatch(format!("missing dataset {dataset_id}")))?;
-        if &snapshot.manifest.semantic_digest != digest {
-            return Err(LabError::InputHashMismatch(format!(
-                "dataset digest mismatch: {dataset_id}"
-            )));
-        }
-    }
-    Ok(())
-}
-
 /// One strategy binding per market, matching the portfolio asset list.
 #[expect(
     clippy::too_many_lines,
@@ -796,22 +763,22 @@ fn mark_state(
     time: UtcTimestamp,
 ) -> Result<PortfolioMark, LabError> {
     let mut position_value = Decimal::ZERO;
-    let mut weights = BTreeMap::new();
+    let mut slot_values = Vec::with_capacity(slots.len());
     for slot in slots {
         let close = close_at(slot, time)?;
         let value = checked_mul(slot.qty, close, "marked position")?;
         position_value = checked_add(position_value, value, "position sum")?;
+        slot_values.push((slot.market.code(), value));
     }
     let equity = checked_add(cash_total, position_value, "portfolio equity")?;
-    for slot in slots {
-        let close = close_at(slot, time)?;
-        let value = checked_mul(slot.qty, close, "marked position")?;
+    let mut weights = BTreeMap::new();
+    for (market_code, value) in slot_values {
         let weight = if equity.is_zero() {
             Decimal::ZERO
         } else {
             checked_div(value, equity, "asset weight")?
         };
-        weights.insert(slot.market.code(), weight);
+        weights.insert(market_code, weight);
     }
     let gross_weight = if equity.is_zero() {
         Decimal::ZERO

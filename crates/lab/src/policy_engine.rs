@@ -18,8 +18,13 @@ use crate::contracts::{
     VerifiedProviderCoverage, Weight, strategy_binding, validate_frozen_policy,
 };
 use crate::evidence::EvidenceEvaluator;
-use crate::strategy::indicators::{Ema, RollingExtreme, RollingVol, Rsi, Sma, finite};
-use crate::strategy::{PositionView, StrategyEvaluation, StrategyEvaluator, decimal_f64};
+use crate::strategy::indicators::{
+    Atr, Bollinger, BollingerOutput, DrawdownFromHigh, Ema, Macd, MacdOutput, Roc, RollingExtreme,
+    RollingVol, Rsi, Sma, ZScore, finite,
+};
+use crate::strategy::{
+    PositionView, StrategyEvaluation, StrategyEvaluator, annualize, decimal_f64,
+};
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1131,6 +1136,12 @@ enum IndicatorState {
     AnnualVol(RollingVol),
     PriorHigh(RollingExtreme),
     PriorLow(RollingExtreme),
+    Atr(Atr),
+    Bollinger(Bollinger),
+    Macd(Macd),
+    ZScore(ZScore),
+    Roc(Roc),
+    DrawdownFromHigh(DrawdownFromHigh),
 }
 
 impl RulesEvaluator {
@@ -1741,6 +1752,69 @@ impl IndicatorRuntime {
             PolicyIndicatorKind::PriorLow { window } => {
                 IndicatorState::PriorLow(RollingExtreme::new(*window))
             }
+            PolicyIndicatorKind::Atr { window } => IndicatorState::Atr(Atr::new(*window)),
+            PolicyIndicatorKind::BollingerUpper { window, multiplier } => {
+                IndicatorState::Bollinger(Bollinger::new(
+                    *window,
+                    *multiplier,
+                    BollingerOutput::Upper,
+                ))
+            }
+            PolicyIndicatorKind::BollingerLower { window, multiplier } => {
+                IndicatorState::Bollinger(Bollinger::new(
+                    *window,
+                    *multiplier,
+                    BollingerOutput::Lower,
+                ))
+            }
+            PolicyIndicatorKind::BollingerBandwidth { window, multiplier } => {
+                IndicatorState::Bollinger(Bollinger::new(
+                    *window,
+                    *multiplier,
+                    BollingerOutput::Bandwidth,
+                ))
+            }
+            PolicyIndicatorKind::BollingerPercentB { window, multiplier } => {
+                IndicatorState::Bollinger(Bollinger::new(
+                    *window,
+                    *multiplier,
+                    BollingerOutput::PercentB,
+                ))
+            }
+            PolicyIndicatorKind::MacdLine {
+                fast_window,
+                slow_window,
+            } => IndicatorState::Macd(Macd::new(
+                *fast_window,
+                *slow_window,
+                None,
+                MacdOutput::Line,
+            )),
+            PolicyIndicatorKind::MacdSignal {
+                fast_window,
+                slow_window,
+                signal_window,
+            } => IndicatorState::Macd(Macd::new(
+                *fast_window,
+                *slow_window,
+                Some(*signal_window),
+                MacdOutput::Signal,
+            )),
+            PolicyIndicatorKind::MacdHistogram {
+                fast_window,
+                slow_window,
+                signal_window,
+            } => IndicatorState::Macd(Macd::new(
+                *fast_window,
+                *slow_window,
+                Some(*signal_window),
+                MacdOutput::Histogram,
+            )),
+            PolicyIndicatorKind::ZScore { window } => IndicatorState::ZScore(ZScore::new(*window)),
+            PolicyIndicatorKind::Roc { window } => IndicatorState::Roc(Roc::new(*window)),
+            PolicyIndicatorKind::DrawdownFromHigh { window } => {
+                IndicatorState::DrawdownFromHigh(DrawdownFromHigh::new(*window))
+            }
         };
         Self {
             id: spec.id.clone(),
@@ -1784,6 +1858,12 @@ impl IndicatorRuntime {
             IndicatorState::PriorLow(state) => {
                 Ok(state.prior_then_update(prices.high, prices.low)?.1)
             }
+            IndicatorState::Atr(state) => state.update(prices.high, prices.low, prices.close),
+            IndicatorState::Bollinger(state) => state.update(prices.close),
+            IndicatorState::Macd(state) => state.update(prices.close),
+            IndicatorState::ZScore(state) => state.update(prices.close),
+            IndicatorState::Roc(state) => state.update(prices.close),
+            IndicatorState::DrawdownFromHigh(state) => state.update(prices.close),
         }
     }
 }
@@ -1811,14 +1891,6 @@ fn nonnegative_decimal_f64(value: Decimal, label: &str) -> Result<f64, LabError>
         )));
     }
     Ok(value)
-}
-
-fn annualize(sigma: f64, interval: CandleInterval) -> Result<f64, LabError> {
-    let seconds = i32::try_from(interval.duration().num_seconds())
-        .map_err(|_| LabError::InvalidConfig("policy interval exceeds i32 seconds".into()))?;
-    let result = sigma * (365.25 * 24.0 * 60.0 * 60.0 / f64::from(seconds)).sqrt();
-    finite(result, "policy annual volatility")?;
-    Ok(result)
 }
 
 fn named_values(values: &BTreeMap<String, f64>) -> Vec<NamedPolicyValue> {

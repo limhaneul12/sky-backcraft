@@ -65,9 +65,11 @@ impl RegimeClassifier {
 
     fn sma_slope(values: &VecDeque<f64>, length: usize, lookback: usize) -> Option<f64> {
         let now = Self::sma(values, length)?;
-        let past_len = values.len().checked_sub(lookback)?;
-        let past: Vec<f64> = values.iter().take(past_len).copied().collect();
-        let past = Self::sma(&past.into(), length)?;
+        if values.len() < length.checked_add(lookback)? {
+            return None;
+        }
+        let past_sum: f64 = values.iter().rev().skip(lookback).take(length).sum();
+        let past = past_sum / f64::from(u32::try_from(length).unwrap_or(1));
         Some((now - past) / f64::from(u32::try_from(lookback).unwrap_or(1)))
     }
 
@@ -154,15 +156,16 @@ impl RegimeClassifier {
         } else {
             0.0
         };
-        let up_count = self
-            .closes
-            .iter()
-            .rev()
-            .take(self.spec.slope_lookback + 1)
-            .collect::<Vec<_>>()
-            .windows(2)
-            .filter(|pair| pair[1] > pair[0])
-            .count();
+        let mut rev_closes = self.closes.iter().rev().take(self.spec.slope_lookback + 1);
+        let mut up_count = 0_usize;
+        if let Some(mut prev_rev) = rev_closes.next() {
+            for curr_rev in rev_closes {
+                if curr_rev > prev_rev {
+                    up_count += 1;
+                }
+                prev_rev = curr_rev;
+            }
+        }
         let persistence_window = self.spec.slope_lookback;
         let directional_persistence = if persistence_window == 0 {
             0.0
@@ -232,15 +235,14 @@ impl RegimeClassifier {
         if n < length + 1 {
             return 0.0;
         }
-        let closes: Vec<f64> = self.closes.iter().copied().collect();
-        let highs: Vec<f64> = self.highs.iter().copied().collect();
-        let lows: Vec<f64> = self.lows.iter().copied().collect();
         let mut total = 0.0;
         for index in n - length..n {
-            let previous_close = closes[index - 1];
-            let true_range = (highs[index] - lows[index])
-                .max((highs[index] - previous_close).abs())
-                .max((lows[index] - previous_close).abs());
+            let previous_close = self.closes[index - 1];
+            let high = self.highs[index];
+            let low = self.lows[index];
+            let true_range = (high - low)
+                .max((high - previous_close).abs())
+                .max((low - previous_close).abs());
             total += true_range;
         }
         total / f64::from(u32::try_from(length).unwrap_or(1))
@@ -252,23 +254,29 @@ impl RegimeClassifier {
         if n < length + 1 {
             return 0.0;
         }
-        let closes: Vec<f64> = self.closes.iter().copied().collect();
-        let mut returns = Vec::with_capacity(length);
+        let mut sum = 0.0;
+        let mut count = 0_usize;
         for index in n - length..n {
-            if closes[index - 1] > 0.0 {
-                returns.push(closes[index] / closes[index - 1] - 1.0);
+            let previous_close = self.closes[index - 1];
+            if previous_close > 0.0 {
+                sum += self.closes[index] / previous_close - 1.0;
+                count += 1;
             }
         }
-        if returns.is_empty() {
+        if count == 0 {
             return 0.0;
         }
-        let mean =
-            returns.iter().sum::<f64>() / f64::from(u32::try_from(returns.len()).unwrap_or(1));
-        let variance = returns
-            .iter()
-            .map(|value| (value - mean) * (value - mean))
-            .sum::<f64>()
-            / f64::from(u32::try_from(returns.len().saturating_sub(1)).unwrap_or(1)).max(1.0);
+        let mean = sum / f64::from(u32::try_from(count).unwrap_or(1));
+        let mut sq_diff_sum = 0.0;
+        for index in n - length..n {
+            let previous_close = self.closes[index - 1];
+            if previous_close > 0.0 {
+                let value = self.closes[index] / previous_close - 1.0;
+                sq_diff_sum += (value - mean) * (value - mean);
+            }
+        }
+        let variance =
+            sq_diff_sum / f64::from(u32::try_from(count.saturating_sub(1)).unwrap_or(1)).max(1.0);
         variance.sqrt()
     }
 }

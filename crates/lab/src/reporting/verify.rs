@@ -880,6 +880,15 @@ impl<'a> Verifier<'a> {
                 .map(|trace| trace.state_after.as_slice());
         }
         self.verify_order_history(model, &signals, &orders, &episodes, global_event_sequences);
+        let mut filled_by_order: BTreeMap<&str, Option<Decimal>> = BTreeMap::new();
+        for fill in &model.fills {
+            filled_by_order
+                .entry(fill.order_id.as_str())
+                .and_modify(|sum| {
+                    *sum = sum.and_then(|current| current.checked_add(fill.qty.get()));
+                })
+                .or_insert_with(|| Some(fill.qty.get()));
+        }
         for order in &model.orders {
             self.verify_context_identity(model, &order.context);
             if !signals.contains_key(order.parent_signal_id.as_str()) {
@@ -922,13 +931,10 @@ impl<'a> Verifier<'a> {
                     model.model_id, order.order_id
                 ));
             }
-            let filled = checked_sum(
-                model
-                    .fills
-                    .iter()
-                    .filter(|fill| fill.order_id == order.order_id)
-                    .map(|fill| fill.qty.get()),
-            );
+            let filled = filled_by_order
+                .get(order.order_id.as_str())
+                .copied()
+                .unwrap_or(Some(Decimal::ZERO));
             if filled.is_none_or(|value| {
                 value != order.cumulative_filled_qty.get() || value > order.requested_qty.get()
             }) {
@@ -938,6 +944,17 @@ impl<'a> Verifier<'a> {
                 ));
             }
         }
+        let signal_time_sequences: BTreeSet<(crate::contracts::UtcTimestamp, u64, &str)> = model
+            .signals
+            .iter()
+            .map(|signal| {
+                (
+                    signal.context.accounting_event_time,
+                    signal.context.event_seq,
+                    signal.signal_id.as_str(),
+                )
+            })
+            .collect();
         for fill in &model.fills {
             self.verify_context(model, &fill.context, global_event_sequences);
             self.checked_fills = self.checked_fills.saturating_add(1);
@@ -955,7 +972,14 @@ impl<'a> Verifier<'a> {
                     model.model_id, fill.fill_id
                 ));
             }
-            self.verify_fill_causality(model, fill, &orders, &signals, observations);
+            self.verify_fill_causality(
+                model,
+                fill,
+                &orders,
+                &signals,
+                &signal_time_sequences,
+                observations,
+            );
             if fill.price.get().checked_mul(fill.qty.get()) != Some(fill.notional.get()) {
                 self.finding(format!(
                     "{} fill {} notional is not price times quantity",
@@ -1416,6 +1440,7 @@ impl<'a> Verifier<'a> {
         fill: &FillRecord,
         orders: &BTreeMap<&str, &crate::contracts::OrderRecord>,
         signals: &BTreeMap<&str, &crate::contracts::SignalRecord>,
+        signal_time_sequences: &BTreeSet<(crate::contracts::UtcTimestamp, u64, &str)>,
         observations: &BTreeMap<&str, &crate::contracts::CandleObservation>,
     ) {
         let Some(order) = orders.get(fill.order_id.as_str()).copied() else {
@@ -1538,11 +1563,10 @@ impl<'a> Verifier<'a> {
         if order.order_type == crate::contracts::SimulatedOrderType::PassiveBuyLimit {
             self.verify_passive_fill(model, fill, order, source, liquidity_source, observations);
         }
-        if model.signals.iter().any(|candidate| {
-            candidate.signal_id != signal.signal_id
-                && candidate.context.accounting_event_time == fill_time
-                && candidate.context.event_seq < fill.context.event_seq
-        }) {
+        if signal_time_sequences
+            .range((fill_time, 0, "")..(fill_time, fill.context.event_seq, ""))
+            .any(|(_, _, candidate_id)| *candidate_id != signal.signal_id.as_str())
+        {
             self.finding(format!(
                 "{} fill {} does not precede a same-time later decision",
                 model.model_id, fill.fill_id

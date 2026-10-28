@@ -327,7 +327,14 @@ impl RiskGuard {
                 .admission
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            (admission.emergency_stop, admission.paused)
+            (
+                admission.emergency_stop
+                    || admission
+                        .pending_safety
+                        .values()
+                        .any(|emergency| *emergency),
+                admission.paused || !admission.pending_safety.is_empty(),
+            )
         };
         if emergency_stop {
             return Err(RiskError::EmergencyStopActive);

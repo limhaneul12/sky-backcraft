@@ -21,7 +21,7 @@ use crate::paper::{
     MAX_PAPER_SESSION_VERIFICATION_OBSERVATIONS, PAPER_CHECKPOINT_SCHEMA_VERSION,
     PaperMarketCheckpoint, PaperStepOutcome, PreparedPaperSourceFrame, StoredCheckpointRow,
     StoredEventRow, default_start_options, materialize_candle_event, policy_option_from_revision,
-    request_payload_digest, semantic_digest, verify_paper_session,
+    request_payload_digest, verify_paper_session,
 };
 use rusqlite::{OptionalExtension, Transaction, params, params_from_iter};
 use std::collections::{BTreeMap, BTreeSet};
@@ -151,20 +151,23 @@ impl Store {
             )
             .map_err(sql_error)?;
 
-        let mut items = Vec::new();
+        let limit_usize = usize::try_from(limit)
+            .map_err(|_| LabError::ResourceLimit("limit exceeds usize".into()))?;
+        let mut raw_views = Vec::new();
         for row in rows {
-            let view_json = row.map_err(sql_error)?;
+            raw_views.push(row.map_err(sql_error)?);
+        }
+        let has_more = raw_views.len() > limit_usize;
+        if has_more {
+            raw_views.truncate(limit_usize);
+        }
+        let mut items = Vec::with_capacity(raw_views.len());
+        for view_json in raw_views {
             let mut view: PaperSessionView =
                 serde_json::from_str(&view_json).map_err(json_error)?;
             refresh_view_freshness(&mut view, now);
             self.project_paper_verification(&mut view)?;
             items.push(view);
-        }
-        let limit_usize = usize::try_from(limit)
-            .map_err(|_| LabError::ResourceLimit("limit exceeds usize".into()))?;
-        let has_more = items.len() > limit_usize;
-        if has_more {
-            items.truncate(limit_usize);
         }
         let next_cursor = if has_more {
             items.last().map(|item| PaperSessionCursor {
@@ -301,32 +304,27 @@ impl Store {
             set_unavailable_paper_verification(session, "OBSERVATION_REFERENCES_OVER_40000");
             return Ok(());
         }
-        let observation_sizes = load_observation_sizes(&self.connection, &observation_ids)?;
-        let observation_bytes = observation_sizes
-            .iter()
-            .try_fold(0_usize, |total, (_, bytes)| total.checked_add(*bytes));
-        let Some(observation_bytes) = observation_bytes else {
-            set_unavailable_paper_verification(session, "OBSERVATION_JSON_SIZE_OVERFLOW");
-            return Ok(());
+        let observations = match load_verification_observations(
+            &self.connection,
+            &observation_ids,
+            event_bytes,
+            checkpoint_bytes,
+        ) {
+            Ok(VerificationObservationLoad::Loaded(rows)) => rows,
+            Ok(VerificationObservationLoad::SizeOverflow) => {
+                set_unavailable_paper_verification(session, "OBSERVATION_JSON_SIZE_OVERFLOW");
+                return Ok(());
+            }
+            Ok(VerificationObservationLoad::OverLimit) => {
+                set_unavailable_paper_verification(session, "OBSERVATION_JSON_OVER_64MIB");
+                return Ok(());
+            }
+            Err(LabError::DataCorrupt(_)) => {
+                set_failed_paper_verification(session, "OBSERVATION_JSON_CORRUPT");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
         };
-        if observation_bytes > MAX_PAPER_SESSION_VERIFICATION_OBSERVATION_BYTES
-            || event_bytes
-                .checked_add(checkpoint_bytes)
-                .and_then(|total| total.checked_add(observation_bytes))
-                .is_none_or(|total| total > MAX_PAPER_SESSION_VERIFICATION_JSON_BYTES)
-        {
-            set_unavailable_paper_verification(session, "OBSERVATION_JSON_OVER_64MIB");
-            return Ok(());
-        }
-        let observations =
-            match load_verification_observations(&self.connection, &observation_sizes) {
-                Ok(rows) => rows,
-                Err(LabError::DataCorrupt(_)) => {
-                    set_failed_paper_verification(session, "OBSERVATION_JSON_CORRUPT");
-                    return Ok(());
-                }
-                Err(error) => return Err(error),
-            };
         let proof_ids = event_rows
             .iter()
             .filter_map(|row| row.event.provider_recovery.as_ref())
@@ -1594,38 +1592,18 @@ impl Store {
         for obs in decision_bars {
             if obs.candle.completed
                 && obs.candle.close_time_utc <= now
-                && !obs.raw_object_ids.is_empty()
+                && all_raw_objects_exist(&transaction, &obs.raw_object_ids)?
             {
-                let raw_exists: Option<i64> = transaction
-                    .query_row(
-                        "SELECT 1 FROM raw_objects WHERE id = ?1",
-                        [obs.raw_object_ids[0].as_str()],
-                        |row| row.get(0),
-                    )
-                    .optional()
-                    .map_err(sql_error)?;
-                if raw_exists.is_some() {
-                    insert_observation(&transaction, obs)?;
-                }
+                insert_observation(&transaction, obs)?;
             }
         }
         for bars in source_bars.values() {
             for obs in bars {
                 if obs.candle.completed
                     && obs.candle.close_time_utc <= now
-                    && !obs.raw_object_ids.is_empty()
+                    && all_raw_objects_exist(&transaction, &obs.raw_object_ids)?
                 {
-                    let raw_exists: Option<i64> = transaction
-                        .query_row(
-                            "SELECT 1 FROM raw_objects WHERE id = ?1",
-                            [obs.raw_object_ids[0].as_str()],
-                            |row| row.get(0),
-                        )
-                        .optional()
-                        .map_err(sql_error)?;
-                    if raw_exists.is_some() {
-                        insert_observation(&transaction, obs)?;
-                    }
+                    insert_observation(&transaction, obs)?;
                 }
             }
         }
@@ -2302,7 +2280,12 @@ fn load_session_event_rows(
 ) -> Result<Vec<StoredEventRow>, LabError> {
     let mut statement = connection
         .prepare(
-            "SELECT sequence, market, kind, event_json FROM paper_session_events \
+            "SELECT sequence, market, kind, \
+                    CASE WHEN json_valid(event_json) \
+                         THEN json_remove(event_json, '$.signals[0].policy_trace', '$.signals[0].decision_trace') \
+                         ELSE event_json \
+                    END \
+             FROM paper_session_events \
              WHERE session_id=?1 ORDER BY sequence ASC",
         )
         .map_err(sql_error)?;
@@ -2332,83 +2315,108 @@ fn load_session_event_rows(
     Ok(events)
 }
 
-fn load_observation_sizes(
-    connection: &rusqlite::Connection,
-    ids: &BTreeSet<ObservationId>,
-) -> Result<Vec<(ObservationId, usize)>, LabError> {
-    let ids = ids.iter().cloned().collect::<Vec<_>>();
-    let mut sizes = Vec::new();
-    for chunk in ids.chunks(400) {
-        if chunk.is_empty() {
-            continue;
-        }
-        let values = chunk
-            .iter()
-            .map(|id| id.as_str().to_owned())
-            .collect::<Vec<_>>();
-        let placeholders = (1..=values.len())
-            .map(|index| format!("?{index}"))
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql = format!(
-            "SELECT id, length(CAST(observation_json AS BLOB)) FROM candle_observations \
-             WHERE id IN ({placeholders})"
-        );
-        let mut statement = connection.prepare(&sql).map_err(sql_error)?;
-        let rows = statement
-            .query_map(params_from_iter(values.iter()), |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })
-            .map_err(sql_error)?;
-        for row in rows {
-            let (id, size) = row.map_err(sql_error)?;
-            let id = ObservationId::new(id)?;
-            let size = usize::try_from(size)
-                .map_err(|_| LabError::DataCorrupt("negative observation JSON length".into()))?;
-            sizes.push((id, size));
-        }
-    }
-    Ok(sizes)
+enum VerificationObservationLoad {
+    Loaded(BTreeMap<ObservationId, CandleObservation>),
+    SizeOverflow,
+    OverLimit,
 }
 
 fn load_verification_observations(
     connection: &rusqlite::Connection,
-    sizes: &[(ObservationId, usize)],
-) -> Result<BTreeMap<ObservationId, CandleObservation>, LabError> {
-    let ids = sizes.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>();
-    let mut observations = BTreeMap::new();
+    ids: &BTreeSet<ObservationId>,
+    event_bytes: usize,
+    checkpoint_bytes: usize,
+) -> Result<VerificationObservationLoad, LabError> {
+    let ids = ids.iter().cloned().collect::<Vec<_>>();
+    let max_obs_bytes_i64 = usize_to_i64(MAX_PAPER_SESSION_VERIFICATION_OBSERVATION_BYTES)?;
+    let mut observation_bytes = 0_usize;
+    let mut over_limit = false;
+    let mut raw_rows = Vec::with_capacity(ids.len());
     for chunk in ids.chunks(400) {
         if chunk.is_empty() {
             continue;
         }
-        let values = chunk
-            .iter()
-            .map(|id| id.as_str().to_owned())
-            .collect::<Vec<_>>();
-        let placeholders = (1..=values.len())
+        let placeholders = (2..=chunk.len() + 1)
             .map(|index| format!("?{index}"))
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
-            "SELECT id, observation_json FROM candle_observations \
-             WHERE id IN ({placeholders})"
+            "SELECT id, length(CAST(observation_json AS BLOB)), \
+             CASE WHEN length(CAST(observation_json AS BLOB)) <= ?1 THEN observation_json END \
+             FROM candle_observations WHERE id IN ({placeholders})"
         );
         let mut statement = connection.prepare(&sql).map_err(sql_error)?;
+        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() + 1);
+        params.push(rusqlite::types::Value::Integer(max_obs_bytes_i64));
+        for id in chunk {
+            params.push(rusqlite::types::Value::Text(id.as_str().to_owned()));
+        }
         let rows = statement
-            .query_map(params_from_iter(values.iter()), |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            .query_map(params_from_iter(params.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
             })
             .map_err(sql_error)?;
         for row in rows {
-            let (id, json) = row.map_err(sql_error)?;
+            let (id, size, json) = row.map_err(sql_error)?;
             let id = ObservationId::new(id)?;
-            let observation = serde_json::from_str(&json).map_err(|error| {
-                LabError::DataCorrupt(format!("paper source observation JSON is invalid: {error}"))
-            })?;
-            observations.insert(id, observation);
+            let size = usize::try_from(size)
+                .map_err(|_| LabError::DataCorrupt("negative observation JSON length".into()))?;
+            let Some(next_total) = observation_bytes.checked_add(size) else {
+                return Ok(VerificationObservationLoad::SizeOverflow);
+            };
+            observation_bytes = next_total;
+            if observation_bytes > MAX_PAPER_SESSION_VERIFICATION_OBSERVATION_BYTES
+                || event_bytes
+                    .checked_add(checkpoint_bytes)
+                    .and_then(|total| total.checked_add(observation_bytes))
+                    .is_none_or(|total| total > MAX_PAPER_SESSION_VERIFICATION_JSON_BYTES)
+            {
+                over_limit = true;
+            } else if let Some(json) = json {
+                raw_rows.push((id, json));
+            } else {
+                over_limit = true;
+            }
         }
     }
-    Ok(observations)
+    if over_limit {
+        return Ok(VerificationObservationLoad::OverLimit);
+    }
+    let mut observations = BTreeMap::new();
+    for (id, json) in raw_rows {
+        let observation = serde_json::from_str(&json).map_err(|error| {
+            LabError::DataCorrupt(format!("paper source observation JSON is invalid: {error}"))
+        })?;
+        observations.insert(id, observation);
+    }
+    Ok(VerificationObservationLoad::Loaded(observations))
+}
+
+fn all_raw_objects_exist(
+    transaction: &Transaction<'_>,
+    raw_object_ids: &[crate::contracts::RawObjectId],
+) -> Result<bool, LabError> {
+    if raw_object_ids.is_empty() {
+        return Ok(false);
+    }
+    for raw_id in raw_object_ids {
+        let exists: Option<i64> = transaction
+            .query_row(
+                "SELECT 1 FROM raw_objects WHERE id = ?1",
+                [raw_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        if exists.is_none() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn load_session_checkpoint_rows(
@@ -2469,54 +2477,10 @@ fn load_session_checkpoints(
     connection: &rusqlite::Connection,
     session_id: &PaperSessionId,
 ) -> Result<Vec<PaperMarketCheckpoint>, LabError> {
-    let mut statement = connection
-        .prepare(
-            "SELECT schema_version, engine_version, checkpoint_digest, checkpoint_json \
-             FROM paper_market_checkpoints \
-             WHERE session_id = ?1 \
-             ORDER BY market_order ASC",
-        )
-        .map_err(sql_error)?;
-    let rows = statement
-        .query_map([session_id.as_str()], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })
-        .map_err(sql_error)?;
-    let mut checkpoints = Vec::new();
-    for row in rows {
-        let (schema_version, engine_version, expected_digest, checkpoint_json) =
-            row.map_err(sql_error)?;
-        if schema_version != PAPER_CHECKPOINT_SCHEMA_VERSION {
-            return Err(LabError::DataCorrupt(format!(
-                "unsupported paper checkpoint schema version: {schema_version}"
-            )));
-        }
-        if engine_version != ENGINE_VERSION {
-            return Err(LabError::DataCorrupt(format!(
-                "paper checkpoint engine version mismatch: expected {ENGINE_VERSION}, found {engine_version}"
-            )));
-        }
-        let actual_digest = ContentHash::of_bytes(checkpoint_json.as_bytes());
-        if actual_digest.as_str() != expected_digest {
-            return Err(LabError::DataCorrupt(
-                "paper market checkpoint digest mismatch".into(),
-            ));
-        }
-        let checkpoint: PaperMarketCheckpoint =
-            serde_json::from_str(&checkpoint_json).map_err(json_error)?;
-        checkpoints.push(checkpoint);
-    }
-    if checkpoints.is_empty() {
-        return Err(LabError::DataCorrupt(
-            "paper session has no market checkpoints".into(),
-        ));
-    }
-    Ok(checkpoints)
+    Ok(load_session_checkpoint_rows(connection, session_id)?
+        .into_iter()
+        .map(|(_, _, checkpoint)| checkpoint)
+        .collect())
 }
 
 fn insert_session_row(
@@ -2615,7 +2579,6 @@ fn upsert_checkpoint_row(
 ) -> Result<(), LabError> {
     let checkpoint_json = serde_json::to_string(checkpoint).map_err(json_error)?;
     let checkpoint_digest = ContentHash::of_bytes(checkpoint_json.as_bytes());
-    let _ = semantic_digest("paper_checkpoint_v1", &checkpoint_digest)?;
     transaction
         .execute(
             "INSERT INTO paper_market_checkpoints( \

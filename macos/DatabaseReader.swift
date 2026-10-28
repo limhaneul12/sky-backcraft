@@ -469,7 +469,7 @@ final class DatabaseReader: @unchecked Sendable {
             let appSupport = FileManager.default.urls(
                 for: .applicationSupportDirectory,
                 in: .userDomainMask
-            ).first!
+            ).first ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support", isDirectory: true)
             dbPath = appSupport.appendingPathComponent("Sky Backcraft/research/lab.sqlite").path
         }
     }
@@ -730,10 +730,11 @@ final class DatabaseReader: @unchecked Sendable {
         }
         sqlite3_bind_int64(statement, 8, Int64(limit + 1))
 
+        let decoder = JSONDecoder()
         var results: [RealRun] = []
         var step = sqlite3_step(statement)
         while step == SQLITE_ROW {
-            results.append(try readRun(statement, operation: operation))
+            results.append(try readRun(statement, operation: operation, decoder: decoder))
             step = sqlite3_step(statement)
         }
         try ensureDone(step, db: db, operation: operation)
@@ -823,18 +824,18 @@ final class DatabaseReader: @unchecked Sendable {
         return RunHistoryFilterOptions(costAssumptionLabels: costs, policyRevisions: revisions)
     }
 
-    private func readRun(_ statement: OpaquePointer, operation: String) throws -> RealRun {
+    private func readRun(_ statement: OpaquePointer, operation: String, decoder: JSONDecoder) throws -> RealRun {
         let runId = try requiredText(statement, column: 0, operation: operation, field: "run_id")
         let manifestText = try requiredText(statement, column: 6, operation: operation, field: "manifest_json")
         let planText = try requiredText(statement, column: 7, operation: operation, field: "resolved_plan_json")
-        let manifest: RunManifest = try decode(RunManifest.self, text: manifestText, operation: "run \(runId) manifest")
-        let plan: ResolvedPlan = try decode(ResolvedPlan.self, text: planText, operation: "run \(runId) plan")
+        let manifest: RunManifest = try decode(RunManifest.self, text: manifestText, operation: "run \(runId) manifest", decoder: decoder)
+        let plan: ResolvedPlan = try decode(ResolvedPlan.self, text: planText, operation: "run \(runId) plan", decoder: decoder)
         let initialCash = try plan.spec.initialCash.map {
             try decimal($0, operation: "run \(runId) plan", field: "initial_cash")
         }
         var f08Report: F08Report?
         if let reportText = optionalText(statement, column: 9) {
-            f08Report = try decode(F08Report.self, text: reportText, operation: "run \(runId) F08")
+            f08Report = try decode(F08Report.self, text: reportText, operation: "run \(runId) F08", decoder: decoder)
             guard f08Report?.runId == runId, f08Report?.status == optionalText(statement, column: 8) else {
                 throw LedgerReadError.inconsistentData(operation: "run \(runId) F08", detail: "validation row and report identity/status differ")
             }
@@ -908,13 +909,14 @@ final class DatabaseReader: @unchecked Sendable {
         operation: String,
         db: OpaquePointer
     ) throws -> [RealModelComparison] {
+        let decoder = JSONDecoder()
         var results: [RealModelComparison] = []
         var step = sqlite3_step(statement)
         while step == SQLITE_ROW {
             let storedRunId = try requiredText(statement, column: 0, operation: operation, field: "run_id")
             let modelId = try requiredText(statement, column: 1, operation: operation, field: "model_id")
             let recordText = try requiredText(statement, column: 2, operation: operation, field: "comparison_json")
-            let record: ModelComparisonRecord = try decode(ModelComparisonRecord.self, text: recordText, operation: "model comparison \(storedRunId)/\(modelId)")
+            let record: ModelComparisonRecord = try decode(ModelComparisonRecord.self, text: recordText, operation: "model comparison \(storedRunId)/\(modelId)", decoder: decoder)
             let market = try requiredText(statement, column: 3, operation: operation, field: "market")
             let persistedStatus = optionalText(statement, column: 4)
             guard expectedRunIds.contains(storedRunId),
@@ -1283,6 +1285,7 @@ final class DatabaseReader: @unchecked Sendable {
         defer { sqlite3_finalize(statement) }
         sqlite3_bind_int64(statement, 1, Int64(limit))
 
+        let decoder = JSONDecoder()
         var results: [RealCollectionSchedule] = []
         var step = sqlite3_step(statement)
         while step == SQLITE_ROW {
@@ -1291,7 +1294,8 @@ final class DatabaseReader: @unchecked Sendable {
                 let failure: ScheduleFailure = try decode(
                     ScheduleFailure.self,
                     text: failureJSON,
-                    operation: operation
+                    operation: operation,
+                    decoder: decoder
                 )
                 failureCode = failure.code
             } else {

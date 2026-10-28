@@ -506,15 +506,16 @@ fn accept_market_message(
             "message_sequence_exhausted",
         )
     })?;
+    let provider_at = parsed.provider_at;
+    let subscription = parsed.subscription.clone();
     let transport = RawWebSocketTransport {
         connection_epoch,
         message_sequence: *sequence,
-        provider_at: Some(parsed.provider_at),
+        provider_at: Some(provider_at),
         received_at,
     };
-    let frame = parsed.clone();
     let subscriptions_now = shared.subscriptions.borrow().clone();
-    let (disposition, all_ready) = {
+    let (disposition, all_ready, due) = {
         let mut cache = shared.cache.lock().map_err(|_| {
             ConnectionFailure::new(
                 PublicFeedErrorCategory::Recovery,
@@ -522,18 +523,22 @@ fn accept_market_message(
             )
             .with_lab_error_category("INTERNAL")
         })?;
-        let disposition = cache.apply_frame(frame, raw.to_vec(), transport);
+        let disposition = cache.apply_frame(parsed, raw.to_vec(), transport);
         let all_ready = cache.all_required_ready(&subscriptions_now, received_at);
-        (disposition, all_ready)
+        let due = cache.has_due_candidate(&subscription, received_at);
+        (disposition, all_ready, due)
     };
     let lag_ms = received_at
         .0
-        .signed_duration_since(parsed.provider_at.0)
+        .signed_duration_since(provider_at.0)
         .num_milliseconds();
+    let max_skew_ms = super::state::MAX_PROVIDER_CLOCK_SKEW_SECONDS * 1_000;
     shared.health.send_modify(|health| {
         health.status.last_received_at_utc = Some(received_at);
-        health.last_provider_at_utc = Some(parsed.provider_at);
-        health.last_data_lag_millis = u64::try_from(lag_ms).ok();
+        health.last_provider_at_utc = Some(provider_at);
+        health.last_data_lag_millis = (lag_ms >= -max_skew_ms)
+            .then(|| u64::try_from(lag_ms.max(0)).ok())
+            .flatten();
         health.status.ready_for_decisions = all_ready
             && health.last_pong_at_utc.is_some()
             && (health.status.connection_count == 1
@@ -555,16 +560,6 @@ fn accept_market_message(
             }
         }
     });
-    let due = {
-        let cache = shared.cache.lock().map_err(|_| {
-            ConnectionFailure::new(
-                PublicFeedErrorCategory::Recovery,
-                "feed_cache_lock_poisoned",
-            )
-            .with_lab_error_category("INTERNAL")
-        })?;
-        cache.has_due_candidate(&parsed.subscription, received_at)
-    };
     if due
         || matches!(
             disposition,

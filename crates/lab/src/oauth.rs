@@ -655,7 +655,10 @@ fn consent_live_order_request_id(client_id: &str, code: &str, resource: &str) ->
     digest.update(resource.as_bytes());
     digest.update([0]);
     digest.update(code.as_bytes());
-    format!("oauth-consent-{}", base64url(&digest.finalize()))
+    format!(
+        "oauth-consent-{}",
+        crate::upbit::auth::base64url_encode(&digest.finalize())
+    )
 }
 
 fn discard_unreturned_tokens(state: &OAuthState, access_token: &str, refresh_token: &str) {
@@ -1452,7 +1455,7 @@ async fn token(State(state): State<OAuthState>, RawForm(body): RawForm) -> Respo
     if !(43..=128).contains(&verifier.len()) || !verifier.bytes().all(is_pkce_verifier_byte) {
         return oauth_error(StatusCode::BAD_REQUEST, "invalid_grant");
     }
-    let challenge = base64url(&Sha256::digest(verifier.as_bytes()));
+    let challenge = crate::upbit::auth::base64url_encode(&Sha256::digest(verifier.as_bytes()));
     let Ok(access_token) = random_token(32) else {
         return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
     };
@@ -1762,26 +1765,7 @@ fn random_token(byte_count: usize) -> Result<String, ()> {
     std::fs::File::open("/dev/urandom")
         .and_then(|mut file| file.read_exact(&mut bytes))
         .map_err(|_| ())?;
-    Ok(base64url(&bytes))
-}
-
-fn base64url(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let a = chunk[0];
-        let b = chunk.get(1).copied().unwrap_or(0);
-        let c = chunk.get(2).copied().unwrap_or(0);
-        output.push(char::from(ALPHABET[usize::from(a >> 2)]));
-        output.push(char::from(ALPHABET[usize::from((a & 0x03) << 4 | b >> 4)]));
-        if chunk.len() > 1 {
-            output.push(char::from(ALPHABET[usize::from((b & 0x0f) << 2 | c >> 6)]));
-        }
-        if chunk.len() > 2 {
-            output.push(char::from(ALPHABET[usize::from(c & 0x3f)]));
-        }
-    }
-    output
+    Ok(crate::upbit::auth::base64url_encode(&bytes))
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
@@ -1851,7 +1835,7 @@ mod tests {
     fn base64url_matches_pkce_reference_vector() {
         let digest = Sha256::digest(b"dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk");
         assert_eq!(
-            base64url(&digest),
+            crate::upbit::auth::base64url_encode(&digest),
             "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
         );
     }

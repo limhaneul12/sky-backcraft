@@ -240,7 +240,9 @@ impl StrategyEvaluator {
             .map(|state| state.update(close))
             .transpose()?
             .flatten();
-        let annual_vol = bar_sigma.map(|sigma| self.annualize(sigma)).transpose()?;
+        let annual_vol = bar_sigma
+            .map(|sigma| annualize(sigma, self.interval))
+            .transpose()?;
         self.completed_bars_seen += 1;
         self.last_close_time = Some(candle.close_time_utc);
 
@@ -488,17 +490,16 @@ impl StrategyEvaluator {
         }
         Ok(())
     }
+}
 
-    fn annualize(&self, sigma: f64) -> Result<f64, LabError> {
-        let interval_seconds =
-            i32::try_from(self.interval.duration().num_seconds()).map_err(|_| {
-                LabError::InvalidConfig("strategy interval seconds exceed i32 range".to_owned())
-            })?;
-        let bars_per_year = 365.25 * 24.0 * 60.0 * 60.0 / f64::from(interval_seconds);
-        let annual = sigma * bars_per_year.sqrt();
-        finite(annual, "annualized volatility")?;
-        Ok(annual)
-    }
+pub(crate) fn annualize(sigma: f64, interval: CandleInterval) -> Result<f64, LabError> {
+    let interval_seconds = i32::try_from(interval.duration().num_seconds()).map_err(|_| {
+        LabError::InvalidConfig("strategy interval seconds exceed i32 range".to_owned())
+    })?;
+    let bars_per_year = 365.25 * 24.0 * 60.0 * 60.0 / f64::from(interval_seconds);
+    let annual = sigma * bars_per_year.sqrt();
+    finite(annual, "annualized volatility")?;
+    Ok(annual)
 }
 
 fn state_decision(

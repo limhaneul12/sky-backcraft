@@ -327,7 +327,7 @@ impl Store {
                 "job",
             )?,
             R::Run { run_id } => self.seeded_id(
-                "SELECT 1 FROM runs WHERE id=?1",
+                "SELECT 1 FROM runs WHERE id=?1 UNION ALL SELECT 1 FROM portfolio_runs WHERE id=?1",
                 "INSERT OR IGNORE INTO del_runs(id) VALUES (?1)",
                 run_id.as_str(),
                 "run",
@@ -492,7 +492,7 @@ impl Store {
                 );
                 push_all(
                     self.string_column(
-                        "SELECT o.run_id FROM job_attempt_run_outputs o WHERE o.attempt_id IN (SELECT id FROM del_attempts) ORDER BY o.run_id",
+                        "SELECT id FROM (SELECT o.run_id AS id FROM job_attempt_run_outputs o WHERE o.attempt_id IN (SELECT id FROM del_attempts) UNION SELECT r.id FROM runs r WHERE r.job_id IN (SELECT id FROM del_jobs) OR r.attempt_id IN (SELECT id FROM del_attempts) UNION SELECT p.id FROM portfolio_runs p JOIN job_attempts a ON json_extract(a.state_json, '$.output.run_id')=p.id WHERE a.id IN (SELECT id FROM del_attempts) AND json_extract(a.state_json, '$.output.kind')='PORTFOLIO') ORDER BY id",
                     )?,
                     "this job published a run; cascade removes it",
                 );
@@ -506,7 +506,7 @@ impl Store {
             R::Run { .. } => {
                 push_all(
                     self.string_column(
-                        "SELECT job_id FROM runs WHERE id IN (SELECT id FROM del_runs) ORDER BY job_id",
+                        "SELECT job_id FROM (SELECT job_id FROM runs WHERE id IN (SELECT id FROM del_runs) UNION SELECT a.job_id FROM job_attempts a WHERE json_extract(a.state_json, '$.output.kind')='PORTFOLIO' AND json_extract(a.state_json, '$.output.run_id') IN (SELECT id FROM del_runs)) ORDER BY job_id",
                     )?,
                     "the producing job attempt records this run as its output; cascade removes the job history",
                 );
@@ -621,19 +621,79 @@ impl Store {
             })
             .map_err(sql_error)?;
         // Observations still referenced by survivors are retained, never deleted.
-        connection
-            .execute_batch(
-                "CREATE TEMP TABLE keep_obs AS
-                 SELECT m.observation_id AS id FROM dataset_members m WHERE m.dataset_id NOT IN (SELECT id FROM del_datasets)
-                 UNION SELECT c.constituent_id FROM observation_constituents c WHERE c.observation_id NOT IN (SELECT id FROM del_obs)
-                 UNION SELECT s.observation_id FROM signal_source_bars s JOIN signals sg ON sg.signal_id=s.signal_id WHERE sg.run_id NOT IN (SELECT id FROM del_runs)
-                 UNION SELECT f.source_bar_id FROM fills f WHERE f.run_id NOT IN (SELECT id FROM del_runs)
-                 UNION SELECT am.source_bar_id FROM account_marks am WHERE am.run_id NOT IN (SELECT id FROM del_runs)
-                 UNION SELECT pm.observation_id FROM collection_page_members pm WHERE pm.request_id NOT IN (SELECT id FROM del_requests);
-                 DELETE FROM del_obs WHERE id IN (SELECT id FROM keep_obs);
-                 DROP TABLE keep_obs;",
-            )
-            .map_err(sql_error)?;
+        if candidate_observations > 0 {
+            connection
+                .execute_batch(
+                    "DELETE FROM del_obs WHERE
+                     EXISTS (SELECT 1 FROM dataset_members m WHERE m.observation_id=del_obs.id AND m.dataset_id NOT IN (SELECT id FROM del_datasets))
+                     OR EXISTS (SELECT 1 FROM observation_constituents c WHERE c.constituent_id=del_obs.id AND c.observation_id NOT IN (SELECT id FROM del_obs))
+                     OR EXISTS (SELECT 1 FROM signal_source_bars s JOIN signals sg ON sg.signal_id=s.signal_id WHERE s.observation_id=del_obs.id AND sg.run_id NOT IN (SELECT id FROM del_runs))
+                     OR EXISTS (SELECT 1 FROM fills f WHERE f.source_bar_id=del_obs.id AND f.run_id NOT IN (SELECT id FROM del_runs))
+                     OR EXISTS (SELECT 1 FROM account_marks am WHERE am.source_bar_id=del_obs.id AND am.run_id NOT IN (SELECT id FROM del_runs))
+                     OR EXISTS (SELECT 1 FROM collection_page_members pm WHERE pm.observation_id=del_obs.id AND pm.request_id NOT IN (SELECT id FROM del_requests));",
+                )
+                .map_err(sql_error)?;
+            let check_paper_sessions: i64 = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM del_obs) AND EXISTS(SELECT 1 FROM paper_sessions)",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error)?;
+            if check_paper_sessions != 0 {
+                connection
+                    .execute_batch(
+                        "DELETE FROM del_obs WHERE id IN (
+                             SELECT json_extract(event_json, '$.candle.observation_id')
+                             FROM paper_session_events
+                             WHERE json_extract(event_json, '$.candle.observation_id') IS NOT NULL
+                             UNION
+                             SELECT j.value
+                             FROM paper_session_events e,
+                                  json_each(e.event_json, '$.signals') s,
+                                  json_each(s.value, '$.source_bar_ids') j
+                             WHERE j.value IS NOT NULL
+                             UNION
+                             SELECT json_extract(f.value, '$.source_bar_id')
+                             FROM paper_session_events e,
+                                  json_each(e.event_json, '$.fills') f
+                             WHERE json_extract(f.value, '$.source_bar_id') IS NOT NULL
+                             UNION
+                             SELECT json_extract(f.value, '$.liquidity_source_bar_id')
+                             FROM paper_session_events e,
+                                  json_each(e.event_json, '$.fills') f
+                             WHERE json_extract(f.value, '$.liquidity_source_bar_id') IS NOT NULL
+                             UNION
+                             SELECT json_extract(m.value, '$.source_bar_id')
+                             FROM paper_session_events e,
+                                  json_each(e.event_json, '$.account_marks') m
+                             WHERE json_extract(m.value, '$.source_bar_id') IS NOT NULL
+                             UNION
+                             SELECT json_extract(checkpoint_json, '$.initial_mark.source_bar_id')
+                             FROM paper_market_checkpoints
+                             WHERE json_extract(checkpoint_json, '$.initial_mark.source_bar_id') IS NOT NULL
+                             UNION
+                             SELECT json_extract(checkpoint_json, '$.latest_mark.source_bar_id')
+                             FROM paper_market_checkpoints
+                             WHERE json_extract(checkpoint_json, '$.latest_mark.source_bar_id') IS NOT NULL
+                             UNION
+                             SELECT json_extract(checkpoint_json, '$.prior_execution_bar.id')
+                             FROM paper_market_checkpoints
+                             WHERE json_extract(checkpoint_json, '$.prior_execution_bar.id') IS NOT NULL
+                             UNION
+                             SELECT json_extract(checkpoint_json, '$.prior_passive_liquidity_bar.id')
+                             FROM paper_market_checkpoints
+                             WHERE json_extract(checkpoint_json, '$.prior_passive_liquidity_bar.id') IS NOT NULL
+                         );
+                         DELETE FROM del_obs WHERE EXISTS (
+                             SELECT 1 FROM observation_constituents c
+                             WHERE c.constituent_id=del_obs.id
+                               AND c.observation_id NOT IN (SELECT id FROM del_obs)
+                         );",
+                    )
+                    .map_err(sql_error)?;
+            }
+        }
         scope.observations = self.scalar("SELECT COUNT(*) FROM del_obs")?;
         // Candidate raw objects linked by the scope.
         connection
@@ -671,24 +731,22 @@ impl Store {
                 row.get::<_, i64>(0)
             })
             .map_err(sql_error)?;
-        connection
-            .execute_batch(
-                "CREATE TEMP TABLE keep_raws AS
-                 SELECT r.raw_object_id AS id FROM dataset_raw_objects r WHERE r.dataset_id NOT IN (SELECT id FROM del_datasets)
-                 UNION SELECT q.raw_object_id FROM quality_issue_raw_objects q WHERE q.dataset_id NOT IN (SELECT id FROM del_datasets)
-                 UNION SELECT o.raw_object_id FROM observation_raw_objects o WHERE o.observation_id NOT IN (SELECT id FROM del_obs)
-                 UNION SELECT c.raw_object_id FROM collection_raw_objects c WHERE c.request_id NOT IN (SELECT id FROM del_requests)
-                 UNION SELECT p.raw_object_id FROM collection_pages p WHERE p.request_id NOT IN (SELECT id FROM del_requests)
-                 UNION SELECT first_raw_object_id FROM provider_absence_pending_reads
-                 UNION SELECT conflict_raw_object_id FROM provider_absence_pending_reads WHERE conflict_raw_object_id IS NOT NULL
-                 UNION SELECT first_raw_object_id FROM provider_absence_spans
-                 UNION SELECT second_raw_object_id FROM provider_absence_spans
-                 UNION SELECT raw_object_id FROM provider_absence_conflicts
-                 UNION SELECT raw_object_id FROM provider_feed_recovery_pages;
-                 DELETE FROM del_raws WHERE id IN (SELECT id FROM keep_raws);
-                 DROP TABLE keep_raws;",
-            )
-            .map_err(sql_error)?;
+        if candidate_raws > 0 {
+            connection
+                .execute_batch(
+                    "DELETE FROM del_raws WHERE
+                     EXISTS (SELECT 1 FROM dataset_raw_objects r WHERE r.raw_object_id=del_raws.id AND r.dataset_id NOT IN (SELECT id FROM del_datasets))
+                     OR EXISTS (SELECT 1 FROM quality_issue_raw_objects q WHERE q.raw_object_id=del_raws.id AND q.dataset_id NOT IN (SELECT id FROM del_datasets))
+                     OR EXISTS (SELECT 1 FROM observation_raw_objects o WHERE o.raw_object_id=del_raws.id AND o.observation_id NOT IN (SELECT id FROM del_obs))
+                     OR EXISTS (SELECT 1 FROM collection_raw_objects c WHERE c.raw_object_id=del_raws.id AND c.request_id NOT IN (SELECT id FROM del_requests))
+                     OR EXISTS (SELECT 1 FROM collection_pages p WHERE p.raw_object_id=del_raws.id AND p.request_id NOT IN (SELECT id FROM del_requests))
+                     OR EXISTS (SELECT 1 FROM provider_absence_pending_reads WHERE first_raw_object_id=del_raws.id OR conflict_raw_object_id=del_raws.id)
+                     OR EXISTS (SELECT 1 FROM provider_absence_spans WHERE first_raw_object_id=del_raws.id OR second_raw_object_id=del_raws.id)
+                     OR EXISTS (SELECT 1 FROM provider_absence_conflicts WHERE raw_object_id=del_raws.id)
+                     OR EXISTS (SELECT 1 FROM provider_feed_recovery_pages WHERE raw_object_id=del_raws.id);",
+                )
+                .map_err(sql_error)?;
+        }
         let retained_raws = self.scalar("SELECT COUNT(*) FROM del_raws")?;
         let retained_raw_count = u64::try_from(candidate_raws)
             .map_err(|_| LabError::DataCorrupt("negative raw candidate count".into()))?
@@ -979,13 +1037,33 @@ impl Store {
     }
 
     fn compute_scope_counts(&self, scope: &mut DeleteScope) -> Result<(), LabError> {
-        for sql in SCOPE_COUNTS {
-            let count = self.scalar(sql)?;
+        let combined_sql = format!(
+            "SELECT {}",
+            SCOPE_COUNTS
+                .iter()
+                .map(|sql| format!("({sql})"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let counts = self
+            .connection
+            .query_row(&combined_sql, [], |row| {
+                let mut values = Vec::with_capacity(SCOPE_COUNTS.len());
+                for index in 0..SCOPE_COUNTS.len() {
+                    values.push(row.get::<_, i64>(index)?.max(0).cast_unsigned());
+                }
+                Ok(values)
+            })
+            .map_err(sql_error)?;
+        for count in counts {
             scope.counts.push((DeleteEntryKind::Run, count));
         }
         // Retained frozen plans and policy revisions referenced only by scope runs.
         let retained_plans = self.scalar(
-            "SELECT COUNT(DISTINCT plan_id) FROM runs WHERE id IN (SELECT id FROM del_runs) AND plan_id NOT IN (SELECT id FROM del_plans)",
+            "SELECT COUNT(DISTINCT plan_id) FROM (
+                SELECT plan_id FROM runs WHERE id IN (SELECT id FROM del_runs)
+                UNION ALL SELECT plan_id FROM portfolio_runs WHERE id IN (SELECT id FROM del_runs)
+            ) WHERE plan_id NOT IN (SELECT id FROM del_plans)",
         )?;
         if retained_plans > 0 {
             scope.retained_shared.push(DeleteRetainedGroup {
@@ -1397,6 +1475,10 @@ const SCOPE_DELETES: &[&str] = &[
     "DELETE FROM schedule_fires WHERE id IN (SELECT id FROM del_schedule_fires)",
     "DELETE FROM collection_schedules WHERE id IN (SELECT id FROM del_schedules)",
     "DELETE FROM managed_backups WHERE id IN (SELECT id FROM del_backups)",
+    // job output join tables reference runs, artifacts, datasets, and attempts
+    "DELETE FROM job_attempt_dataset_outputs WHERE attempt_id IN (SELECT id FROM del_attempts) OR dataset_id IN (SELECT id FROM del_datasets)",
+    "DELETE FROM job_attempt_run_outputs WHERE attempt_id IN (SELECT id FROM del_attempts) OR run_id IN (SELECT id FROM del_runs)",
+    "DELETE FROM job_attempt_artifact_outputs WHERE attempt_id IN (SELECT id FROM del_attempts) OR artifact_id IN (SELECT id FROM del_artifacts)",
     // run bundles
     "DELETE FROM run_artifacts WHERE id IN (SELECT id FROM del_artifacts) OR run_id IN (SELECT id FROM del_runs)",
     "DELETE FROM validation_results WHERE run_id IN (SELECT id FROM del_runs)",
@@ -1412,13 +1494,16 @@ const SCOPE_DELETES: &[&str] = &[
     "DELETE FROM account_marks WHERE run_id IN (SELECT id FROM del_runs)",
     "DELETE FROM episode_identities WHERE run_id IN (SELECT id FROM del_runs)",
     "DELETE FROM run_events WHERE run_id IN (SELECT id FROM del_runs)",
+    "DELETE FROM run_model_comparisons WHERE run_id IN (SELECT id FROM del_runs)",
     "DELETE FROM run_models WHERE run_id IN (SELECT id FROM del_runs)",
     "DELETE FROM run_ledger_chunks WHERE run_id IN (SELECT id FROM del_runs)",
     "DELETE FROM runs WHERE id IN (SELECT id FROM del_runs)",
+    // portfolio run bundles
+    "DELETE FROM portfolio_projection_rows WHERE run_id IN (SELECT id FROM portfolio_runs WHERE id IN (SELECT id FROM del_runs) OR plan_id IN (SELECT id FROM del_plans))",
+    "DELETE FROM portfolio_projection_meta WHERE run_id IN (SELECT id FROM portfolio_runs WHERE id IN (SELECT id FROM del_runs) OR plan_id IN (SELECT id FROM del_plans))",
+    "DELETE FROM portfolio_facts WHERE run_id IN (SELECT id FROM portfolio_runs WHERE id IN (SELECT id FROM del_runs) OR plan_id IN (SELECT id FROM del_plans))",
+    "DELETE FROM portfolio_runs WHERE id IN (SELECT id FROM del_runs) OR plan_id IN (SELECT id FROM del_plans)",
     // job history
-    "DELETE FROM job_attempt_dataset_outputs WHERE attempt_id IN (SELECT id FROM del_attempts)",
-    "DELETE FROM job_attempt_run_outputs WHERE attempt_id IN (SELECT id FROM del_attempts)",
-    "DELETE FROM job_attempt_artifact_outputs WHERE attempt_id IN (SELECT id FROM del_attempts)",
     "DELETE FROM job_attempts WHERE job_id IN (SELECT id FROM del_jobs)",
     "DELETE FROM jobs WHERE id IN (SELECT id FROM del_jobs)",
     // frozen plans
@@ -1461,6 +1546,9 @@ const SCOPE_COUNTS: &[&str] = &[
     "SELECT COUNT(*) FROM schedule_fires WHERE id IN (SELECT id FROM del_schedule_fires)",
     "SELECT COUNT(*) FROM collection_schedules WHERE id IN (SELECT id FROM del_schedules)",
     "SELECT COUNT(*) FROM managed_backups WHERE id IN (SELECT id FROM del_backups)",
+    "SELECT COUNT(*) FROM job_attempt_dataset_outputs WHERE attempt_id IN (SELECT id FROM del_attempts) OR dataset_id IN (SELECT id FROM del_datasets)",
+    "SELECT COUNT(*) FROM job_attempt_run_outputs WHERE attempt_id IN (SELECT id FROM del_attempts) OR run_id IN (SELECT id FROM del_runs)",
+    "SELECT COUNT(*) FROM job_attempt_artifact_outputs WHERE attempt_id IN (SELECT id FROM del_attempts) OR artifact_id IN (SELECT id FROM del_artifacts)",
     "SELECT COUNT(*) FROM run_artifacts WHERE id IN (SELECT id FROM del_artifacts) OR run_id IN (SELECT id FROM del_runs)",
     "SELECT COUNT(*) FROM validation_results WHERE run_id IN (SELECT id FROM del_runs)",
     "SELECT COUNT(*) FROM signal_source_bars WHERE signal_id IN (SELECT signal_id FROM signals WHERE run_id IN (SELECT id FROM del_runs))",
@@ -1475,12 +1563,14 @@ const SCOPE_COUNTS: &[&str] = &[
     "SELECT COUNT(*) FROM account_marks WHERE run_id IN (SELECT id FROM del_runs)",
     "SELECT COUNT(*) FROM episode_identities WHERE run_id IN (SELECT id FROM del_runs)",
     "SELECT COUNT(*) FROM run_events WHERE run_id IN (SELECT id FROM del_runs)",
+    "SELECT COUNT(*) FROM run_model_comparisons WHERE run_id IN (SELECT id FROM del_runs)",
     "SELECT COUNT(*) FROM run_models WHERE run_id IN (SELECT id FROM del_runs)",
     "SELECT COUNT(*) FROM run_ledger_chunks WHERE run_id IN (SELECT id FROM del_runs)",
     "SELECT COUNT(*) FROM runs WHERE id IN (SELECT id FROM del_runs)",
-    "SELECT COUNT(*) FROM job_attempt_dataset_outputs WHERE attempt_id IN (SELECT id FROM del_attempts)",
-    "SELECT COUNT(*) FROM job_attempt_run_outputs WHERE attempt_id IN (SELECT id FROM del_attempts)",
-    "SELECT COUNT(*) FROM job_attempt_artifact_outputs WHERE attempt_id IN (SELECT id FROM del_attempts)",
+    "SELECT COUNT(*) FROM portfolio_projection_rows WHERE run_id IN (SELECT id FROM portfolio_runs WHERE id IN (SELECT id FROM del_runs) OR plan_id IN (SELECT id FROM del_plans))",
+    "SELECT COUNT(*) FROM portfolio_projection_meta WHERE run_id IN (SELECT id FROM portfolio_runs WHERE id IN (SELECT id FROM del_runs) OR plan_id IN (SELECT id FROM del_plans))",
+    "SELECT COUNT(*) FROM portfolio_facts WHERE run_id IN (SELECT id FROM portfolio_runs WHERE id IN (SELECT id FROM del_runs) OR plan_id IN (SELECT id FROM del_plans))",
+    "SELECT COUNT(*) FROM portfolio_runs WHERE id IN (SELECT id FROM del_runs) OR plan_id IN (SELECT id FROM del_plans)",
     "SELECT COUNT(*) FROM job_attempts WHERE job_id IN (SELECT id FROM del_jobs)",
     "SELECT COUNT(*) FROM jobs WHERE id IN (SELECT id FROM del_jobs)",
     "SELECT COUNT(*) FROM plan_policy_revisions WHERE plan_id IN (SELECT id FROM del_plans)",
@@ -1542,7 +1632,18 @@ CREATE TEMP TABLE del_schedules(id TEXT PRIMARY KEY);
 DROP TABLE IF EXISTS temp.del_schedule_fires;
 CREATE TEMP TABLE del_schedule_fires(id TEXT PRIMARY KEY);
 DROP TABLE IF EXISTS temp.del_backups;
-CREATE TEMP TABLE del_backups(id TEXT PRIMARY KEY);";
+CREATE TEMP TABLE del_backups(id TEXT PRIMARY KEY);
+CREATE INDEX IF NOT EXISTS idx_fk_observation_raw_objects_raw ON observation_raw_objects(raw_object_id);
+CREATE INDEX IF NOT EXISTS idx_fk_observation_constituents_const ON observation_constituents(constituent_id);
+CREATE INDEX IF NOT EXISTS idx_fk_collection_page_members_obs ON collection_page_members(observation_id);
+CREATE INDEX IF NOT EXISTS idx_fk_dataset_members_obs ON dataset_members(observation_id);
+CREATE INDEX IF NOT EXISTS idx_fk_dataset_raw_objects_raw ON dataset_raw_objects(raw_object_id);
+CREATE INDEX IF NOT EXISTS idx_fk_dataset_obs_raw_objects_obs ON dataset_observation_raw_objects(observation_id);
+CREATE INDEX IF NOT EXISTS idx_fk_dataset_obs_raw_objects_raw ON dataset_observation_raw_objects(raw_object_id);
+CREATE INDEX IF NOT EXISTS idx_fk_dataset_obs_constituents_obs ON dataset_observation_constituents(observation_id);
+CREATE INDEX IF NOT EXISTS idx_fk_dataset_obs_constituents_const ON dataset_observation_constituents(constituent_id);
+CREATE INDEX IF NOT EXISTS idx_fk_quality_issue_raw_objects_raw ON quality_issue_raw_objects(raw_object_id);
+CREATE INDEX IF NOT EXISTS idx_fk_collection_raw_objects_raw ON collection_raw_objects(raw_object_id);";
 
 /// Closure-expansion edges; each `INSERT..SELECT` returns newly added rows.
 const SCOPE_EDGES: &[&str] = &[
@@ -1551,10 +1652,14 @@ const SCOPE_EDGES: &[&str] = &[
     "INSERT OR IGNORE INTO del_schedule_fires SELECT id FROM schedule_fires WHERE schedule_id IN (SELECT id FROM del_schedules)",
     // runs -> owning jobs; plans -> their runs
     "INSERT OR IGNORE INTO del_runs SELECT id FROM runs WHERE plan_id IN (SELECT id FROM del_plans)",
+    "INSERT OR IGNORE INTO del_runs SELECT id FROM portfolio_runs WHERE plan_id IN (SELECT id FROM del_plans)",
     "INSERT OR IGNORE INTO del_jobs SELECT job_id FROM runs WHERE id IN (SELECT id FROM del_runs)",
+    "INSERT OR IGNORE INTO del_jobs SELECT a.job_id FROM job_attempts a WHERE json_extract(a.state_json, '$.output.kind')='PORTFOLIO' AND json_extract(a.state_json, '$.output.run_id') IN (SELECT id FROM del_runs)",
     // jobs -> attempts -> outputs
     "INSERT OR IGNORE INTO del_attempts SELECT id FROM job_attempts WHERE job_id IN (SELECT id FROM del_jobs)",
     "INSERT OR IGNORE INTO del_runs SELECT run_id FROM job_attempt_run_outputs WHERE attempt_id IN (SELECT id FROM del_attempts)",
+    "INSERT OR IGNORE INTO del_runs SELECT id FROM runs WHERE job_id IN (SELECT id FROM del_jobs) OR attempt_id IN (SELECT id FROM del_attempts)",
+    "INSERT OR IGNORE INTO del_runs SELECT p.id FROM portfolio_runs p JOIN job_attempts a ON json_extract(a.state_json, '$.output.run_id')=p.id WHERE a.id IN (SELECT id FROM del_attempts) AND json_extract(a.state_json, '$.output.kind')='PORTFOLIO'",
     "INSERT OR IGNORE INTO del_datasets SELECT dataset_id FROM job_attempt_dataset_outputs WHERE attempt_id IN (SELECT id FROM del_attempts)",
     "INSERT OR IGNORE INTO del_artifacts SELECT artifact_id FROM job_attempt_artifact_outputs WHERE attempt_id IN (SELECT id FROM del_attempts)",
     // dataset closure: derived children and their consumers

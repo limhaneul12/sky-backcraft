@@ -138,7 +138,7 @@ pub struct EvidenceImport {
     pub versions: Vec<EvidenceVersion>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EligibleEvidence {
     pub revision_id: EvidenceRevisionId,
@@ -148,7 +148,7 @@ pub struct EligibleEvidence {
     pub eligibility_reason: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EvidenceDecisionEffect {
     pub policy: PitPolicy,

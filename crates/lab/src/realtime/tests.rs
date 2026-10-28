@@ -1438,6 +1438,55 @@ fn cold_sql_pins_keep_warm_cache_bounds_and_report_raw_revisions() -> Result<(),
     Ok(())
 }
 
+#[test]
+fn provider_clock_skew_tolerates_bounded_forward_drift_and_rejects_excessive_future_timestamps()
+-> Result<(), LabError> {
+    let subscription =
+        PublicMarketSubscription::new(MarketId::parse_upbit("KRW-BTC")?, CandleInterval::H1);
+    let rest_row = rest_observation(
+        &state_frame("2026-01-01T00:00:00Z", "100", "1")?,
+        "rest-bootstrap-row",
+    )?;
+    let fetched_at = time("2026-01-01T01:00:01Z")?;
+    let mut cache = FeedCache::new(8);
+    cache.store_rest_snapshot(
+        &subscription,
+        rest_raw("rest-bootstrap", fetched_at),
+        std::slice::from_ref(&rest_row),
+        true,
+    );
+    cache.confirm_rest_snapshot(&subscription, std::slice::from_ref(&rest_row))?;
+
+    let mut minor_forward_skew = state_frame("2026-01-01T01:00:00Z", "101", "1")?;
+    minor_forward_skew.received_at = time("2026-01-01T01:00:02Z")?;
+    minor_forward_skew.provider_at = time("2026-01-01T01:00:05Z")?;
+    cache.apply_frame(
+        minor_forward_skew,
+        b"{}".to_vec(),
+        transport(1, 1, "2026-01-01T01:00:02Z")?,
+    );
+    let readiness = cache.subscription_readiness(&subscription, time("2026-01-01T01:00:03Z")?);
+    assert!(readiness.ready);
+    assert!(readiness.blockers.is_empty());
+
+    let mut excessive_forward_skew = state_frame("2026-01-01T01:00:00Z", "102", "2")?;
+    excessive_forward_skew.received_at = time("2026-01-01T01:00:02Z")?;
+    excessive_forward_skew.provider_at = time("2026-01-01T01:00:35Z")?;
+    cache.apply_frame(
+        excessive_forward_skew,
+        b"{}".to_vec(),
+        transport(1, 2, "2026-01-01T01:00:02Z")?,
+    );
+    let blocked = cache.subscription_readiness(&subscription, time("2026-01-01T01:00:03Z")?);
+    assert!(!blocked.ready);
+    assert!(
+        blocked
+            .blockers
+            .contains(&crate::contracts::RealtimeReadinessBlocker::ProviderClockInvalid)
+    );
+    Ok(())
+}
+
 fn state_frame(open_at: &str, close: &str, volume: &str) -> Result<ValidatedCandleFrame, LabError> {
     let open_time = time(open_at)?;
     let interval = CandleInterval::H1;

@@ -110,12 +110,6 @@ struct PlannedOrder {
     asset_reserve: AssetQuantity,
 }
 
-#[derive(Debug)]
-struct CurrentDecision {
-    intent_id: AutomationIntentId,
-    action: &'static str,
-}
-
 impl JobService {
     /// Recover only persisted local requests, then let the owned coordinator
     /// reconcile venue identifiers before it can resume any session.
@@ -1670,7 +1664,6 @@ impl JobService {
             .load_cross_interval_bars(&checkpoint, &record.view.market, UtcTimestamp::now())
             .await?;
         let batch_end = candidates.len().min(AUTOMATION_CATCHUP_LIMIT);
-        let mut latest_decision = None;
         for index in 0..batch_end {
             if self.inner.stop.is_cancelled() {
                 return Err(LabError::Cancelled(
@@ -1816,7 +1809,6 @@ impl JobService {
                 )
                 .await?;
                 record.view.last_finalized_candle_at = Some(observation.candle.close_time_utc);
-                latest_decision = Some(CurrentDecision { intent_id, action });
             } else {
                 checkpoint.last_observation = Some(observation.clone());
                 let warmup = serde_json::json!({
@@ -1855,17 +1847,6 @@ impl JobService {
                 .await?;
             *record = refreshed;
             return Ok(());
-        }
-        if let Some(decision) = latest_decision
-            && decision.action != "HOLD"
-        {
-            let pending = self.load_pending_intents(&record.view.session_id).await?;
-            if pending
-                .iter()
-                .any(|intent| intent.intent_id == decision.intent_id)
-            {
-                self.admit_pending_intent(record, &pending[0]).await?;
-            }
         }
         Ok(())
     }
@@ -2182,8 +2163,13 @@ impl JobService {
             .await;
         match result {
             Ok(_order) => {
-                self.dispatch_reserved_by_identifier(&identifier, mode, &record.view.session_id)
-                    .await
+                self.dispatch_reserved_by_identifier(
+                    &identifier,
+                    mode,
+                    &record.view.session_id,
+                    Some(chance),
+                )
+                .await
             }
             Err(error) => {
                 // Admission has no venue effect. Exact identifier readback
@@ -2197,6 +2183,7 @@ impl JobService {
                             &identifier,
                             mode,
                             &record.view.session_id,
+                            Some(chance),
                         )
                         .await?;
                     }
@@ -2271,14 +2258,24 @@ impl JobService {
         Ok((false, false))
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the send-claim path keeps exact readback, RESERVED-only release, and unknown-effect handling ordered"
-    )]
     async fn dispatch_reserved_order(
         &self,
         order: &AutomationPendingOrder,
         mode: AutomationSessionMode,
+    ) -> Result<(), LabError> {
+        self.dispatch_reserved_order_with_chance(order, mode, None)
+            .await
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the send-claim path keeps exact readback, RESERVED-only release, and unknown-effect handling ordered"
+    )]
+    async fn dispatch_reserved_order_with_chance(
+        &self,
+        order: &AutomationPendingOrder,
+        mode: AutomationSessionMode,
+        cached_chance: Option<crate::upbit::client::UpbitOrderChance>,
     ) -> Result<(), LabError> {
         if order.state != AutomationOrderState::Reserved {
             return Err(LabError::Conflict(
@@ -2319,10 +2316,13 @@ impl JobService {
                 "reserved order is scoped to a different venue account".into(),
             ));
         }
-        let chance = venue
-            .order_chance(&order.request.market)
-            .await
-            .map_err(client_error)?;
+        let chance = match cached_chance {
+            Some(chance) => chance,
+            None => venue
+                .order_chance(&order.request.market)
+                .await
+                .map_err(client_error)?,
+        };
         let rules = verify_market_rules(&order.request.market, &chance, mode, UtcTimestamp::now())?;
         let identifier = order.request.client_identifier.clone();
         let now = UtcTimestamp::now();
@@ -2723,6 +2723,7 @@ impl JobService {
         identifier: &AutomationOrderIdentifier,
         mode: AutomationSessionMode,
         session_id: &crate::contracts::AutomationSessionId,
+        cached_chance: Option<crate::upbit::client::UpbitOrderChance>,
     ) -> Result<(), LabError> {
         if !automation_mode_enabled(mode, self.live_execution_policy()) {
             return Err(LabError::BlockedEvidence(
@@ -2757,7 +2758,8 @@ impl JobService {
                 "reserved order session mode changed before dispatch".into(),
             ));
         }
-        self.dispatch_reserved_order(&order, mode).await
+        self.dispatch_reserved_order_with_chance(&order, mode, cached_chance)
+            .await
     }
 
     async fn record_admission_deferral(
