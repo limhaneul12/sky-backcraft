@@ -529,6 +529,8 @@ fn evaluate_condition_trace(
         actual_state: PositionState::Cash,
         actual_weight: 0.0,
         held_bars: 0.0,
+        unrealized_return_bps: 0.0,
+        trailing_drawdown_bps: 0.0,
         evidence_multiplier: 0.0,
         evidence_coverage: 0.0,
         crosses,
@@ -824,6 +826,8 @@ fn state_and_selected_target_guards_keep_scope_and_unknown_result() -> Result<()
         actual_state: PositionState::Cash,
         actual_weight: 0.0,
         held_bars: 0.0,
+        unrealized_return_bps: 0.0,
+        trailing_drawdown_bps: 0.0,
         evidence_multiplier: 0.0,
         evidence_coverage: 0.0,
         crosses: &crosses,
@@ -875,6 +879,8 @@ fn skipped_target_and_fallback_guards_are_not_evaluated() -> Result<(), LabError
         actual_state: PositionState::Cash,
         actual_weight: 0.0,
         held_bars: 0.0,
+        unrealized_return_bps: 0.0,
+        trailing_drawdown_bps: 0.0,
         evidence_multiplier: 0.0,
         evidence_coverage: 0.0,
         crosses: &crosses,
@@ -951,6 +957,8 @@ fn unknown_cross_condition_keeps_legacy_false_result() {
         actual_state: PositionState::Cash,
         actual_weight: 0.0,
         held_bars: 0.0,
+        unrealized_return_bps: 0.0,
+        trailing_drawdown_bps: 0.0,
         evidence_multiplier: 0.0,
         evidence_coverage: 0.0,
         crosses: &crosses,
@@ -1740,4 +1748,118 @@ fn prepared_bar_cache_reuses_identical_arc_slices() -> Result<(), LabError> {
     assert_eq!(first.len(), 1);
     assert_eq!(first[0].candle.close.get(), Decimal::from(503));
     Ok(())
+}
+
+fn position_aware_test_program() -> RulesProgram {
+    RulesProgram {
+        indicators: vec![close_indicator()],
+        states: vec![
+            PolicyState {
+                id: "seen_return_bps".into(),
+                initial: 0.0,
+                next: NumericExpr::UnrealizedReturnBps,
+            },
+            PolicyState {
+                id: "seen_drawdown_bps".into(),
+                initial: 0.0,
+                next: NumericExpr::TrailingDrawdownBps,
+            },
+        ],
+        rules: vec![
+            PolicyRule {
+                id: "trailing_stop_exit".into(),
+                condition: BoolExpr::And {
+                    conditions: vec![
+                        BoolExpr::PositionIs {
+                            state: PositionState::Long,
+                        },
+                        BoolExpr::Compare {
+                            comparison: CompareOp::Gte,
+                            left: NumericExpr::TrailingDrawdownBps,
+                            right: constant(400.0),
+                        },
+                    ],
+                },
+                target: PolicyTarget::Weight {
+                    value: constant(0.0),
+                },
+            },
+            PolicyRule {
+                id: "enter_long".into(),
+                condition: BoolExpr::PositionIs {
+                    state: PositionState::Cash,
+                },
+                target: PolicyTarget::Weight {
+                    value: constant(1.0),
+                },
+            },
+        ],
+        fallback: PolicyTarget::Hold,
+        signal_expiry: PolicySignalExpiry::EndOfRange,
+        condition_roles: Vec::new(),
+    }
+}
+
+fn state_value(eval: &RuleEvaluation, id: &str) -> f64 {
+    eval.trace
+        .state_after
+        .iter()
+        .find(|v| v.id == id)
+        .expect(id)
+        .value
+}
+
+#[test]
+fn position_aware_unrealized_return_and_trailing_drawdown_operands_evaluate_deterministically() {
+    let mut evaluator = RulesEvaluator::new(
+        &definition(position_aware_test_program()),
+        market(),
+        CandleInterval::H1,
+    )
+    .expect("compile");
+
+    let bar0 = observation(0, 100);
+    let eval0 = evaluator
+        .observe(&bar0, cash(), None)
+        .expect("bar0")
+        .expect("ready");
+    assert_eq!(eval0.trace.matched_rule_id.as_deref(), Some("enter_long"));
+    assert_eq!(eval0.target.get(), Decimal::ONE);
+
+    let bar1 = observation(1, 110);
+    let episode_open = bar1.candle.open_time_utc;
+    let eval1 = evaluator
+        .observe(&bar1, long(episode_open), None)
+        .expect("bar1")
+        .expect("ready");
+    assert_eq!(eval1.trace.matched_rule_id, None);
+    assert_eq!(eval1.target.get(), Decimal::ONE);
+    let ret1 = state_value(&eval1, "seen_return_bps");
+    let dd1 = state_value(&eval1, "seen_drawdown_bps");
+    assert!(
+        (ret1 - 1_000.0).abs() < 1e-9,
+        "expected +1000 bps, got {ret1}"
+    );
+    assert!(
+        dd1.abs() < 1e-9,
+        "expected 0 bps drawdown at peak, got {dd1}"
+    );
+
+    let bar2 = observation(2, 104);
+    let eval2 = evaluator
+        .observe(&bar2, long(episode_open), None)
+        .expect("bar2")
+        .expect("ready");
+    assert_eq!(
+        eval2.trace.matched_rule_id.as_deref(),
+        Some("trailing_stop_exit")
+    );
+    assert_eq!(eval2.target.get(), Decimal::ZERO);
+    let ret2 = state_value(&eval2, "seen_return_bps");
+    let dd2 = state_value(&eval2, "seen_drawdown_bps");
+    assert!((ret2 - 400.0).abs() < 1e-9, "expected +400 bps, got {ret2}");
+    assert!(
+        (dd2 - (6.0 / 110.0) * 10_000.0).abs() < 1e-9,
+        "expected ~545.45 bps trailing drawdown, got {dd2}"
+    );
 }

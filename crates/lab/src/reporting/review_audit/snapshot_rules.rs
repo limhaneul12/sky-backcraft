@@ -591,6 +591,8 @@ fn collect_cross_paths_numeric(expr: &NumericExpr, path: &str, output: &mut Vec<
         | NumericExpr::State { .. }
         | NumericExpr::ActualWeight
         | NumericExpr::HeldBars
+        | NumericExpr::UnrealizedReturnBps
+        | NumericExpr::TrailingDrawdownBps
         | NumericExpr::EvidenceMultiplier
         | NumericExpr::EvidenceCoverage => {}
     }
@@ -690,6 +692,8 @@ fn collect_current_crosses_numeric(
         | NumericExpr::State { .. }
         | NumericExpr::ActualWeight
         | NumericExpr::HeldBars
+        | NumericExpr::UnrealizedReturnBps
+        | NumericExpr::TrailingDrawdownBps
         | NumericExpr::EvidenceMultiplier
         | NumericExpr::EvidenceCoverage => {}
     }
@@ -766,6 +770,24 @@ fn eval_numeric(
                     EvalIssue::UnsupportedArithmetic(format!("{path}.held_bars_range"))
                 })?,
             )
+        }
+        NumericExpr::UnrealizedReturnBps => {
+            if context.actual_state == PositionState::Cash {
+                0.0
+            } else {
+                return Err(EvalIssue::MissingEvidence(format!(
+                    "{path}.unrealized_return_bps"
+                )));
+            }
+        }
+        NumericExpr::TrailingDrawdownBps => {
+            if context.actual_state == PositionState::Cash {
+                0.0
+            } else {
+                return Err(EvalIssue::MissingEvidence(format!(
+                    "{path}.trailing_drawdown_bps"
+                )));
+            }
         }
         NumericExpr::EvidenceMultiplier => context.evidence_multiplier,
         NumericExpr::EvidenceCoverage => context.evidence_coverage,

@@ -198,6 +198,8 @@ pub enum NumericExpr {
     },
     ActualWeight,
     HeldBars,
+    UnrealizedReturnBps,
+    TrailingDrawdownBps,
     EvidenceMultiplier,
     EvidenceCoverage,
     Add {
@@ -862,6 +864,8 @@ fn collect_numeric_condition_paths(expr: &NumericExpr, path: &str, output: &mut 
         | NumericExpr::State { .. }
         | NumericExpr::ActualWeight
         | NumericExpr::HeldBars
+        | NumericExpr::UnrealizedReturnBps
+        | NumericExpr::TrailingDrawdownBps
         | NumericExpr::EvidenceMultiplier
         | NumericExpr::EvidenceCoverage => {}
     }
@@ -1064,6 +1068,8 @@ impl NumericExpr {
             | Self::State { .. }
             | Self::ActualWeight
             | Self::HeldBars
+            | Self::UnrealizedReturnBps
+            | Self::TrailingDrawdownBps
             | Self::EvidenceMultiplier
             | Self::EvidenceCoverage => Ok(()),
         }
@@ -1091,6 +1097,8 @@ impl NumericExpr {
             | Self::State { .. }
             | Self::ActualWeight
             | Self::HeldBars
+            | Self::UnrealizedReturnBps
+            | Self::TrailingDrawdownBps
             | Self::EvidenceMultiplier
             | Self::EvidenceCoverage => false,
         }
@@ -1122,7 +1130,9 @@ impl NumericExpr {
             | Self::Indicator { .. }
             | Self::State { .. }
             | Self::ActualWeight
-            | Self::HeldBars => false,
+            | Self::HeldBars
+            | Self::UnrealizedReturnBps
+            | Self::TrailingDrawdownBps => false,
         }
     }
 }

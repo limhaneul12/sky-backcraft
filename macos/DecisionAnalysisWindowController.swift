@@ -539,10 +539,29 @@ final class DecisionAnalysisWindowController: NSWindowController, NSWindowDelega
 
         let cell = NSTextField(labelWithString: value)
         cell.font = TerminalTheme.table
+        cell.textColor = Self.tableCellTextColor(for: value, column: key)
         cell.lineBreakMode = .byTruncatingTail
         cell.toolTip = value
         cell.setAccessibilityLabel(value)
         return cell
+    }
+
+    private static func tableCellTextColor(for value: String, column: String) -> NSColor {
+        if column == "action" || column == "execution" || column == "group" {
+            if value.contains("충족") && !value.contains("불충족") {
+                return TerminalTheme.positive
+            }
+            if value.contains("불충족") || value.contains("거부") {
+                return TerminalTheme.negative
+            }
+            if value.contains("확인 불가") || value.contains("대기") || value.contains("부분 체결") {
+                return TerminalTheme.warning
+            }
+            if column == "execution", value == "체결" {
+                return TerminalTheme.positive
+            }
+        }
+        return .labelColor
     }
 
     func tableViewSelectionDidChange(_ notification: Notification) {
@@ -1440,6 +1459,7 @@ final class DecisionAnalysisWindowController: NSWindowController, NSWindowDelega
             explanationText.string = "목록에서 한 판단을 선택하면 저장된 행동, 평가 결과, 비교 입력, 이유와 연결 주문·체결을 읽기 쉬운 설명으로 표시합니다."
         }
         explanationText.setAccessibilityValue(explanationText.string)
+        applyExplanationSyntaxHighlighting()
 
         if let comparison {
             comparisonText.string = comparisonLines(comparison, masked: masked).joined(separator: "\n")
@@ -1453,7 +1473,72 @@ final class DecisionAnalysisWindowController: NSWindowController, NSWindowDelega
             comparisonText.string = "선택 판단의 비교를 표시합니다. 기간 밖 또는 시각 미기록 판단을 임의로 이전 기록으로 지정하지 않습니다."
         }
         comparisonText.setAccessibilityValue(comparisonText.string)
+        applyComparisonSyntaxHighlighting()
         updateControls()
+    }
+
+    private func applyExplanationSyntaxHighlighting() {
+        guard let storage = explanationText.textStorage else { return }
+        let fullText = storage.string as NSString
+        let fullRange = NSRange(location: 0, length: fullText.length)
+        guard fullRange.length > 0 else { return }
+        let baseFont = TerminalTheme.monospacedDigitFont(ofSize: 11, weight: .regular)
+        let boldFont = TerminalTheme.monospacedDigitFont(ofSize: 11, weight: .semibold)
+        storage.beginEditing()
+        storage.addAttributes([
+            .font: baseFont,
+            .foregroundColor: NSColor.labelColor
+        ], range: fullRange)
+        if !isShowingRawExplanation {
+            fullText.enumerateSubstrings(in: fullRange, options: .byLines) { line, lineRange, _, _ in
+                guard let line else { return }
+                if line.hasPrefix("조건 "), line.contains(" · ") {
+                    if line.hasSuffix(" · 충족") {
+                        storage.addAttributes([.font: boldFont, .foregroundColor: TerminalTheme.positive], range: lineRange)
+                    } else if line.hasSuffix(" · 불충족") {
+                        storage.addAttributes([.font: boldFont, .foregroundColor: TerminalTheme.negative], range: lineRange)
+                    } else if line.hasSuffix(" · 확인 불가") {
+                        storage.addAttributes([.font: boldFont, .foregroundColor: TerminalTheme.warning], range: lineRange)
+                    } else if line.hasSuffix(" · 미평가") {
+                        storage.addAttributes([.foregroundColor: TerminalTheme.secondaryText], range: lineRange)
+                    }
+                } else if line.hasPrefix("  근거 위치 · ") {
+                    storage.addAttributes([.foregroundColor: TerminalTheme.accent], range: lineRange)
+                } else if line.hasPrefix("저장된 설명 ·") {
+                    storage.addAttributes([.font: boldFont, .foregroundColor: TerminalTheme.secondaryText], range: lineRange)
+                }
+            }
+        }
+        storage.endEditing()
+    }
+
+    private func applyComparisonSyntaxHighlighting() {
+        guard let storage = comparisonText.textStorage else { return }
+        let fullText = storage.string as NSString
+        let fullRange = NSRange(location: 0, length: fullText.length)
+        guard fullRange.length > 0 else { return }
+        let baseFont = TerminalTheme.monospacedDigitFont(ofSize: 11, weight: .regular)
+        let boldFont = TerminalTheme.monospacedDigitFont(ofSize: 11, weight: .semibold)
+        storage.beginEditing()
+        storage.addAttributes([
+            .font: baseFont,
+            .foregroundColor: NSColor.labelColor
+        ], range: fullRange)
+        fullText.enumerateSubstrings(in: fullRange, options: .byLines) { line, lineRange, _, _ in
+            guard let line else { return }
+            if line.hasPrefix("달라진 저장 사실 · ") {
+                if !line.hasSuffix(" · 없음") && !line.hasSuffix(" · 비교 대상 없음") {
+                    storage.addAttributes([.font: boldFont, .foregroundColor: TerminalTheme.warning], range: lineRange)
+                } else {
+                    storage.addAttributes([.foregroundColor: TerminalTheme.secondaryText], range: lineRange)
+                }
+            } else if line.hasPrefix("비교 불가 · ") {
+                storage.addAttributes([.font: boldFont, .foregroundColor: TerminalTheme.warning], range: lineRange)
+            } else if line.hasPrefix("선택한 판단 · ") || line.hasPrefix("비교한 판단 · ") {
+                storage.addAttributes([.font: boldFont, .foregroundColor: TerminalTheme.accent], range: lineRange)
+            }
+        }
+        storage.endEditing()
     }
 
     private func comparisonLines(_ comparison: DecisionAnalysisComparison, masked: Bool) -> [String] {

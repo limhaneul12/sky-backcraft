@@ -988,6 +988,17 @@ pub(crate) struct RulesEvaluator {
     /// Missing means a legacy checkpoint did not capture source provenance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source_provenance: Option<BTreeMap<String, SourceProvenanceState>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_cash_close: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    episode_prices: Option<EpisodePriceState>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct EpisodePriceState {
+    opened_at: Option<UtcTimestamp>,
+    entry_close: f64,
+    peak_close: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1098,6 +1109,8 @@ struct EvalContext<'a> {
     actual_state: PositionState,
     actual_weight: f64,
     held_bars: f64,
+    unrealized_return_bps: f64,
+    trailing_drawdown_bps: f64,
     evidence_multiplier: f64,
     evidence_coverage: f64,
     crosses: &'a BTreeMap<String, CrossSample>,
@@ -1191,6 +1204,8 @@ impl RulesEvaluator {
             cross_last_close: BTreeMap::new(),
             requires_evidence: definition.requires_evidence(),
             source_provenance,
+            last_cash_close: None,
+            episode_prices: None,
         })
     }
 
@@ -1392,9 +1407,61 @@ impl RulesEvaluator {
         })?;
         self.last_close = Some(observation.candle.close_time_utc);
         if values.len() != self.indicators.len() {
+            if position.actual_qty.get().is_zero() {
+                self.last_cash_close =
+                    Some(decimal_f64(observation.candle.close.get(), "policy close")?);
+                self.episode_prices = None;
+            }
             return Ok(None);
         }
         self.evaluate_ready_observation(observation, position, evidence, &values)
+    }
+
+    fn update_position_prices(
+        &mut self,
+        observation: &CandleObservation,
+        position: PositionView,
+        actual_state: PositionState,
+    ) -> Result<(f64, f64), LabError> {
+        let close = decimal_f64(observation.candle.close.get(), "policy close")?;
+        if close <= 0.0 {
+            return Err(LabError::DataCorrupt(
+                "policy observation close must be positive".into(),
+            ));
+        }
+        match actual_state {
+            PositionState::Cash => {
+                self.last_cash_close = Some(close);
+                self.episode_prices = None;
+                Ok((0.0, 0.0))
+            }
+            PositionState::Long => {
+                let (entry_close, peak_close) = match self.episode_prices {
+                    Some(existing)
+                        if existing.opened_at == position.episode_opened_at
+                            && existing.entry_close > 0.0
+                            && existing.peak_close > 0.0 =>
+                    {
+                        (existing.entry_close, existing.peak_close.max(close))
+                    }
+                    _ => {
+                        let entry = self.last_cash_close.filter(|v| *v > 0.0).unwrap_or(close);
+                        (entry, entry.max(close))
+                    }
+                };
+                self.episode_prices = Some(EpisodePriceState {
+                    opened_at: position.episode_opened_at,
+                    entry_close,
+                    peak_close,
+                });
+                let unrealized_return_bps = ((close - entry_close) / entry_close) * 10_000.0;
+                let trailing_drawdown_bps =
+                    (((peak_close - close) / peak_close) * 10_000.0).max(0.0);
+                finite(unrealized_return_bps, "policy unrealized return bps")?;
+                finite(trailing_drawdown_bps, "policy trailing drawdown bps")?;
+                Ok((unrealized_return_bps, trailing_drawdown_bps))
+            }
+        }
     }
 
     fn update_decision_indicators(
@@ -1445,6 +1512,8 @@ impl RulesEvaluator {
         let (multiplier, coverage, evidence_trace) =
             self.evidence_values(observation.candle.close_time_utc, evidence)?;
         let actual_state = position.state(observation.candle.close_time_utc)?;
+        let (unrealized_return_bps, trailing_drawdown_bps) =
+            self.update_position_prices(observation, position, actual_state)?;
         let actual_weight =
             nonnegative_decimal_f64(position.actual_weight.get(), "policy actual weight")?;
         let held_bars = u32::try_from(position.held_decision_bars.unwrap_or(0))
@@ -1459,6 +1528,8 @@ impl RulesEvaluator {
             actual_state,
             actual_weight,
             held_bars,
+            unrealized_return_bps,
+            trailing_drawdown_bps,
             evidence_multiplier: multiplier,
             evidence_coverage: coverage,
             crosses: &self.crosses,
@@ -2037,6 +2108,8 @@ impl<'a> ConditionTraceCollector<'a> {
             | NumericExpr::State { .. }
             | NumericExpr::ActualWeight
             | NumericExpr::HeldBars
+            | NumericExpr::UnrealizedReturnBps
+            | NumericExpr::TrailingDrawdownBps
             | NumericExpr::EvidenceMultiplier
             | NumericExpr::EvidenceCoverage => {}
         }
@@ -2156,6 +2229,8 @@ impl<'a> ConditionTraceCollector<'a> {
             | NumericExpr::State { .. }
             | NumericExpr::ActualWeight
             | NumericExpr::HeldBars
+            | NumericExpr::UnrealizedReturnBps
+            | NumericExpr::TrailingDrawdownBps
             | NumericExpr::EvidenceMultiplier
             | NumericExpr::EvidenceCoverage => false,
         }
@@ -2223,6 +2298,8 @@ fn eval_numeric(
             .ok_or_else(|| LabError::InvalidConfig(format!("policy state is absent: {id}")))?,
         NumericExpr::ActualWeight => context.actual_weight,
         NumericExpr::HeldBars => context.held_bars,
+        NumericExpr::UnrealizedReturnBps => context.unrealized_return_bps,
+        NumericExpr::TrailingDrawdownBps => context.trailing_drawdown_bps,
         NumericExpr::EvidenceMultiplier => context.evidence_multiplier,
         NumericExpr::EvidenceCoverage => context.evidence_coverage,
         NumericExpr::Add { .. }
@@ -2690,6 +2767,8 @@ fn collect_crosses_numeric(
         | NumericExpr::State { .. }
         | NumericExpr::ActualWeight
         | NumericExpr::HeldBars
+        | NumericExpr::UnrealizedReturnBps
+        | NumericExpr::TrailingDrawdownBps
         | NumericExpr::EvidenceMultiplier
         | NumericExpr::EvidenceCoverage => {}
     }
