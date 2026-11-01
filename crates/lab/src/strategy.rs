@@ -6,11 +6,12 @@
 pub(crate) mod indicators;
 
 use crate::contracts::{
-    AssetQuantity, CandleInterval, CandleObservation, CompareOp, EvidenceDecisionEffect,
-    FinitePolicyNumber, INDICATOR_VERSION, IndicatorSnapshot, LabError, MarketId,
-    PolicyConditionEvidence, PolicyConditionOutcome, PolicyConditionReason, PolicyConditionRole,
-    PolicyConditionScope, PolicyConditionTrace, PositionState, PriceKrw, ReasonCode,
-    StateParameters, StrategyKind, StrategySpec, UtcTimestamp, VerifiedProviderCoverage, Weight,
+    AssetQuantity, BasisPoints, CandleInterval, CandleObservation, CompareOp,
+    EvidenceDecisionEffect, FinitePolicyNumber, INDICATOR_VERSION, IndicatorSnapshot, LabError,
+    MarketId, NUMERIC_TOLERANCE, PolicyConditionEvidence, PolicyConditionOutcome,
+    PolicyConditionReason, PolicyConditionRole, PolicyConditionScope, PolicyConditionTrace,
+    PositionState, PriceKrw, QuoteAmount, ReasonCode, Side, SignedAmount, StateParameters,
+    StrategyKind, StrategySpec, UtcTimestamp, VerifiedProviderCoverage, Weight, checked,
 };
 use crate::evidence::EvidenceEvaluator;
 use indicators::{Ema, RollingExtreme, RollingVol, Rsi, finite, finite_positive};
@@ -18,6 +19,100 @@ use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
+
+/// Causal execution context snapshot for the active holding episode and any
+/// uncommitted order at `decision_time`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecutionContextSnapshot {
+    /// Total confirmed fills recorded in the active holding episode.
+    pub episode_fill_count: u64,
+    /// Confirmed buy fills in the active holding episode (`> 1` indicates scale-in or partial buy fills).
+    pub episode_buy_fill_count: u64,
+    /// Confirmed sell fills in the active holding episode (`> 0` while `Long` indicates partial liquidation).
+    pub episode_sell_fill_count: u64,
+    /// Execution price of the most recent fill in the active episode.
+    pub last_fill_price: Option<PriceKrw>,
+    /// Executed quantity of the most recent fill in the active episode.
+    pub last_fill_qty: Option<AssetQuantity>,
+    /// Execution timestamp of the most recent fill in the active episode.
+    pub last_fill_at: Option<UtcTimestamp>,
+    /// Side of the most recent fill in the active episode.
+    pub last_fill_side: Option<Side>,
+    /// True when an order is still open or partially filled at decision time.
+    pub has_pending_order: bool,
+    /// Remaining unexecuted quote notional of the pending order (`0` when none).
+    pub pending_remaining_notional_krw: QuoteAmount,
+    /// True when the pending order has already partially executed.
+    pub pending_partially_filled: bool,
+}
+
+/// Causal position and account cost-basis snapshot for an open long holding at `decision_time`.
+///
+/// All quote amounts are in KRW (`QuoteAmount` / `SignedAmount`), unit prices in `PriceKrw`,
+/// and average prices are unrounded `Decimal` quotients (`price_basis_krw / actual_qty` and
+/// `total_cost_basis_krw / actual_qty`) so accounting identities hold within [`NUMERIC_TOLERANCE`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PositionAccountingSnapshot {
+    /// Average execution price per held unit excluding entry fees (`price_basis_krw / actual_qty`).
+    pub avg_entry_price_krw: PriceKrw,
+    /// Average all-in cost price per held unit including allocated entry fees (`total_cost_basis_krw / actual_qty`).
+    pub avg_cost_price_krw: PriceKrw,
+    /// Remaining execution notional basis of held inventory ($B_{\text{price}}$).
+    pub price_basis_krw: QuoteAmount,
+    /// Entry fees allocated to the remaining held inventory ($F_{\text{entry}}$).
+    pub allocated_entry_fee_krw: QuoteAmount,
+    /// Execution price cost (half-spread + slippage + impact + tick rounding) embedded in `price_basis_krw` on remaining inventory.
+    pub allocated_entry_embedded_cost_krw: QuoteAmount,
+    /// Total cost basis including allocated entry fees ($B_{\text{total}} = B_{\text{price}} + F_{\text{entry}}$).
+    pub total_cost_basis_krw: QuoteAmount,
+    /// Mark-to-market position value at decision close ($V_{\text{mark}} = Q \times P_{\text{close}}$).
+    pub position_value_krw: QuoteAmount,
+    /// Gross unrealized `PnL` before fees ($V_{\text{mark}} - B_{\text{price}}$).
+    pub gross_unrealized_pnl_krw: SignedAmount,
+    /// Net unrealized `PnL` after allocated entry fees ($V_{\text{mark}} - B_{\text{total}}$).
+    pub net_unrealized_pnl_krw: SignedAmount,
+    /// Estimated market sell execution price at decision close after sell-side spread, slippage, impact, and tick rounding ($P_{\text{exit}}$).
+    pub estimated_exit_price_krw: PriceKrw,
+    /// Estimated gross liquidation proceeds ($V_{\text{exit}} = Q \times P_{\text{exit}}$).
+    pub estimated_exit_notional_krw: QuoteAmount,
+    /// Estimated sell fee upon full liquidation at decision close ($F_{\text{exit}}$).
+    pub estimated_exit_fee_krw: QuoteAmount,
+    /// Estimated sell-side execution price cost upon full liquidation ($C_{\text{exit\_embedded}} = Q \times \max(0, P_{\text{close}} - P_{\text{exit}})$).
+    pub estimated_exit_embedded_cost_krw: QuoteAmount,
+    /// Estimated net realized `PnL` if the entire position were liquidated at decision close ($(V_{\text{exit}} - F_{\text{exit}}) - B_{\text{total}}$).
+    pub estimated_liquidation_net_pnl_krw: SignedAmount,
+    /// Account total quote cash (`cash_free_krw + cash_locked_krw`).
+    pub cash_total_krw: QuoteAmount,
+    /// Account free quote cash.
+    pub cash_free_krw: QuoteAmount,
+    /// Account reserved/locked quote cash.
+    pub cash_locked_krw: QuoteAmount,
+    /// Total account or portfolio equity at decision mark.
+    pub equity_krw: QuoteAmount,
+    /// Cumulative gross realized price `PnL` across the account/slot.
+    pub cumulative_realized_pnl_krw: SignedAmount,
+    /// Cumulative fees paid across the account/slot.
+    pub cumulative_fees_krw: QuoteAmount,
+}
+
+/// Causal market and venue rule snapshot at `decision_time`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarketContextSnapshot {
+    /// Confirmed completed decision bar close price.
+    pub decision_close_krw: PriceKrw,
+    /// Minimum order notional in KRW under active market rules.
+    pub min_order_notional_krw: QuoteAmount,
+    /// Lot/quantity step under active market rules.
+    pub quantity_step: AssetQuantity,
+    /// Effective tick size at `decision_close_krw`.
+    pub tick_size_krw: PriceKrw,
+    /// Effective taker sell fee in basis points.
+    pub sell_fee_bps: BasisPoints,
+    /// Effective taker buy fee in basis points.
+    pub buy_fee_bps: BasisPoints,
+    /// Whether the market is tradable at `decision_time`.
+    pub tradable: bool,
+}
 
 /// Actual filled holding context supplied by execution/accounting.
 ///
@@ -29,9 +124,47 @@ pub struct PositionView {
     pub actual_weight: Weight,
     pub episode_opened_at: Option<UtcTimestamp>,
     pub held_decision_bars: Option<u64>,
+    pub execution: Option<ExecutionContextSnapshot>,
+    pub accounting: Option<PositionAccountingSnapshot>,
+    pub market: Option<MarketContextSnapshot>,
 }
 
 impl PositionView {
+    /// Construct a zero-inventory cash position view.
+    ///
+    /// # Errors
+    /// Propagates contract constructor errors if zero invariants fail.
+    pub fn cash() -> Result<Self, LabError> {
+        Ok(Self {
+            actual_qty: AssetQuantity::new(Decimal::ZERO)?,
+            actual_weight: Weight::new(Decimal::ZERO)?,
+            episode_opened_at: None,
+            held_decision_bars: None,
+            execution: None,
+            accounting: None,
+            market: None,
+        })
+    }
+
+    /// Construct a basic position view without execution/accounting/market sub-contexts.
+    #[must_use]
+    pub const fn basic(
+        actual_qty: AssetQuantity,
+        actual_weight: Weight,
+        episode_opened_at: Option<UtcTimestamp>,
+        held_decision_bars: Option<u64>,
+    ) -> Self {
+        Self {
+            actual_qty,
+            actual_weight,
+            episode_opened_at,
+            held_decision_bars,
+            execution: None,
+            accounting: None,
+            market: None,
+        }
+    }
+
     pub(crate) fn state(self, decision_time: UtcTimestamp) -> Result<PositionState, LabError> {
         let holding = self.actual_qty.get() > Decimal::ZERO;
         if holding {
@@ -51,18 +184,188 @@ impl PositionView {
                     "episode opens after decision time".into(),
                 ));
             }
+            if let Some(acc) = self.accounting {
+                self.validate_accounting_snapshot(&acc)?;
+            }
             Ok(PositionState::Long)
         } else {
             if self.actual_weight.get() != Decimal::ZERO
                 || self.episode_opened_at.is_some()
                 || self.held_decision_bars.is_some()
+                || self.accounting.is_some()
             {
                 return Err(LabError::InvalidConfig(
-                    "cash position cannot carry weight or episode context".into(),
+                    "cash position cannot carry weight, episode, or position accounting context"
+                        .into(),
                 ));
             }
             Ok(PositionState::Cash)
         }
+    }
+
+    fn validate_accounting_snapshot(
+        self,
+        acc: &PositionAccountingSnapshot,
+    ) -> Result<(), LabError> {
+        let qty = self.actual_qty.get();
+        let price_basis = acc.price_basis_krw.get();
+        let entry_fee = acc.allocated_entry_fee_krw.get();
+        let total_basis = acc.total_cost_basis_krw.get();
+        let pos_value = acc.position_value_krw.get();
+        let equity = acc.equity_krw.get();
+        if price_basis <= Decimal::ZERO || total_basis < price_basis || equity <= Decimal::ZERO {
+            return Err(LabError::AccountingInvariant(
+                "filled position accounting requires positive basis and equity".into(),
+            ));
+        }
+        let expected_total_basis =
+            checked::add(price_basis, entry_fee, "position total cost basis")?;
+        if checked::sub(expected_total_basis, total_basis, "total basis residual")?.abs()
+            > NUMERIC_TOLERANCE
+        {
+            return Err(LabError::AccountingInvariant(
+                "total_cost_basis_krw does not equal price_basis_krw + allocated_entry_fee_krw"
+                    .into(),
+            ));
+        }
+        let reconstructed_price_basis = checked::mul(
+            acc.avg_entry_price_krw.get(),
+            qty,
+            "reconstructed price basis",
+        )?;
+        if checked::sub(
+            reconstructed_price_basis,
+            price_basis,
+            "avg entry price basis residual",
+        )?
+        .abs()
+            > NUMERIC_TOLERANCE
+        {
+            return Err(LabError::AccountingInvariant(
+                "avg_entry_price_krw * actual_qty does not reconcile with price_basis_krw".into(),
+            ));
+        }
+        let reconstructed_total_basis = checked::mul(
+            acc.avg_cost_price_krw.get(),
+            qty,
+            "reconstructed total basis",
+        )?;
+        if checked::sub(
+            reconstructed_total_basis,
+            total_basis,
+            "avg cost price basis residual",
+        )?
+        .abs()
+            > NUMERIC_TOLERANCE
+        {
+            return Err(LabError::AccountingInvariant(
+                "avg_cost_price_krw * actual_qty does not reconcile with total_cost_basis_krw"
+                    .into(),
+            ));
+        }
+        Self::validate_cash_and_pnl_reconciliation(
+            acc,
+            self.actual_weight.get(),
+            price_basis,
+            total_basis,
+            pos_value,
+            equity,
+        )
+    }
+
+    fn validate_cash_and_pnl_reconciliation(
+        acc: &PositionAccountingSnapshot,
+        actual_weight: Decimal,
+        price_basis: Decimal,
+        total_basis: Decimal,
+        pos_value: Decimal,
+        equity: Decimal,
+    ) -> Result<(), LabError> {
+        let expected_cash_total = checked::add(
+            acc.cash_free_krw.get(),
+            acc.cash_locked_krw.get(),
+            "cash total check",
+        )?;
+        if checked::sub(
+            expected_cash_total,
+            acc.cash_total_krw.get(),
+            "cash total residual",
+        )?
+        .abs()
+            > NUMERIC_TOLERANCE
+        {
+            return Err(LabError::AccountingInvariant(
+                "cash_free_krw + cash_locked_krw does not equal cash_total_krw".into(),
+            ));
+        }
+        let slot_cash_plus_pos =
+            checked::add(acc.cash_total_krw.get(), pos_value, "cash plus position")?;
+        if slot_cash_plus_pos > checked::add(equity, NUMERIC_TOLERANCE, "equity upper bound")? {
+            return Err(LabError::AccountingInvariant(
+                "cash_total_krw + position_value_krw exceeds equity_krw".into(),
+            ));
+        }
+        let expected_weight = checked::div(pos_value, equity, "expected actual weight")?;
+        if checked::sub(expected_weight, actual_weight, "actual weight residual")?.abs()
+            > NUMERIC_TOLERANCE
+        {
+            return Err(LabError::AccountingInvariant(
+                "position_value_krw / equity_krw does not match actual_weight".into(),
+            ));
+        }
+        let expected_gross_unrealized =
+            checked::sub(pos_value, price_basis, "expected gross unrealized")?;
+        if checked::sub(
+            expected_gross_unrealized,
+            acc.gross_unrealized_pnl_krw.get(),
+            "gross unrealized residual",
+        )?
+        .abs()
+            > NUMERIC_TOLERANCE
+        {
+            return Err(LabError::AccountingInvariant(
+                "gross_unrealized_pnl_krw does not reconcile with position_value_krw - price_basis_krw"
+                    .into(),
+            ));
+        }
+        let expected_net_unrealized =
+            checked::sub(pos_value, total_basis, "expected net unrealized")?;
+        if checked::sub(
+            expected_net_unrealized,
+            acc.net_unrealized_pnl_krw.get(),
+            "net unrealized residual",
+        )?
+        .abs()
+            > NUMERIC_TOLERANCE
+        {
+            return Err(LabError::AccountingInvariant(
+                "net_unrealized_pnl_krw does not reconcile with position_value_krw - total_cost_basis_krw"
+                    .into(),
+            ));
+        }
+        let expected_liquidation_net = checked::sub(
+            checked::sub(
+                acc.estimated_exit_notional_krw.get(),
+                acc.estimated_exit_fee_krw.get(),
+                "net exit proceeds",
+            )?,
+            total_basis,
+            "expected liquidation net pnl",
+        )?;
+        if checked::sub(
+            expected_liquidation_net,
+            acc.estimated_liquidation_net_pnl_krw.get(),
+            "liquidation net pnl residual",
+        )?
+        .abs()
+            > NUMERIC_TOLERANCE
+        {
+            return Err(LabError::AccountingInvariant(
+                "estimated_liquidation_net_pnl_krw does not reconcile with exit proceeds minus total_cost_basis_krw"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -199,6 +502,10 @@ impl StrategyEvaluator {
     ///
     /// # Errors
     /// Preserves all existing bar, market, OHLC, evidence and position guards.
+    #[allow(
+        clippy::large_types_passed_by_value,
+        reason = "PositionView is stack-only Copy to avoid per-bar heap allocations"
+    )]
     pub(crate) fn observe_with_provider_coverage(
         &mut self,
         observation: &CandleObservation,
@@ -277,6 +584,10 @@ impl StrategyEvaluator {
         Ok(Some(decision))
     }
 
+    #[allow(
+        clippy::large_types_passed_by_value,
+        reason = "PositionView is stack-only Copy to avoid per-bar heap allocations"
+    )]
     #[expect(
         clippy::too_many_lines,
         reason = "one exhaustive strategy transition keeps state and evidence overlays in their evaluation order"
@@ -601,6 +912,10 @@ fn donchian_decision(
     Ok((state_after, target, target, reasons))
 }
 
+#[allow(
+    clippy::large_types_passed_by_value,
+    reason = "PositionView is stack-only Copy to avoid per-bar heap allocations"
+)]
 fn trend_pullback_decision(
     close: f64,
     state_before: PositionState,

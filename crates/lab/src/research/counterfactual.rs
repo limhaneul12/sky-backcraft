@@ -4,7 +4,7 @@
 mod tests;
 
 use crate::contracts::{
-    AccountMark, ArbitrationPolicy, AssetQuantity, COUNTERFACTUAL_CONTRACT_VERSION, CandleInterval,
+    AccountMark, ArbitrationPolicy, COUNTERFACTUAL_CONTRACT_VERSION, CandleInterval,
     CandleObservation, ContentHash, CostPolicy, CounterfactualAnalysisRequest,
     CounterfactualCandidateIdentity, CounterfactualCandidateInput, CounterfactualCandidateReport,
     CounterfactualCapitalScope, CounterfactualEvidenceInput, CounterfactualExecution,
@@ -1114,12 +1114,7 @@ fn evaluate_policy_prefix(
         .bars_by_interval
         .get(&interval_key(variant.decision_interval))
         .ok_or_else(|| LabError::DataGap("variant decision interval bars are missing".into()))?;
-    let cash_position = PositionView {
-        actual_qty: AssetQuantity::new(Decimal::ZERO)?,
-        actual_weight: Weight::new(Decimal::ZERO)?,
-        episode_opened_at: None,
-        held_decision_bars: None,
-    };
+    let cash_position = PositionView::cash()?;
     let mut selected = None;
     for bar in decision_bars
         .iter()

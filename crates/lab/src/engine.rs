@@ -10,19 +10,22 @@ use crate::contracts::{
     ExecutionPolicy, FillId, FillRecord, FillTiming, LabError, MAX_DATASET_ROWS, MAX_MODEL_EVENTS,
     MarkKind, ModelAdmission, ModelLedger, ModelStatus, ObservationId, OrderId, OrderRecord,
     OrderStatus, PriceKrw, QuoteAmount, ReasonCode, ResolvedPlan, RunId, Side, SignalId,
-    SignalOutcome, SignalRecord, SimulatedOrderType, StrategyBinding, TerminalPolicy, UtcRange,
-    UtcTimestamp, Weight,
+    SignalOutcome, SignalRecord, SignedAmount, SimulatedOrderType, StrategyBinding, TerminalPolicy,
+    UtcRange, UtcTimestamp, Weight,
 };
 use crate::evidence::EvidenceEvaluator;
 use crate::policy_engine::{CrossIntervalFeed, PolicyEvaluator};
-use crate::strategy::{PositionView, StrategyEvaluation};
+use crate::strategy::{
+    ExecutionContextSnapshot, MarketContextSnapshot, PositionAccountingSnapshot, PositionView,
+    StrategyEvaluation,
+};
 use accounting::{
-    Account, aggregate_identity_within_tolerance, checked_add, checked_div, checked_mul,
-    checked_sub,
+    Account, MarkedAccount, aggregate_identity_within_tolerance, checked_add, checked_div,
+    checked_mul, checked_sub,
 };
 use execution::{
-    ExecutionDecision, PlannedFill, plan_market_arrival, plan_market_request, plan_passive_arrival,
-    plan_passive_buy_request,
+    ExecutionDecision, PlannedFill, bps_rate, market_price, plan_market_arrival,
+    plan_market_request, plan_passive_arrival, plan_passive_buy_request, tick_for,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -203,12 +206,7 @@ pub fn run_model_with_cache(
         .get(decision_index)
         .is_some_and(|bar| bar.candle.close_time_utc < plan.spec.range.start())
     {
-        let cash = PositionView {
-            actual_qty: AssetQuantity::new(Decimal::ZERO)?,
-            actual_weight: Weight::new(Decimal::ZERO)?,
-            episode_opened_at: None,
-            held_decision_bars: None,
-        };
+        let cash = PositionView::cash()?;
         source_feed.feed_until(
             &mut evaluator,
             decision_bars[decision_index].candle.close_time_utc,
@@ -285,7 +283,8 @@ pub fn run_model_with_cache(
             if decision_bar.candle.close_time_utc == now {
                 source_feed.feed_until(&mut evaluator, decision_bar.candle.close_time_utc)?;
                 let marked = state.account.mark(decision_bar.candle.close)?;
-                let position = state.position_view(marked.actual_weight, now)?;
+                let position =
+                    state.position_view(marked, decision_bar, pending.as_ref(), plan, now)?;
                 let evaluation = evaluator
                     .observe(decision_bar, position, evidence_evaluator.as_ref())?
                     .ok_or_else(|| {
@@ -311,13 +310,20 @@ pub fn run_model_with_cache(
                     let decision_at = decision_bar.candle.close_time_utc;
                     let tradable = plan.spec.rules_at(decision_at)?.tradable_at(decision_at);
                     let effective_at = add_millis(now, plan.spec.latency_ms)?;
+                    let order_signal_expiry = evaluator.order_signal_expiry(
+                        now,
+                        effective_at,
+                        plan.spec.decision_interval,
+                        plan.spec.execution_resolution,
+                        plan.spec.range.end(),
+                    )?;
                     let order_expiry = passive_order_expiry(
                         &plan.spec.execution,
                         target > position.actual_weight,
                         &execution_bars,
                         execution_index,
                         effective_at,
-                        expiry,
+                        order_signal_expiry,
                     );
                     if tradable {
                         let position_value = checked_mul(
@@ -528,7 +534,10 @@ impl EngineState {
 
     pub(crate) fn position_view(
         &mut self,
-        actual_weight: Decimal,
+        marked: MarkedAccount,
+        decision_bar: &CandleObservation,
+        pending: Option<&PendingExecution>,
+        plan: &ResolvedPlan,
         at: UtcTimestamp,
     ) -> Result<PositionView, LabError> {
         if let Some(episode) = &mut self.active_episode
@@ -541,19 +550,179 @@ impl EngineState {
                     LabError::ResourceLimit("episode holding counter overflow".into())
                 })?;
         }
-        let (opened_at, held) = match &self.active_episode {
-            Some(episode) => (
-                Some(episode.opened_at),
-                Some(episode.decision_marks_since_open),
-            ),
-            None => (None, None),
+        let (opened_at, held, allocated_entry_fee, allocated_embedded_cost) =
+            match &self.active_episode {
+                Some(episode) => (
+                    Some(episode.opened_at),
+                    Some(episode.decision_marks_since_open),
+                    episode.allocated_entry_fee,
+                    episode.allocated_embedded_cost,
+                ),
+                None => (None, None, Decimal::ZERO, Decimal::ZERO),
+            };
+        let close = decision_bar.candle.close;
+        let rules = plan.spec.rules_at(at)?;
+        let (costs, _) = effective_costs(plan, at, decision_bar, marked.position_value)?;
+        let tick = PriceKrw::new(tick_for(close.get(), rules)?)?;
+        let market_snapshot = MarketContextSnapshot {
+            decision_close_krw: close,
+            min_order_notional_krw: rules.min_notional,
+            quantity_step: rules.quantity_step,
+            tick_size_krw: tick,
+            sell_fee_bps: costs.sell_fee_bps,
+            buy_fee_bps: costs.buy_fee_bps,
+            tradable: rules.tradable_at(at),
         };
+        let execution_snapshot = self.execution_snapshot(close, pending)?;
+        let accounting_snapshot = self.accounting_snapshot(
+            marked,
+            close,
+            allocated_entry_fee,
+            allocated_embedded_cost,
+            &costs,
+            rules,
+        )?;
+
         Ok(PositionView {
             actual_qty: AssetQuantity::new(self.account.qty())?,
-            actual_weight: Weight::new(actual_weight)?,
+            actual_weight: Weight::new(marked.actual_weight)?,
             episode_opened_at: opened_at,
             held_decision_bars: held,
+            execution: Some(execution_snapshot),
+            accounting: accounting_snapshot,
+            market: Some(market_snapshot),
         })
+    }
+
+    fn execution_snapshot(
+        &self,
+        close: PriceKrw,
+        pending: Option<&PendingExecution>,
+    ) -> Result<ExecutionContextSnapshot, LabError> {
+        let (has_pending_order, pending_remaining_notional_krw, pending_partially_filled) =
+            if let Some(order_state) = pending {
+                let rem_qty = checked_sub(
+                    order_state.order.requested_qty.get(),
+                    order_state.order.cumulative_filled_qty.get(),
+                    "pending order remaining qty",
+                )?
+                .max(Decimal::ZERO);
+                let ref_price = order_state.order.requested_price.unwrap_or(close).get();
+                let rem_notional =
+                    checked_mul(rem_qty, ref_price, "pending order remaining notional")?;
+                (
+                    true,
+                    QuoteAmount::new(rem_notional)?,
+                    order_state.order.cumulative_filled_qty.get() > Decimal::ZERO,
+                )
+            } else {
+                (false, QuoteAmount::new(Decimal::ZERO)?, false)
+            };
+
+        let (
+            episode_fill_count,
+            episode_buy_fill_count,
+            episode_sell_fill_count,
+            last_fill_price,
+            last_fill_qty,
+            last_fill_at,
+            last_fill_side,
+        ) = match &self.active_episode {
+            Some(episode) => (
+                episode.episode_fill_count,
+                episode.episode_buy_fill_count,
+                episode.episode_sell_fill_count,
+                episode.last_fill_price,
+                episode.last_fill_qty,
+                episode.last_fill_at,
+                episode.last_fill_side,
+            ),
+            None => (0, 0, 0, None, None, None, None),
+        };
+
+        Ok(ExecutionContextSnapshot {
+            episode_fill_count,
+            episode_buy_fill_count,
+            episode_sell_fill_count,
+            last_fill_price,
+            last_fill_qty,
+            last_fill_at,
+            last_fill_side,
+            has_pending_order,
+            pending_remaining_notional_krw,
+            pending_partially_filled,
+        })
+    }
+
+    fn accounting_snapshot(
+        &self,
+        marked: MarkedAccount,
+        close: PriceKrw,
+        allocated_entry_fee: Decimal,
+        allocated_embedded_cost: Decimal,
+        costs: &CostPolicy,
+        rules: &crate::contracts::MarketRuleSnapshot,
+    ) -> Result<Option<PositionAccountingSnapshot>, LabError> {
+        let qty = self.account.qty();
+        if qty <= Decimal::ZERO {
+            return Ok(None);
+        }
+        let account_state = self.account.state()?;
+        let price_basis = account_state.price_basis.get();
+        let total_cost_basis = checked_add(
+            price_basis,
+            allocated_entry_fee,
+            "position total cost basis",
+        )?;
+        let avg_entry_price =
+            PriceKrw::new(checked_div(price_basis, qty, "position avg entry price")?)?;
+        let avg_cost_price = PriceKrw::new(checked_div(
+            total_cost_basis,
+            qty,
+            "position avg cost price",
+        )?)?;
+        let position_value = marked.position_value;
+        let gross_unrealized = marked.gross_unrealized;
+        let net_unrealized =
+            checked_sub(position_value, total_cost_basis, "position net unrealized")?;
+        let (exit_price, exit_unit_cost) = market_price(close, Side::Sell, costs, rules)?;
+        let exit_notional = checked_mul(qty, exit_price.get(), "estimated exit notional")?;
+        let sell_fee_rate = bps_rate(costs.sell_fee_bps)?;
+        let exit_fee = checked_mul(exit_notional, sell_fee_rate, "estimated exit fee")?;
+        let exit_embedded_cost = checked_mul(
+            qty,
+            exit_unit_cost.max(Decimal::ZERO),
+            "estimated exit embedded cost",
+        )?;
+        let net_exit_proceeds =
+            checked_sub(exit_notional, exit_fee, "estimated net exit proceeds")?;
+        let liquidation_net_pnl = checked_sub(
+            net_exit_proceeds,
+            total_cost_basis,
+            "estimated liquidation net pnl",
+        )?;
+        Ok(Some(PositionAccountingSnapshot {
+            avg_entry_price_krw: avg_entry_price,
+            avg_cost_price_krw: avg_cost_price,
+            price_basis_krw: account_state.price_basis,
+            allocated_entry_fee_krw: QuoteAmount::new(allocated_entry_fee)?,
+            allocated_entry_embedded_cost_krw: QuoteAmount::new(allocated_embedded_cost)?,
+            total_cost_basis_krw: QuoteAmount::new(total_cost_basis)?,
+            position_value_krw: QuoteAmount::new(position_value)?,
+            gross_unrealized_pnl_krw: SignedAmount::new(gross_unrealized)?,
+            net_unrealized_pnl_krw: SignedAmount::new(net_unrealized)?,
+            estimated_exit_price_krw: exit_price,
+            estimated_exit_notional_krw: QuoteAmount::new(exit_notional)?,
+            estimated_exit_fee_krw: QuoteAmount::new(exit_fee)?,
+            estimated_exit_embedded_cost_krw: QuoteAmount::new(exit_embedded_cost)?,
+            estimated_liquidation_net_pnl_krw: SignedAmount::new(liquidation_net_pnl)?,
+            cash_total_krw: account_state.cash_total,
+            cash_free_krw: account_state.cash_free,
+            cash_locked_krw: account_state.cash_reserved,
+            equity_krw: QuoteAmount::new(marked.equity)?,
+            cumulative_realized_pnl_krw: account_state.gross_realized,
+            cumulative_fees_krw: account_state.cumulative_fees,
+        }))
     }
 
     pub(crate) fn push_signal(
@@ -1317,30 +1486,8 @@ impl EngineState {
         let episode = self.active_episode.as_mut().ok_or_else(|| {
             LabError::AccountingInvariant("fill did not resolve an episode".into())
         })?;
+        episode.record_fill(fill, fill_id, order_id, removed_basis, realized, at)?;
         episode.sample_qty(before_qty, at)?;
-        episode.fill_ids.push(fill_id);
-        episode.order_ids.push(order_id);
-        episode.fees = checked_add(episode.fees, fill.fee.get(), "episode fees")?;
-        episode.realized = checked_add(episode.realized, realized, "episode realized")?;
-        match fill.side {
-            Side::Buy => {
-                episode.buy_notional =
-                    checked_add(episode.buy_notional, fill.notional.get(), "episode buys")?;
-                episode.buy_qty =
-                    checked_add(episode.buy_qty, fill.qty.get(), "episode buy quantity")?;
-            }
-            Side::Sell => {
-                episode.sell_notional =
-                    checked_add(episode.sell_notional, fill.notional.get(), "episode sells")?;
-                episode.sell_qty =
-                    checked_add(episode.sell_qty, fill.qty.get(), "episode sell quantity")?;
-                episode.removed_basis = checked_add(
-                    episode.removed_basis,
-                    removed_basis,
-                    "episode removed basis",
-                )?;
-            }
-        }
         episode.max_qty = episode.max_qty.max(self.account.qty());
         episode.sample_qty(self.account.qty(), at)?;
         let marked = self.account.mark(fill.price)?;
@@ -1511,6 +1658,26 @@ pub(crate) struct ActiveEpisode {
     pub(crate) mfe_at: UtcTimestamp,
     pub(crate) exit_reason: Option<ReasonCode>,
     pub(crate) decision_marks_since_open: u64,
+    #[serde(default)]
+    pub(crate) episode_fill_count: u64,
+    #[serde(default)]
+    pub(crate) episode_buy_fill_count: u64,
+    #[serde(default)]
+    pub(crate) episode_sell_fill_count: u64,
+    #[serde(default)]
+    pub(crate) running_qty: Decimal,
+    #[serde(default)]
+    pub(crate) allocated_entry_fee: Decimal,
+    #[serde(default)]
+    pub(crate) allocated_embedded_cost: Decimal,
+    #[serde(default)]
+    pub(crate) last_fill_price: Option<PriceKrw>,
+    #[serde(default)]
+    pub(crate) last_fill_qty: Option<AssetQuantity>,
+    #[serde(default)]
+    pub(crate) last_fill_at: Option<UtcTimestamp>,
+    #[serde(default)]
+    pub(crate) last_fill_side: Option<Side>,
 }
 
 impl ActiveEpisode {
@@ -1539,7 +1706,126 @@ impl ActiveEpisode {
             mfe_at: opened_at,
             exit_reason: None,
             decision_marks_since_open: 0,
+            episode_fill_count: 0,
+            episode_buy_fill_count: 0,
+            episode_sell_fill_count: 0,
+            running_qty: Decimal::ZERO,
+            allocated_entry_fee: Decimal::ZERO,
+            allocated_embedded_cost: Decimal::ZERO,
+            last_fill_price: None,
+            last_fill_qty: None,
+            last_fill_at: None,
+            last_fill_side: None,
         }
+    }
+
+    fn record_fill(
+        &mut self,
+        fill: &PlannedFill,
+        fill_id: FillId,
+        order_id: OrderId,
+        removed_basis: Decimal,
+        realized: Decimal,
+        at: UtcTimestamp,
+    ) -> Result<(), LabError> {
+        let expected_count = u64::try_from(self.fill_ids.len()).map_err(|_| {
+            LabError::AccountingInvariant("episode fill_ids length exceeds u64".into())
+        })?;
+        if self.episode_fill_count != expected_count {
+            return Err(LabError::AccountingInvariant(
+                "active episode fill counter desynchronized from fill_ids".into(),
+            ));
+        }
+        let next_count = self
+            .episode_fill_count
+            .checked_add(1)
+            .ok_or_else(|| LabError::AccountingInvariant("episode fill counter overflow".into()))?;
+        let next_fees = checked_add(self.fees, fill.fee.get(), "episode fees")?;
+        let next_realized = checked_add(self.realized, realized, "episode realized")?;
+        match fill.side {
+            Side::Buy => self.record_buy_fill(fill)?,
+            Side::Sell => self.record_sell_fill(fill, removed_basis)?,
+        }
+        self.fill_ids.push(fill_id);
+        self.order_ids.push(order_id);
+        self.fees = next_fees;
+        self.realized = next_realized;
+        self.episode_fill_count = next_count;
+        self.last_fill_price = Some(fill.price);
+        self.last_fill_qty = Some(fill.qty);
+        self.last_fill_at = Some(at);
+        self.last_fill_side = Some(fill.side);
+        Ok(())
+    }
+
+    fn record_buy_fill(&mut self, fill: &PlannedFill) -> Result<(), LabError> {
+        let next_buy_count = self.episode_buy_fill_count.checked_add(1).ok_or_else(|| {
+            LabError::AccountingInvariant("episode buy fill counter overflow".into())
+        })?;
+        let next_buy_notional =
+            checked_add(self.buy_notional, fill.notional.get(), "episode buys")?;
+        let next_buy_qty = checked_add(self.buy_qty, fill.qty.get(), "episode buy quantity")?;
+        let next_running_qty = checked_add(self.running_qty, fill.qty.get(), "episode buy qty")?;
+        let next_allocated_fee = checked_add(
+            self.allocated_entry_fee,
+            fill.fee.get(),
+            "episode allocated entry fee",
+        )?;
+        let fill_embedded = checked_mul(
+            fill.price_cost_attribution.max(Decimal::ZERO),
+            fill.qty.get(),
+            "episode buy embedded cost",
+        )?;
+        let next_allocated_embedded = checked_add(
+            self.allocated_embedded_cost,
+            fill_embedded,
+            "episode allocated embedded cost",
+        )?;
+        self.buy_notional = next_buy_notional;
+        self.buy_qty = next_buy_qty;
+        self.episode_buy_fill_count = next_buy_count;
+        self.running_qty = next_running_qty;
+        self.allocated_entry_fee = next_allocated_fee;
+        self.allocated_embedded_cost = next_allocated_embedded;
+        Ok(())
+    }
+
+    fn record_sell_fill(
+        &mut self,
+        fill: &PlannedFill,
+        removed_basis: Decimal,
+    ) -> Result<(), LabError> {
+        let next_sell_count = self.episode_sell_fill_count.checked_add(1).ok_or_else(|| {
+            LabError::AccountingInvariant("episode sell fill counter overflow".into())
+        })?;
+        let next_sell_notional =
+            checked_add(self.sell_notional, fill.notional.get(), "episode sells")?;
+        let next_sell_qty = checked_add(self.sell_qty, fill.qty.get(), "episode sell quantity")?;
+        let next_removed_basis =
+            checked_add(self.removed_basis, removed_basis, "episode removed basis")?;
+        let sell_qty = fill.qty.get();
+        let (next_running_qty, next_allocated_fee, next_allocated_embedded) =
+            if sell_qty >= self.running_qty {
+                (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO)
+            } else {
+                let rem_qty = checked_sub(self.running_qty, sell_qty, "episode remaining qty")?;
+                let ratio = checked_div(rem_qty, self.running_qty, "episode retain ratio")?;
+                let ret_fee = checked_mul(self.allocated_entry_fee, ratio, "retained entry fee")?;
+                let ret_emb = checked_mul(
+                    self.allocated_embedded_cost,
+                    ratio,
+                    "retained embedded cost",
+                )?;
+                (rem_qty, ret_fee, ret_emb)
+            };
+        self.sell_notional = next_sell_notional;
+        self.sell_qty = next_sell_qty;
+        self.removed_basis = next_removed_basis;
+        self.episode_sell_fill_count = next_sell_count;
+        self.running_qty = next_running_qty;
+        self.allocated_entry_fee = next_allocated_fee;
+        self.allocated_embedded_cost = next_allocated_embedded;
+        Ok(())
     }
 
     fn sample_qty(&mut self, qty: Decimal, at: UtcTimestamp) -> Result<(), LabError> {

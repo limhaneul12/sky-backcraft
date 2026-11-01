@@ -335,6 +335,10 @@ pub struct UpbitOrderPreviewParams {
     pub current_krw_balance: Option<String>,
     #[serde(default)]
     pub current_coin_balance: Option<String>,
+    #[serde(default)]
+    pub stop_price: Option<String>,
+    #[serde(default)]
+    pub max_loss_krw: Option<String>,
 }
 
 /// Tool input for `upbit_order_test`.
@@ -496,7 +500,8 @@ fn typed_tool_error(value: &impl Serialize) -> Result<CallToolResult, McpError> 
 }
 
 fn upbit_tool_error(err: &impl std::fmt::Display) -> CallToolResult {
-    CallToolResult::error(vec![ContentBlock::text(err.to_string())])
+    let text: String = err.to_string().chars().take(1_024).collect();
+    CallToolResult::error(vec![ContentBlock::text(text)])
 }
 
 fn upbit_invalid_params(msg: impl std::fmt::Display) -> McpError {
@@ -1598,7 +1603,8 @@ impl LabMcpService {
             MarketId::parse_upbit(&params.market).map_err(|error| invalid_params(&error))?;
         let interval =
             CandleInterval::parse_code(&params.interval).map_err(|error| invalid_params(&error))?;
-        let database = params.save_raw.then_some(&self.database);
+        let database =
+            (params.save_raw && !self.exposure.public_no_auth()).then_some(&self.database);
         match self
             .upbit
             .fetch_completed_candles(&market, interval, params.count, database)
@@ -1752,6 +1758,11 @@ impl LabMcpService {
         let action: crate::contracts::PortfolioAction = parse_arguments(arguments)?;
         match action {
             crate::contracts::PortfolioAction::Create { request } => {
+                if self.exposure.public_no_auth() {
+                    return result_or_error::<()>(Err(LabError::Conflict(
+                        "portfolio backtest submission is disabled when public_no_auth is enabled; authenticated local or bearer access required".into(),
+                    )));
+                }
                 let submission = JobSubmission {
                     request_id: request.request_id.clone(),
                     payload: JobPayload::PortfolioBacktest { request },
@@ -2052,6 +2063,11 @@ impl LabMcpService {
     )]
     async fn plan_backtest(&self, arguments: JsonObject) -> Result<CallToolResult, McpError> {
         let request: PlanRequest = parse_arguments(arguments)?;
+        if self.exposure.public_no_auth() {
+            return result_or_error::<()>(Err(LabError::Conflict(
+                "backtest planning is disabled when public_no_auth is enabled; authenticated local or bearer access required".into(),
+            )));
+        }
         request
             .spec
             .validate()
@@ -2081,6 +2097,11 @@ impl LabMcpService {
     )]
     async fn run_backtests(&self, arguments: JsonObject) -> Result<CallToolResult, McpError> {
         let request: RunRequest = parse_arguments(arguments)?;
+        if self.exposure.public_no_auth() {
+            return result_or_error::<()>(Err(LabError::Conflict(
+                "backtest job submission is disabled when public_no_auth is enabled; authenticated local or bearer access required".into(),
+            )));
+        }
         let submission = JobSubmission {
             request_id: request.request_id.clone(),
             payload: JobPayload::Backtest { request },
@@ -2219,6 +2240,11 @@ impl LabMcpService {
     )]
     async fn export_report(&self, arguments: JsonObject) -> Result<CallToolResult, McpError> {
         let params: ExportReportParams = parse_arguments(arguments)?;
+        if self.exposure.public_no_auth() {
+            return result_or_error::<()>(Err(LabError::Conflict(
+                "export job submission is disabled when public_no_auth is enabled; authenticated local or bearer access required".into(),
+            )));
+        }
         let submission = JobSubmission {
             request_id: params.request_id,
             payload: JobPayload::Export {
@@ -2308,6 +2334,11 @@ impl LabMcpService {
     )]
     async fn verify_run(&self, arguments: JsonObject) -> Result<CallToolResult, McpError> {
         let params: VerifyRunParams = parse_arguments(arguments)?;
+        if self.exposure.public_no_auth() {
+            return result_or_error::<()>(Err(LabError::Conflict(
+                "verification job submission is disabled when public_no_auth is enabled; authenticated local or bearer access required".into(),
+            )));
+        }
         let submission = JobSubmission {
             request_id: params.request_id,
             payload: JobPayload::Verify {
@@ -2319,7 +2350,7 @@ impl LabMcpService {
     }
 
     #[tool(
-        description = "Preview the exact irreversible hard-delete scope of one registered resource (policy, dataset, job, run, evidence snapshot, artifact): blockers, cascade dependents, retained shared rows, reclaimable files, expiring confirmation token",
+        description = "Preview the exact irreversible hard-delete scope of one registered resource (policy, dataset, job, run, evidence snapshot, artifact, suite, schedule, backup, paper_session): blockers, cascade dependents, retained shared rows, reclaimable files, expiring confirmation token",
         input_schema = tagged_schema::<DeleteResource>(),
         annotations(
             title = "Delete Preview",
@@ -2444,11 +2475,13 @@ impl LabMcpService {
     )]
     async fn storage_maintenance(&self, arguments: JsonObject) -> Result<CallToolResult, McpError> {
         let action: crate::contracts::StorageMaintenanceAction = parse_arguments(arguments)?;
-        if matches!(
-            &action,
-            crate::contracts::StorageMaintenanceAction::HardDeleteBatch { .. }
-                | crate::contracts::StorageMaintenanceAction::Compact
-        ) && self.exposure.public_no_auth()
+        if self.exposure.public_no_auth()
+            && !matches!(
+                &action,
+                crate::contracts::StorageMaintenanceAction::Usage
+                    | crate::contracts::StorageMaintenanceAction::ListBackups
+                    | crate::contracts::StorageMaintenanceAction::RetentionCandidates { .. }
+            )
         {
             return result_or_error::<()>(Err(LabError::Conflict(
                 "destructive or physical maintenance operations are disabled when public_no_auth is enabled; authenticated local or bearer access required".into(),
@@ -2710,6 +2743,18 @@ impl LabMcpService {
             .map(std::str::FromStr::from_str)
             .transpose()
             .map_err(|e| upbit_invalid_params(format!("invalid current_coin_balance: {e}")))?;
+        let stop_price = params
+            .stop_price
+            .as_deref()
+            .map(std::str::FromStr::from_str)
+            .transpose()
+            .map_err(|e| upbit_invalid_params(format!("invalid stop_price: {e}")))?;
+        let max_loss_krw = params
+            .max_loss_krw
+            .as_deref()
+            .map(std::str::FromStr::from_str)
+            .transpose()
+            .map_err(|e| upbit_invalid_params(format!("invalid max_loss_krw: {e}")))?;
 
         let req = OrderPreviewRequest {
             market: params.market,
@@ -2719,6 +2764,8 @@ impl LabMcpService {
             volume,
             current_krw_balance,
             current_coin_balance,
+            stop_price,
+            max_loss_krw,
         };
 
         match OrderPreview::build(req, chrono::Utc::now()) {

@@ -37,7 +37,10 @@ pub(crate) use delete_store::PolicyDeleteAdmission;
 pub use equity_chart::EquityChartProjection;
 pub use job_store::AttemptPublication;
 pub use ledger_seal::RunLedgerSealStats;
-pub(crate) use oauth_client_store::{NewOAuthClientRecord, StoredOAuthClientRecord};
+pub(crate) use oauth_client_store::{
+    NewOAuthClientRecord, NewOAuthRefreshGrantRecord, StoredOAuthClientRecord,
+    StoredOAuthRefreshGrantRecord,
+};
 pub use paper_store::PaperPollRequirement;
 pub use plan_store::StoredPlan;
 pub(crate) use public_feed_recovery::{

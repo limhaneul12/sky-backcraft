@@ -174,12 +174,37 @@ pub enum PolicyIndicatorKind {
     },
 }
 
+/// Lifecycle scope for a policy state slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PolicyStateScope {
+    /// Persistent across bars and holding episodes (legacy default).
+    #[default]
+    Global,
+    /// Scoped to the active holding episode: automatically resets to `initial`
+    /// while `PositionState::Cash` or when a new episode opens, and evaluates
+    /// sequentially on `PositionState::Long` bars so subsequent `Episode` states
+    /// and rules on the same bar observe updated values.
+    Episode,
+}
+
+impl PolicyStateScope {
+    /// True when the scope is the default [`Self::Global`], used to omit the field
+    /// when serializing legacy policy definitions so their canonical digests remain identical.
+    #[must_use]
+    pub const fn is_default(&self) -> bool {
+        matches!(self, Self::Global)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyState {
     pub id: String,
     #[serde(deserialize_with = "finite_statistic")]
     pub initial: f64,
+    #[serde(default, skip_serializing_if = "PolicyStateScope::is_default")]
+    pub scope: PolicyStateScope,
     pub next: NumericExpr,
 }
 
@@ -197,9 +222,40 @@ pub enum NumericExpr {
         id: String,
     },
     ActualWeight,
+    ActualQty,
     HeldBars,
+    HeldSeconds,
+    EntryPrice,
     UnrealizedReturnBps,
     TrailingDrawdownBps,
+    AvgEntryPrice,
+    AvgCostPrice,
+    CostBasisKrw,
+    AllocatedEntryFeeKrw,
+    TotalCostBasisKrw,
+    CostReturnBps,
+    GrossUnrealizedPnlKrw,
+    NetUnrealizedPnlKrw,
+    NetUnrealizedReturnBps,
+    LiquidationNetPnlKrw,
+    LiquidationNetReturnBps,
+    RoundTripCostKrw,
+    RoundTripCostBps,
+    EpisodePeakClose,
+    EpisodeTroughClose,
+    PeakCostReturnBps,
+    CostTrailingDrawdownBps,
+    PeakLiquidationNetPnlKrw,
+    PeakLiquidationReturnBps,
+    BarRangeBps,
+    BarBodyBps,
+    CloseLocation,
+    EpisodeFillCount,
+    LastFillPrice,
+    SecondsSinceLastFill,
+    MoveSinceLastFillBps,
+    UtcHour,
+    UtcMinute,
     EvidenceMultiplier,
     EvidenceCoverage,
     Add {
@@ -740,24 +796,42 @@ impl RulesProgram {
         requirements
     }
 
+    fn any_expr(
+        &self,
+        num_pred: fn(&NumericExpr) -> bool,
+        bool_pred: fn(&BoolExpr) -> bool,
+    ) -> bool {
+        self.states
+            .iter()
+            .any(|state| state.next.any_expr(num_pred, bool_pred))
+            || self.rules.iter().any(|rule| {
+                rule.condition.any_expr(num_pred, bool_pred)
+                    || rule.target.any_expr(num_pred, bool_pred)
+            })
+            || self.fallback.any_expr(num_pred, bool_pred)
+    }
+
     fn has_cross(&self) -> bool {
-        self.states.iter().any(|state| state.next.has_cross())
-            || self
-                .rules
-                .iter()
-                .any(|rule| rule.condition.has_cross() || rule.target.has_cross())
-            || self.fallback.has_cross()
+        self.any_expr(|_| false, BoolExpr::is_cross_op)
     }
 
     fn requires_evidence(&self) -> bool {
-        self.states
-            .iter()
-            .any(|state| state.next.requires_evidence())
-            || self
-                .rules
-                .iter()
-                .any(|rule| rule.condition.requires_evidence() || rule.target.requires_evidence())
-            || self.fallback.requires_evidence()
+        self.any_expr(NumericExpr::is_evidence_operand, |_| false)
+    }
+
+    /// True when any expression in this rules program references cost-basis, fee,
+    /// liquidation `PnL`, or episode accounting watermark operands.
+    #[must_use]
+    pub fn uses_accounting_operands(&self) -> bool {
+        self.any_expr(NumericExpr::is_accounting_operand, |_| false)
+    }
+
+    /// True when any expression in this rules program references own-execution
+    /// event context operands (`EPISODE_FILL_COUNT`, `LAST_FILL_PRICE`,
+    /// `SECONDS_SINCE_LAST_FILL`, or `MOVE_SINCE_LAST_FILL_BPS`).
+    #[must_use]
+    pub fn uses_execution_operands(&self) -> bool {
+        self.any_expr(NumericExpr::is_execution_operand, |_| false)
     }
 }
 
@@ -863,9 +937,40 @@ fn collect_numeric_condition_paths(expr: &NumericExpr, path: &str, output: &mut 
         | NumericExpr::Indicator { .. }
         | NumericExpr::State { .. }
         | NumericExpr::ActualWeight
+        | NumericExpr::ActualQty
         | NumericExpr::HeldBars
+        | NumericExpr::HeldSeconds
+        | NumericExpr::EntryPrice
         | NumericExpr::UnrealizedReturnBps
         | NumericExpr::TrailingDrawdownBps
+        | NumericExpr::AvgEntryPrice
+        | NumericExpr::AvgCostPrice
+        | NumericExpr::CostBasisKrw
+        | NumericExpr::AllocatedEntryFeeKrw
+        | NumericExpr::TotalCostBasisKrw
+        | NumericExpr::CostReturnBps
+        | NumericExpr::GrossUnrealizedPnlKrw
+        | NumericExpr::NetUnrealizedPnlKrw
+        | NumericExpr::NetUnrealizedReturnBps
+        | NumericExpr::LiquidationNetPnlKrw
+        | NumericExpr::LiquidationNetReturnBps
+        | NumericExpr::RoundTripCostKrw
+        | NumericExpr::RoundTripCostBps
+        | NumericExpr::EpisodePeakClose
+        | NumericExpr::EpisodeTroughClose
+        | NumericExpr::PeakCostReturnBps
+        | NumericExpr::CostTrailingDrawdownBps
+        | NumericExpr::PeakLiquidationNetPnlKrw
+        | NumericExpr::PeakLiquidationReturnBps
+        | NumericExpr::BarRangeBps
+        | NumericExpr::BarBodyBps
+        | NumericExpr::CloseLocation
+        | NumericExpr::EpisodeFillCount
+        | NumericExpr::LastFillPrice
+        | NumericExpr::SecondsSinceLastFill
+        | NumericExpr::MoveSinceLastFillBps
+        | NumericExpr::UtcHour
+        | NumericExpr::UtcMinute
         | NumericExpr::EvidenceMultiplier
         | NumericExpr::EvidenceCoverage => {}
     }
@@ -1067,73 +1172,166 @@ impl NumericExpr {
             | Self::Indicator { .. }
             | Self::State { .. }
             | Self::ActualWeight
+            | Self::ActualQty
             | Self::HeldBars
+            | Self::HeldSeconds
+            | Self::EntryPrice
             | Self::UnrealizedReturnBps
             | Self::TrailingDrawdownBps
+            | Self::AvgEntryPrice
+            | Self::AvgCostPrice
+            | Self::CostBasisKrw
+            | Self::AllocatedEntryFeeKrw
+            | Self::TotalCostBasisKrw
+            | Self::CostReturnBps
+            | Self::GrossUnrealizedPnlKrw
+            | Self::NetUnrealizedPnlKrw
+            | Self::NetUnrealizedReturnBps
+            | Self::LiquidationNetPnlKrw
+            | Self::LiquidationNetReturnBps
+            | Self::RoundTripCostKrw
+            | Self::RoundTripCostBps
+            | Self::EpisodePeakClose
+            | Self::EpisodeTroughClose
+            | Self::PeakCostReturnBps
+            | Self::CostTrailingDrawdownBps
+            | Self::PeakLiquidationNetPnlKrw
+            | Self::PeakLiquidationReturnBps
+            | Self::BarRangeBps
+            | Self::BarBodyBps
+            | Self::CloseLocation
+            | Self::EpisodeFillCount
+            | Self::LastFillPrice
+            | Self::SecondsSinceLastFill
+            | Self::MoveSinceLastFillBps
+            | Self::UtcHour
+            | Self::UtcMinute
             | Self::EvidenceMultiplier
             | Self::EvidenceCoverage => Ok(()),
         }
     }
 
-    fn has_cross(&self) -> bool {
-        match self {
-            Self::Add { left, right }
-            | Self::Sub { left, right }
-            | Self::Mul { left, right }
-            | Self::Div { left, right }
-            | Self::Min { left, right }
-            | Self::Max { left, right } => left.has_cross() || right.has_cross(),
-            Self::Abs { value } => value.has_cross(),
-            Self::Clamp { value, min, max } => {
-                value.has_cross() || min.has_cross() || max.has_cross()
-            }
-            Self::If {
-                condition,
-                then_value,
-                else_value,
-            } => condition.has_cross() || then_value.has_cross() || else_value.has_cross(),
-            Self::Constant { .. }
-            | Self::Indicator { .. }
-            | Self::State { .. }
-            | Self::ActualWeight
-            | Self::HeldBars
-            | Self::UnrealizedReturnBps
-            | Self::TrailingDrawdownBps
-            | Self::EvidenceMultiplier
-            | Self::EvidenceCoverage => false,
-        }
+    fn is_evidence_operand(&self) -> bool {
+        matches!(self, Self::EvidenceMultiplier | Self::EvidenceCoverage)
     }
 
-    fn requires_evidence(&self) -> bool {
+    fn is_accounting_operand(&self) -> bool {
+        matches!(
+            self,
+            Self::AvgEntryPrice
+                | Self::AvgCostPrice
+                | Self::CostBasisKrw
+                | Self::AllocatedEntryFeeKrw
+                | Self::TotalCostBasisKrw
+                | Self::CostReturnBps
+                | Self::GrossUnrealizedPnlKrw
+                | Self::NetUnrealizedPnlKrw
+                | Self::NetUnrealizedReturnBps
+                | Self::LiquidationNetPnlKrw
+                | Self::LiquidationNetReturnBps
+                | Self::RoundTripCostKrw
+                | Self::RoundTripCostBps
+                | Self::EpisodePeakClose
+                | Self::EpisodeTroughClose
+                | Self::PeakCostReturnBps
+                | Self::CostTrailingDrawdownBps
+                | Self::PeakLiquidationNetPnlKrw
+                | Self::PeakLiquidationReturnBps
+        )
+    }
+
+    fn is_execution_operand(&self) -> bool {
+        matches!(
+            self,
+            Self::EpisodeFillCount
+                | Self::LastFillPrice
+                | Self::SecondsSinceLastFill
+                | Self::MoveSinceLastFillBps
+        )
+    }
+
+    fn any_expr(&self, num_pred: fn(&Self) -> bool, bool_pred: fn(&BoolExpr) -> bool) -> bool {
+        if num_pred(self) {
+            return true;
+        }
         match self {
-            Self::EvidenceMultiplier | Self::EvidenceCoverage => true,
             Self::Add { left, right }
             | Self::Sub { left, right }
             | Self::Mul { left, right }
             | Self::Div { left, right }
             | Self::Min { left, right }
-            | Self::Max { left, right } => left.requires_evidence() || right.requires_evidence(),
-            Self::Abs { value } => value.requires_evidence(),
+            | Self::Max { left, right } => {
+                left.any_expr(num_pred, bool_pred) || right.any_expr(num_pred, bool_pred)
+            }
+            Self::Abs { value } => value.any_expr(num_pred, bool_pred),
             Self::Clamp { value, min, max } => {
-                value.requires_evidence() || min.requires_evidence() || max.requires_evidence()
+                value.any_expr(num_pred, bool_pred)
+                    || min.any_expr(num_pred, bool_pred)
+                    || max.any_expr(num_pred, bool_pred)
             }
             Self::If {
                 condition,
                 then_value,
                 else_value,
             } => {
-                condition.requires_evidence()
-                    || then_value.requires_evidence()
-                    || else_value.requires_evidence()
+                condition.any_expr(num_pred, bool_pred)
+                    || then_value.any_expr(num_pred, bool_pred)
+                    || else_value.any_expr(num_pred, bool_pred)
             }
             Self::Constant { .. }
             | Self::Indicator { .. }
             | Self::State { .. }
             | Self::ActualWeight
+            | Self::ActualQty
             | Self::HeldBars
+            | Self::HeldSeconds
+            | Self::EntryPrice
             | Self::UnrealizedReturnBps
-            | Self::TrailingDrawdownBps => false,
+            | Self::TrailingDrawdownBps
+            | Self::AvgEntryPrice
+            | Self::AvgCostPrice
+            | Self::CostBasisKrw
+            | Self::AllocatedEntryFeeKrw
+            | Self::TotalCostBasisKrw
+            | Self::CostReturnBps
+            | Self::GrossUnrealizedPnlKrw
+            | Self::NetUnrealizedPnlKrw
+            | Self::NetUnrealizedReturnBps
+            | Self::LiquidationNetPnlKrw
+            | Self::LiquidationNetReturnBps
+            | Self::RoundTripCostKrw
+            | Self::RoundTripCostBps
+            | Self::EpisodePeakClose
+            | Self::EpisodeTroughClose
+            | Self::PeakCostReturnBps
+            | Self::CostTrailingDrawdownBps
+            | Self::PeakLiquidationNetPnlKrw
+            | Self::PeakLiquidationReturnBps
+            | Self::BarRangeBps
+            | Self::BarBodyBps
+            | Self::CloseLocation
+            | Self::EpisodeFillCount
+            | Self::LastFillPrice
+            | Self::SecondsSinceLastFill
+            | Self::MoveSinceLastFillBps
+            | Self::UtcHour
+            | Self::UtcMinute
+            | Self::EvidenceMultiplier
+            | Self::EvidenceCoverage => false,
         }
+    }
+
+    /// True when this expression uses any cost-basis, fee, liquidation `PnL`, or
+    /// episode accounting watermark operand.
+    #[must_use]
+    pub fn uses_accounting_operands(&self) -> bool {
+        self.any_expr(Self::is_accounting_operand, |_| false)
+    }
+
+    /// True when this expression uses any own-execution event context operand.
+    #[must_use]
+    pub fn uses_execution_operands(&self) -> bool {
+        self.any_expr(Self::is_execution_operand, |_| false)
     }
 }
 
@@ -1164,31 +1362,38 @@ impl BoolExpr {
         }
     }
 
-    fn has_cross(&self) -> bool {
-        match self {
-            Self::CrossesAbove { .. } | Self::CrossesBelow { .. } => true,
-            Self::Compare { left, right, .. } => left.has_cross() || right.has_cross(),
-            Self::And { conditions } | Self::Or { conditions } => {
-                conditions.iter().any(Self::has_cross)
-            }
-            Self::Not { condition } => condition.has_cross(),
-            Self::PositionIs { .. } => false,
-        }
+    fn is_cross_op(&self) -> bool {
+        matches!(self, Self::CrossesAbove { .. } | Self::CrossesBelow { .. })
     }
 
-    fn requires_evidence(&self) -> bool {
+    fn any_expr(&self, num_pred: fn(&NumericExpr) -> bool, bool_pred: fn(&Self) -> bool) -> bool {
+        if bool_pred(self) {
+            return true;
+        }
         match self {
             Self::Compare { left, right, .. }
             | Self::CrossesAbove { left, right }
             | Self::CrossesBelow { left, right } => {
-                left.requires_evidence() || right.requires_evidence()
+                left.any_expr(num_pred, bool_pred) || right.any_expr(num_pred, bool_pred)
             }
-            Self::And { conditions } | Self::Or { conditions } => {
-                conditions.iter().any(Self::requires_evidence)
-            }
-            Self::Not { condition } => condition.requires_evidence(),
+            Self::And { conditions } | Self::Or { conditions } => conditions
+                .iter()
+                .any(|condition| condition.any_expr(num_pred, bool_pred)),
+            Self::Not { condition } => condition.any_expr(num_pred, bool_pred),
             Self::PositionIs { .. } => false,
         }
+    }
+
+    /// True when this boolean condition uses any cost-basis or episode accounting operand.
+    #[must_use]
+    pub fn uses_accounting_operands(&self) -> bool {
+        self.any_expr(NumericExpr::is_accounting_operand, |_| false)
+    }
+
+    /// True when this boolean condition uses any own-execution event context operand.
+    #[must_use]
+    pub fn uses_execution_operands(&self) -> bool {
+        self.any_expr(NumericExpr::is_execution_operand, |_| false)
     }
 }
 
@@ -1206,18 +1411,27 @@ impl PolicyTarget {
         }
     }
 
-    fn has_cross(&self) -> bool {
+    fn any_expr(
+        &self,
+        num_pred: fn(&NumericExpr) -> bool,
+        bool_pred: fn(&BoolExpr) -> bool,
+    ) -> bool {
         match self {
             Self::Hold => false,
-            Self::Weight { value } => value.has_cross(),
+            Self::Weight { value } => value.any_expr(num_pred, bool_pred),
         }
     }
 
-    fn requires_evidence(&self) -> bool {
-        match self {
-            Self::Hold => false,
-            Self::Weight { value } => value.requires_evidence(),
-        }
+    /// True when this target expression uses any cost-basis or episode accounting operand.
+    #[must_use]
+    pub fn uses_accounting_operands(&self) -> bool {
+        self.any_expr(NumericExpr::is_accounting_operand, |_| false)
+    }
+
+    /// True when this target expression uses any own-execution event context operand.
+    #[must_use]
+    pub fn uses_execution_operands(&self) -> bool {
+        self.any_expr(NumericExpr::is_execution_operand, |_| false)
     }
 }
 
@@ -1268,6 +1482,7 @@ mod tests {
             states: vec![PolicyState {
                 id: "memory".into(),
                 initial: 0.0,
+                scope: PolicyStateScope::Global,
                 next: NumericExpr::State {
                     id: "memory".into(),
                 },

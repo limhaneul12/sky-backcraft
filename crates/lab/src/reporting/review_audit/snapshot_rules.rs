@@ -1,11 +1,12 @@
 use crate::contracts::policy::{
-    BoolExpr, CompareOp, NumericExpr, PolicyProgram, PolicyTarget, RulesProgram,
+    BoolExpr, CompareOp, NumericExpr, PolicyProgram, PolicyStateScope, PolicyTarget, RulesProgram,
 };
 use crate::contracts::{
     LabError, NamedPolicyValue, PositionState, ReviewAuditBasis, ReviewAuditDiagnosticCode as Code,
     ReviewAuditKind, ReviewAuditReport, SavedRuleDecision, SnapshotRuleAuditInput, Weight,
     observation_digest, validate_frozen_policy,
 };
+use chrono::Timelike;
 use rust_decimal::Decimal;
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
@@ -28,6 +29,11 @@ struct EvalContext<'a> {
     actual_state: PositionState,
     actual_weight: f64,
     held_bars: Option<u64>,
+    bar_range_bps: f64,
+    bar_body_bps: f64,
+    close_location: f64,
+    utc_hour: f64,
+    utc_minute: f64,
     evidence_multiplier: f64,
     evidence_coverage: f64,
     crosses: &'a BTreeMap<String, CrossSample>,
@@ -39,6 +45,11 @@ struct PreparedRuleContext {
     actual_state: PositionState,
     actual_weight: f64,
     held_bars: Option<u64>,
+    bar_range_bps: f64,
+    bar_body_bps: f64,
+    close_location: f64,
+    utc_hour: f64,
+    utc_minute: f64,
     evidence_multiplier: f64,
     evidence_coverage: f64,
 }
@@ -51,6 +62,11 @@ impl PreparedRuleContext {
             actual_state: self.actual_state,
             actual_weight: self.actual_weight,
             held_bars: self.held_bars,
+            bar_range_bps: self.bar_range_bps,
+            bar_body_bps: self.bar_body_bps,
+            close_location: self.close_location,
+            utc_hour: self.utc_hour,
+            utc_minute: self.utc_minute,
             evidence_multiplier: self.evidence_multiplier,
             evidence_coverage: self.evidence_coverage,
             crosses,
@@ -187,12 +203,40 @@ fn prepare_rule_context(
     else {
         return Ok(None);
     };
+    let close_time = input.decision_observation.candle.close_time_utc.0;
+    let candle = &input.decision_observation.candle;
+    let open = decimal_to_f64(candle.open.get(), "decision candle open")?;
+    let high = decimal_to_f64(candle.high.get(), "decision candle high")?;
+    let low = decimal_to_f64(candle.low.get(), "decision candle low")?;
+    let close = decimal_to_f64(candle.close.get(), "decision candle close")?;
+    if open <= 0.0 || close <= 0.0 {
+        return Err(LabError::DataCorrupt(
+            "snapshot rule audit decision candle open/close must be positive".into(),
+        ));
+    }
+    let bar_range_bps = (((high - low) / close) * 10_000.0).max(0.0);
+    let bar_body_bps = ((close - open) / open) * 10_000.0;
+    let close_location = if high > low {
+        ((close - low) / (high - low)).clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
+    if !bar_range_bps.is_finite() || !bar_body_bps.is_finite() || !close_location.is_finite() {
+        return Err(LabError::DataCorrupt(
+            "snapshot rule audit decision candle microstructure metrics are nonfinite".into(),
+        ));
+    }
     Ok(Some(PreparedRuleContext {
         indicators,
         state_before,
         actual_state: input.current.actual_state,
         actual_weight,
         held_bars: input.current.held_bars,
+        bar_range_bps,
+        bar_body_bps,
+        close_location,
+        utc_hour: f64::from(close_time.hour()),
+        utc_minute: f64::from(close_time.minute()),
         evidence_multiplier,
         evidence_coverage,
     }))
@@ -231,11 +275,26 @@ fn evaluate_and_compare(
     context: &EvalContext<'_>,
     findings: &mut AuditFindings,
 ) -> Result<(), LabError> {
+    let mut working_state = context.state.clone();
     let mut state_after = BTreeMap::new();
     for slot in &program.states {
         let path = format!("state:{}:next", slot.id);
-        match eval_numeric(&slot.next, context, &path) {
-            Ok(value) => {
+        let slot_context = EvalContext {
+            state: &working_state,
+            ..*context
+        };
+        match eval_numeric(&slot.next, &slot_context, &path) {
+            Ok(raw_value) => {
+                let value = if slot.scope == PolicyStateScope::Episode
+                    && context.actual_state == PositionState::Cash
+                {
+                    slot.initial
+                } else {
+                    raw_value
+                };
+                if slot.scope == PolicyStateScope::Episode {
+                    working_state.insert(slot.id.clone(), value);
+                }
                 state_after.insert(slot.id.clone(), value);
             }
             Err(issue) => {
@@ -244,7 +303,11 @@ fn evaluate_and_compare(
             }
         }
     }
-    let (matched_rule, target_value) = match select_target(program, context) {
+    let rules_context = EvalContext {
+        state: &working_state,
+        ..*context
+    };
+    let (matched_rule, target_value) = match select_target(program, &rules_context) {
         Ok(value) => value,
         Err(issue) => {
             record_eval_issue(issue, findings);
@@ -590,9 +653,40 @@ fn collect_cross_paths_numeric(expr: &NumericExpr, path: &str, output: &mut Vec<
         | NumericExpr::Indicator { .. }
         | NumericExpr::State { .. }
         | NumericExpr::ActualWeight
+        | NumericExpr::ActualQty
         | NumericExpr::HeldBars
+        | NumericExpr::HeldSeconds
+        | NumericExpr::EntryPrice
         | NumericExpr::UnrealizedReturnBps
         | NumericExpr::TrailingDrawdownBps
+        | NumericExpr::AvgEntryPrice
+        | NumericExpr::AvgCostPrice
+        | NumericExpr::CostBasisKrw
+        | NumericExpr::AllocatedEntryFeeKrw
+        | NumericExpr::TotalCostBasisKrw
+        | NumericExpr::CostReturnBps
+        | NumericExpr::GrossUnrealizedPnlKrw
+        | NumericExpr::NetUnrealizedPnlKrw
+        | NumericExpr::NetUnrealizedReturnBps
+        | NumericExpr::LiquidationNetPnlKrw
+        | NumericExpr::LiquidationNetReturnBps
+        | NumericExpr::RoundTripCostKrw
+        | NumericExpr::RoundTripCostBps
+        | NumericExpr::EpisodePeakClose
+        | NumericExpr::EpisodeTroughClose
+        | NumericExpr::PeakCostReturnBps
+        | NumericExpr::CostTrailingDrawdownBps
+        | NumericExpr::PeakLiquidationNetPnlKrw
+        | NumericExpr::PeakLiquidationReturnBps
+        | NumericExpr::BarRangeBps
+        | NumericExpr::BarBodyBps
+        | NumericExpr::CloseLocation
+        | NumericExpr::EpisodeFillCount
+        | NumericExpr::LastFillPrice
+        | NumericExpr::SecondsSinceLastFill
+        | NumericExpr::MoveSinceLastFillBps
+        | NumericExpr::UtcHour
+        | NumericExpr::UtcMinute
         | NumericExpr::EvidenceMultiplier
         | NumericExpr::EvidenceCoverage => {}
     }
@@ -691,9 +785,40 @@ fn collect_current_crosses_numeric(
         | NumericExpr::Indicator { .. }
         | NumericExpr::State { .. }
         | NumericExpr::ActualWeight
+        | NumericExpr::ActualQty
         | NumericExpr::HeldBars
+        | NumericExpr::HeldSeconds
+        | NumericExpr::EntryPrice
         | NumericExpr::UnrealizedReturnBps
         | NumericExpr::TrailingDrawdownBps
+        | NumericExpr::AvgEntryPrice
+        | NumericExpr::AvgCostPrice
+        | NumericExpr::CostBasisKrw
+        | NumericExpr::AllocatedEntryFeeKrw
+        | NumericExpr::TotalCostBasisKrw
+        | NumericExpr::CostReturnBps
+        | NumericExpr::GrossUnrealizedPnlKrw
+        | NumericExpr::NetUnrealizedPnlKrw
+        | NumericExpr::NetUnrealizedReturnBps
+        | NumericExpr::LiquidationNetPnlKrw
+        | NumericExpr::LiquidationNetReturnBps
+        | NumericExpr::RoundTripCostKrw
+        | NumericExpr::RoundTripCostBps
+        | NumericExpr::EpisodePeakClose
+        | NumericExpr::EpisodeTroughClose
+        | NumericExpr::PeakCostReturnBps
+        | NumericExpr::CostTrailingDrawdownBps
+        | NumericExpr::PeakLiquidationNetPnlKrw
+        | NumericExpr::PeakLiquidationReturnBps
+        | NumericExpr::BarRangeBps
+        | NumericExpr::BarBodyBps
+        | NumericExpr::CloseLocation
+        | NumericExpr::EpisodeFillCount
+        | NumericExpr::LastFillPrice
+        | NumericExpr::SecondsSinceLastFill
+        | NumericExpr::MoveSinceLastFillBps
+        | NumericExpr::UtcHour
+        | NumericExpr::UtcMinute
         | NumericExpr::EvidenceMultiplier
         | NumericExpr::EvidenceCoverage => {}
     }
@@ -745,52 +870,161 @@ fn collect_current_crosses_bool(
     Ok(())
 }
 
+fn eval_leaf_numeric(
+    expr: &NumericExpr,
+    context: &EvalContext<'_>,
+    path: &str,
+) -> Result<f64, EvalIssue> {
+    let value =
+        match expr {
+            NumericExpr::Constant { value } => *value,
+            NumericExpr::Indicator { id } => *context
+                .indicators
+                .get(id)
+                .ok_or_else(|| EvalIssue::MissingEvidence(format!("{path}.indicator.{id}")))?,
+            NumericExpr::State { id } => *context
+                .state
+                .get(id)
+                .ok_or_else(|| EvalIssue::MissingEvidence(format!("{path}.state.{id}")))?,
+            NumericExpr::ActualWeight => context.actual_weight,
+            NumericExpr::HeldBars => {
+                let value = context
+                    .held_bars
+                    .ok_or_else(|| EvalIssue::MissingEvidence(format!("{path}.held_bars")))?;
+                f64::from(u32::try_from(value).map_err(|_| {
+                    EvalIssue::UnsupportedArithmetic(format!("{path}.held_bars_range"))
+                })?)
+            }
+            NumericExpr::BarRangeBps => context.bar_range_bps,
+            NumericExpr::BarBodyBps => context.bar_body_bps,
+            NumericExpr::CloseLocation => context.close_location,
+            NumericExpr::UtcHour => context.utc_hour,
+            NumericExpr::UtcMinute => context.utc_minute,
+            NumericExpr::EvidenceMultiplier => context.evidence_multiplier,
+            NumericExpr::EvidenceCoverage => context.evidence_coverage,
+            NumericExpr::EntryPrice
+            | NumericExpr::UnrealizedReturnBps
+            | NumericExpr::TrailingDrawdownBps
+            | NumericExpr::ActualQty
+            | NumericExpr::HeldSeconds
+            | NumericExpr::AvgEntryPrice
+            | NumericExpr::AvgCostPrice
+            | NumericExpr::CostBasisKrw
+            | NumericExpr::AllocatedEntryFeeKrw
+            | NumericExpr::TotalCostBasisKrw
+            | NumericExpr::CostReturnBps
+            | NumericExpr::GrossUnrealizedPnlKrw
+            | NumericExpr::NetUnrealizedPnlKrw
+            | NumericExpr::NetUnrealizedReturnBps
+            | NumericExpr::LiquidationNetPnlKrw
+            | NumericExpr::LiquidationNetReturnBps
+            | NumericExpr::RoundTripCostKrw
+            | NumericExpr::RoundTripCostBps
+            | NumericExpr::EpisodePeakClose
+            | NumericExpr::EpisodeTroughClose
+            | NumericExpr::PeakCostReturnBps
+            | NumericExpr::CostTrailingDrawdownBps
+            | NumericExpr::PeakLiquidationNetPnlKrw
+            | NumericExpr::PeakLiquidationReturnBps
+            | NumericExpr::EpisodeFillCount
+            | NumericExpr::LastFillPrice
+            | NumericExpr::SecondsSinceLastFill
+            | NumericExpr::MoveSinceLastFillBps => {
+                eval_long_only_missing_operand(expr, context.actual_state, path)?
+            }
+            _ => unreachable!("eval_leaf_numeric only handles leaf NumericExpr variants"),
+        };
+    Ok(value)
+}
+
+fn eval_long_only_missing_operand(
+    expr: &NumericExpr,
+    actual_state: PositionState,
+    path: &str,
+) -> Result<f64, EvalIssue> {
+    if actual_state == PositionState::Cash {
+        return Ok(0.0);
+    }
+    let suffix = match expr {
+        NumericExpr::EntryPrice => "entry_price",
+        NumericExpr::UnrealizedReturnBps => "unrealized_return_bps",
+        NumericExpr::TrailingDrawdownBps => "trailing_drawdown_bps",
+        NumericExpr::ActualQty => "actual_qty",
+        NumericExpr::HeldSeconds => "held_seconds",
+        NumericExpr::AvgEntryPrice => "avg_entry_price",
+        NumericExpr::AvgCostPrice => "avg_cost_price",
+        NumericExpr::CostBasisKrw => "cost_basis_krw",
+        NumericExpr::AllocatedEntryFeeKrw => "allocated_entry_fee_krw",
+        NumericExpr::TotalCostBasisKrw => "total_cost_basis_krw",
+        NumericExpr::CostReturnBps => "cost_return_bps",
+        NumericExpr::GrossUnrealizedPnlKrw => "gross_unrealized_pnl_krw",
+        NumericExpr::NetUnrealizedPnlKrw => "net_unrealized_pnl_krw",
+        NumericExpr::NetUnrealizedReturnBps => "net_unrealized_return_bps",
+        NumericExpr::LiquidationNetPnlKrw => "liquidation_net_pnl_krw",
+        NumericExpr::LiquidationNetReturnBps => "liquidation_net_return_bps",
+        NumericExpr::RoundTripCostKrw => "round_trip_cost_krw",
+        NumericExpr::RoundTripCostBps => "round_trip_cost_bps",
+        NumericExpr::EpisodePeakClose => "episode_peak_close",
+        NumericExpr::EpisodeTroughClose => "episode_trough_close",
+        NumericExpr::PeakCostReturnBps => "peak_cost_return_bps",
+        NumericExpr::CostTrailingDrawdownBps => "cost_trailing_drawdown_bps",
+        NumericExpr::PeakLiquidationNetPnlKrw => "peak_liquidation_net_pnl_krw",
+        NumericExpr::PeakLiquidationReturnBps => "peak_liquidation_return_bps",
+        NumericExpr::EpisodeFillCount => "episode_fill_count",
+        NumericExpr::LastFillPrice => "last_fill_price",
+        NumericExpr::SecondsSinceLastFill => "seconds_since_last_fill",
+        NumericExpr::MoveSinceLastFillBps => "move_since_last_fill_bps",
+        _ => unreachable!("guarded by long-only missing-evidence match"),
+    };
+    Err(EvalIssue::MissingEvidence(format!("{path}.{suffix}")))
+}
+
 fn eval_numeric(
     expr: &NumericExpr,
     context: &EvalContext<'_>,
     path: &str,
 ) -> Result<f64, EvalIssue> {
     let value = match expr {
-        NumericExpr::Constant { value } => *value,
-        NumericExpr::Indicator { id } => *context
-            .indicators
-            .get(id)
-            .ok_or_else(|| EvalIssue::MissingEvidence(format!("{path}.indicator.{id}")))?,
-        NumericExpr::State { id } => *context
-            .state
-            .get(id)
-            .ok_or_else(|| EvalIssue::MissingEvidence(format!("{path}.state.{id}")))?,
-        NumericExpr::ActualWeight => context.actual_weight,
-        NumericExpr::HeldBars => {
-            let value = context
-                .held_bars
-                .ok_or_else(|| EvalIssue::MissingEvidence(format!("{path}.held_bars")))?;
-            f64::from(
-                u32::try_from(value).map_err(|_| {
-                    EvalIssue::UnsupportedArithmetic(format!("{path}.held_bars_range"))
-                })?,
-            )
-        }
-        NumericExpr::UnrealizedReturnBps => {
-            if context.actual_state == PositionState::Cash {
-                0.0
-            } else {
-                return Err(EvalIssue::MissingEvidence(format!(
-                    "{path}.unrealized_return_bps"
-                )));
-            }
-        }
-        NumericExpr::TrailingDrawdownBps => {
-            if context.actual_state == PositionState::Cash {
-                0.0
-            } else {
-                return Err(EvalIssue::MissingEvidence(format!(
-                    "{path}.trailing_drawdown_bps"
-                )));
-            }
-        }
-        NumericExpr::EvidenceMultiplier => context.evidence_multiplier,
-        NumericExpr::EvidenceCoverage => context.evidence_coverage,
+        NumericExpr::Constant { .. }
+        | NumericExpr::Indicator { .. }
+        | NumericExpr::State { .. }
+        | NumericExpr::ActualWeight
+        | NumericExpr::ActualQty
+        | NumericExpr::HeldBars
+        | NumericExpr::HeldSeconds
+        | NumericExpr::EntryPrice
+        | NumericExpr::UnrealizedReturnBps
+        | NumericExpr::TrailingDrawdownBps
+        | NumericExpr::AvgEntryPrice
+        | NumericExpr::AvgCostPrice
+        | NumericExpr::CostBasisKrw
+        | NumericExpr::AllocatedEntryFeeKrw
+        | NumericExpr::TotalCostBasisKrw
+        | NumericExpr::CostReturnBps
+        | NumericExpr::GrossUnrealizedPnlKrw
+        | NumericExpr::NetUnrealizedPnlKrw
+        | NumericExpr::NetUnrealizedReturnBps
+        | NumericExpr::LiquidationNetPnlKrw
+        | NumericExpr::LiquidationNetReturnBps
+        | NumericExpr::RoundTripCostKrw
+        | NumericExpr::RoundTripCostBps
+        | NumericExpr::EpisodePeakClose
+        | NumericExpr::EpisodeTroughClose
+        | NumericExpr::PeakCostReturnBps
+        | NumericExpr::CostTrailingDrawdownBps
+        | NumericExpr::PeakLiquidationNetPnlKrw
+        | NumericExpr::PeakLiquidationReturnBps
+        | NumericExpr::BarRangeBps
+        | NumericExpr::BarBodyBps
+        | NumericExpr::CloseLocation
+        | NumericExpr::EpisodeFillCount
+        | NumericExpr::LastFillPrice
+        | NumericExpr::SecondsSinceLastFill
+        | NumericExpr::MoveSinceLastFillBps
+        | NumericExpr::UtcHour
+        | NumericExpr::UtcMinute
+        | NumericExpr::EvidenceMultiplier
+        | NumericExpr::EvidenceCoverage => eval_leaf_numeric(expr, context, path)?,
         NumericExpr::Add { left, right } => {
             eval_numeric(left, context, &format!("{path}:left"))?
                 + eval_numeric(right, context, &format!("{path}:right"))?

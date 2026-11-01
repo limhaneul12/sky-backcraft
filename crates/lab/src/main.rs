@@ -1556,15 +1556,20 @@ async fn run_mcp_serve(
     let realtime_tasks = RealtimeEventTasks::default();
     let realtime_clients =
         std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_REALTIME_EVENT_CLIENTS));
+    let public_realtime_clients = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+    let realtime_route_with_budget =
+        |path: &str, authorization, budget: std::sync::Arc<tokio::sync::Semaphore>| {
+            RealtimeEvents::new(
+                job_service.subscribe_realtime_status(),
+                authorization,
+                cancellation.child_token(),
+                budget,
+                realtime_tasks.clone(),
+            )
+            .router(path)
+        };
     let realtime_route = |path: &str, authorization| {
-        RealtimeEvents::new(
-            job_service.subscribe_realtime_status(),
-            authorization,
-            cancellation.child_token(),
-            realtime_clients.clone(),
-            realtime_tasks.clone(),
-        )
-        .router(path)
+        realtime_route_with_budget(path, authorization, realtime_clients.clone())
     };
     let realtime_authorization = match &server_auth {
         ServerAuth::OAuth(oauth) => RealtimeEventAuthorization::OAuth(oauth.clone()),
@@ -1574,11 +1579,13 @@ async fn run_mcp_serve(
         },
         ServerAuth::None | ServerAuth::PublicNoAuth => RealtimeEventAuthorization::PublicMarket,
     };
-    let realtime_router =
-        realtime_route("/realtime/events", realtime_authorization).merge(realtime_route(
+    let realtime_router = realtime_route("/realtime/events", realtime_authorization).merge(
+        realtime_route_with_budget(
             "/public/realtime/events",
             RealtimeEventAuthorization::PublicMarket,
-        ));
+            public_realtime_clients,
+        ),
+    );
     let (mcp_router, oauth_routes) = match &server_auth {
         ServerAuth::OAuth(oauth) => {
             let oauth_resource_metadata_url = trading_mcp.then(|| oauth.resource_metadata_url());
@@ -1803,8 +1810,9 @@ async fn run_mcp_serve(
     let app = oauth_routes
         .merge(mcp_router)
         .merge(desktop_router)
-        .merge(realtime_router)
-        .layer(axum::middleware::from_fn(
+        .merge(realtime_router);
+    let app =
+        spot_lab::transport::apply_limits(app, state.clone()).layer(axum::middleware::from_fn(
             move |request: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
                 let allowed_hosts = allowed_hosts.clone();
                 let allowed_origins = allowed_origins.clone();
@@ -1836,8 +1844,7 @@ async fn run_mcp_serve(
                     let is_oauth_form = path == "/authorize/approve" || path == "/authorize";
 
                     let origin_ok = origin.is_none_or(|orig| {
-                        orig == "null"
-                            || is_oauth_form
+                        is_oauth_form
                             || allowed_origins
                                 .iter()
                                 .any(|allowed| authority_matches(orig, allowed))
@@ -1867,7 +1874,6 @@ async fn run_mcp_serve(
                 }
             },
         ));
-    let app = spot_lab::transport::apply_limits(app, state.clone());
     record_lifecycle_phase(LifecyclePhase::Startup, &state);
     tracing::info!(event = "mcp_listening", bind = %bind_address, port, public_no_auth, auth = exposure.auth_name(), transport = "STATELESS_JSON");
     let graceful = cancellation.clone();

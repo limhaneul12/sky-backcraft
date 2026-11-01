@@ -46,6 +46,7 @@ pub(super) struct DeleteScope {
     schedules: Vec<String>,
     schedule_fires: Vec<String>,
     backups: Vec<String>,
+    paper_sessions: Vec<String>,
     artifact_files: Vec<ScopeFile>,
     ledger_files: Vec<ScopeFile>,
     raw_files: Vec<ScopeFile>,
@@ -303,66 +304,76 @@ impl Store {
         Ok(())
     }
 
-    /// Compute the full deletion closure for one resource on the scope tables.
-    fn compute_delete_scope(&self, resource: &DeleteResource) -> Result<DeleteScope, LabError> {
+    fn seed_delete_resource(&self, resource: &DeleteResource) -> Result<(), LabError> {
         use DeleteResource as R;
-        self.init_scope_tables()?;
         match resource {
             R::Policy { policy_id } => self.seeded_id(
                 "SELECT 1 FROM policies WHERE policy_id=?1",
                 "INSERT OR IGNORE INTO del_policies(id) VALUES (?1)",
                 policy_id.as_str(),
                 "policy",
-            )?,
+            ),
             R::Dataset { dataset_id } => self.seeded_id(
                 "SELECT 1 FROM datasets WHERE id=?1",
                 "INSERT OR IGNORE INTO del_datasets(id) VALUES (?1)",
                 dataset_id.as_str(),
                 "dataset",
-            )?,
+            ),
             R::Job { job_id } => self.seeded_id(
                 "SELECT 1 FROM jobs WHERE id=?1",
                 "INSERT OR IGNORE INTO del_jobs(id) VALUES (?1)",
                 job_id.as_str(),
                 "job",
-            )?,
+            ),
             R::Run { run_id } => self.seeded_id(
                 "SELECT 1 FROM runs WHERE id=?1 UNION ALL SELECT 1 FROM portfolio_runs WHERE id=?1",
                 "INSERT OR IGNORE INTO del_runs(id) VALUES (?1)",
                 run_id.as_str(),
                 "run",
-            )?,
+            ),
             R::EvidenceSnapshot { snapshot_id } => self.seeded_id(
                 "SELECT 1 FROM evidence_snapshots WHERE id=?1",
                 "INSERT OR IGNORE INTO del_snapshots(id) VALUES (?1)",
                 snapshot_id.as_str(),
                 "evidence snapshot",
-            )?,
+            ),
             R::Artifact { artifact_id } => self.seeded_id(
                 "SELECT 1 FROM run_artifacts WHERE id=?1",
                 "INSERT OR IGNORE INTO del_artifacts(id) VALUES (?1)",
                 artifact_id.as_str(),
                 "artifact",
-            )?,
+            ),
             R::Suite { suite_id } => self.seeded_id(
                 "SELECT 1 FROM research_suites WHERE id=?1",
                 "INSERT OR IGNORE INTO del_suites(id) VALUES (?1)",
                 suite_id.as_str(),
                 "suite",
-            )?,
+            ),
             R::Schedule { schedule_id } => self.seeded_id(
                 "SELECT 1 FROM collection_schedules WHERE id=?1",
                 "INSERT OR IGNORE INTO del_schedules(id) VALUES (?1)",
                 schedule_id.as_str(),
                 "schedule",
-            )?,
+            ),
             R::Backup { backup_id } => self.seeded_id(
                 "SELECT 1 FROM managed_backups WHERE id=?1",
                 "INSERT OR IGNORE INTO del_backups(id) VALUES (?1)",
                 backup_id.as_str(),
                 "backup",
-            )?,
+            ),
+            R::PaperSession { session_id } => self.seeded_id(
+                "SELECT 1 FROM paper_sessions WHERE session_id=?1",
+                "INSERT OR IGNORE INTO del_paper_sessions(id) VALUES (?1)",
+                session_id.as_str(),
+                "paper session",
+            ),
         }
+    }
+
+    /// Compute the full deletion closure for one resource on the scope tables.
+    fn compute_delete_scope(&self, resource: &DeleteResource) -> Result<DeleteScope, LabError> {
+        self.init_scope_tables()?;
+        self.seed_delete_resource(resource)?;
         for _ in 0..SCOPE_FIXPOINT_LIMIT {
             let mut added = 0_usize;
             for edge in SCOPE_EDGES {
@@ -389,6 +400,7 @@ impl Store {
         scope.schedules = self.ordered_ids("del_schedules")?;
         scope.schedule_fires = self.ordered_ids("del_schedule_fires")?;
         scope.backups = self.ordered_ids("del_backups")?;
+        scope.paper_sessions = self.ordered_ids("del_paper_sessions")?;
         self.connection
             .execute(
                 "INSERT OR IGNORE INTO del_revisions SELECT revision_id FROM policy_revisions WHERE policy_id IN (SELECT id FROM del_policies)",
@@ -527,7 +539,7 @@ impl Store {
                     "a job attempt lists this artifact as its output; cascade removes the job history",
                 );
             }
-            R::Suite { .. } | R::Schedule { .. } | R::Backup { .. } => {}
+            R::Suite { .. } | R::Schedule { .. } | R::Backup { .. } | R::PaperSession { .. } => {}
         }
         Ok(blockers)
     }
@@ -551,7 +563,7 @@ impl Store {
                 "a collection schedule retains this last-success dataset; preview-delete the schedule first",
             ),
             (
-                "SELECT 'paper:' || p.session_id FROM paper_sessions p WHERE p.policy_id IN (SELECT id FROM del_policies) OR p.policy_revision_id IN (SELECT id FROM del_revisions) ORDER BY p.session_id",
+                "SELECT 'paper:' || p.session_id FROM paper_sessions p WHERE (p.policy_id IN (SELECT id FROM del_policies) OR p.policy_revision_id IN (SELECT id FROM del_revisions)) AND p.session_id NOT IN (SELECT id FROM del_paper_sessions) ORDER BY p.session_id",
                 "a persistent paper session retains this frozen policy revision",
             ),
             (
@@ -635,7 +647,7 @@ impl Store {
                 .map_err(sql_error)?;
             let check_paper_sessions: i64 = connection
                 .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM del_obs) AND EXISTS(SELECT 1 FROM paper_sessions)",
+                    "SELECT EXISTS(SELECT 1 FROM del_obs) AND EXISTS(SELECT 1 FROM paper_sessions WHERE session_id NOT IN (SELECT id FROM del_paper_sessions))",
                     [],
                     |row| row.get(0),
                 )
@@ -646,44 +658,53 @@ impl Store {
                         "DELETE FROM del_obs WHERE id IN (
                              SELECT json_extract(event_json, '$.candle.observation_id')
                              FROM paper_session_events
-                             WHERE json_extract(event_json, '$.candle.observation_id') IS NOT NULL
+                             WHERE session_id NOT IN (SELECT id FROM del_paper_sessions)
+                               AND json_extract(event_json, '$.candle.observation_id') IS NOT NULL
                              UNION
                              SELECT j.value
                              FROM paper_session_events e,
                                   json_each(e.event_json, '$.signals') s,
                                   json_each(s.value, '$.source_bar_ids') j
-                             WHERE j.value IS NOT NULL
+                             WHERE e.session_id NOT IN (SELECT id FROM del_paper_sessions)
+                               AND j.value IS NOT NULL
                              UNION
                              SELECT json_extract(f.value, '$.source_bar_id')
                              FROM paper_session_events e,
                                   json_each(e.event_json, '$.fills') f
-                             WHERE json_extract(f.value, '$.source_bar_id') IS NOT NULL
+                             WHERE e.session_id NOT IN (SELECT id FROM del_paper_sessions)
+                               AND json_extract(f.value, '$.source_bar_id') IS NOT NULL
                              UNION
                              SELECT json_extract(f.value, '$.liquidity_source_bar_id')
                              FROM paper_session_events e,
                                   json_each(e.event_json, '$.fills') f
-                             WHERE json_extract(f.value, '$.liquidity_source_bar_id') IS NOT NULL
+                             WHERE e.session_id NOT IN (SELECT id FROM del_paper_sessions)
+                               AND json_extract(f.value, '$.liquidity_source_bar_id') IS NOT NULL
                              UNION
                              SELECT json_extract(m.value, '$.source_bar_id')
                              FROM paper_session_events e,
                                   json_each(e.event_json, '$.account_marks') m
-                             WHERE json_extract(m.value, '$.source_bar_id') IS NOT NULL
+                             WHERE e.session_id NOT IN (SELECT id FROM del_paper_sessions)
+                               AND json_extract(m.value, '$.source_bar_id') IS NOT NULL
                              UNION
                              SELECT json_extract(checkpoint_json, '$.initial_mark.source_bar_id')
                              FROM paper_market_checkpoints
-                             WHERE json_extract(checkpoint_json, '$.initial_mark.source_bar_id') IS NOT NULL
+                             WHERE session_id NOT IN (SELECT id FROM del_paper_sessions)
+                               AND json_extract(checkpoint_json, '$.initial_mark.source_bar_id') IS NOT NULL
                              UNION
                              SELECT json_extract(checkpoint_json, '$.latest_mark.source_bar_id')
                              FROM paper_market_checkpoints
-                             WHERE json_extract(checkpoint_json, '$.latest_mark.source_bar_id') IS NOT NULL
+                             WHERE session_id NOT IN (SELECT id FROM del_paper_sessions)
+                               AND json_extract(checkpoint_json, '$.latest_mark.source_bar_id') IS NOT NULL
                              UNION
                              SELECT json_extract(checkpoint_json, '$.prior_execution_bar.id')
                              FROM paper_market_checkpoints
-                             WHERE json_extract(checkpoint_json, '$.prior_execution_bar.id') IS NOT NULL
+                             WHERE session_id NOT IN (SELECT id FROM del_paper_sessions)
+                               AND json_extract(checkpoint_json, '$.prior_execution_bar.id') IS NOT NULL
                              UNION
                              SELECT json_extract(checkpoint_json, '$.prior_passive_liquidity_bar.id')
                              FROM paper_market_checkpoints
-                             WHERE json_extract(checkpoint_json, '$.prior_passive_liquidity_bar.id') IS NOT NULL
+                             WHERE session_id NOT IN (SELECT id FROM del_paper_sessions)
+                               AND json_extract(checkpoint_json, '$.prior_passive_liquidity_bar.id') IS NOT NULL
                          );
                          DELETE FROM del_obs WHERE EXISTS (
                              SELECT 1 FROM observation_constituents c
@@ -872,7 +893,16 @@ impl Store {
                 reason: "queued/running work refuses deletion; cancel the job first and wait for a terminal state".into(),
             });
         }
+        self.check_active_paper_sessions(scope)?;
         let retained = [
+            (
+                DeleteEntryKind::Policy,
+                "SELECT COUNT(DISTINCT policy_id) FROM paper_sessions WHERE session_id IN (SELECT id FROM del_paper_sessions) AND policy_id NOT IN (SELECT id FROM del_policies)",
+            ),
+            (
+                DeleteEntryKind::PolicyRevision,
+                "SELECT COUNT(DISTINCT policy_revision_id) FROM paper_sessions WHERE session_id IN (SELECT id FROM del_paper_sessions) AND policy_revision_id NOT IN (SELECT id FROM del_revisions)",
+            ),
             (
                 DeleteEntryKind::Plan,
                 "SELECT COUNT(DISTINCT plan_id) FROM research_suite_cases WHERE suite_id IN (SELECT id FROM del_suites) AND plan_id IS NOT NULL",
@@ -929,6 +959,34 @@ impl Store {
                         .push(DeleteRetainedGroup { kind, count });
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn check_active_paper_sessions(&self, scope: &mut DeleteScope) -> Result<(), LabError> {
+        let mut paper_statement = self
+            .connection
+            .prepare(
+                "SELECT session_id, state FROM paper_sessions \
+                 WHERE session_id IN (SELECT id FROM del_paper_sessions) AND state != 'STOPPED' \
+                 ORDER BY session_id",
+            )
+            .map_err(sql_error)?;
+        let active_papers = paper_statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(sql_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sql_error)?;
+        for (session_id, state) in active_papers {
+            scope.blockers.push(DeleteBlocker {
+                class: DeleteBlockerClass::ActiveJob,
+                reference: format!("paper:{session_id}"),
+                reason: format!(
+                    "paper session is in {state} state and refuses deletion; stop the paper session first"
+                ),
+            });
         }
         Ok(())
     }
@@ -1026,7 +1084,10 @@ impl Store {
                         scope.artifacts.iter().any(|id| id == artifact_id.as_str())
                     }
                     R::Job { job_id } => scope.jobs.iter().any(|id| id == job_id.as_str()),
-                    R::Suite { .. } | R::Schedule { .. } | R::Backup { .. } => false,
+                    R::Suite { .. }
+                    | R::Schedule { .. }
+                    | R::Backup { .. }
+                    | R::PaperSession { .. } => false,
                 },
             };
             if intersects {
@@ -1373,6 +1434,7 @@ fn scope_digest(scope: &DeleteScope) -> Result<ContentHash, LabError> {
         "schedules": sorted(scope.schedules.iter()),
         "schedule_fires": sorted(scope.schedule_fires.iter()),
         "backups": sorted(scope.backups.iter()),
+        "paper_sessions": sorted(scope.paper_sessions.iter()),
         "artifact_files": scope.artifact_files.iter().map(|f| (&f.id, &f.relative_path, f.bytes)).collect::<Vec<_>>(),
         "ledger_files": scope.ledger_files.iter().map(|f| (&f.id, &f.relative_path, f.bytes)).collect::<Vec<_>>(),
         "raw_files": scope.raw_files.iter().map(|f| (&f.id, &f.relative_path, f.bytes)).collect::<Vec<_>>(),
@@ -1452,6 +1514,11 @@ fn cascade_groups(scope: &DeleteScope) -> Vec<DeleteCascadeGroup> {
         ),
         group(DeleteEntryKind::Backup, scope.backups.len(), &scope.backups),
         group(
+            DeleteEntryKind::PaperSession,
+            scope.paper_sessions.len(),
+            &scope.paper_sessions,
+        ),
+        group(
             DeleteEntryKind::Artifact,
             scope.ledger_files.len(),
             &scope
@@ -1475,6 +1542,10 @@ const SCOPE_DELETES: &[&str] = &[
     "DELETE FROM schedule_fires WHERE id IN (SELECT id FROM del_schedule_fires)",
     "DELETE FROM collection_schedules WHERE id IN (SELECT id FROM del_schedules)",
     "DELETE FROM managed_backups WHERE id IN (SELECT id FROM del_backups)",
+    "DELETE FROM paper_request_receipts WHERE session_id IN (SELECT id FROM del_paper_sessions)",
+    "DELETE FROM paper_session_events WHERE session_id IN (SELECT id FROM del_paper_sessions)",
+    "DELETE FROM paper_market_checkpoints WHERE session_id IN (SELECT id FROM del_paper_sessions)",
+    "DELETE FROM paper_sessions WHERE session_id IN (SELECT id FROM del_paper_sessions)",
     // job output join tables reference runs, artifacts, datasets, and attempts
     "DELETE FROM job_attempt_dataset_outputs WHERE attempt_id IN (SELECT id FROM del_attempts) OR dataset_id IN (SELECT id FROM del_datasets)",
     "DELETE FROM job_attempt_run_outputs WHERE attempt_id IN (SELECT id FROM del_attempts) OR run_id IN (SELECT id FROM del_runs)",
@@ -1546,6 +1617,10 @@ const SCOPE_COUNTS: &[&str] = &[
     "SELECT COUNT(*) FROM schedule_fires WHERE id IN (SELECT id FROM del_schedule_fires)",
     "SELECT COUNT(*) FROM collection_schedules WHERE id IN (SELECT id FROM del_schedules)",
     "SELECT COUNT(*) FROM managed_backups WHERE id IN (SELECT id FROM del_backups)",
+    "SELECT COUNT(*) FROM paper_request_receipts WHERE session_id IN (SELECT id FROM del_paper_sessions)",
+    "SELECT COUNT(*) FROM paper_session_events WHERE session_id IN (SELECT id FROM del_paper_sessions)",
+    "SELECT COUNT(*) FROM paper_market_checkpoints WHERE session_id IN (SELECT id FROM del_paper_sessions)",
+    "SELECT COUNT(*) FROM paper_sessions WHERE session_id IN (SELECT id FROM del_paper_sessions)",
     "SELECT COUNT(*) FROM job_attempt_dataset_outputs WHERE attempt_id IN (SELECT id FROM del_attempts) OR dataset_id IN (SELECT id FROM del_datasets)",
     "SELECT COUNT(*) FROM job_attempt_run_outputs WHERE attempt_id IN (SELECT id FROM del_attempts) OR run_id IN (SELECT id FROM del_runs)",
     "SELECT COUNT(*) FROM job_attempt_artifact_outputs WHERE attempt_id IN (SELECT id FROM del_attempts) OR artifact_id IN (SELECT id FROM del_artifacts)",
@@ -1633,6 +1708,8 @@ DROP TABLE IF EXISTS temp.del_schedule_fires;
 CREATE TEMP TABLE del_schedule_fires(id TEXT PRIMARY KEY);
 DROP TABLE IF EXISTS temp.del_backups;
 CREATE TEMP TABLE del_backups(id TEXT PRIMARY KEY);
+DROP TABLE IF EXISTS temp.del_paper_sessions;
+CREATE TEMP TABLE del_paper_sessions(id TEXT PRIMARY KEY);
 CREATE INDEX IF NOT EXISTS idx_fk_observation_raw_objects_raw ON observation_raw_objects(raw_object_id);
 CREATE INDEX IF NOT EXISTS idx_fk_observation_constituents_const ON observation_constituents(constituent_id);
 CREATE INDEX IF NOT EXISTS idx_fk_collection_page_members_obs ON collection_page_members(observation_id);

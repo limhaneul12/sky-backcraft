@@ -38,7 +38,10 @@ fn position(quantity: &str, weight: &str, equity: &str) -> AutomationAccountPosi
         equity_krw: QuoteAmount::new(Decimal::from_str_exact(equity).expect("equity"))
             .expect("valid equity"),
         episode_opened_at: None,
+        average_entry_price_krw: None,
         account_observed_at: crate::contracts::UtcTimestamp::now(),
+        execution: None,
+        accounting: None,
     }
 }
 
@@ -285,6 +288,7 @@ fn frozen_policy_fills_through_mock_venue_and_restart_does_not_duplicate_it()
                     }],
                     states: vec![PolicyState {
                         id: "memory".into(),
+                        scope: crate::contracts::PolicyStateScope::Global,
                         initial: 0.0,
                         next: NumericExpr::State {
                             id: "memory".into(),
@@ -333,6 +337,7 @@ fn frozen_policy_fills_through_mock_venue_and_restart_does_not_duplicate_it()
                 max_asset_exposure_krw: QuoteAmount::new(Decimal::from(100_000))?,
                 max_daily_loss_krw: QuoteAmount::new(Decimal::from(100_000))?,
                 activation_loss_limit_krw: None,
+                hard_stop_loss_bps: None,
                 max_open_orders: 1,
                 max_orders_per_interval: 1,
                 max_balance_age_seconds: 3_600,
@@ -359,6 +364,7 @@ fn frozen_policy_fills_through_mock_venue_and_restart_does_not_duplicate_it()
             max_asset_exposure_krw: QuoteAmount::new(Decimal::from(100_000))?,
             max_daily_loss_krw: QuoteAmount::new(Decimal::from(100_000))?,
             activation_loss_limit_krw: None,
+            hard_stop_loss_bps: None,
             max_open_orders: 1,
             max_orders_per_interval: 1,
             max_balance_age_seconds: 3_600,
@@ -730,6 +736,7 @@ fn live_disabled_blocks_private_reads_and_effects_before_adapter_access()
                         max_asset_exposure_krw: QuoteAmount::new(Decimal::from(100_000))?,
                         max_daily_loss_krw: QuoteAmount::new(Decimal::from(100_000))?,
                         activation_loss_limit_krw: None,
+                        hard_stop_loss_bps: None,
                         max_open_orders: 1,
                         max_orders_per_interval: 1,
                         max_balance_age_seconds: 3_600,
@@ -1500,6 +1507,7 @@ async fn seed_mock_order_fixture(
         max_asset_exposure_krw: QuoteAmount::new(Decimal::from(100_000))?,
         max_daily_loss_krw: QuoteAmount::new(Decimal::from(100_000))?,
         activation_loss_limit_krw: None,
+        hard_stop_loss_bps: None,
         max_open_orders: 2,
         max_orders_per_interval: 2,
         max_balance_age_seconds: 3_600,

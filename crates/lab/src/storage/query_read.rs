@@ -47,6 +47,14 @@ pub struct ModelResultSummary {
     pub embedded_price_cost_quote: Option<SignedAmount>,
     pub closed_positions: Option<u64>,
     pub open_positions: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub win_rate: Option<SignedAmount>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payoff_ratio_r: Option<SignedAmount>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub breakeven_win_rate: Option<SignedAmount>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_consecutive_losses: Option<u64>,
     pub financial_null_reason: Option<String>,
 }
 
@@ -423,13 +431,48 @@ impl Store {
                 "summary episode count mismatch".into(),
             ));
         }
+        let episode_metrics = self.closed_episode_metrics(run_id, &model.model_id, closed)?;
         model.terminal_equity = Some(terminal);
         model.total_return_ratio = Some(SignedAmount::new(net_return)?);
         model.total_fees = Some(costs.total_fees);
         model.embedded_price_cost_quote = Some(costs.price_cost_attribution);
         model.closed_positions = Some(closed);
         model.open_positions = Some(open);
+        model.win_rate = episode_metrics.win_rate;
+        model.payoff_ratio_r = episode_metrics.payoff_ratio_r;
+        model.breakeven_win_rate = episode_metrics.breakeven_win_rate;
+        model.max_consecutive_losses = Some(episode_metrics.max_consecutive_losses);
         Ok(())
+    }
+
+    fn closed_episode_metrics(
+        &self,
+        run_id: &RunId,
+        model_id: &ModelId,
+        expected_closed: u64,
+    ) -> Result<ClosedEpisodeMetrics, LabError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT net_realized_decimal FROM episodes \
+                 WHERE run_id=?1 AND model_id=?2 AND status='CLOSED' \
+                 ORDER BY COALESCE(closed_at_ms, opened_at_ms), opened_at_ms, episode_id",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(params![run_id.as_str(), model_id.as_str()], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(sql_error)?;
+        let mut fold = EpisodeMetricsFold::default();
+        for row in rows {
+            let text = row.map_err(sql_error)?;
+            let net_realized = rust_decimal::Decimal::from_str_exact(&text).map_err(|_| {
+                LabError::DataCorrupt("invalid episode net_realized_decimal".into())
+            })?;
+            fold.observe(net_realized)?;
+        }
+        fold.finish(expected_closed)
     }
 
     /// Resolve the exact closing signal from immutable episode/fill/order links.
@@ -540,10 +583,124 @@ fn query_models(
             embedded_price_cost_quote: None,
             closed_positions: None,
             open_positions: None,
+            win_rate: None,
+            payoff_ratio_r: None,
+            breakeven_win_rate: None,
+            max_consecutive_losses: None,
             financial_null_reason: None,
         });
     }
     Ok(models)
+}
+
+struct ClosedEpisodeMetrics {
+    win_rate: Option<SignedAmount>,
+    payoff_ratio_r: Option<SignedAmount>,
+    breakeven_win_rate: Option<SignedAmount>,
+    max_consecutive_losses: u64,
+}
+
+#[derive(Default)]
+struct EpisodeMetricsFold {
+    actual_closed: u64,
+    win_count: u64,
+    loss_count: u64,
+    win_sum: rust_decimal::Decimal,
+    loss_abs_sum: rust_decimal::Decimal,
+    current_loss_streak: u64,
+    max_consecutive_losses: u64,
+}
+
+impl EpisodeMetricsFold {
+    fn observe(&mut self, net_realized: rust_decimal::Decimal) -> Result<(), LabError> {
+        self.actual_closed = self
+            .actual_closed
+            .checked_add(1)
+            .ok_or_else(|| LabError::ResourceLimit("closed episode count overflow".into()))?;
+        match net_realized.cmp(&rust_decimal::Decimal::ZERO) {
+            std::cmp::Ordering::Greater => {
+                self.win_count += 1;
+                self.win_sum = checked_add(self.win_sum, net_realized, "episode win sum")?;
+                self.current_loss_streak = 0;
+            }
+            std::cmp::Ordering::Less => {
+                self.loss_count += 1;
+                self.loss_abs_sum =
+                    checked_add(self.loss_abs_sum, net_realized.abs(), "episode loss sum")?;
+                self.current_loss_streak += 1;
+                if self.current_loss_streak > self.max_consecutive_losses {
+                    self.max_consecutive_losses = self.current_loss_streak;
+                }
+            }
+            std::cmp::Ordering::Equal => {
+                self.current_loss_streak = 0;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self, expected_closed: u64) -> Result<ClosedEpisodeMetrics, LabError> {
+        if self.actual_closed != expected_closed {
+            return Err(LabError::DataCorrupt(
+                "closed episode row count differs from summary count".into(),
+            ));
+        }
+        let win_rate = if self.actual_closed > 0 {
+            let ratio = rust_decimal::Decimal::from(self.win_count)
+                .checked_div(rust_decimal::Decimal::from(self.actual_closed))
+                .ok_or_else(|| LabError::AccountingInvariant("win_rate division failed".into()))?
+                .round_dp(8);
+            Some(SignedAmount::new(ratio)?)
+        } else {
+            None
+        };
+        let (payoff_ratio_r, breakeven_win_rate) = self.payoff_and_breakeven()?;
+        Ok(ClosedEpisodeMetrics {
+            win_rate,
+            payoff_ratio_r,
+            breakeven_win_rate,
+            max_consecutive_losses: self.max_consecutive_losses,
+        })
+    }
+
+    fn payoff_and_breakeven(
+        &self,
+    ) -> Result<(Option<SignedAmount>, Option<SignedAmount>), LabError> {
+        if self.win_count == 0
+            || self.loss_count == 0
+            || self.loss_abs_sum <= rust_decimal::Decimal::ZERO
+        {
+            return Ok((None, None));
+        }
+        let avg_win = self
+            .win_sum
+            .checked_div(rust_decimal::Decimal::from(self.win_count))
+            .ok_or_else(|| LabError::AccountingInvariant("average win division failed".into()))?;
+        let avg_loss = self
+            .loss_abs_sum
+            .checked_div(rust_decimal::Decimal::from(self.loss_count))
+            .ok_or_else(|| LabError::AccountingInvariant("average loss division failed".into()))?;
+        if avg_loss <= rust_decimal::Decimal::ZERO {
+            return Ok((None, None));
+        }
+        let payoff = avg_win
+            .checked_div(avg_loss)
+            .ok_or_else(|| LabError::AccountingInvariant("payoff ratio division failed".into()))?;
+        let denom = rust_decimal::Decimal::ONE
+            .checked_add(payoff)
+            .ok_or_else(|| {
+                LabError::AccountingInvariant("breakeven denominator overflow".into())
+            })?;
+        let breakeven = rust_decimal::Decimal::ONE
+            .checked_div(denom)
+            .ok_or_else(|| {
+                LabError::AccountingInvariant("breakeven win rate division failed".into())
+            })?;
+        Ok((
+            Some(SignedAmount::new(payoff.round_dp(8))?),
+            Some(SignedAmount::new(breakeven.round_dp(8))?),
+        ))
+    }
 }
 
 struct ModelCostHeader {
@@ -869,6 +1026,18 @@ mod tests {
         assert!(blocked_entry.embedded_price_cost_quote.is_none());
         assert!(blocked_entry.closed_positions.is_none());
         assert!(blocked_entry.open_positions.is_none());
+        assert!(blocked_entry.win_rate.is_none());
+        assert!(blocked_entry.payoff_ratio_r.is_none());
+        assert!(blocked_entry.breakeven_win_rate.is_none());
+        assert!(blocked_entry.max_consecutive_losses.is_none());
+
+        let completed_entry = compacted_summary
+            .models
+            .iter()
+            .find(|m| m.model_id == seeded.completed_models[0])
+            .expect("completed model in summary");
+        assert!(completed_entry.win_rate.is_some());
+        assert!(completed_entry.max_consecutive_losses.is_some());
 
         for (model_id, expected_bytes) in &detail_costs {
             let cost = store

@@ -782,6 +782,7 @@ fn full_tool_catalog_and_malformed_inputs_use_protocol_contract()
             mode: crate::contracts::AutomationSessionMode::Mock,
             risk: crate::contracts::AutomationRiskPolicy {
                 activation_loss_limit_krw: None,
+                hard_stop_loss_bps: None,
                 max_order_notional_krw: crate::contracts::QuoteAmount::new(
                     rust_decimal::Decimal::from(100_000),
                 )?,
@@ -1510,6 +1511,45 @@ fn public_no_auth_blocks_mutations_and_permits_reads() -> Result<(), Box<dyn std
             .map_err(|e| LabError::Internal(e.to_string()))?;
         assert_eq!(compact_output.is_error, Some(true));
         assert!(result_text(compact_output).contains("disabled when public_no_auth is enabled"));
+
+        for (tool_name, arguments) in [
+            (
+                "storage_maintenance",
+                serde_json::json!({ "action": "create_backup", "request_id": "req-backup-blocked" }),
+            ),
+            (
+                "storage_maintenance",
+                serde_json::json!({ "action": "checkpoint", "mode": "PASSIVE" }),
+            ),
+            (
+                "export_report",
+                serde_json::json!({
+                    "request_id": "req-export-blocked",
+                    "run_id": "00000000-0000-0000-0000-000000000001"
+                }),
+            ),
+            (
+                "verify_run",
+                serde_json::json!({
+                    "request_id": "req-verify-blocked",
+                    "artifact_id": "00000000-0000-0000-0000-000000000001",
+                    "replay": false
+                }),
+            ),
+        ] {
+            let mut request = CallToolRequestParams::default();
+            request.name = tool_name.into();
+            request.arguments = Some(object(arguments));
+            let output = client
+                .call_tool(request)
+                .await
+                .map_err(|error| LabError::Internal(error.to_string()))?;
+            assert_eq!(output.is_error, Some(true), "{tool_name} must be denied");
+            assert!(
+                result_text(output).contains("disabled when public_no_auth is enabled"),
+                "{tool_name} must be rejected on public_no_auth"
+            );
+        }
 
         // Reads must be permitted
         let mut status_params = CallToolRequestParams::default();

@@ -7,8 +7,8 @@
 //! `deleted_at`/`archived` flags.
 
 use super::{
-    ArtifactId, BackupId, ContentHash, DatasetId, EvidenceSnapshotId, JobId, PolicyId, RunId,
-    ScheduleId, SuiteId, UtcTimestamp,
+    ArtifactId, BackupId, ContentHash, DatasetId, EvidenceSnapshotId, JobId, PaperSessionId,
+    PolicyId, RunId, ScheduleId, SuiteId, UtcTimestamp,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -31,6 +31,7 @@ pub enum DeleteResource {
     Suite { suite_id: SuiteId },
     Schedule { schedule_id: ScheduleId },
     Backup { backup_id: BackupId },
+    PaperSession { session_id: PaperSessionId },
 }
 
 impl DeleteResource {
@@ -49,6 +50,9 @@ impl DeleteResource {
             Self::Suite { suite_id } => format!("suite:{}", suite_id.as_str()),
             Self::Schedule { schedule_id } => format!("schedule:{}", schedule_id.as_str()),
             Self::Backup { backup_id } => format!("backup:{}", backup_id.as_str()),
+            Self::PaperSession { session_id } => {
+                format!("paper_session:{}", session_id.as_str())
+            }
         }
     }
 }
@@ -74,6 +78,7 @@ pub enum DeleteEntryKind {
     Suite,
     Schedule,
     Backup,
+    PaperSession,
 }
 
 /// One live reference that makes a non-cascade delete impossible.

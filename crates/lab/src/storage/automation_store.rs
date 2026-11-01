@@ -63,6 +63,17 @@ struct AutomationAccountReservationFacts {
     reserved_bid_exposure: Decimal,
 }
 
+struct AccountMarketEpisodeFacts {
+    opened_at: Option<UtcTimestamp>,
+    average_entry_price_krw: Option<crate::contracts::PriceKrw>,
+    price_basis_krw: Decimal,
+    allocated_entry_fee_krw: Decimal,
+    cumulative_realized_pnl_krw: Decimal,
+    cumulative_fees_krw: Decimal,
+    last_ask_fee_rate: Option<Decimal>,
+    execution: Option<crate::strategy::ExecutionContextSnapshot>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(
     tag = "state",
@@ -2303,7 +2314,7 @@ impl Store {
                 LabError::DataCorrupt("account currency total exceeds decimal capacity".into())
             })?;
             let other_market = MarketId::parse_upbit(&format!("KRW-{}", balance.currency))?;
-            self.account_market_episode(&account_identity, &other_market, quantity)?;
+            let _ = self.account_market_episode(&account_identity, &other_market, quantity)?;
         }
         let base = balances
             .iter()
@@ -2315,8 +2326,9 @@ impl Store {
         } else {
             Decimal::ZERO
         };
-        let episode_opened_at =
-            self.account_market_episode(&account_identity, &market, actual_qty)?;
+        let episode = self.account_market_episode(&account_identity, &market, actual_qty)?;
+        let episode_opened_at = episode.opened_at;
+        let average_entry_price_krw = episode.average_entry_price_krw;
         let mut equity = Decimal::ZERO;
         for balance in &balances {
             let quantity = balance.balance.checked_add(balance.locked).ok_or_else(|| {
@@ -2360,34 +2372,117 @@ impl Store {
                 "fill ledger episode remains open while exchange account is flat".into(),
             ));
         }
+        let position_value_krw = actual_qty.checked_mul(mark.get()).ok_or_else(|| {
+            LabError::DataCorrupt("position value exceeds decimal capacity".into())
+        })?;
         let actual_weight = if equity == Decimal::ZERO {
             crate::contracts::Weight::new(Decimal::ZERO)?
         } else {
-            crate::contracts::Weight::new(
-                actual_qty.checked_mul(mark.get()).ok_or_else(|| {
-                    LabError::DataCorrupt("position value exceeds decimal capacity".into())
-                })? / equity,
-            )?
+            crate::contracts::Weight::new(position_value_krw / equity)?
+        };
+        let (cash_free_krw, cash_locked_krw) = balances
+            .iter()
+            .find(|row| row.currency == "KRW")
+            .map_or((Decimal::ZERO, Decimal::ZERO), |row| {
+                (row.balance, row.locked)
+            });
+        let cash_total_krw = cash_free_krw
+            .checked_add(cash_locked_krw)
+            .ok_or_else(|| LabError::DataCorrupt("KRW balance total overflow".into()))?;
+        let accounting = if actual_qty > Decimal::ZERO {
+            let price_basis_krw = episode.price_basis_krw;
+            if price_basis_krw <= Decimal::ZERO {
+                return Err(LabError::DataCorrupt(
+                    "filled account position has non-positive cost basis".into(),
+                ));
+            }
+            let allocated_entry_fee_krw = episode.allocated_entry_fee_krw;
+            let total_cost_basis_krw = price_basis_krw
+                .checked_add(allocated_entry_fee_krw)
+                .ok_or_else(|| LabError::DataCorrupt("total cost basis overflow".into()))?;
+            let avg_entry_price_krw =
+                crate::contracts::PriceKrw::new(price_basis_krw / actual_qty)?;
+            let avg_cost_price_krw =
+                crate::contracts::PriceKrw::new(total_cost_basis_krw / actual_qty)?;
+            let gross_unrealized_pnl_krw = position_value_krw
+                .checked_sub(price_basis_krw)
+                .ok_or_else(|| LabError::DataCorrupt("gross unrealized pnl overflow".into()))?;
+            let net_unrealized_pnl_krw = position_value_krw
+                .checked_sub(total_cost_basis_krw)
+                .ok_or_else(|| LabError::DataCorrupt("net unrealized pnl overflow".into()))?;
+            let ask_fee_rate = episode
+                .last_ask_fee_rate
+                .unwrap_or_else(|| Decimal::new(5, 4));
+            let estimated_exit_fee_krw = position_value_krw
+                .checked_mul(ask_fee_rate)
+                .ok_or_else(|| LabError::DataCorrupt("estimated exit fee overflow".into()))?;
+            let estimated_liquidation_net_pnl_krw = position_value_krw
+                .checked_sub(estimated_exit_fee_krw)
+                .and_then(|value| value.checked_sub(total_cost_basis_krw))
+                .ok_or_else(|| {
+                    LabError::DataCorrupt("estimated liquidation net pnl overflow".into())
+                })?;
+            Some(crate::strategy::PositionAccountingSnapshot {
+                avg_entry_price_krw,
+                avg_cost_price_krw,
+                price_basis_krw: QuoteAmount::new(price_basis_krw)?,
+                allocated_entry_fee_krw: QuoteAmount::new(allocated_entry_fee_krw)?,
+                allocated_entry_embedded_cost_krw: QuoteAmount::new(Decimal::ZERO)?,
+                total_cost_basis_krw: QuoteAmount::new(total_cost_basis_krw)?,
+                position_value_krw: QuoteAmount::new(position_value_krw)?,
+                gross_unrealized_pnl_krw: crate::contracts::SignedAmount::new(
+                    gross_unrealized_pnl_krw,
+                )?,
+                net_unrealized_pnl_krw: crate::contracts::SignedAmount::new(
+                    net_unrealized_pnl_krw,
+                )?,
+                estimated_exit_price_krw: mark,
+                estimated_exit_notional_krw: QuoteAmount::new(position_value_krw)?,
+                estimated_exit_fee_krw: QuoteAmount::new(estimated_exit_fee_krw)?,
+                estimated_exit_embedded_cost_krw: QuoteAmount::new(Decimal::ZERO)?,
+                estimated_liquidation_net_pnl_krw: crate::contracts::SignedAmount::new(
+                    estimated_liquidation_net_pnl_krw,
+                )?,
+                cash_total_krw: QuoteAmount::new(cash_total_krw)?,
+                cash_free_krw: QuoteAmount::new(cash_free_krw)?,
+                cash_locked_krw: QuoteAmount::new(cash_locked_krw)?,
+                equity_krw: QuoteAmount::new(equity)?,
+                cumulative_realized_pnl_krw: crate::contracts::SignedAmount::new(
+                    episode.cumulative_realized_pnl_krw,
+                )?,
+                cumulative_fees_krw: QuoteAmount::new(episode.cumulative_fees_krw)?,
+            })
+        } else {
+            None
         };
         Ok(crate::automation::AutomationAccountPosition {
             actual_qty: AssetQuantity::new(actual_qty)?,
             actual_weight,
             equity_krw: QuoteAmount::new(equity)?,
             episode_opened_at,
+            average_entry_price_krw,
             account_observed_at: observed_at,
+            execution: episode.execution,
+            accounting,
         })
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one sequential fill ledger scan derives open episode cost basis, allocated fees, and execution provenance"
+    )]
     fn account_market_episode(
         &self,
         account_identity: &str,
         market: &MarketId,
         observed_qty: Decimal,
-    ) -> Result<Option<UtcTimestamp>, LabError> {
+    ) -> Result<AccountMarketEpisodeFacts, LabError> {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT f.side,f.volume,f.trade_time_utc FROM automation_fills f \
+                "SELECT f.side,f.volume,f.funds_krw,f.trade_time_utc,f.price_krw, \
+                        o.executed_volume,o.paid_fee_krw,o.rules_snapshot_json \
+                 FROM automation_fills f \
                  JOIN automation_orders o USING(client_identifier) \
                  WHERE o.account_identity=?1 AND f.market=?2 \
                  ORDER BY f.trade_time_utc,f.trade_uuid",
@@ -2399,23 +2494,80 @@ impl Store {
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
                 ))
             })
             .map_err(sql_error)?;
         let rows = rows.collect::<Result<Vec<_>, _>>().map_err(sql_error)?;
         let mut quantity = Decimal::ZERO;
+        let mut cost_basis = Decimal::ZERO;
+        let mut allocated_entry_fee = Decimal::ZERO;
+        let mut cumulative_realized_pnl = Decimal::ZERO;
+        let mut cumulative_fees = Decimal::ZERO;
         let mut opened = None;
-        for (side, volume, trade_time) in rows {
+        let mut episode_fill_count = 0_u64;
+        let mut episode_buy_fill_count = 0_u64;
+        let mut episode_sell_fill_count = 0_u64;
+        let mut last_ask_fee_rate = None;
+        let mut last_fill = None;
+        for (
+            side,
+            volume,
+            funds,
+            trade_time,
+            price_raw,
+            order_executed_raw,
+            order_fee_raw,
+            rules_raw,
+        ) in rows
+        {
             let volume = parse_decimal(&volume)?;
+            let funds = parse_decimal(&funds)?;
             let at = UtcTimestamp::parse_rfc3339(&trade_time)?;
+            let price = parse_decimal(&price_raw)?;
+            let order_executed = parse_decimal(&order_executed_raw)?;
+            let order_fee = parse_decimal(&order_fee_raw)?;
+            let fill_fee = if order_executed > Decimal::ZERO {
+                order_fee
+                    .checked_mul(volume)
+                    .ok_or_else(|| LabError::DataCorrupt("fill fee scaling overflow".into()))?
+                    / order_executed
+            } else {
+                Decimal::ZERO
+            };
+            cumulative_fees = cumulative_fees
+                .checked_add(fill_fee)
+                .ok_or_else(|| LabError::DataCorrupt("cumulative fee overflow".into()))?;
+            if let Ok(rules) = serde_json::from_str::<VerifiedMarketRules>(&rules_raw)
+                && rules.ask_fee >= Decimal::ZERO
+            {
+                last_ask_fee_rate = Some(rules.ask_fee);
+            }
             match side.as_str() {
                 "BID" => {
                     if quantity == Decimal::ZERO {
                         opened = Some(at);
+                        episode_fill_count = 0;
+                        episode_buy_fill_count = 0;
+                        episode_sell_fill_count = 0;
                     }
                     quantity = quantity.checked_add(volume).ok_or_else(|| {
                         LabError::DataCorrupt("fill position quantity overflow".into())
                     })?;
+                    cost_basis = cost_basis.checked_add(funds).ok_or_else(|| {
+                        LabError::DataCorrupt("fill position cost basis overflow".into())
+                    })?;
+                    allocated_entry_fee =
+                        allocated_entry_fee.checked_add(fill_fee).ok_or_else(|| {
+                            LabError::DataCorrupt("fill position entry fee overflow".into())
+                        })?;
+                    episode_fill_count = episode_fill_count.saturating_add(1);
+                    episode_buy_fill_count = episode_buy_fill_count.saturating_add(1);
+                    last_fill = Some((crate::contracts::Side::Buy, price, volume, at));
                 }
                 "ASK" => {
                     if volume > quantity {
@@ -2423,9 +2575,44 @@ impl Store {
                             "account fill ledger sells more than its owned position".into(),
                         ));
                     }
-                    quantity -= volume;
-                    if quantity == Decimal::ZERO {
+                    let removed_basis = if volume == quantity {
+                        cost_basis
+                    } else {
+                        cost_basis
+                            .checked_mul(volume)
+                            .ok_or_else(|| LabError::DataCorrupt("removed basis overflow".into()))?
+                            / quantity
+                    };
+                    let realized_pnl = funds.checked_sub(removed_basis).ok_or_else(|| {
+                        LabError::DataCorrupt("realized price pnl overflow".into())
+                    })?;
+                    cumulative_realized_pnl = cumulative_realized_pnl
+                        .checked_add(realized_pnl)
+                        .ok_or_else(|| {
+                            LabError::DataCorrupt("cumulative realized pnl overflow".into())
+                        })?;
+                    let remaining = quantity - volume;
+                    if remaining == Decimal::ZERO {
+                        quantity = Decimal::ZERO;
+                        cost_basis = Decimal::ZERO;
+                        allocated_entry_fee = Decimal::ZERO;
                         opened = None;
+                        episode_fill_count = 0;
+                        episode_buy_fill_count = 0;
+                        episode_sell_fill_count = 0;
+                        last_fill = None;
+                    } else {
+                        cost_basis = cost_basis.checked_mul(remaining).ok_or_else(|| {
+                            LabError::DataCorrupt("fill cost basis scaling overflow".into())
+                        })? / quantity;
+                        allocated_entry_fee =
+                            allocated_entry_fee.checked_mul(remaining).ok_or_else(|| {
+                                LabError::DataCorrupt("fill entry fee scaling overflow".into())
+                            })? / quantity;
+                        quantity = remaining;
+                        episode_fill_count = episode_fill_count.saturating_add(1);
+                        episode_sell_fill_count = episode_sell_fill_count.saturating_add(1);
+                        last_fill = Some((crate::contracts::Side::Sell, price, volume, at));
                     }
                 }
                 other => return Err(LabError::DataCorrupt(format!("unknown fill side {other}"))),
@@ -2437,7 +2624,53 @@ impl Store {
                 market.code()
             )));
         }
-        Ok(opened)
+        let pending_order_count: u64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM automation_orders WHERE account_identity=?1 AND market=?2 \
+                 AND state NOT IN ('FILLED','CANCELLED','REJECTED')",
+                params![account_identity, market.code()],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(sql_error)
+            .and_then(from_sql_u64)?;
+        let execution = if quantity > Decimal::ZERO || pending_order_count > 0 {
+            Some(crate::strategy::ExecutionContextSnapshot {
+                episode_fill_count,
+                episode_buy_fill_count,
+                episode_sell_fill_count,
+                last_fill_price: last_fill
+                    .map(|(_, p, _, _)| crate::contracts::PriceKrw::new(p))
+                    .transpose()?,
+                last_fill_qty: last_fill
+                    .map(|(_, _, q, _)| AssetQuantity::new(q))
+                    .transpose()?,
+                last_fill_at: last_fill.map(|(_, _, _, t)| t),
+                last_fill_side: last_fill.map(|(s, _, _, _)| s),
+                has_pending_order: pending_order_count > 0,
+                pending_remaining_notional_krw: QuoteAmount::new(Decimal::ZERO)?,
+                pending_partially_filled: false,
+            })
+        } else {
+            None
+        };
+        let average_entry_price = if quantity > Decimal::ZERO && cost_basis > Decimal::ZERO {
+            Some(crate::contracts::PriceKrw::new(
+                (cost_basis / quantity).round_dp(8),
+            )?)
+        } else {
+            None
+        };
+        Ok(AccountMarketEpisodeFacts {
+            opened_at: opened,
+            average_entry_price_krw: average_entry_price,
+            price_basis_krw: cost_basis,
+            allocated_entry_fee_krw: allocated_entry_fee,
+            cumulative_realized_pnl_krw: cumulative_realized_pnl,
+            cumulative_fees_krw: cumulative_fees,
+            last_ask_fee_rate,
+            execution,
+        })
     }
 
     fn latest_account_market_mark(
@@ -9601,6 +9834,7 @@ mod tests {
                 max_asset_exposure_krw: QuoteAmount::new(Decimal::from(20_000))?,
                 max_daily_loss_krw: QuoteAmount::new(Decimal::from(2_000))?,
                 activation_loss_limit_krw: None,
+                hard_stop_loss_bps: None,
                 max_open_orders: 2,
                 max_orders_per_interval: 1,
                 max_balance_age_seconds: 60,
@@ -9677,6 +9911,7 @@ mod tests {
                 max_asset_exposure_krw: QuoteAmount::new(Decimal::from(20_000))?,
                 max_daily_loss_krw: QuoteAmount::new(Decimal::from(2_000))?,
                 activation_loss_limit_krw: None,
+                hard_stop_loss_bps: None,
                 max_open_orders: 2,
                 max_orders_per_interval: 1,
                 max_balance_age_seconds: 60,
@@ -9762,6 +9997,7 @@ mod tests {
                 max_asset_exposure_krw: QuoteAmount::new(Decimal::from(20_000))?,
                 max_daily_loss_krw: QuoteAmount::new(Decimal::from(2_000))?,
                 activation_loss_limit_krw: None,
+                hard_stop_loss_bps: None,
                 max_open_orders: 2,
                 max_orders_per_interval: 1,
                 max_balance_age_seconds: 60,
@@ -9864,6 +10100,7 @@ mod tests {
                 max_asset_exposure_krw: QuoteAmount::new(Decimal::from(20_000))?,
                 max_daily_loss_krw: QuoteAmount::new(Decimal::from(2_000))?,
                 activation_loss_limit_krw: None,
+                hard_stop_loss_bps: None,
                 max_open_orders: 2,
                 max_orders_per_interval: 1,
                 max_balance_age_seconds: 60,
@@ -10026,6 +10263,7 @@ mod tests {
                 max_asset_exposure_krw: QuoteAmount::new(Decimal::new(500_000, 0))?,
                 max_daily_loss_krw: QuoteAmount::new(Decimal::new(100_000, 0))?,
                 activation_loss_limit_krw: None,
+                hard_stop_loss_bps: None,
                 max_open_orders: 3,
                 max_orders_per_interval: 2,
                 max_balance_age_seconds: 60,
@@ -10204,6 +10442,7 @@ mod tests {
                 max_asset_exposure_krw: QuoteAmount::new(Decimal::from(20_000_000))?,
                 max_daily_loss_krw: QuoteAmount::new(Decimal::from(100_000))?,
                 activation_loss_limit_krw: None,
+                hard_stop_loss_bps: None,
                 max_open_orders: 5,
                 max_orders_per_interval: 1,
                 max_balance_age_seconds: 60,
@@ -10450,6 +10689,7 @@ mod tests {
                 max_asset_exposure_krw: QuoteAmount::new(Decimal::from(12_000))?,
                 max_daily_loss_krw: QuoteAmount::new(Decimal::from(1_000))?,
                 activation_loss_limit_krw: None,
+                hard_stop_loss_bps: None,
                 max_open_orders: 3,
                 max_orders_per_interval: 3,
                 max_balance_age_seconds: 60,
@@ -11273,6 +11513,7 @@ mod tests {
                 max_asset_exposure_krw: QuoteAmount::new(Decimal::from(500_000))?,
                 max_daily_loss_krw: QuoteAmount::new(Decimal::from(50_000))?,
                 activation_loss_limit_krw: None,
+                hard_stop_loss_bps: None,
                 max_open_orders: 3,
                 max_orders_per_interval: 2,
                 max_balance_age_seconds: 60,
@@ -11357,6 +11598,7 @@ mod tests {
                 max_asset_exposure_krw: QuoteAmount::new(Decimal::from(500_000))?,
                 max_daily_loss_krw: QuoteAmount::new(Decimal::from(50_000))?,
                 activation_loss_limit_krw: None,
+                hard_stop_loss_bps: None,
                 max_open_orders: 3,
                 max_orders_per_interval: 2,
                 max_balance_age_seconds: 60,
@@ -11410,6 +11652,7 @@ mod tests {
                 max_asset_exposure_krw: QuoteAmount::new(Decimal::from(500_000))?,
                 max_daily_loss_krw: QuoteAmount::new(Decimal::from(50_000))?,
                 activation_loss_limit_krw: None,
+                hard_stop_loss_bps: None,
                 max_open_orders: 3,
                 max_orders_per_interval: 2,
                 max_balance_age_seconds: 60,
@@ -11674,6 +11917,7 @@ mod tests {
             max_asset_exposure_krw: QuoteAmount::new(Decimal::from(500_000))?,
             max_daily_loss_krw: QuoteAmount::new(Decimal::from(50_000))?,
             activation_loss_limit_krw: None,
+            hard_stop_loss_bps: None,
             max_open_orders: 2,
             max_orders_per_interval: 1,
             max_balance_age_seconds: 60,
@@ -12076,6 +12320,7 @@ mod tests {
                 max_asset_exposure_krw: QuoteAmount::new(Decimal::from(500_000))?,
                 max_daily_loss_krw: QuoteAmount::new(Decimal::from(50_000))?,
                 activation_loss_limit_krw: None,
+                hard_stop_loss_bps: None,
                 max_open_orders: 2,
                 max_orders_per_interval: 1,
                 max_balance_age_seconds: 60,
@@ -12555,6 +12800,7 @@ mod tests {
                 max_asset_exposure_krw: QuoteAmount::new(Decimal::from(10_000_000))?,
                 max_daily_loss_krw: QuoteAmount::new(Decimal::from(500_000))?,
                 activation_loss_limit_krw: None,
+                hard_stop_loss_bps: None,
                 max_open_orders: 2,
                 max_orders_per_interval: 1,
                 max_balance_age_seconds: 60,

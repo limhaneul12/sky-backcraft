@@ -189,9 +189,15 @@ ON은 세션 시작·재개나 긴급 정지 해제가 아니다. OFF는 실거�
 운영 검증은 읽기만 하고, ON/OFF와 체결 검증은 명시된 격리 MOCK에서 수행한다.
 
 전략 시작 요청은 정확한 policy_ref(정책/리비전/digest), market, decision_interval,
-명시적 MOCK/LIVE mode와 risk 전체를 넣는다. 주문당·하루 주문액·최대 자산 노출·
+명시적 MOCK/LIVE mode와 risk 전체(`hard_stop_loss_bps` 선택적 포지션 하드 스톱 포함)를 넣는다. 주문당·하루 주문액·최대 자산 노출·
 손실 한도 및 주문 수·신선도 한도를 사용자 의도에 맞게 정하고, 숫자를 임의 추천하거나
 누락 기본값으로 채우지 않는다. get 응답의 동결 정책과 risk를 대조한다.
+세션 시작·재개·전송 ON 및 주문 제어는 단일 액션별 명시적 확인을 원칙으로 하며,
+"전부 승인"("yes to all") 같은 일괄 승인을 받지 않는다. 포지션 축소·청산(`ask`)과
+일시중단(`pause`)·정지(`stop`)·긴급정지(`EmergencyStop`)는 일일 손실 한도나 신규 진입
+횟수 제한으로 차단하지 않는다(Exit-Never-Blocked). `upbit_order_preview`에서 지정가
+매수(`limit` `bid`) 시 `volume` 대신 `stop_price`와 `max_loss_krw`를 지정하면 왕복
+수수료(5 bps × 2)·호가단위·최소 손절폭(15 bps)을 반영한 8자리 코인 수량을 결정론적으로 산출한다.
 
 권한이 있는 경우 `automation_session_write`의 start/pause/resume/stop과
 `trading_control`을 사용한다. 일시중단·정지는 신규 주문을 막으며 자동 매도나

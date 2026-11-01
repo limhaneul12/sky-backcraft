@@ -730,12 +730,7 @@ impl PaperMarketCheckpoint {
         }
         let warmup_slice = &contiguous[contiguous.len() - max_pre_start..];
         let evidence_evaluator = EvidenceEvaluator::new(evidence, self.plan.spec.pit_policy)?;
-        let cash = PositionView {
-            actual_qty: AssetQuantity::new(Decimal::ZERO)?,
-            actual_weight: Weight::new(Decimal::ZERO)?,
-            episode_opened_at: None,
-            held_decision_bars: None,
-        };
+        let cash = PositionView::cash()?;
         let mut source_frame =
             PreparedPaperSourceFrame::new(&self.evaluator, &self.market, source_bars);
         for bar in warmup_slice {
@@ -924,9 +919,13 @@ impl PaperMarketCheckpoint {
                 break;
             }
             let marked = self.engine_state.account.mark(bar.candle.close)?;
-            let position = self
-                .engine_state
-                .position_view(marked.actual_weight, bar.candle.close_time_utc)?;
+            let position = self.engine_state.position_view(
+                marked,
+                bar,
+                self.pending.as_ref(),
+                &self.plan,
+                bar.candle.close_time_utc,
+            )?;
             {
                 let _ = self.evaluator.observe_with_provider_coverage(
                     bar,
@@ -998,9 +997,13 @@ impl PaperMarketCheckpoint {
         }
         {
             let marked = self.engine_state.account.mark(previous.candle.close)?;
-            let position = self
-                .engine_state
-                .position_view(marked.actual_weight, previous.candle.close_time_utc)?;
+            let position = self.engine_state.position_view(
+                marked,
+                &previous,
+                self.pending.as_ref(),
+                &self.plan,
+                previous.candle.close_time_utc,
+            )?;
             let _ = self.evaluator.observe_with_provider_coverage(
                 &previous,
                 position,
@@ -1211,7 +1214,13 @@ impl PaperMarketCheckpoint {
                     self.feed_sources_until_prepared(source_frame, prev.candle.close_time_utc)?;
                 if source_ready {
                     let marked = self.engine_state.account.mark(prev.candle.close)?;
-                    let position = self.engine_state.position_view(marked.actual_weight, now)?;
+                    let position = self.engine_state.position_view(
+                        marked,
+                        &prev,
+                        self.pending.as_ref(),
+                        &self.plan,
+                        now,
+                    )?;
                     let evaluation = self.evaluator.observe_with_provider_coverage(
                         &prev,
                         position,
@@ -1252,11 +1261,18 @@ impl PaperMarketCheckpoint {
                         if self.pending.is_none() && target != position.actual_weight {
                             let tradable = self.plan.spec.rules_at(now)?.tradable_at(now);
                             let effective_at = add_millis(now, self.plan.spec.latency_ms)?;
+                            let order_signal_expiry = self.evaluator.order_signal_expiry(
+                                now,
+                                effective_at,
+                                self.plan.spec.decision_interval,
+                                self.plan.spec.execution_resolution,
+                                self.plan.spec.range.end(),
+                            )?;
                             let order_expiry = self.compute_order_expiry(
                                 target > position.actual_weight,
                                 now,
                                 effective_at,
-                                expiry,
+                                order_signal_expiry,
                             )?;
                             if tradable {
                                 let position_value = checked::mul(
@@ -1330,12 +1346,7 @@ impl PaperMarketCheckpoint {
         // Determine whether `bar` itself is still a pre-evaluation warmup bar or an eligible decision bar.
         let next_seen = self.evaluator.completed_bars_seen().saturating_add(1);
         let bar_evaluated = if next_seen < u64::from(self.warmup_required_bars) {
-            let cash = PositionView {
-                actual_qty: AssetQuantity::new(Decimal::ZERO)?,
-                actual_weight: Weight::new(Decimal::ZERO)?,
-                episode_opened_at: None,
-                held_decision_bars: None,
-            };
+            let cash = PositionView::cash()?;
             if self.feed_sources_until_prepared(source_frame, bar.candle.close_time_utc)? {
                 self.evaluator.observe_with_provider_coverage(
                     bar,
@@ -1758,20 +1769,17 @@ impl PaperMarketCheckpoint {
         if !is_buy || !matches!(self.plan.spec.execution, ExecutionPolicy::PassiveBuy { .. }) {
             return Ok(signal_expiry);
         }
+        let first_open = crate::policy_engine::first_eligible_execution_open(
+            decision_close,
+            effective_at,
+            self.plan.spec.execution_resolution,
+        )?;
         let duration = self.plan.spec.execution_resolution.duration();
-        let next_close = if effective_at <= decision_close {
-            decision_close
-                .0
-                .checked_add_signed(duration)
-                .map(UtcTimestamp)
-                .ok_or_else(|| LabError::InvalidConfig("passive expiry overflow".into()))?
-        } else {
-            decision_close
-                .0
-                .checked_add_signed(duration * 2)
-                .map(UtcTimestamp)
-                .ok_or_else(|| LabError::InvalidConfig("passive expiry overflow".into()))?
-        };
+        let next_close = first_open
+            .0
+            .checked_add_signed(duration)
+            .map(UtcTimestamp)
+            .ok_or_else(|| LabError::InvalidConfig("passive expiry overflow".into()))?;
         Ok(next_close.min(signal_expiry))
     }
 
@@ -5465,6 +5473,27 @@ mod tests {
                 b.class == DeleteBlockerClass::ProtectedReference && b.reference == expected_blocker
             }));
 
+            // Active (RUNNING) paper session must refuse direct deletion.
+            let active_paper_preview = store.delete_preview(
+                &DeleteResource::PaperSession {
+                    session_id: created.session.session_id.clone(),
+                },
+                start_now,
+            )?;
+            assert!(active_paper_preview.blockers.iter().any(|b| {
+                b.class == DeleteBlockerClass::ActiveJob && b.reference == expected_blocker
+            }));
+            assert!(matches!(
+                store.execute_hard_delete(
+                    &crate::contracts::HardDeleteRequest {
+                        preview: active_paper_preview,
+                        cascade: true,
+                    },
+                    start_now,
+                ),
+                Err(LabError::Conflict(_))
+            ));
+
             let session_id = created.session.session_id.clone();
             let btc = MarketId::parse_upbit("KRW-BTC")?;
 
@@ -5562,6 +5591,39 @@ mod tests {
                     .items
                     .iter()
                     .any(|ev| ev.kind == PaperEventKind::Stop)
+            );
+
+            // Stopped paper session can now be previewed and hard-deleted cleanly, unblocking policy deletion.
+            let stopped_paper_preview = store.delete_preview(
+                &DeleteResource::PaperSession {
+                    session_id: session_id.clone(),
+                },
+                halt_now,
+            )?;
+            assert!(stopped_paper_preview.blockers.is_empty());
+            let deleted_paper = store.execute_hard_delete(
+                &crate::contracts::HardDeleteRequest {
+                    preview: stopped_paper_preview,
+                    cascade: false,
+                },
+                halt_now,
+            )?;
+            assert!(deleted_paper.deleted_db_rows >= 4);
+            assert!(matches!(
+                store.paper_get_session(&session_id, halt_now),
+                Err(LabError::InvalidConfig(_))
+            ));
+            let unblocked_policy_preview = store.delete_preview(
+                &DeleteResource::Policy {
+                    policy_id: s1_option.reference.policy_id.clone(),
+                },
+                halt_now,
+            )?;
+            assert!(
+                !unblocked_policy_preview
+                    .blockers
+                    .iter()
+                    .any(|b| b.reference == expected_blocker)
             );
 
             Ok::<(), LabError>(())

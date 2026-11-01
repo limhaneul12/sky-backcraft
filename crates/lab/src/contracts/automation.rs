@@ -567,6 +567,8 @@ pub struct AutomationRiskPolicy {
     pub max_daily_loss_krw: QuoteAmount,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activation_loss_limit_krw: Option<QuoteAmount>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_stop_loss_bps: Option<u32>,
     pub max_open_orders: u32,
     pub max_orders_per_interval: u32,
     pub max_balance_age_seconds: u32,
@@ -590,6 +592,9 @@ impl AutomationRiskPolicy {
             || self
                 .activation_loss_limit_krw
                 .is_some_and(|value| value.get() <= rust_decimal::Decimal::ZERO)
+            || self
+                .hard_stop_loss_bps
+                .is_some_and(|bps| !(1..=10_000).contains(&bps))
             || self.max_order_notional_krw > self.max_daily_notional_krw
             || self.max_open_orders == 0
             || self.max_open_orders > 100

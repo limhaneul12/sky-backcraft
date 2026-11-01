@@ -1159,6 +1159,7 @@ impl<'a> Verifier<'a> {
                     trace,
                     previous_state,
                     requires_evidence,
+                    None,
                 );
             }
             (Some(_), PolicyProgram::Rules { program }, Some(trace)) => {
@@ -1189,6 +1190,7 @@ impl<'a> Verifier<'a> {
                     trace,
                     previous_state,
                     requires_evidence,
+                    Some(&program.states),
                 );
             }
             _ => self.finding(format!(
@@ -1205,6 +1207,7 @@ impl<'a> Verifier<'a> {
         trace: &crate::contracts::PolicyTrace,
         previous_state: Option<&[crate::contracts::NamedPolicyValue]>,
         requires_evidence: bool,
+        rules_states: Option<&[crate::contracts::PolicyState]>,
     ) {
         let artificial_terminal = signal
             .reasons
@@ -1214,7 +1217,11 @@ impl<'a> Verifier<'a> {
         } else {
             &trace.state_before
         };
-        if previous_state.is_some_and(|previous| !same_named_values(previous, continuity_target)) {
+        let state_continuous = previous_state.is_none_or(|previous| match rules_states {
+            Some(states) => same_rules_state_values(previous, continuity_target, states),
+            None => same_named_values(previous, continuity_target),
+        });
+        if !state_continuous {
             self.finding(format!(
                 "{} signal {} policy state is not continuous",
                 model.model_id, signal.signal_id
@@ -2251,6 +2258,31 @@ fn same_named_values(
             .iter()
             .zip(right)
             .all(|(left, right)| left.id == right.id && left.value == right.value)
+}
+
+#[allow(
+    clippy::float_cmp,
+    reason = "state continuity requires byte-stable deterministic replay values or exact episode reset to initial"
+)]
+fn same_rules_state_values(
+    left: &[crate::contracts::NamedPolicyValue],
+    right: &[crate::contracts::NamedPolicyValue],
+    states: &[crate::contracts::PolicyState],
+) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            if left.id != right.id {
+                return false;
+            }
+            if left.value == right.value {
+                return true;
+            }
+            states.iter().any(|slot| {
+                slot.id == right.id
+                    && slot.scope == crate::contracts::PolicyStateScope::Episode
+                    && right.value == slot.initial
+            })
+        })
 }
 
 enum LedgerEvent<'a> {

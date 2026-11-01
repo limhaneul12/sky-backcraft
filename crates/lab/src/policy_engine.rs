@@ -9,13 +9,13 @@ use crate::contracts::policy::{
     PolicyConditionRoleDeclaration, PolicyConditionScope, PolicyConditionTrace, PolicyDefinition,
     PolicyEvidenceTrace, PolicyIndicator, PolicyIndicatorKind, PolicyIndicatorSourceTrace,
     PolicyOperandPair, PolicyProgram, PolicySourceCaptureOrigin, PolicySourceObservationRef,
-    PolicyTarget, PolicyTrace, RulesProgram,
+    PolicyStateScope, PolicyTarget, PolicyTrace, RulesProgram,
 };
 use crate::contracts::{
     AdmissionStatus, CandleInterval, CandleObservation, CausalExecutionPolicy, ContentHash,
     DatasetSnapshot, FrozenPolicyRevision, IndicatorSnapshot, LabError, MarketId, ObservationId,
     PositionState, ReasonCode, ResolvedPlan, StrategyBinding, UtcRange, UtcTimestamp,
-    VerifiedProviderCoverage, Weight, strategy_binding, validate_frozen_policy,
+    VerifiedProviderCoverage, Weight, checked, strategy_binding, validate_frozen_policy,
 };
 use crate::evidence::EvidenceEvaluator;
 use crate::strategy::indicators::{
@@ -25,6 +25,7 @@ use crate::strategy::indicators::{
 use crate::strategy::{
     PositionView, StrategyEvaluation, StrategyEvaluator, annualize, decimal_f64,
 };
+use chrono::Timelike;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -145,6 +146,10 @@ impl PolicyEvaluator {
         })
     }
 
+    #[allow(
+        clippy::large_types_passed_by_value,
+        reason = "PositionView is stack-only Copy to avoid per-bar heap allocations"
+    )]
     pub(crate) fn observe(
         &mut self,
         observation: &CandleObservation,
@@ -164,6 +169,10 @@ impl PolicyEvaluator {
     ///
     /// # Errors
     /// Preserves all dense-observation validation and fails closed outside exact coverage.
+    #[allow(
+        clippy::large_types_passed_by_value,
+        reason = "PositionView is stack-only Copy to avoid per-bar heap allocations"
+    )]
     pub(crate) fn observe_with_provider_coverage(
         &mut self,
         observation: &CandleObservation,
@@ -317,6 +326,65 @@ impl PolicyEvaluator {
             })?;
         Ok(expiry.min(range_end))
     }
+
+    /// Order-level signal expiry anchored at the first execution-bar open eligible at or
+    /// after `effective_at` (`decision_time + latency_ms`), clamped to `range_end` while
+    /// preserving `order.effective_at <= order.expires_at` when `effective_at <= range_end`.
+    ///
+    /// When `latency_ms == 0` (`effective_at == decision_time`), `first_open == decision_time`
+    /// and this returns the exact same timestamp as [`Self::signal_expiry`].
+    pub(crate) fn order_signal_expiry(
+        &self,
+        decision_time: UtcTimestamp,
+        effective_at: UtcTimestamp,
+        decision_interval: CandleInterval,
+        execution_resolution: CandleInterval,
+        range_end: UtcTimestamp,
+    ) -> Result<UtcTimestamp, LabError> {
+        let first_open =
+            first_eligible_execution_open(decision_time, effective_at, execution_resolution)?;
+        if matches!(self.inner, CompiledPolicy::Builtin(_)) {
+            return Ok(range_end);
+        }
+        let clamped_open = first_open.min(range_end);
+        let raw_expiry = self.signal_expiry(clamped_open, decision_interval, range_end)?;
+        Ok(raw_expiry.max(effective_at.min(range_end)).min(range_end))
+    }
+}
+
+/// First execution-bar open time `t_open` on the `execution_resolution` grid at or after
+/// `decision_time` that satisfies `t_open >= effective_at`.
+///
+/// When `latency_ms == 0` (`effective_at <= decision_time`), `t_open == decision_time`.
+/// When `latency_ms > 0` (`effective_at > decision_time`), `t_open` advances by
+/// `ceil((effective_at - decision_time) / execution_resolution) * execution_resolution`.
+pub(crate) fn first_eligible_execution_open(
+    decision_time: UtcTimestamp,
+    effective_at: UtcTimestamp,
+    execution_resolution: CandleInterval,
+) -> Result<UtcTimestamp, LabError> {
+    let res_ms = execution_resolution.duration().num_milliseconds();
+    if res_ms <= 0 {
+        return Err(LabError::InvalidConfig(
+            "execution resolution must have positive duration".into(),
+        ));
+    }
+    if effective_at <= decision_time {
+        return Ok(decision_time);
+    }
+    let delta_ms = (effective_at.0 - decision_time.0).num_milliseconds().max(1);
+    let bars_to_advance = delta_ms
+        .checked_add(res_ms - 1)
+        .ok_or_else(|| LabError::InvalidConfig("execution latency alignment overflow".into()))?
+        / res_ms;
+    let advance_ms = bars_to_advance
+        .checked_mul(res_ms)
+        .ok_or_else(|| LabError::InvalidConfig("execution latency alignment overflow".into()))?;
+    decision_time
+        .0
+        .checked_add_signed(chrono::Duration::milliseconds(advance_ms))
+        .map(UtcTimestamp)
+        .ok_or_else(|| LabError::InvalidConfig("first eligible execution open overflow".into()))
 }
 
 /// Bounded incremental cross-interval feed: per-interval cursors over the
@@ -884,6 +952,10 @@ fn validate_interval_bars(
     Ok(())
 }
 
+#[allow(
+    clippy::large_types_passed_by_value,
+    reason = "PositionView is stack-only Copy to avoid per-bar heap allocations"
+)]
 fn rule_strategy_evaluation(
     policy_ref: Option<crate::contracts::PolicyRevisionRef>,
     evaluation: RuleEvaluation,
@@ -992,6 +1064,10 @@ pub(crate) struct RulesEvaluator {
     last_cash_close: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     episode_prices: Option<EpisodePriceState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    episode_accounting: Option<EpisodeAccountingState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_episode_opened_at: Option<UtcTimestamp>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -999,6 +1075,144 @@ struct EpisodePriceState {
     opened_at: Option<UtcTimestamp>,
     entry_close: f64,
     peak_close: f64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct EpisodeAccountingState {
+    opened_at: Option<UtcTimestamp>,
+    peak_close: f64,
+    trough_close: f64,
+    peak_cost_return_bps: f64,
+    peak_liquidation_net_pnl_krw: f64,
+    peak_liquidation_return_bps: f64,
+    last_qty: Decimal,
+    last_avg_entry_price: f64,
+}
+
+impl EpisodeAccountingState {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "watermark progression requires prior state, position identity/qty, and current bar accounting metrics"
+    )]
+    fn advance(
+        prior: Option<Self>,
+        opened_at: Option<UtcTimestamp>,
+        actual_qty: Decimal,
+        close: f64,
+        avg_entry_price: f64,
+        total_cost_basis_krw: f64,
+        cost_return_bps: f64,
+        liquidation_net_pnl_krw: f64,
+        liquidation_net_return_bps: f64,
+    ) -> Result<Self, LabError> {
+        let (
+            peak_close,
+            trough_close,
+            peak_cost_return_bps,
+            peak_liquidation_net_pnl_krw,
+            peak_liquidation_return_bps,
+        ) = match prior {
+            Some(existing)
+                if existing.opened_at == opened_at
+                    && existing.peak_close > 0.0
+                    && existing.trough_close > 0.0 =>
+            {
+                let peak_close = existing.peak_close.max(close);
+                let trough_close = existing.trough_close.min(close);
+                let recomputed_peak_cost_ret =
+                    ((peak_close - avg_entry_price) / avg_entry_price) * 10_000.0;
+                let peak_cost_ret =
+                    if (existing.last_avg_entry_price - avg_entry_price).abs() <= 1e-9 {
+                        existing.peak_cost_return_bps.max(cost_return_bps)
+                    } else {
+                        recomputed_peak_cost_ret.max(cost_return_bps)
+                    };
+                let scaled_prior_peak_liq_pnl =
+                    if existing.last_qty > Decimal::ZERO && actual_qty < existing.last_qty {
+                        let ratio = decimal_f64(
+                            checked::div(
+                                actual_qty,
+                                existing.last_qty,
+                                "partial sell watermark scale ratio",
+                            )?,
+                            "partial sell watermark scale ratio",
+                        )?;
+                        existing.peak_liquidation_net_pnl_krw * ratio
+                    } else {
+                        existing.peak_liquidation_net_pnl_krw
+                    };
+                let peak_liq_pnl = scaled_prior_peak_liq_pnl.max(liquidation_net_pnl_krw);
+                let peak_liq_ret = ((peak_liq_pnl / total_cost_basis_krw) * 10_000.0)
+                    .max(liquidation_net_return_bps);
+                (
+                    peak_close,
+                    trough_close,
+                    peak_cost_ret,
+                    peak_liq_pnl,
+                    peak_liq_ret,
+                )
+            }
+            _ => (
+                close,
+                close,
+                cost_return_bps,
+                liquidation_net_pnl_krw,
+                liquidation_net_return_bps,
+            ),
+        };
+        finite(peak_close, "policy episode peak close")?;
+        finite(trough_close, "policy episode trough close")?;
+        finite(peak_cost_return_bps, "policy peak cost return bps")?;
+        finite(
+            peak_liquidation_net_pnl_krw,
+            "policy peak liquidation net pnl krw",
+        )?;
+        finite(
+            peak_liquidation_return_bps,
+            "policy peak liquidation return bps",
+        )?;
+        Ok(Self {
+            opened_at,
+            peak_close,
+            trough_close,
+            peak_cost_return_bps,
+            peak_liquidation_net_pnl_krw,
+            peak_liquidation_return_bps,
+            last_qty: actual_qty,
+            last_avg_entry_price: avg_entry_price,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct EvalAccountingValues {
+    avg_entry_price: f64,
+    avg_cost_price: f64,
+    cost_basis_krw: f64,
+    allocated_entry_fee_krw: f64,
+    total_cost_basis_krw: f64,
+    cost_return_bps: f64,
+    gross_unrealized_pnl_krw: f64,
+    net_unrealized_pnl_krw: f64,
+    net_unrealized_return_bps: f64,
+    liquidation_net_pnl_krw: f64,
+    liquidation_net_return_bps: f64,
+    round_trip_cost_krw: f64,
+    round_trip_cost_bps: f64,
+    episode_peak_close: f64,
+    episode_trough_close: f64,
+    peak_cost_return_bps: f64,
+    cost_trailing_drawdown_bps: f64,
+    peak_liquidation_net_pnl_krw: f64,
+    peak_liquidation_return_bps: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct EvalExecutionValues {
+    episode_fill_count: f64,
+    last_fill_price: f64,
+    seconds_since_last_fill: f64,
+    move_since_last_fill_bps: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1108,9 +1322,19 @@ struct EvalContext<'a> {
     state: &'a BTreeMap<String, f64>,
     actual_state: PositionState,
     actual_weight: f64,
+    actual_qty: f64,
     held_bars: f64,
+    held_seconds: f64,
+    entry_price: f64,
     unrealized_return_bps: f64,
     trailing_drawdown_bps: f64,
+    bar_range_bps: f64,
+    bar_body_bps: f64,
+    close_location: f64,
+    execution: Option<EvalExecutionValues>,
+    accounting: Option<EvalAccountingValues>,
+    utc_hour: f64,
+    utc_minute: f64,
     evidence_multiplier: f64,
     evidence_coverage: f64,
     crosses: &'a BTreeMap<String, CrossSample>,
@@ -1206,6 +1430,8 @@ impl RulesEvaluator {
             source_provenance,
             last_cash_close: None,
             episode_prices: None,
+            episode_accounting: None,
+            last_episode_opened_at: None,
         })
     }
 
@@ -1374,6 +1600,10 @@ impl RulesEvaluator {
     /// contract.
     /// # Errors
     /// Propagates observation validation failures.
+    #[allow(
+        clippy::large_types_passed_by_value,
+        reason = "PositionView is stack-only Copy to avoid per-bar heap allocations"
+    )]
     pub(crate) fn observe(
         &mut self,
         observation: &CandleObservation,
@@ -1393,6 +1623,10 @@ impl RulesEvaluator {
     ///
     /// # Errors
     /// Rejects uncovered or malformed observations and invalid policy state.
+    #[allow(
+        clippy::large_types_passed_by_value,
+        reason = "PositionView is stack-only Copy to avoid per-bar heap allocations"
+    )]
     pub(crate) fn observe_with_provider_coverage(
         &mut self,
         observation: &CandleObservation,
@@ -1411,18 +1645,29 @@ impl RulesEvaluator {
                 self.last_cash_close =
                     Some(decimal_f64(observation.candle.close.get(), "policy close")?);
                 self.episode_prices = None;
+                self.episode_accounting = None;
+                self.last_episode_opened_at = None;
+                for slot in &self.program.states {
+                    if slot.scope == PolicyStateScope::Episode {
+                        self.state.insert(slot.id.clone(), slot.initial);
+                    }
+                }
             }
             return Ok(None);
         }
         self.evaluate_ready_observation(observation, position, evidence, &values)
     }
 
+    #[allow(
+        clippy::large_types_passed_by_value,
+        reason = "PositionView is stack-only Copy to avoid per-bar heap allocations"
+    )]
     fn update_position_prices(
         &mut self,
         observation: &CandleObservation,
         position: PositionView,
         actual_state: PositionState,
-    ) -> Result<(f64, f64), LabError> {
+    ) -> Result<(f64, f64, f64), LabError> {
         let close = decimal_f64(observation.candle.close.get(), "policy close")?;
         if close <= 0.0 {
             return Err(LabError::DataCorrupt(
@@ -1433,7 +1678,7 @@ impl RulesEvaluator {
             PositionState::Cash => {
                 self.last_cash_close = Some(close);
                 self.episode_prices = None;
-                Ok((0.0, 0.0))
+                Ok((0.0, 0.0, 0.0))
             }
             PositionState::Long => {
                 let (entry_close, peak_close) = match self.episode_prices {
@@ -1457,11 +1702,136 @@ impl RulesEvaluator {
                 let unrealized_return_bps = ((close - entry_close) / entry_close) * 10_000.0;
                 let trailing_drawdown_bps =
                     (((peak_close - close) / peak_close) * 10_000.0).max(0.0);
+                finite(entry_close, "policy entry price")?;
                 finite(unrealized_return_bps, "policy unrealized return bps")?;
                 finite(trailing_drawdown_bps, "policy trailing drawdown bps")?;
-                Ok((unrealized_return_bps, trailing_drawdown_bps))
+                Ok((entry_close, unrealized_return_bps, trailing_drawdown_bps))
             }
         }
+    }
+
+    #[allow(
+        clippy::large_types_passed_by_value,
+        reason = "PositionView is stack-only Copy to avoid per-bar heap allocations"
+    )]
+    fn update_episode_accounting(
+        &mut self,
+        observation: &CandleObservation,
+        position: PositionView,
+        actual_state: PositionState,
+    ) -> Result<Option<EvalAccountingValues>, LabError> {
+        if !self.program.uses_accounting_operands() || actual_state == PositionState::Cash {
+            self.episode_accounting = None;
+            return Ok(None);
+        }
+        let Some(acc) = position.accounting else {
+            return Err(LabError::InvalidConfig(
+                "policy references position accounting operands while Long, but PositionAccountingSnapshot is absent"
+                    .into(),
+            ));
+        };
+        let close = decimal_f64(observation.candle.close.get(), "policy close")?;
+        let avg_entry_price = decimal_f64(acc.avg_entry_price_krw.get(), "policy avg entry price")?;
+        let avg_cost_price = decimal_f64(acc.avg_cost_price_krw.get(), "policy avg cost price")?;
+        let cost_basis_krw = decimal_f64(acc.price_basis_krw.get(), "policy cost basis krw")?;
+        let allocated_entry_fee_krw = nonnegative_decimal_f64(
+            acc.allocated_entry_fee_krw.get(),
+            "policy allocated entry fee krw",
+        )?;
+        let total_cost_basis_krw = decimal_f64(
+            acc.total_cost_basis_krw.get(),
+            "policy total cost basis krw",
+        )?;
+        let gross_unrealized_pnl_krw = signed_decimal_f64(
+            acc.gross_unrealized_pnl_krw.get(),
+            "policy gross unrealized pnl krw",
+        )?;
+        let net_unrealized_pnl_krw = signed_decimal_f64(
+            acc.net_unrealized_pnl_krw.get(),
+            "policy net unrealized pnl krw",
+        )?;
+        let liquidation_net_pnl_krw = signed_decimal_f64(
+            acc.estimated_liquidation_net_pnl_krw.get(),
+            "policy liquidation net pnl krw",
+        )?;
+        let round_trip_cost_krw = Self::round_trip_cost_krw(&acc)?;
+        let cost_return_bps = ((close - avg_entry_price) / avg_entry_price) * 10_000.0;
+        let net_unrealized_return_bps = (net_unrealized_pnl_krw / total_cost_basis_krw) * 10_000.0;
+        let liquidation_net_return_bps =
+            (liquidation_net_pnl_krw / total_cost_basis_krw) * 10_000.0;
+        let round_trip_cost_bps = (round_trip_cost_krw / total_cost_basis_krw) * 10_000.0;
+        finite(cost_return_bps, "policy cost return bps")?;
+        finite(
+            net_unrealized_return_bps,
+            "policy net unrealized return bps",
+        )?;
+        finite(
+            liquidation_net_return_bps,
+            "policy liquidation net return bps",
+        )?;
+        finite(round_trip_cost_bps, "policy round trip cost bps")?;
+
+        let next_state = EpisodeAccountingState::advance(
+            self.episode_accounting,
+            position.episode_opened_at,
+            position.actual_qty.get(),
+            close,
+            avg_entry_price,
+            total_cost_basis_krw,
+            cost_return_bps,
+            liquidation_net_pnl_krw,
+            liquidation_net_return_bps,
+        )?;
+        let cost_trailing_drawdown_bps =
+            (next_state.peak_cost_return_bps - cost_return_bps).max(0.0);
+        finite(
+            cost_trailing_drawdown_bps,
+            "policy cost trailing drawdown bps",
+        )?;
+        self.episode_accounting = Some(next_state);
+
+        Ok(Some(EvalAccountingValues {
+            avg_entry_price,
+            avg_cost_price,
+            cost_basis_krw,
+            allocated_entry_fee_krw,
+            total_cost_basis_krw,
+            cost_return_bps,
+            gross_unrealized_pnl_krw,
+            net_unrealized_pnl_krw,
+            net_unrealized_return_bps,
+            liquidation_net_pnl_krw,
+            liquidation_net_return_bps,
+            round_trip_cost_krw,
+            round_trip_cost_bps,
+            episode_peak_close: next_state.peak_close,
+            episode_trough_close: next_state.trough_close,
+            peak_cost_return_bps: next_state.peak_cost_return_bps,
+            cost_trailing_drawdown_bps,
+            peak_liquidation_net_pnl_krw: next_state.peak_liquidation_net_pnl_krw,
+            peak_liquidation_return_bps: next_state.peak_liquidation_return_bps,
+        }))
+    }
+
+    fn round_trip_cost_krw(
+        acc: &crate::strategy::PositionAccountingSnapshot,
+    ) -> Result<f64, LabError> {
+        let round_trip_fees_dec = checked::add(
+            acc.allocated_entry_fee_krw.get(),
+            acc.estimated_exit_fee_krw.get(),
+            "round trip fees",
+        )?;
+        let round_trip_embedded_dec = checked::add(
+            acc.allocated_entry_embedded_cost_krw.get(),
+            acc.estimated_exit_embedded_cost_krw.get(),
+            "round trip embedded cost",
+        )?;
+        let round_trip_cost_dec = checked::add(
+            round_trip_fees_dec,
+            round_trip_embedded_dec,
+            "round trip total cost",
+        )?;
+        nonnegative_decimal_f64(round_trip_cost_dec, "policy round trip cost krw")
     }
 
     fn update_decision_indicators(
@@ -1502,6 +1872,85 @@ impl RulesEvaluator {
         Ok(values)
     }
 
+    #[allow(
+        clippy::large_types_passed_by_value,
+        reason = "PositionView is stack-only Copy to avoid per-bar heap allocations"
+    )]
+    fn update_episode_execution(
+        &self,
+        observation: &CandleObservation,
+        position: PositionView,
+        actual_state: PositionState,
+        close_price: f64,
+    ) -> Result<Option<EvalExecutionValues>, LabError> {
+        if !self.program.uses_execution_operands() {
+            return Ok(None);
+        }
+        match (actual_state, position.execution) {
+            (PositionState::Cash, _) => Ok(None),
+            (PositionState::Long, None) => Err(LabError::InvalidConfig(
+                "policy references position execution operands while Long, but ExecutionContextSnapshot is absent"
+                    .into(),
+            )),
+            (PositionState::Long, Some(exec)) => {
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "episode fill count fits exact f64 up to 2^53 fills"
+                )]
+                let episode_fill_count = exec.episode_fill_count as f64;
+                finite(episode_fill_count, "policy episode fill count")?;
+                let (last_fill_price, move_since_last_fill_bps) = match exec.last_fill_price {
+                    Some(price) => {
+                        let lfp = decimal_f64(price.get(), "policy last fill price")?;
+                        if lfp <= 0.0 {
+                            return Err(LabError::DataCorrupt(
+                                "policy last fill price must be positive".into(),
+                            ));
+                        }
+                        let move_bps = ((close_price - lfp) / lfp) * 10_000.0;
+                        finite(move_bps, "policy move since last fill bps")?;
+                        (lfp, move_bps)
+                    }
+                    None => (0.0, 0.0),
+                };
+                let seconds_since_last_fill = match exec.last_fill_at {
+                    Some(at) => {
+                        if at > observation.candle.close_time_utc {
+                            return Err(LabError::DataCorrupt(
+                                "policy last fill timestamp cannot be after observation close"
+                                    .into(),
+                            ));
+                        }
+                        let secs = observation
+                            .candle
+                            .close_time_utc
+                            .0
+                            .signed_duration_since(at.0)
+                            .num_seconds();
+                        #[expect(
+                            clippy::cast_precision_loss,
+                            reason = "seconds since last fill fits exact f64 up to 2^53 seconds"
+                        )]
+                        let val = secs as f64;
+                        finite(val, "policy seconds since last fill")?;
+                        val
+                    }
+                    None => 0.0,
+                };
+                Ok(Some(EvalExecutionValues {
+                    episode_fill_count,
+                    last_fill_price,
+                    seconds_since_last_fill,
+                    move_since_last_fill_bps,
+                }))
+            }
+        }
+    }
+
+    #[allow(
+        clippy::large_types_passed_by_value,
+        reason = "PositionView is stack-only Copy to avoid per-bar heap allocations"
+    )]
     fn evaluate_ready_observation(
         &mut self,
         observation: &CandleObservation,
@@ -1512,14 +1961,29 @@ impl RulesEvaluator {
         let (multiplier, coverage, evidence_trace) =
             self.evidence_values(observation.candle.close_time_utc, evidence)?;
         let actual_state = position.state(observation.candle.close_time_utc)?;
-        let (unrealized_return_bps, trailing_drawdown_bps) =
+        let (entry_price, unrealized_return_bps, trailing_drawdown_bps) =
             self.update_position_prices(observation, position, actual_state)?;
+        let accounting = self.update_episode_accounting(observation, position, actual_state)?;
+        let prices = CandlePrices::from_observation(observation)?;
+        let (bar_range_bps, bar_body_bps, close_location) = prices.microstructure_metrics()?;
+        let execution =
+            self.update_episode_execution(observation, position, actual_state, prices.close)?;
         let actual_weight =
             nonnegative_decimal_f64(position.actual_weight.get(), "policy actual weight")?;
+        let actual_qty = nonnegative_decimal_f64(position.actual_qty.get(), "policy actual qty")?;
         let held_bars = u32::try_from(position.held_decision_bars.unwrap_or(0))
             .map(f64::from)
             .map_err(|_| LabError::ResourceLimit("policy held bars exceed u32".into()))?;
         finite(held_bars, "policy held bars")?;
+        let held_seconds = Self::held_seconds(
+            actual_state,
+            position.episode_opened_at,
+            observation.candle.close_time_utc,
+        )?;
+        let utc_hour = f64::from(observation.candle.close_time_utc.0.hour());
+        let utc_minute = f64::from(observation.candle.close_time_utc.0.minute());
+
+        self.reset_episode_scoped_states(actual_state, position.episode_opened_at);
 
         let before = self.state.clone();
         let base = EvalContext {
@@ -1527,9 +1991,19 @@ impl RulesEvaluator {
             state: &before,
             actual_state,
             actual_weight,
+            actual_qty,
             held_bars,
+            held_seconds,
+            entry_price,
             unrealized_return_bps,
             trailing_drawdown_bps,
+            bar_range_bps,
+            bar_body_bps,
+            close_location,
+            execution,
+            accounting,
+            utc_hour,
+            utc_minute,
             evidence_multiplier: multiplier,
             evidence_coverage: coverage,
             crosses: &self.crosses,
@@ -1539,9 +2013,13 @@ impl RulesEvaluator {
             crosses: &next_crosses,
             ..base
         };
-        let (after, state_trace) = self.evaluate_next_state(&context)?;
+        let (after, working_state, state_trace) = self.evaluate_next_state(&context)?;
+        let rules_context = EvalContext {
+            state: &working_state,
+            ..context
+        };
         let (matched_rule_id, target_value, rule_trace) =
-            self.evaluate_rules_with_trace(&context)?;
+            self.evaluate_rules_with_trace(&rules_context)?;
         let condition_trace = state_trace
             .into_iter()
             .chain(rule_trace)
@@ -1576,10 +2054,73 @@ impl RulesEvaluator {
         }))
     }
 
+    fn held_seconds(
+        actual_state: PositionState,
+        episode_opened_at: Option<UtcTimestamp>,
+        close_time_utc: UtcTimestamp,
+    ) -> Result<f64, LabError> {
+        match (actual_state, episode_opened_at) {
+            (PositionState::Long, Some(opened_at)) => {
+                let secs = close_time_utc
+                    .0
+                    .signed_duration_since(opened_at.0)
+                    .num_seconds()
+                    .max(0);
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "holding duration in seconds fits exact f64 up to 2^53 seconds"
+                )]
+                let value = secs as f64;
+                finite(value, "policy held seconds")?;
+                Ok(value)
+            }
+            _ => Ok(0.0),
+        }
+    }
+
+    fn reset_episode_scoped_states(
+        &mut self,
+        actual_state: PositionState,
+        episode_opened_at: Option<UtcTimestamp>,
+    ) {
+        let has_episode_states = self
+            .program
+            .states
+            .iter()
+            .any(|slot| slot.scope == PolicyStateScope::Episode);
+        if has_episode_states {
+            if actual_state == PositionState::Cash
+                || self.last_episode_opened_at != episode_opened_at
+            {
+                for slot in &self.program.states {
+                    if slot.scope == PolicyStateScope::Episode {
+                        self.state.insert(slot.id.clone(), slot.initial);
+                    }
+                }
+            }
+            self.last_episode_opened_at = match actual_state {
+                PositionState::Cash => None,
+                PositionState::Long => episode_opened_at,
+            };
+        }
+    }
+
+    #[expect(
+        clippy::type_complexity,
+        reason = "returns (state_after, working_state_for_rules, condition_trace)"
+    )]
     fn evaluate_next_state(
         &self,
         context: &EvalContext<'_>,
-    ) -> Result<(BTreeMap<String, f64>, Vec<PolicyConditionTrace>), LabError> {
+    ) -> Result<
+        (
+            BTreeMap<String, f64>,
+            BTreeMap<String, f64>,
+            Vec<PolicyConditionTrace>,
+        ),
+        LabError,
+    > {
+        let mut working_state = context.state.clone();
         let mut after = BTreeMap::new();
         let mut condition_trace = Vec::new();
         for slot in &self.program.states {
@@ -1589,17 +2130,31 @@ impl RulesEvaluator {
                 },
                 &[],
             );
-            let value = eval_numeric(
+            let slot_context = EvalContext {
+                state: &working_state,
+                ..context.clone()
+            };
+            let raw_value = eval_numeric(
                 &slot.next,
-                context,
+                &slot_context,
                 &format!("state:{}:next", slot.id),
                 Some(&mut collector),
             )?;
-            finite(value, "policy next state")?;
+            finite(raw_value, "policy next state")?;
+            let value = if slot.scope == PolicyStateScope::Episode
+                && context.actual_state == PositionState::Cash
+            {
+                slot.initial
+            } else {
+                raw_value
+            };
+            if slot.scope == PolicyStateScope::Episode {
+                working_state.insert(slot.id.clone(), value);
+            }
             after.insert(slot.id.clone(), value);
             condition_trace.extend(collector.entries);
         }
-        Ok((after, condition_trace))
+        Ok((after, working_state, condition_trace))
     }
 
     fn evaluate_rules_with_trace(
@@ -1949,6 +2504,25 @@ impl CandlePrices {
             close: decimal_f64(candle.close.get(), "policy close")?,
         })
     }
+
+    fn microstructure_metrics(&self) -> Result<(f64, f64, f64), LabError> {
+        if self.open <= 0.0 || self.close <= 0.0 {
+            return Err(LabError::DataCorrupt(
+                "policy observation open and close must be positive".into(),
+            ));
+        }
+        let bar_range_bps = (((self.high - self.low) / self.close) * 10_000.0).max(0.0);
+        let bar_body_bps = ((self.close - self.open) / self.open) * 10_000.0;
+        let close_location = if self.high > self.low {
+            ((self.close - self.low) / (self.high - self.low)).clamp(0.0, 1.0)
+        } else {
+            0.5
+        };
+        finite(bar_range_bps, "policy bar range bps")?;
+        finite(bar_body_bps, "policy bar body bps")?;
+        finite(close_location, "policy close location")?;
+        Ok((bar_range_bps, bar_body_bps, close_location))
+    }
 }
 
 fn nonnegative_decimal_f64(value: Decimal, label: &str) -> Result<f64, LabError> {
@@ -1961,6 +2535,14 @@ fn nonnegative_decimal_f64(value: Decimal, label: &str) -> Result<f64, LabError>
             "{label} must be nonnegative"
         )));
     }
+    Ok(value)
+}
+
+fn signed_decimal_f64(value: Decimal, label: &str) -> Result<f64, LabError> {
+    let value = value.to_f64().ok_or_else(|| {
+        LabError::DataCorrupt(format!("{label} cannot be represented as finite f64"))
+    })?;
+    finite(value, label)?;
     Ok(value)
 }
 
@@ -2107,9 +2689,40 @@ impl<'a> ConditionTraceCollector<'a> {
             | NumericExpr::Indicator { .. }
             | NumericExpr::State { .. }
             | NumericExpr::ActualWeight
+            | NumericExpr::ActualQty
             | NumericExpr::HeldBars
+            | NumericExpr::HeldSeconds
+            | NumericExpr::EntryPrice
             | NumericExpr::UnrealizedReturnBps
             | NumericExpr::TrailingDrawdownBps
+            | NumericExpr::AvgEntryPrice
+            | NumericExpr::AvgCostPrice
+            | NumericExpr::CostBasisKrw
+            | NumericExpr::AllocatedEntryFeeKrw
+            | NumericExpr::TotalCostBasisKrw
+            | NumericExpr::CostReturnBps
+            | NumericExpr::GrossUnrealizedPnlKrw
+            | NumericExpr::NetUnrealizedPnlKrw
+            | NumericExpr::NetUnrealizedReturnBps
+            | NumericExpr::LiquidationNetPnlKrw
+            | NumericExpr::LiquidationNetReturnBps
+            | NumericExpr::RoundTripCostKrw
+            | NumericExpr::RoundTripCostBps
+            | NumericExpr::EpisodePeakClose
+            | NumericExpr::EpisodeTroughClose
+            | NumericExpr::PeakCostReturnBps
+            | NumericExpr::CostTrailingDrawdownBps
+            | NumericExpr::PeakLiquidationNetPnlKrw
+            | NumericExpr::PeakLiquidationReturnBps
+            | NumericExpr::BarRangeBps
+            | NumericExpr::BarBodyBps
+            | NumericExpr::CloseLocation
+            | NumericExpr::EpisodeFillCount
+            | NumericExpr::LastFillPrice
+            | NumericExpr::SecondsSinceLastFill
+            | NumericExpr::MoveSinceLastFillBps
+            | NumericExpr::UtcHour
+            | NumericExpr::UtcMinute
             | NumericExpr::EvidenceMultiplier
             | NumericExpr::EvidenceCoverage => {}
         }
@@ -2228,9 +2841,40 @@ impl<'a> ConditionTraceCollector<'a> {
             | NumericExpr::Indicator { .. }
             | NumericExpr::State { .. }
             | NumericExpr::ActualWeight
+            | NumericExpr::ActualQty
             | NumericExpr::HeldBars
+            | NumericExpr::HeldSeconds
+            | NumericExpr::EntryPrice
             | NumericExpr::UnrealizedReturnBps
             | NumericExpr::TrailingDrawdownBps
+            | NumericExpr::AvgEntryPrice
+            | NumericExpr::AvgCostPrice
+            | NumericExpr::CostBasisKrw
+            | NumericExpr::AllocatedEntryFeeKrw
+            | NumericExpr::TotalCostBasisKrw
+            | NumericExpr::CostReturnBps
+            | NumericExpr::GrossUnrealizedPnlKrw
+            | NumericExpr::NetUnrealizedPnlKrw
+            | NumericExpr::NetUnrealizedReturnBps
+            | NumericExpr::LiquidationNetPnlKrw
+            | NumericExpr::LiquidationNetReturnBps
+            | NumericExpr::RoundTripCostKrw
+            | NumericExpr::RoundTripCostBps
+            | NumericExpr::EpisodePeakClose
+            | NumericExpr::EpisodeTroughClose
+            | NumericExpr::PeakCostReturnBps
+            | NumericExpr::CostTrailingDrawdownBps
+            | NumericExpr::PeakLiquidationNetPnlKrw
+            | NumericExpr::PeakLiquidationReturnBps
+            | NumericExpr::BarRangeBps
+            | NumericExpr::BarBodyBps
+            | NumericExpr::CloseLocation
+            | NumericExpr::EpisodeFillCount
+            | NumericExpr::LastFillPrice
+            | NumericExpr::SecondsSinceLastFill
+            | NumericExpr::MoveSinceLastFillBps
+            | NumericExpr::UtcHour
+            | NumericExpr::UtcMinute
             | NumericExpr::EvidenceMultiplier
             | NumericExpr::EvidenceCoverage => false,
         }
@@ -2297,9 +2941,40 @@ fn eval_numeric(
             .get(id)
             .ok_or_else(|| LabError::InvalidConfig(format!("policy state is absent: {id}")))?,
         NumericExpr::ActualWeight => context.actual_weight,
+        NumericExpr::ActualQty => context.actual_qty,
         NumericExpr::HeldBars => context.held_bars,
+        NumericExpr::HeldSeconds => context.held_seconds,
+        NumericExpr::EntryPrice => context.entry_price,
         NumericExpr::UnrealizedReturnBps => context.unrealized_return_bps,
         NumericExpr::TrailingDrawdownBps => context.trailing_drawdown_bps,
+        NumericExpr::AvgEntryPrice
+        | NumericExpr::AvgCostPrice
+        | NumericExpr::CostBasisKrw
+        | NumericExpr::AllocatedEntryFeeKrw
+        | NumericExpr::TotalCostBasisKrw
+        | NumericExpr::CostReturnBps
+        | NumericExpr::GrossUnrealizedPnlKrw
+        | NumericExpr::NetUnrealizedPnlKrw
+        | NumericExpr::NetUnrealizedReturnBps
+        | NumericExpr::LiquidationNetPnlKrw
+        | NumericExpr::LiquidationNetReturnBps
+        | NumericExpr::RoundTripCostKrw
+        | NumericExpr::RoundTripCostBps
+        | NumericExpr::EpisodePeakClose
+        | NumericExpr::EpisodeTroughClose
+        | NumericExpr::PeakCostReturnBps
+        | NumericExpr::CostTrailingDrawdownBps
+        | NumericExpr::PeakLiquidationNetPnlKrw
+        | NumericExpr::PeakLiquidationReturnBps => eval_accounting_operand(expr, context, path)?,
+        NumericExpr::BarRangeBps => context.bar_range_bps,
+        NumericExpr::BarBodyBps => context.bar_body_bps,
+        NumericExpr::CloseLocation => context.close_location,
+        NumericExpr::EpisodeFillCount
+        | NumericExpr::LastFillPrice
+        | NumericExpr::SecondsSinceLastFill
+        | NumericExpr::MoveSinceLastFillBps => eval_execution_operand(expr, context, path)?,
+        NumericExpr::UtcHour => context.utc_hour,
+        NumericExpr::UtcMinute => context.utc_minute,
         NumericExpr::EvidenceMultiplier => context.evidence_multiplier,
         NumericExpr::EvidenceCoverage => context.evidence_coverage,
         NumericExpr::Add { .. }
@@ -2322,6 +2997,65 @@ fn eval_numeric(
     };
     finite(value, "policy numeric expression")?;
     Ok(value)
+}
+
+fn eval_accounting_operand(
+    expr: &NumericExpr,
+    context: &EvalContext<'_>,
+    path: &str,
+) -> Result<f64, LabError> {
+    if context.actual_state == PositionState::Cash {
+        return Ok(0.0);
+    }
+    let acc = context.accounting.ok_or_else(|| {
+        LabError::InvalidConfig(format!(
+            "policy accounting operand at {path} requires PositionAccountingSnapshot when Long"
+        ))
+    })?;
+    Ok(match expr {
+        NumericExpr::AvgEntryPrice => acc.avg_entry_price,
+        NumericExpr::AvgCostPrice => acc.avg_cost_price,
+        NumericExpr::CostBasisKrw => acc.cost_basis_krw,
+        NumericExpr::AllocatedEntryFeeKrw => acc.allocated_entry_fee_krw,
+        NumericExpr::TotalCostBasisKrw => acc.total_cost_basis_krw,
+        NumericExpr::CostReturnBps => acc.cost_return_bps,
+        NumericExpr::GrossUnrealizedPnlKrw => acc.gross_unrealized_pnl_krw,
+        NumericExpr::NetUnrealizedPnlKrw => acc.net_unrealized_pnl_krw,
+        NumericExpr::NetUnrealizedReturnBps => acc.net_unrealized_return_bps,
+        NumericExpr::LiquidationNetPnlKrw => acc.liquidation_net_pnl_krw,
+        NumericExpr::LiquidationNetReturnBps => acc.liquidation_net_return_bps,
+        NumericExpr::RoundTripCostKrw => acc.round_trip_cost_krw,
+        NumericExpr::RoundTripCostBps => acc.round_trip_cost_bps,
+        NumericExpr::EpisodePeakClose => acc.episode_peak_close,
+        NumericExpr::EpisodeTroughClose => acc.episode_trough_close,
+        NumericExpr::PeakCostReturnBps => acc.peak_cost_return_bps,
+        NumericExpr::CostTrailingDrawdownBps => acc.cost_trailing_drawdown_bps,
+        NumericExpr::PeakLiquidationNetPnlKrw => acc.peak_liquidation_net_pnl_krw,
+        NumericExpr::PeakLiquidationReturnBps => acc.peak_liquidation_return_bps,
+        _ => unreachable!("guarded by outer accounting operand match"),
+    })
+}
+
+fn eval_execution_operand(
+    expr: &NumericExpr,
+    context: &EvalContext<'_>,
+    path: &str,
+) -> Result<f64, LabError> {
+    if context.actual_state == PositionState::Cash {
+        return Ok(0.0);
+    }
+    let exec = context.execution.ok_or_else(|| {
+        LabError::InvalidConfig(format!(
+            "policy execution operand at {path} requires ExecutionContextSnapshot when Long"
+        ))
+    })?;
+    Ok(match expr {
+        NumericExpr::EpisodeFillCount => exec.episode_fill_count,
+        NumericExpr::LastFillPrice => exec.last_fill_price,
+        NumericExpr::SecondsSinceLastFill => exec.seconds_since_last_fill,
+        NumericExpr::MoveSinceLastFillBps => exec.move_since_last_fill_bps,
+        _ => unreachable!("guarded by outer execution operand match"),
+    })
 }
 
 fn eval_numeric_binary(
@@ -2766,9 +3500,40 @@ fn collect_crosses_numeric(
         | NumericExpr::Indicator { .. }
         | NumericExpr::State { .. }
         | NumericExpr::ActualWeight
+        | NumericExpr::ActualQty
         | NumericExpr::HeldBars
+        | NumericExpr::HeldSeconds
+        | NumericExpr::EntryPrice
         | NumericExpr::UnrealizedReturnBps
         | NumericExpr::TrailingDrawdownBps
+        | NumericExpr::AvgEntryPrice
+        | NumericExpr::AvgCostPrice
+        | NumericExpr::CostBasisKrw
+        | NumericExpr::AllocatedEntryFeeKrw
+        | NumericExpr::TotalCostBasisKrw
+        | NumericExpr::CostReturnBps
+        | NumericExpr::GrossUnrealizedPnlKrw
+        | NumericExpr::NetUnrealizedPnlKrw
+        | NumericExpr::NetUnrealizedReturnBps
+        | NumericExpr::LiquidationNetPnlKrw
+        | NumericExpr::LiquidationNetReturnBps
+        | NumericExpr::RoundTripCostKrw
+        | NumericExpr::RoundTripCostBps
+        | NumericExpr::EpisodePeakClose
+        | NumericExpr::EpisodeTroughClose
+        | NumericExpr::PeakCostReturnBps
+        | NumericExpr::CostTrailingDrawdownBps
+        | NumericExpr::PeakLiquidationNetPnlKrw
+        | NumericExpr::PeakLiquidationReturnBps
+        | NumericExpr::BarRangeBps
+        | NumericExpr::BarBodyBps
+        | NumericExpr::CloseLocation
+        | NumericExpr::EpisodeFillCount
+        | NumericExpr::LastFillPrice
+        | NumericExpr::SecondsSinceLastFill
+        | NumericExpr::MoveSinceLastFillBps
+        | NumericExpr::UtcHour
+        | NumericExpr::UtcMinute
         | NumericExpr::EvidenceMultiplier
         | NumericExpr::EvidenceCoverage => {}
     }

@@ -1,6 +1,6 @@
 use super::*;
 use crate::contracts::{
-    AccountMark, AccountState, BasisPoints, CandleRecord, ContentHash, CostPolicy,
+    AccountMark, AccountState, AssetQuantity, BasisPoints, CandleRecord, ContentHash, CostPolicy,
     CounterfactualAnalysisRequest, CounterfactualCandidateDeclaration,
     CounterfactualCandidateInput, CounterfactualCandidateRole, CounterfactualEvidenceInput,
     CounterfactualFixedExit, CounterfactualVariant, EventContext, ExecutionPolicy,

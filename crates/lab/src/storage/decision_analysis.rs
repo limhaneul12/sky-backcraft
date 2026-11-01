@@ -1670,6 +1670,7 @@ impl Store {
         let automation_created = analysis_time("2026-10-13T23:00:00Z")?;
         let risk = crate::contracts::AutomationRiskPolicy {
             activation_loss_limit_krw: None,
+            hard_stop_loss_bps: None,
             max_order_notional_krw: crate::contracts::QuoteAmount::new(Decimal::from(50_000))?,
             max_daily_notional_krw: crate::contracts::QuoteAmount::new(Decimal::from(500_000))?,
             max_asset_exposure_krw: crate::contracts::QuoteAmount::new(Decimal::from(100_000))?,

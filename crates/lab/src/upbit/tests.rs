@@ -231,6 +231,8 @@ fn cancelled_emergency_reply_still_commits_and_blocks_execution()
                 volume: Some(Decimal::new(1, 4)),
                 current_krw_balance: None,
                 current_coin_balance: None,
+                stop_price: None,
+                max_loss_krw: None,
             },
             Utc::now(),
         )
@@ -380,6 +382,8 @@ fn isolated_mock_control_exercises_approval_and_transitions()
                 volume: Some(Decimal::new(1, 4)),
                 current_krw_balance: None,
                 current_coin_balance: None,
+                stop_price: None,
+                max_loss_krw: None,
             },
             Utc::now(),
         )
@@ -427,6 +431,8 @@ async fn test_preview_all_order_types() {
             volume: Some(Decimal::new(1, 2)), // 0.01 BTC = 900,000 KRW
             current_krw_balance: Some(Decimal::new(1_000_000, 0)),
             current_coin_balance: None,
+            stop_price: None,
+            max_loss_krw: None,
         },
         now,
     )
@@ -444,6 +450,8 @@ async fn test_preview_all_order_types() {
             volume: None,
             current_krw_balance: Some(Decimal::new(200_000, 0)),
             current_coin_balance: None,
+            stop_price: None,
+            max_loss_krw: None,
         },
         now,
     )
@@ -461,6 +469,8 @@ async fn test_preview_all_order_types() {
             volume: Some(Decimal::new(50, 0)), // 50 XRP
             current_krw_balance: None,
             current_coin_balance: Some(Decimal::new(100, 0)),
+            stop_price: None,
+            max_loss_krw: None,
         },
         now,
     )
@@ -511,6 +521,25 @@ async fn test_risk_guard_violations() {
             .await
             .is_ok()
     );
+
+    // Canonical KRW altcoin markets pass by default; non-KRW markets fail
+    let later_alt = later + chrono::Duration::seconds(5);
+    assert!(
+        guard
+            .validate_order("KRW-SOL", Decimal::new(20_000, 0), later_alt)
+            .await
+            .is_ok()
+    );
+    assert!(matches!(
+        guard
+            .validate_order(
+                "USDT-BTC",
+                Decimal::new(20_000, 0),
+                later_alt + chrono::Duration::seconds(5)
+            )
+            .await,
+        Err(super::risk::RiskError::DisallowedMarket(_))
+    ));
 }
 
 #[tokio::test]
@@ -572,6 +601,8 @@ async fn test_execution_gate_live_disabled_and_mock() {
             volume: Some(Decimal::new(1, 2)),
             current_krw_balance: None,
             current_coin_balance: None,
+            stop_price: None,
+            max_loss_krw: None,
         },
         now,
     )

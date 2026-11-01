@@ -8,7 +8,8 @@ use crate::automation::{
     AutomationAccountPosition, AutomationCancelPreparation, AutomationCheckpoint,
     AutomationOrderAdmission, AutomationOrderDispatch, AutomationPendingCancelRequest,
     AutomationPendingIntent, AutomationPendingOrder, AutomationRuntimeRecord, VenueAdapter,
-    VerifiedMarketRules, validate_submit_ack_identity, verify_market_rules,
+    VerifiedMarketRules, hard_stop_loss_breached, validate_submit_ack_identity,
+    verify_market_rules,
 };
 use crate::contracts::{
     AssetQuantity, AutomationCommandOutcome, AutomationIntentId, AutomationOrderIdentifier,
@@ -1781,11 +1782,26 @@ impl JobService {
             )?;
             let evaluation = checkpoint.observe(&observation, position_view)?;
             checkpoint.last_observation = Some(observation.clone());
-            if let Some(evaluation) = evaluation {
+            if let Some(mut evaluation) = evaluation {
                 if evaluation.decision_time != observation.candle.close_time_utc {
                     return Err(LabError::DataCorrupt(
                         "strategy evaluation time differs from its finalized source candle".into(),
                     ));
+                }
+                if position.actual_qty.get() > Decimal::ZERO
+                    && let (Some(stop_bps), Some(entry_price)) = (
+                        record.view.risk.hard_stop_loss_bps,
+                        position.average_entry_price_krw,
+                    )
+                    && hard_stop_loss_breached(
+                        entry_price,
+                        observation.candle.low,
+                        observation.candle.close,
+                        stop_bps,
+                    )?
+                {
+                    evaluation.constrained_target_weight = Weight::new(Decimal::ZERO)?;
+                    evaluation.state_after = crate::contracts::PositionState::Cash;
                 }
                 let action =
                     action_for_target(evaluation.constrained_target_weight, position.actual_weight);
@@ -3807,12 +3823,7 @@ fn feed_causal_sources(
 }
 
 fn cash_position() -> Result<crate::strategy::PositionView, LabError> {
-    Ok(crate::strategy::PositionView {
-        actual_qty: AssetQuantity::new(Decimal::ZERO)?,
-        actual_weight: Weight::new(Decimal::ZERO)?,
-        episode_opened_at: None,
-        held_decision_bars: None,
-    })
+    crate::strategy::PositionView::cash()
 }
 
 fn validate_account_position_freshness(
@@ -3844,6 +3855,9 @@ fn advance_position_checkpoint(
             actual_weight: position.actual_weight,
             episode_opened_at: None,
             held_decision_bars: None,
+            execution: position.execution,
+            accounting: position.accounting,
+            market: None,
         });
     }
     let opened = position.episode_opened_at.ok_or_else(|| {
@@ -3884,6 +3898,9 @@ fn advance_position_checkpoint(
         actual_weight: position.actual_weight,
         episode_opened_at: Some(opened),
         held_decision_bars: Some(held),
+        execution: position.execution,
+        accounting: position.accounting,
+        market: None,
     })
 }
 

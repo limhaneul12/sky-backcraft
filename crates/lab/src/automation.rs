@@ -182,7 +182,39 @@ pub(crate) struct AutomationAccountPosition {
     pub actual_weight: crate::contracts::Weight,
     pub equity_krw: QuoteAmount,
     pub episode_opened_at: Option<UtcTimestamp>,
+    pub average_entry_price_krw: Option<PriceKrw>,
     pub account_observed_at: UtcTimestamp,
+    pub execution: Option<crate::strategy::ExecutionContextSnapshot>,
+    pub accounting: Option<crate::strategy::PositionAccountingSnapshot>,
+}
+
+/// Evaluate whether an open long position's candle low or close breached `hard_stop_loss_bps`
+/// relative to its average entry price.
+pub(crate) fn hard_stop_loss_breached(
+    entry_price: PriceKrw,
+    candle_low: PriceKrw,
+    candle_close: PriceKrw,
+    hard_stop_loss_bps: u32,
+) -> Result<bool, LabError> {
+    if entry_price.get() <= Decimal::ZERO || hard_stop_loss_bps == 0 {
+        return Ok(false);
+    }
+    let worst_price = candle_low.get().min(candle_close.get());
+    if worst_price >= entry_price.get() {
+        return Ok(false);
+    }
+    let drop = entry_price
+        .get()
+        .checked_sub(worst_price)
+        .ok_or_else(|| LabError::DataCorrupt("hard stop loss price drop overflow".into()))?;
+    let drop_scaled = drop
+        .checked_mul(Decimal::from(10_000))
+        .ok_or_else(|| LabError::DataCorrupt("hard stop loss bps scaling overflow".into()))?;
+    let threshold_scaled = entry_price
+        .get()
+        .checked_mul(Decimal::from(hard_stop_loss_bps))
+        .ok_or_else(|| LabError::DataCorrupt("hard stop loss threshold scaling overflow".into()))?;
+    Ok(drop_scaled >= threshold_scaled)
 }
 
 impl AutomationCheckpoint {
@@ -202,6 +234,10 @@ impl AutomationCheckpoint {
         })
     }
 
+    #[allow(
+        clippy::large_types_passed_by_value,
+        reason = "PositionView is stack-only Copy to avoid per-bar heap allocations"
+    )]
     pub(crate) fn observe(
         &mut self,
         candle: &CandleObservation,
@@ -1078,6 +1114,19 @@ mod order_update_tests {
             validate_order_update(&request, &bad_funds_detail, now),
             Err(LabError::DataCorrupt(msg)) if msg.contains("venue trade identity, currency, side, or exact amount is invalid")
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn hard_stop_loss_breached_triggers_on_intra_bar_low_or_close_drop() -> Result<(), LabError> {
+        let entry = PriceKrw::new(Decimal::from(100_000))?;
+        let low_safe = PriceKrw::new(Decimal::from(99_300))?;
+        let low_breach = PriceKrw::new(Decimal::from(99_200))?;
+        let close_high = PriceKrw::new(Decimal::from(100_100))?;
+
+        // 80 bps drop from 100,000 is 99,200
+        assert!(!hard_stop_loss_breached(entry, low_safe, close_high, 80)?);
+        assert!(hard_stop_loss_breached(entry, low_breach, close_high, 80)?);
         Ok(())
     }
 }

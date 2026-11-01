@@ -36,6 +36,7 @@ impl ReviewFixture {
         let created = time("2026-10-14T00:00:00Z")?;
         let risk = AutomationRiskPolicy {
             activation_loss_limit_krw: None,
+            hard_stop_loss_bps: None,
             max_order_notional_krw: QuoteAmount::new(Decimal::from(50_000))?,
             max_daily_notional_krw: QuoteAmount::new(Decimal::from(500_000))?,
             max_asset_exposure_krw: QuoteAmount::new(Decimal::from(100_000))?,

@@ -236,6 +236,7 @@ fn audit_source_fixture() -> SourceIndicatorAuditInput {
 fn snapshot_rules_reconstruct_target_state_and_detect_mismatch() -> Result<(), LabError> {
     let state = PolicyState {
         id: "memory".into(),
+        scope: crate::contracts::PolicyStateScope::Global,
         initial: 0.0,
         next: NumericExpr::Add {
             left: Box::new(NumericExpr::State {
@@ -1099,5 +1100,59 @@ fn advanced_indicators_recompute_identically_in_source_audit() -> Result<(), Lab
         "{:?}",
         report.diagnostics
     );
+    Ok(())
+}
+
+#[test]
+fn snapshot_rule_audit_reconstructs_candle_microstructure_operands() -> Result<(), LabError> {
+    let policy = frozen(PolicyProgram::Rules {
+        program: simple_rules_program(
+            None,
+            BoolExpr::And {
+                conditions: vec![
+                    BoolExpr::Compare {
+                        comparison: CompareOp::Gte,
+                        left: NumericExpr::BarRangeBps,
+                        right: NumericExpr::Constant { value: 190.0 },
+                    },
+                    BoolExpr::Compare {
+                        comparison: CompareOp::Eq,
+                        left: NumericExpr::BarBodyBps,
+                        right: NumericExpr::Constant { value: 0.0 },
+                    },
+                    BoolExpr::Compare {
+                        comparison: CompareOp::Eq,
+                        left: NumericExpr::CloseLocation,
+                        right: NumericExpr::Constant { value: 0.5 },
+                    },
+                ],
+            },
+            PolicyTarget::Weight {
+                value: NumericExpr::Constant { value: 1.0 },
+            },
+            PolicyTarget::Hold,
+            Vec::new(),
+        ),
+    });
+    let bar = observation(CandleInterval::H1, 0, 100, 101, 99);
+    let saved = SavedRuleDecision {
+        policy_ref: policy.reference.clone(),
+        observation_id: bar.id.clone(),
+        decision_time_utc: bar.candle.close_time_utc,
+        matched_rule_id: Some("enter".into()),
+        target_weight: Weight::new(Decimal::ONE).expect("full weight"),
+        state_after: Vec::new(),
+    };
+    let input = snapshot_input(
+        policy,
+        bar,
+        1,
+        vec![named("close", 100.0)],
+        Vec::new(),
+        saved,
+        None,
+    );
+    let report = audit_snapshot_rules(&input)?;
+    assert_eq!(report.status, ReviewAuditStatus::Verified);
     Ok(())
 }

@@ -1710,3 +1710,236 @@ async fn realtime_sse_oauth_expiry_releases_admission_without_body_reads() -> Te
     tokio::time::timeout(Duration::from_secs(2), server).await???;
     Ok(())
 }
+
+#[tokio::test]
+async fn persistent_refresh_grant_survives_database_owner_restart_without_reopening_live_gate()
+-> TestResult {
+    use crate::database::DatabaseOwner;
+    use crate::upbit::execution::LiveExecutionPolicy;
+    use crate::upbit::live_order_control::{LiveOrderControlService, LiveOrderSendGate};
+
+    let root = OAuthTempRoot::new()?;
+    let first_owner = DatabaseOwner::open_with_live_order_control(root.0.clone(), true)?;
+    let first_state = full_trading_state()?
+        .with_pre_registered_clients(chatgpt_client_registry(PUBLIC_URL))
+        .map_err(test_error)?
+        .with_persistent_clients(first_owner.handle())
+        .await?;
+
+    let code = approve_authorization_with_redirect(
+        &first_state,
+        CHATGPT_CLIENT_ID,
+        CHATGPT_CALLBACK,
+        "restart-refresh-consent",
+        OAuthPermissions::Research,
+    )
+    .await?;
+    let issued_resp = token(
+        axum::extract::State(first_state.clone()),
+        RawForm(axum::body::Bytes::from(
+            authorization_code_form_with_redirect(&code, CHATGPT_CLIENT_ID, CHATGPT_CALLBACK),
+        )),
+    )
+    .await;
+    assert_eq!(issued_resp.status(), axum::http::StatusCode::OK);
+    let issued = response_json(issued_resp).await?;
+    let refresh_token = response_string(&issued, "refresh_token")?.to_owned();
+
+    drop(first_state);
+    first_owner.shutdown()?;
+
+    let second_owner = DatabaseOwner::open_with_live_order_control(root.0.clone(), true)?;
+    let gate = LiveOrderSendGate::new_disabled();
+    let exchange = crate::upbit::UpbitExchangeService::new_mock_with_policy_and_send_gate(
+        LiveExecutionPolicy::OperatorEnabled,
+        gate.clone(),
+    );
+    let live_order_control = LiveOrderControlService::new(
+        second_owner.handle(),
+        exchange.live_execution_policy(),
+        exchange.live_order_send_gate(),
+        exchange.exchange_read_mode(),
+    );
+    let restarted = full_trading_state()?
+        .with_pre_registered_clients(chatgpt_client_registry(PUBLIC_URL))
+        .map_err(test_error)?
+        .with_persistent_clients(second_owner.handle())
+        .await?;
+    restarted
+        .bind_managed_live_order_control(live_order_control)
+        .map_err(test_error)?;
+
+    let refreshed_resp = token(
+        axum::extract::State(restarted.clone()),
+        RawForm(axum::body::Bytes::from(refresh_form(
+            &refresh_token,
+            CHATGPT_CLIENT_ID,
+            None,
+        ))),
+    )
+    .await;
+    assert_eq!(refreshed_resp.status(), axum::http::StatusCode::OK);
+    let refreshed = response_json(refreshed_resp).await?;
+    let new_access = response_string(&refreshed, "access_token")?;
+    let headers = bearer_headers(new_access)?;
+    assert_eq!(
+        restarted.permissions_for_headers(&headers),
+        Some(OAuthPermissions::TradingControl)
+    );
+    assert!(
+        !gate.is_enabled(),
+        "refresh across restart must keep live_order_control OFF"
+    );
+
+    // Replaying the old refresh token after rotation must fail with invalid_grant.
+    let replayed = token(
+        axum::extract::State(restarted.clone()),
+        RawForm(axum::body::Bytes::from(refresh_form(
+            &refresh_token,
+            CHATGPT_CLIENT_ID,
+            None,
+        ))),
+    )
+    .await;
+    assert_eq!(replayed.status(), axum::http::StatusCode::BAD_REQUEST);
+
+    drop(restarted);
+    second_owner.shutdown()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn persisted_refresh_grant_protects_dcr_client_from_eviction_after_restart() -> TestResult {
+    use crate::database::DatabaseOwner;
+
+    let root = OAuthTempRoot::new()?;
+    let first_owner = DatabaseOwner::open(root.0.clone())?;
+    let first_state = enabled_state()?
+        .with_persistent_clients(first_owner.handle())
+        .await?;
+
+    let mut dcr_clients = Vec::with_capacity(MAX_CLIENTS);
+    for index in 0..MAX_CLIENTS {
+        let reg = register(
+            axum::extract::State(first_state.clone()),
+            serde_json::json!({
+                "redirect_uris": [REDIRECT_URI],
+                "client_name": format!("DCR Client {index}")
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(reg.status(), axum::http::StatusCode::CREATED);
+        let body = response_json(reg).await?;
+        dcr_clients.push(response_string(&body, "client_id")?.to_owned());
+    }
+
+    let protected_client = &dcr_clients[0];
+    let code = approve_authorization(
+        &first_state,
+        protected_client,
+        "dcr-eviction-guard",
+        OAuthPermissions::Research,
+    )
+    .await?;
+    let issued_resp = token(
+        axum::extract::State(first_state.clone()),
+        RawForm(axum::body::Bytes::from(authorization_code_form(
+            &code,
+            protected_client,
+        ))),
+    )
+    .await;
+    assert_eq!(issued_resp.status(), axum::http::StatusCode::OK);
+    let issued = response_json(issued_resp).await?;
+    let refresh_token = response_string(&issued, "refresh_token")?.to_owned();
+
+    drop(first_state);
+    first_owner.shutdown()?;
+
+    let second_owner = DatabaseOwner::open(root.0.clone())?;
+    let restarted = enabled_state()?
+        .with_persistent_clients(second_owner.handle())
+        .await?;
+
+    let extra_reg = register(
+        axum::extract::State(restarted.clone()),
+        serde_json::json!({
+            "redirect_uris": [REDIRECT_URI],
+            "client_name": "Post-Restart Challenger"
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(extra_reg.status(), axum::http::StatusCode::CREATED);
+
+    let refreshed_resp = token(
+        axum::extract::State(restarted.clone()),
+        RawForm(axum::body::Bytes::from(refresh_form(
+            &refresh_token,
+            protected_client,
+            None,
+        ))),
+    )
+    .await;
+    assert_eq!(
+        refreshed_resp.status(),
+        axum::http::StatusCode::OK,
+        "DCR client with active persisted refresh grant must not be evicted after restart"
+    );
+
+    drop(restarted);
+    second_owner.shutdown()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn pending_approval_flood_is_isolated_per_client() -> TestResult {
+    let state = enabled_state()?;
+    add_test_client(&state, "honest-client");
+    add_test_client(&state, "noisy-client");
+
+    let honest_resp = authorize(
+        axum::extract::State(state.clone()),
+        axum::extract::RawQuery(Some(authorization_query(
+            "honest-client",
+            "honest-flow",
+            encoded_scope(OAuthPermissions::Research),
+        ))),
+    )
+    .await;
+    assert_eq!(honest_resp.status(), axum::http::StatusCode::OK);
+
+    for index in 0..(MAX_PENDING_APPROVALS + 16) {
+        let noisy_resp = authorize(
+            axum::extract::State(state.clone()),
+            axum::extract::RawQuery(Some(authorization_query(
+                "noisy-client",
+                &format!("noisy-{index}"),
+                encoded_scope(OAuthPermissions::Research),
+            ))),
+        )
+        .await;
+        assert_eq!(noisy_resp.status(), axum::http::StatusCode::OK);
+    }
+
+    let grants = state
+        .inner
+        .grants
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        grants
+            .pending
+            .values()
+            .any(|p| p.client_id == "honest-client" && p.state == "honest-flow"),
+        "honest client's pending approval must survive noisy-client flood"
+    );
+    let noisy_count = grants
+        .pending
+        .values()
+        .filter(|p| p.client_id == "noisy-client")
+        .count();
+    assert!(noisy_count <= MAX_PENDING_APPROVALS_PER_CLIENT);
+    Ok(())
+}

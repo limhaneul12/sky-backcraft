@@ -15,13 +15,15 @@ use crate::contracts::{
     ModelId, PortfolioAttribution, PortfolioFillRecord, PortfolioIntentRecord, PortfolioLedger,
     PortfolioMarkRecord, PortfolioRejectionReason, PortfolioRejectionRecord, PortfolioSpec,
     PortfolioStatus, PortfolioTotals, PriceKrw, QuoteAmount, ReasonCode, RegimeGateSpec,
-    RegimeLabel, RegimeObservation, ResolvedPlan, RunId, Side, StrategyBinding, StrategyKind,
-    TerminalPolicy, UtcTimestamp, Weight,
+    RegimeLabel, RegimeObservation, ResolvedPlan, RunId, Side, SignedAmount, StrategyBinding,
+    StrategyKind, TerminalPolicy, UtcTimestamp, Weight,
 };
-use crate::engine::execution::{bps_rate, floor_to_step, tick_for};
+use crate::engine::execution::{bps_rate, floor_to_step, market_price, tick_for};
 use crate::policy_engine::{CrossIntervalFeed, PolicyEvaluator, PreparedBarCache};
 use crate::regime::{RegimeClassifier, gate_action};
-use crate::strategy::PositionView;
+use crate::strategy::{
+    ExecutionContextSnapshot, MarketContextSnapshot, PositionAccountingSnapshot, PositionView,
+};
 use rust_decimal::Decimal;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -42,6 +44,8 @@ struct MarketSlot {
     execution_bars: Arc<[CandleObservation]>,
     qty: Decimal,
     price_basis: Decimal,
+    open_entry_fee: Decimal,
+    open_embedded_cost: Decimal,
     realized: Decimal,
     fees: Decimal,
     buy_notional: Decimal,
@@ -51,6 +55,13 @@ struct MarketSlot {
     exposure_seconds: u64,
     episode_opened_at: Option<UtcTimestamp>,
     decision_marks_since_open: u64,
+    episode_fill_count: u64,
+    episode_buy_fill_count: u64,
+    episode_sell_fill_count: u64,
+    last_fill_price: Option<PriceKrw>,
+    last_fill_qty: Option<AssetQuantity>,
+    last_fill_at: Option<UtcTimestamp>,
+    last_fill_side: Option<Side>,
     gate: Option<(RegimeClassifier, Vec<CandleObservation>)>,
     /// Bounded causal cross-interval feed; empty for single-interval policies.
     source_feed: CrossIntervalFeed,
@@ -322,12 +333,7 @@ pub fn run_portfolio(
             if bar.candle.close_time_utc >= plan.spec.range.start() {
                 break;
             }
-            let view = PositionView {
-                actual_qty: AssetQuantity::new(Decimal::ZERO)?,
-                actual_weight: Weight::new(Decimal::ZERO)?,
-                episode_opened_at: None,
-                held_decision_bars: None,
-            };
+            let view = PositionView::cash()?;
             slot.source_feed
                 .feed_until(&mut slot.evaluator, bar.candle.close_time_utc)?;
             slot.evaluator.observe(bar, view, None)?;
@@ -403,6 +409,94 @@ pub fn run_portfolio(
                 }
             }
             let holding = slots[slot_index].qty > Decimal::ZERO;
+            let rules = plan.spec.rules_at(*time)?;
+            let fees = plan.spec.fee_policy_at(*time)?;
+            let close = bar.candle.close;
+            let tick = PriceKrw::new(tick_for(close.get(), rules)?)?;
+            let market_snapshot = MarketContextSnapshot {
+                decision_close_krw: close,
+                min_order_notional_krw: rules.min_notional,
+                quantity_step: rules.quantity_step,
+                tick_size_krw: tick,
+                sell_fee_bps: fees.sell,
+                buy_fee_bps: fees.buy,
+                tradable: rules.tradable_at(*time),
+            };
+            let execution_snapshot = ExecutionContextSnapshot {
+                episode_fill_count: slots[slot_index].episode_fill_count,
+                episode_buy_fill_count: slots[slot_index].episode_buy_fill_count,
+                episode_sell_fill_count: slots[slot_index].episode_sell_fill_count,
+                last_fill_price: slots[slot_index].last_fill_price,
+                last_fill_qty: slots[slot_index].last_fill_qty,
+                last_fill_at: slots[slot_index].last_fill_at,
+                last_fill_side: slots[slot_index].last_fill_side,
+                has_pending_order: false,
+                pending_remaining_notional_krw: QuoteAmount::new(Decimal::ZERO)?,
+                pending_partially_filled: false,
+            };
+            let accounting_snapshot = if holding {
+                let slot = &slots[slot_index];
+                let qty = slot.qty;
+                let price_basis = slot.price_basis;
+                let entry_fee = slot.open_entry_fee;
+                let embedded_cost = slot.open_embedded_cost;
+                let total_cost_basis =
+                    checked_add(price_basis, entry_fee, "portfolio slot total cost basis")?;
+                let avg_entry_price =
+                    PriceKrw::new(checked_div(price_basis, qty, "portfolio avg entry price")?)?;
+                let avg_cost_price = PriceKrw::new(checked_div(
+                    total_cost_basis,
+                    qty,
+                    "portfolio avg cost price",
+                )?)?;
+                let gross_unrealized =
+                    checked_sub(position_value, price_basis, "portfolio gross unrealized")?;
+                let net_unrealized =
+                    checked_sub(position_value, total_cost_basis, "portfolio net unrealized")?;
+                let (exit_price, exit_unit_cost) =
+                    market_price(close, Side::Sell, &plan.spec.costs, rules)?;
+                let exit_notional =
+                    checked_mul(qty, exit_price.get(), "portfolio estimated exit notional")?;
+                let sell_fee_rate = bps_rate(fees.sell)?;
+                let exit_fee =
+                    checked_mul(exit_notional, sell_fee_rate, "portfolio estimated exit fee")?;
+                let exit_embedded_cost = checked_mul(
+                    qty,
+                    exit_unit_cost.max(Decimal::ZERO),
+                    "portfolio estimated exit embedded cost",
+                )?;
+                let net_exit_proceeds =
+                    checked_sub(exit_notional, exit_fee, "portfolio net exit proceeds")?;
+                let liquidation_net_pnl = checked_sub(
+                    net_exit_proceeds,
+                    total_cost_basis,
+                    "portfolio estimated liquidation net pnl",
+                )?;
+                Some(PositionAccountingSnapshot {
+                    avg_entry_price_krw: avg_entry_price,
+                    avg_cost_price_krw: avg_cost_price,
+                    price_basis_krw: QuoteAmount::new(price_basis)?,
+                    allocated_entry_fee_krw: QuoteAmount::new(entry_fee)?,
+                    allocated_entry_embedded_cost_krw: QuoteAmount::new(embedded_cost)?,
+                    total_cost_basis_krw: QuoteAmount::new(total_cost_basis)?,
+                    position_value_krw: QuoteAmount::new(position_value)?,
+                    gross_unrealized_pnl_krw: SignedAmount::new(gross_unrealized)?,
+                    net_unrealized_pnl_krw: SignedAmount::new(net_unrealized)?,
+                    estimated_exit_price_krw: exit_price,
+                    estimated_exit_notional_krw: QuoteAmount::new(exit_notional)?,
+                    estimated_exit_fee_krw: QuoteAmount::new(exit_fee)?,
+                    estimated_exit_embedded_cost_krw: QuoteAmount::new(exit_embedded_cost)?,
+                    estimated_liquidation_net_pnl_krw: SignedAmount::new(liquidation_net_pnl)?,
+                    cash_total_krw: QuoteAmount::new(cash.total)?,
+                    cash_free_krw: QuoteAmount::new(cash.free()?)?,
+                    cash_locked_krw: QuoteAmount::new(cash.reserved)?,
+                    equity_krw: QuoteAmount::new(marked.equity)?,
+                    cumulative_realized_pnl_krw: SignedAmount::new(slot.realized)?,
+                    cumulative_fees_krw: QuoteAmount::new(slot.fees)?,
+                })
+            } else {
+                None
+            };
             let view = PositionView {
                 actual_qty: AssetQuantity::new(slots[slot_index].qty)?,
                 actual_weight: Weight::new(actual_weight)?,
@@ -410,6 +504,9 @@ pub fn run_portfolio(
                     .then_some(slots[slot_index].episode_opened_at)
                     .flatten(),
                 held_decision_bars: holding.then_some(slots[slot_index].decision_marks_since_open),
+                execution: Some(execution_snapshot),
+                accounting: accounting_snapshot,
+                market: Some(market_snapshot),
             };
             let evaluation = {
                 let slot = &mut slots[slot_index];
@@ -696,6 +793,8 @@ fn market_slots(
             execution_bars,
             qty: Decimal::ZERO,
             price_basis: Decimal::ZERO,
+            open_entry_fee: Decimal::ZERO,
+            open_embedded_cost: Decimal::ZERO,
             realized: Decimal::ZERO,
             fees: Decimal::ZERO,
             buy_notional: Decimal::ZERO,
@@ -705,6 +804,13 @@ fn market_slots(
             exposure_seconds: 0,
             episode_opened_at: None,
             decision_marks_since_open: 0,
+            episode_fill_count: 0,
+            episode_buy_fill_count: 0,
+            episode_sell_fill_count: 0,
+            last_fill_price: None,
+            last_fill_qty: None,
+            last_fill_at: None,
+            last_fill_side: None,
             source_feed,
             gate,
         });
@@ -1568,9 +1674,28 @@ fn execute_fill(
                 )));
             }
             cash.settle_buy(debit)?;
+            if slot.qty.is_zero() {
+                slot.open_entry_fee = Decimal::ZERO;
+                slot.open_embedded_cost = Decimal::ZERO;
+                slot.episode_fill_count = 0;
+                slot.episode_buy_fill_count = 0;
+                slot.episode_sell_fill_count = 0;
+            }
             slot.qty = checked_add(slot.qty, qty, "buy quantity")?;
             slot.price_basis = checked_add(slot.price_basis, notional, "buy basis")?;
+            slot.open_entry_fee = checked_add(slot.open_entry_fee, fee, "buy allocated entry fee")?;
+            slot.open_embedded_cost = checked_add(
+                slot.open_embedded_cost,
+                price_cost_quote.max(Decimal::ZERO),
+                "buy allocated embedded cost",
+            )?;
             slot.buy_notional = checked_add(slot.buy_notional, notional, "buy notional")?;
+            slot.episode_fill_count = slot.episode_fill_count.saturating_add(1);
+            slot.episode_buy_fill_count = slot.episode_buy_fill_count.saturating_add(1);
+            slot.last_fill_price = Some(PriceKrw::new(rounded)?);
+            slot.last_fill_qty = Some(AssetQuantity::new(qty)?);
+            slot.last_fill_at = Some(execution_time);
+            slot.last_fill_side = Some(Side::Buy);
         }
         Side::Sell => {
             if qty > slot.qty {
@@ -1579,6 +1704,7 @@ fn execute_fill(
                     slot.market, slot.qty
                 )));
             }
+            let prior_qty = slot.qty;
             let removed_basis = if qty == slot.qty {
                 slot.price_basis
             } else {
@@ -1595,6 +1721,33 @@ fn execute_fill(
             slot.price_basis = checked_sub(slot.price_basis, removed_basis, "remaining basis")?;
             if slot.qty.is_zero() {
                 slot.price_basis = Decimal::ZERO;
+                slot.open_entry_fee = Decimal::ZERO;
+                slot.open_embedded_cost = Decimal::ZERO;
+                slot.episode_fill_count = 0;
+                slot.episode_buy_fill_count = 0;
+                slot.episode_sell_fill_count = 0;
+                slot.last_fill_price = None;
+                slot.last_fill_qty = None;
+                slot.last_fill_at = None;
+                slot.last_fill_side = None;
+            } else {
+                let retain_ratio = checked_div(slot.qty, prior_qty, "portfolio retain ratio")?;
+                slot.open_entry_fee = checked_mul(
+                    slot.open_entry_fee,
+                    retain_ratio,
+                    "retained allocated entry fee",
+                )?;
+                slot.open_embedded_cost = checked_mul(
+                    slot.open_embedded_cost,
+                    retain_ratio,
+                    "retained allocated embedded cost",
+                )?;
+                slot.episode_fill_count = slot.episode_fill_count.saturating_add(1);
+                slot.episode_sell_fill_count = slot.episode_sell_fill_count.saturating_add(1);
+                slot.last_fill_price = Some(PriceKrw::new(rounded)?);
+                slot.last_fill_qty = Some(AssetQuantity::new(qty)?);
+                slot.last_fill_at = Some(execution_time);
+                slot.last_fill_side = Some(Side::Sell);
             }
             slot.realized = checked_add(slot.realized, realized, "cumulative realized")?;
             slot.sell_notional = checked_add(slot.sell_notional, notional, "sell notional")?;

@@ -948,6 +948,7 @@ fn active_mtf_automation_contributes_decision_and_source_intervals_in_order() {
                 .expect("exposure limit"),
             max_daily_loss_krw: QuoteAmount::new(Decimal::from(100_000)).expect("loss limit"),
             activation_loss_limit_krw: None,
+            hard_stop_loss_bps: None,
             max_open_orders: 1,
             max_orders_per_interval: 1,
             max_balance_age_seconds: 3_600,

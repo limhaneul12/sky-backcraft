@@ -429,6 +429,7 @@ fn typed_start(
         mode: AutomationSessionMode::Mock,
         risk: AutomationRiskPolicy {
             activation_loss_limit_krw: None,
+            hard_stop_loss_bps: None,
             max_order_notional_krw: QuoteAmount::new(Decimal::from(100_000))?,
             max_daily_notional_krw: QuoteAmount::new(Decimal::from(1_000_000))?,
             max_asset_exposure_krw: QuoteAmount::new(Decimal::from(100_000))?,

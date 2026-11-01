@@ -182,21 +182,16 @@ fn revision_for(program: RulesProgram, seed: &str) -> FrozenPolicyRevision {
 }
 
 fn cash() -> PositionView {
-    PositionView {
-        actual_qty: AssetQuantity::new(Decimal::ZERO).expect("qty"),
-        actual_weight: Weight::new(Decimal::ZERO).expect("weight"),
-        episode_opened_at: None,
-        held_decision_bars: None,
-    }
+    PositionView::cash().expect("cash position view")
 }
 
 fn long(at: UtcTimestamp) -> PositionView {
-    PositionView {
-        actual_qty: AssetQuantity::new(Decimal::ONE).expect("qty"),
-        actual_weight: Weight::new(Decimal::ONE).expect("weight"),
-        episode_opened_at: Some(at),
-        held_decision_bars: Some(1),
-    }
+    PositionView::basic(
+        AssetQuantity::new(Decimal::ONE).expect("qty"),
+        Weight::new(Decimal::ONE).expect("weight"),
+        Some(at),
+        Some(1),
+    )
 }
 
 fn close_indicator() -> PolicyIndicator {
@@ -218,6 +213,7 @@ fn state_updates_read_one_prior_snapshot_and_commit_simultaneously() {
         states: vec![
             PolicyState {
                 id: "a".into(),
+                scope: crate::contracts::PolicyStateScope::Global,
                 initial: 1.0,
                 next: NumericExpr::Add {
                     left: Box::new(NumericExpr::State { id: "b".into() }),
@@ -226,6 +222,7 @@ fn state_updates_read_one_prior_snapshot_and_commit_simultaneously() {
             },
             PolicyState {
                 id: "b".into(),
+                scope: crate::contracts::PolicyStateScope::Global,
                 initial: 2.0,
                 next: NumericExpr::Add {
                     left: Box::new(NumericExpr::State { id: "a".into() }),
@@ -337,6 +334,7 @@ fn nested_trace_policy() -> (PolicyDefinition, String) {
         indicators: vec![close_indicator()],
         states: vec![PolicyState {
             id: "memory".into(),
+            scope: crate::contracts::PolicyStateScope::Global,
             initial: 0.25,
             next: NumericExpr::Add {
                 left: Box::new(NumericExpr::State {
@@ -527,10 +525,20 @@ fn evaluate_condition_trace(
         indicators: &indicators,
         state: &state,
         actual_state: PositionState::Cash,
+        actual_qty: 0.0,
         actual_weight: 0.0,
         held_bars: 0.0,
+        held_seconds: 0.0,
+        entry_price: 0.0,
         unrealized_return_bps: 0.0,
         trailing_drawdown_bps: 0.0,
+        bar_range_bps: 0.0,
+        bar_body_bps: 0.0,
+        close_location: 0.5,
+        execution: Some(EvalExecutionValues::default()),
+        accounting: Some(EvalAccountingValues::default()),
+        utc_hour: 0.0,
+        utc_minute: 0.0,
         evidence_multiplier: 0.0,
         evidence_coverage: 0.0,
         crosses,
@@ -775,6 +783,7 @@ fn scoped_guard_policy() -> PolicyDefinition {
         indicators: vec![close_indicator()],
         states: vec![PolicyState {
             id: "memory".into(),
+            scope: crate::contracts::PolicyStateScope::Global,
             initial: 0.0,
             next: numeric_guard(1.0, 0.25),
         }],
@@ -824,16 +833,26 @@ fn state_and_selected_target_guards_keep_scope_and_unknown_result() -> Result<()
         indicators: &indicators,
         state: &state,
         actual_state: PositionState::Cash,
+        actual_qty: 0.0,
         actual_weight: 0.0,
         held_bars: 0.0,
+        held_seconds: 0.0,
+        entry_price: 0.0,
         unrealized_return_bps: 0.0,
         trailing_drawdown_bps: 0.0,
+        bar_range_bps: 0.0,
+        bar_body_bps: 0.0,
+        close_location: 0.5,
+        execution: Some(EvalExecutionValues::default()),
+        accounting: Some(EvalAccountingValues::default()),
+        utc_hour: 0.0,
+        utc_minute: 0.0,
         evidence_multiplier: 0.0,
         evidence_coverage: 0.0,
         crosses: &crosses,
     };
     let evaluator = RulesEvaluator::new(&policy, market(), CandleInterval::H1)?;
-    let (_, state_trace) = evaluator.evaluate_next_state(&context)?;
+    let (_, _, state_trace) = evaluator.evaluate_next_state(&context)?;
     assert_eq!(state_trace.len(), 1);
     assert_eq!(
         state_trace[0].scope,
@@ -877,10 +896,20 @@ fn skipped_target_and_fallback_guards_are_not_evaluated() -> Result<(), LabError
         indicators: &indicators,
         state: &state,
         actual_state: PositionState::Cash,
+        actual_qty: 0.0,
         actual_weight: 0.0,
         held_bars: 0.0,
+        held_seconds: 0.0,
+        entry_price: 0.0,
         unrealized_return_bps: 0.0,
         trailing_drawdown_bps: 0.0,
+        bar_range_bps: 0.0,
+        bar_body_bps: 0.0,
+        close_location: 0.5,
+        execution: Some(EvalExecutionValues::default()),
+        accounting: Some(EvalAccountingValues::default()),
+        utc_hour: 0.0,
+        utc_minute: 0.0,
         evidence_multiplier: 0.0,
         evidence_coverage: 0.0,
         crosses: &crosses,
@@ -955,10 +984,20 @@ fn unknown_cross_condition_keeps_legacy_false_result() {
         indicators: &indicators,
         state: &state,
         actual_state: PositionState::Cash,
+        actual_qty: 0.0,
         actual_weight: 0.0,
         held_bars: 0.0,
+        held_seconds: 0.0,
+        entry_price: 0.0,
         unrealized_return_bps: 0.0,
         trailing_drawdown_bps: 0.0,
+        bar_range_bps: 0.0,
+        bar_body_bps: 0.0,
+        close_location: 0.5,
+        execution: Some(EvalExecutionValues::default()),
+        accounting: Some(EvalAccountingValues::default()),
+        utc_hour: 0.0,
+        utc_minute: 0.0,
         evidence_multiplier: 0.0,
         evidence_coverage: 0.0,
         crosses: &crosses,
@@ -1756,11 +1795,13 @@ fn position_aware_test_program() -> RulesProgram {
         states: vec![
             PolicyState {
                 id: "seen_return_bps".into(),
+                scope: crate::contracts::PolicyStateScope::Global,
                 initial: 0.0,
                 next: NumericExpr::UnrealizedReturnBps,
             },
             PolicyState {
                 id: "seen_drawdown_bps".into(),
+                scope: crate::contracts::PolicyStateScope::Global,
                 initial: 0.0,
                 next: NumericExpr::TrailingDrawdownBps,
             },
@@ -1862,4 +1903,834 @@ fn position_aware_unrealized_return_and_trailing_drawdown_operands_evaluate_dete
         (dd2 - (6.0 / 110.0) * 10_000.0).abs() < 1e-9,
         "expected ~545.45 bps trailing drawdown, got {dd2}"
     );
+}
+
+fn entry_price_and_utc_clock_test_program() -> RulesProgram {
+    RulesProgram {
+        indicators: vec![close_indicator()],
+        states: vec![
+            PolicyState {
+                id: "seen_entry_price".into(),
+                scope: crate::contracts::PolicyStateScope::Global,
+                initial: 0.0,
+                next: NumericExpr::EntryPrice,
+            },
+            PolicyState {
+                id: "seen_utc_hour".into(),
+                scope: crate::contracts::PolicyStateScope::Global,
+                initial: 0.0,
+                next: NumericExpr::UtcHour,
+            },
+            PolicyState {
+                id: "seen_utc_minute".into(),
+                scope: crate::contracts::PolicyStateScope::Global,
+                initial: 0.0,
+                next: NumericExpr::UtcMinute,
+            },
+        ],
+        rules: vec![
+            PolicyRule {
+                id: "atr_or_price_stop_exit".into(),
+                condition: BoolExpr::And {
+                    conditions: vec![
+                        BoolExpr::PositionIs {
+                            state: PositionState::Long,
+                        },
+                        BoolExpr::Compare {
+                            comparison: CompareOp::Lte,
+                            left: NumericExpr::Indicator { id: "close".into() },
+                            right: NumericExpr::Sub {
+                                left: Box::new(NumericExpr::EntryPrice),
+                                right: Box::new(constant(5.0)),
+                            },
+                        },
+                    ],
+                },
+                target: PolicyTarget::Weight {
+                    value: constant(0.0),
+                },
+            },
+            PolicyRule {
+                id: "enter_long_at_01_utc".into(),
+                condition: BoolExpr::And {
+                    conditions: vec![
+                        BoolExpr::PositionIs {
+                            state: PositionState::Cash,
+                        },
+                        BoolExpr::Compare {
+                            comparison: CompareOp::Eq,
+                            left: NumericExpr::UtcHour,
+                            right: constant(1.0),
+                        },
+                        BoolExpr::Compare {
+                            comparison: CompareOp::Eq,
+                            left: NumericExpr::UtcMinute,
+                            right: constant(0.0),
+                        },
+                    ],
+                },
+                target: PolicyTarget::Weight {
+                    value: constant(1.0),
+                },
+            },
+        ],
+        fallback: PolicyTarget::Hold,
+        signal_expiry: PolicySignalExpiry::EndOfRange,
+        condition_roles: Vec::new(),
+    }
+}
+
+#[test]
+fn entry_price_and_utc_clock_operands_evaluate_deterministically() {
+    let program = entry_price_and_utc_clock_test_program();
+
+    let mut evaluator =
+        RulesEvaluator::new(&definition(program), market(), CandleInterval::H1).expect("compile");
+
+    // bar0 closes at 01:00 UTC -> enter_long_at_01_utc matches while in cash (entry_price = 0.0)
+    let bar0 = observation(0, 100);
+    let eval0 = evaluator
+        .observe(&bar0, cash(), None)
+        .expect("bar0")
+        .expect("ready");
+    assert_eq!(
+        eval0.trace.matched_rule_id.as_deref(),
+        Some("enter_long_at_01_utc")
+    );
+    assert!((state_value(&eval0, "seen_entry_price") - 0.0).abs() < 1e-9);
+    assert!((state_value(&eval0, "seen_utc_hour") - 1.0).abs() < 1e-9);
+    assert!((state_value(&eval0, "seen_utc_minute") - 0.0).abs() < 1e-9);
+
+    // bar1 opens the long episode (entry_price = 100.0 from bar0's cash decision close);
+    // close at 105 (above 100 - 5 = 95) -> holds
+    let bar1 = observation(1, 105);
+    let episode_open = bar1.candle.open_time_utc;
+    let eval1 = evaluator
+        .observe(&bar1, long(episode_open), None)
+        .expect("bar1")
+        .expect("ready");
+    assert_eq!(eval1.trace.matched_rule_id, None);
+    assert!((state_value(&eval1, "seen_entry_price") - 100.0).abs() < 1e-9);
+    assert!((state_value(&eval1, "seen_utc_hour") - 2.0).abs() < 1e-9);
+
+    // bar2 closes at 95 (<= 100 - 5 = 95) -> atr_or_price_stop_exit triggers
+    let bar2 = observation(2, 95);
+    let eval2 = evaluator
+        .observe(&bar2, long(episode_open), None)
+        .expect("bar2")
+        .expect("ready");
+    assert_eq!(
+        eval2.trace.matched_rule_id.as_deref(),
+        Some("atr_or_price_stop_exit")
+    );
+    assert_eq!(eval2.target.get(), Decimal::ZERO);
+    assert!((state_value(&eval2, "seen_entry_price") - 100.0).abs() < 1e-9);
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "test fixture constructs a complete reconciled PositionView from exact fill/mark numbers"
+)]
+fn long_with_accounting(
+    opened_at: UtcTimestamp,
+    held_bars: u64,
+    qty_dec: Decimal,
+    entry_price_dec: Decimal,
+    entry_fee_dec: Decimal,
+    entry_embedded_dec: Decimal,
+    close_price_dec: Decimal,
+    exit_price_dec: Decimal,
+    exit_fee_dec: Decimal,
+    cash_free_dec: Decimal,
+) -> PositionView {
+    let price_basis = qty_dec * entry_price_dec;
+    let total_cost_basis = price_basis + entry_fee_dec;
+    let avg_entry = PriceKrw::new(price_basis / qty_dec).expect("avg_entry");
+    let avg_cost = PriceKrw::new(total_cost_basis / qty_dec).expect("avg_cost");
+    let position_value = qty_dec * close_price_dec;
+    let gross_unrealized = position_value - price_basis;
+    let net_unrealized = position_value - total_cost_basis;
+    let exit_notional = qty_dec * exit_price_dec;
+    let exit_embedded = qty_dec * (close_price_dec - exit_price_dec).max(Decimal::ZERO);
+    let liq_net_pnl = (exit_notional - exit_fee_dec) - total_cost_basis;
+    let equity = cash_free_dec + position_value;
+    let weight = Weight::new(position_value / equity).expect("weight");
+    PositionView {
+        actual_qty: AssetQuantity::new(qty_dec).expect("qty"),
+        actual_weight: weight,
+        episode_opened_at: Some(opened_at),
+        held_decision_bars: Some(held_bars),
+        execution: Some(crate::strategy::ExecutionContextSnapshot {
+            episode_fill_count: 1,
+            episode_buy_fill_count: 1,
+            episode_sell_fill_count: 0,
+            last_fill_price: Some(avg_entry),
+            last_fill_qty: Some(AssetQuantity::new(qty_dec).expect("qty")),
+            last_fill_at: Some(opened_at),
+            last_fill_side: Some(crate::contracts::Side::Buy),
+            has_pending_order: false,
+            pending_remaining_notional_krw: crate::contracts::QuoteAmount::new(Decimal::ZERO)
+                .expect("zero"),
+            pending_partially_filled: false,
+        }),
+        accounting: Some(crate::strategy::PositionAccountingSnapshot {
+            avg_entry_price_krw: avg_entry,
+            avg_cost_price_krw: avg_cost,
+            price_basis_krw: crate::contracts::QuoteAmount::new(price_basis).expect("basis"),
+            allocated_entry_fee_krw: crate::contracts::QuoteAmount::new(entry_fee_dec)
+                .expect("entry fee"),
+            allocated_entry_embedded_cost_krw: crate::contracts::QuoteAmount::new(
+                entry_embedded_dec,
+            )
+            .expect("entry embedded"),
+            total_cost_basis_krw: crate::contracts::QuoteAmount::new(total_cost_basis)
+                .expect("total basis"),
+            position_value_krw: crate::contracts::QuoteAmount::new(position_value)
+                .expect("pos value"),
+            gross_unrealized_pnl_krw: crate::contracts::SignedAmount::new(gross_unrealized)
+                .expect("gross pnl"),
+            net_unrealized_pnl_krw: crate::contracts::SignedAmount::new(net_unrealized)
+                .expect("net pnl"),
+            estimated_exit_price_krw: PriceKrw::new(exit_price_dec).expect("exit price"),
+            estimated_exit_notional_krw: crate::contracts::QuoteAmount::new(exit_notional)
+                .expect("exit notional"),
+            estimated_exit_fee_krw: crate::contracts::QuoteAmount::new(exit_fee_dec)
+                .expect("exit fee"),
+            estimated_exit_embedded_cost_krw: crate::contracts::QuoteAmount::new(exit_embedded)
+                .expect("exit embedded"),
+            estimated_liquidation_net_pnl_krw: crate::contracts::SignedAmount::new(liq_net_pnl)
+                .expect("liq net pnl"),
+            cash_total_krw: crate::contracts::QuoteAmount::new(cash_free_dec).expect("cash total"),
+            cash_free_krw: crate::contracts::QuoteAmount::new(cash_free_dec).expect("cash free"),
+            cash_locked_krw: crate::contracts::QuoteAmount::new(Decimal::ZERO)
+                .expect("cash locked"),
+            equity_krw: crate::contracts::QuoteAmount::new(equity).expect("equity"),
+            cumulative_realized_pnl_krw: crate::contracts::SignedAmount::new(Decimal::ZERO)
+                .expect("realized"),
+            cumulative_fees_krw: crate::contracts::QuoteAmount::new(entry_fee_dec)
+                .expect("cum fees"),
+        }),
+        market: None,
+    }
+}
+
+#[test]
+fn diagnostic_xrp_fill_price_1785_vs_1787_separates_cost_return_from_legacy_close_return() {
+    let program = RulesProgram {
+        indicators: vec![close_indicator()],
+        states: vec![
+            PolicyState {
+                id: "legacy_unrealized_bps".into(),
+                scope: crate::contracts::PolicyStateScope::Episode,
+                initial: 0.0,
+                next: NumericExpr::UnrealizedReturnBps,
+            },
+            PolicyState {
+                id: "cost_return_bps".into(),
+                scope: crate::contracts::PolicyStateScope::Episode,
+                initial: 0.0,
+                next: NumericExpr::CostReturnBps,
+            },
+            PolicyState {
+                id: "avg_entry_price".into(),
+                scope: crate::contracts::PolicyStateScope::Episode,
+                initial: 0.0,
+                next: NumericExpr::AvgEntryPrice,
+            },
+            PolicyState {
+                id: "liq_net_pnl".into(),
+                scope: crate::contracts::PolicyStateScope::Episode,
+                initial: 0.0,
+                next: NumericExpr::LiquidationNetPnlKrw,
+            },
+        ],
+        rules: vec![PolicyRule {
+            id: "enter".into(),
+            condition: BoolExpr::PositionIs {
+                state: PositionState::Cash,
+            },
+            target: PolicyTarget::Weight {
+                value: constant(0.4),
+            },
+        }],
+        fallback: PolicyTarget::Hold,
+        signal_expiry: PolicySignalExpiry::EndOfRange,
+        condition_roles: Vec::new(),
+    };
+    let def = definition(program);
+    let mut eval_1785 = RulesEvaluator::new(&def, market(), CandleInterval::H1).expect("compile");
+    let mut eval_1787 = RulesEvaluator::new(&def, market(), CandleInterval::H1).expect("compile");
+
+    // Cash decision bar closes at 1,785 KRW in both runs
+    let bar0 = observation(0, 1_785);
+    eval_1785.observe(&bar0, cash(), None).expect("bar0 1785");
+    eval_1787.observe(&bar0, cash(), None).expect("bar0 1787");
+
+    // Next bar closes at 1,783 KRW; run A filled at 1,785 KRW, run B filled at 1,787 KRW
+    let bar1 = observation(1, 1_783);
+    let opened = bar1.candle.open_time_utc;
+    let qty_dec = Decimal::from(1_000);
+    let pos_1785 = long_with_accounting(
+        opened,
+        1,
+        qty_dec,
+        Decimal::from(1_785),
+        Decimal::from(892),
+        Decimal::ZERO,
+        Decimal::from(1_783),
+        Decimal::from(1_783),
+        Decimal::from(891),
+        Decimal::from(2_500_000),
+    );
+    let pos_1787 = long_with_accounting(
+        opened,
+        1,
+        qty_dec,
+        Decimal::from(1_787),
+        Decimal::from(893),
+        Decimal::from(2_000),
+        Decimal::from(1_783),
+        Decimal::from(1_783),
+        Decimal::from(891),
+        Decimal::from(2_500_000),
+    );
+
+    let out_1785 = eval_1785
+        .observe(&bar1, pos_1785, None)
+        .expect("eval 1785")
+        .expect("ready");
+    let out_1787 = eval_1787
+        .observe(&bar1, pos_1787, None)
+        .expect("eval 1787")
+        .expect("ready");
+
+    // 1. Legacy UNREALIZED_RETURN_BPS is identical (-11.204481792717086 bps) because both entered from 1,785 cash close
+    let legacy_1785 = state_value(&out_1785, "legacy_unrealized_bps");
+    let legacy_1787 = state_value(&out_1787, "legacy_unrealized_bps");
+    let expected_legacy = ((1_783.0 - 1_785.0) / 1_785.0) * 10_000.0;
+    assert!((legacy_1785 - expected_legacy).abs() < 1e-9);
+    assert!((legacy_1787 - expected_legacy).abs() < 1e-9);
+
+    // 2. Cost-basis COST_RETURN_BPS reflects actual fill price (1,785 vs 1,787)
+    let cost_1785 = state_value(&out_1785, "cost_return_bps");
+    let cost_1787 = state_value(&out_1787, "cost_return_bps");
+    let expected_cost_1787 = ((1_783.0 - 1_787.0) / 1_787.0) * 10_000.0;
+    assert!((cost_1785 - expected_legacy).abs() < 1e-9);
+    assert!((cost_1787 - expected_cost_1787).abs() < 1e-9);
+    assert_ne!(cost_1785.to_bits(), cost_1787.to_bits());
+    assert!((state_value(&out_1785, "avg_entry_price") - 1_785.0).abs() < 1e-9);
+    assert!((state_value(&out_1787, "avg_entry_price") - 1_787.0).abs() < 1e-9);
+    assert!(state_value(&out_1787, "liq_net_pnl") < state_value(&out_1785, "liq_net_pnl"));
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "single multi-bar progression verifies initial entry, scale-in, partial sell, exit, and episode state reset"
+)]
+fn scale_in_partial_sell_and_episode_reset_maintain_exact_accounting_and_watermarks() {
+    let program = RulesProgram {
+        indicators: vec![close_indicator()],
+        states: vec![
+            PolicyState {
+                id: "global_counter".into(),
+                scope: crate::contracts::PolicyStateScope::Global,
+                initial: 0.0,
+                next: NumericExpr::Add {
+                    left: Box::new(NumericExpr::State {
+                        id: "global_counter".into(),
+                    }),
+                    right: Box::new(constant(1.0)),
+                },
+            },
+            PolicyState {
+                id: "arm_50".into(),
+                scope: crate::contracts::PolicyStateScope::Episode,
+                initial: 0.0,
+                next: NumericExpr::If {
+                    condition: Box::new(BoolExpr::And {
+                        conditions: vec![
+                            BoolExpr::PositionIs {
+                                state: PositionState::Long,
+                            },
+                            BoolExpr::Compare {
+                                comparison: CompareOp::Gte,
+                                left: NumericExpr::LiquidationNetPnlKrw,
+                                right: NumericExpr::RoundTripCostKrw,
+                            },
+                        ],
+                    }),
+                    then_value: Box::new(constant(1.0)),
+                    else_value: Box::new(NumericExpr::State {
+                        id: "arm_50".into(),
+                    }),
+                },
+            },
+            PolicyState {
+                id: "floor_pnl".into(),
+                scope: crate::contracts::PolicyStateScope::Episode,
+                initial: 0.0,
+                next: NumericExpr::If {
+                    condition: Box::new(BoolExpr::Compare {
+                        comparison: CompareOp::Gte,
+                        left: NumericExpr::State {
+                            id: "arm_50".into(),
+                        },
+                        right: constant(0.5),
+                    }),
+                    then_value: Box::new(NumericExpr::Max {
+                        left: Box::new(NumericExpr::State {
+                            id: "floor_pnl".into(),
+                        }),
+                        right: Box::new(NumericExpr::Mul {
+                            left: Box::new(NumericExpr::PeakLiquidationNetPnlKrw),
+                            right: Box::new(constant(0.5)),
+                        }),
+                    }),
+                    else_value: Box::new(constant(0.0)),
+                },
+            },
+            PolicyState {
+                id: "seen_peak_liq_pnl".into(),
+                scope: crate::contracts::PolicyStateScope::Episode,
+                initial: 0.0,
+                next: NumericExpr::PeakLiquidationNetPnlKrw,
+            },
+            PolicyState {
+                id: "seen_peak_cost_bps".into(),
+                scope: crate::contracts::PolicyStateScope::Episode,
+                initial: 0.0,
+                next: NumericExpr::PeakCostReturnBps,
+            },
+            PolicyState {
+                id: "seen_cost_dd_bps".into(),
+                scope: crate::contracts::PolicyStateScope::Episode,
+                initial: 0.0,
+                next: NumericExpr::CostTrailingDrawdownBps,
+            },
+        ],
+        rules: vec![
+            PolicyRule {
+                id: "profit_protect_exit".into(),
+                condition: BoolExpr::And {
+                    conditions: vec![
+                        BoolExpr::PositionIs {
+                            state: PositionState::Long,
+                        },
+                        BoolExpr::Compare {
+                            comparison: CompareOp::Gte,
+                            left: NumericExpr::State {
+                                id: "arm_50".into(),
+                            },
+                            right: constant(0.5),
+                        },
+                        BoolExpr::Compare {
+                            comparison: CompareOp::Lte,
+                            left: NumericExpr::LiquidationNetPnlKrw,
+                            right: NumericExpr::State {
+                                id: "floor_pnl".into(),
+                            },
+                        },
+                    ],
+                },
+                target: PolicyTarget::Weight {
+                    value: constant(0.0),
+                },
+            },
+            PolicyRule {
+                id: "enter_long".into(),
+                condition: BoolExpr::PositionIs {
+                    state: PositionState::Cash,
+                },
+                target: PolicyTarget::Weight {
+                    value: constant(0.5),
+                },
+            },
+        ],
+        fallback: PolicyTarget::Hold,
+        signal_expiry: PolicySignalExpiry::EndOfRange,
+        condition_roles: Vec::new(),
+    };
+    let mut evaluator =
+        RulesEvaluator::new(&definition(program), market(), CandleInterval::H1).expect("compile");
+
+    // Bar 0: Cash
+    let bar0 = observation(0, 1_000);
+    let eval0 = evaluator
+        .observe(&bar0, cash(), None)
+        .expect("bar0")
+        .expect("ready");
+    assert!((state_value(&eval0, "global_counter") - 1.0).abs() < 1e-9);
+    assert!((state_value(&eval0, "arm_50") - 0.0).abs() < 1e-9);
+
+    // Bar 1: Initial buy of 10 units @ 1,000 KRW (fee 5 KRW). Close = 1,020 KRW, exit = 1,020 KRW (exit fee 5.1 KRW).
+    // Round-trip cost = 10.1 KRW. Liquidation net PnL = 10,200 - 5.1 - 10,005 = +189.9 KRW >= 10.1 KRW -> arms!
+    let bar1 = observation(1, 1_020);
+    let ep1 = bar1.candle.open_time_utc;
+    let pos1 = long_with_accounting(
+        ep1,
+        1,
+        Decimal::from(10),
+        Decimal::from(1_000),
+        Decimal::from(5),
+        Decimal::ZERO,
+        Decimal::from(1_020),
+        Decimal::from(1_020),
+        Decimal::new(51, 1),
+        Decimal::from(10_000),
+    );
+    let eval1 = evaluator
+        .observe(&bar1, pos1, None)
+        .expect("bar1")
+        .expect("ready");
+    // Sequential Episode state update: arm_50 becomes 1.0 AND floor_pnl immediately sees arm_50 == 1.0 on the same bar!
+    assert!((state_value(&eval1, "arm_50") - 1.0).abs() < 1e-9);
+    assert!((state_value(&eval1, "seen_peak_liq_pnl") - 189.9).abs() < 1e-9);
+    assert!((state_value(&eval1, "floor_pnl") - 94.95).abs() < 1e-9);
+
+    // Bar 2: Scale-in! Bought 10 more units @ 1,200 KRW (fee 6 KRW) -> 20 units @ avg_entry 1,100 KRW (entry fee 11 KRW).
+    // Close = 1,150 KRW. Peak close is now 1,150 KRW -> peak_cost_return_bps recomputed against avg_entry 1,100 = (50 / 1100)*10000 = 454.5454... bps!
+    let bar2 = observation(2, 1_150);
+    let pos2 = long_with_accounting(
+        ep1,
+        2,
+        Decimal::from(20),
+        Decimal::from(1_100),
+        Decimal::from(11),
+        Decimal::ZERO,
+        Decimal::from(1_150),
+        Decimal::from(1_150),
+        Decimal::new(115, 1),
+        Decimal::from(0),
+    );
+    let eval2 = evaluator
+        .observe(&bar2, pos2, None)
+        .expect("bar2")
+        .expect("ready");
+    let expected_peak_bps = ((1_150.0 - 1_100.0) / 1_100.0) * 10_000.0;
+    assert!((state_value(&eval2, "seen_peak_cost_bps") - expected_peak_bps).abs() < 1e-6);
+    assert!(state_value(&eval2, "seen_cost_dd_bps").abs() < 1e-9);
+    // Liquidation net PnL at bar 2 = 23,000 - 11.5 - 22,011 = +977.5 KRW -> floor_pnl = 488.75 KRW
+    assert!((state_value(&eval2, "seen_peak_liq_pnl") - 977.5).abs() < 1e-9);
+    assert!((state_value(&eval2, "floor_pnl") - 488.75).abs() < 1e-9);
+
+    // Bar 3: Partial sell! Sold 5 units (25% of position), remaining = 15 units @ avg_entry 1,100 KRW (allocated entry fee = 8.25 KRW).
+    // Close = 1,140 KRW. Peak liquidation net PnL scales proportionally by 15/20 = 0.75: 977.5 * 0.75 = 733.125 KRW!
+    let bar3 = observation(3, 1_140);
+    let pos3 = long_with_accounting(
+        ep1,
+        3,
+        Decimal::from(15),
+        Decimal::from(1_100),
+        Decimal::new(825, 2),
+        Decimal::ZERO,
+        Decimal::from(1_140),
+        Decimal::from(1_140),
+        Decimal::new(855, 2),
+        Decimal::from(5_700),
+    );
+    let eval3 = evaluator
+        .observe(&bar3, pos3, None)
+        .expect("bar3")
+        .expect("ready");
+    assert!((state_value(&eval3, "seen_peak_liq_pnl") - 733.125).abs() < 1e-6);
+
+    // Bar 4: Price drops to 1,115 KRW -> liquidation net PnL on 15 units = 16,725 - 8.36 - 16,508.25 = +208.39 KRW <= floor_pnl (488.75) -> profit_protect_exit triggers!
+    let bar4 = observation(4, 1_115);
+    let pos4 = long_with_accounting(
+        ep1,
+        4,
+        Decimal::from(15),
+        Decimal::from(1_100),
+        Decimal::new(825, 2),
+        Decimal::ZERO,
+        Decimal::from(1_115),
+        Decimal::from(1_115),
+        Decimal::new(836, 2),
+        Decimal::from(5_700),
+    );
+    let eval4 = evaluator
+        .observe(&bar4, pos4, None)
+        .expect("bar4")
+        .expect("ready");
+    assert_eq!(
+        eval4.trace.matched_rule_id.as_deref(),
+        Some("profit_protect_exit")
+    );
+    assert_eq!(eval4.target.get(), Decimal::ZERO);
+
+    // Bar 5: Back in Cash -> Episode states (arm_50, floor_pnl, seen_peak_liq_pnl) reset to 0.0, while Global state (global_counter) advances to 6.0!
+    let bar5 = observation(5, 1_110);
+    let eval5 = evaluator
+        .observe(&bar5, cash(), None)
+        .expect("bar5")
+        .expect("ready");
+    assert!((state_value(&eval5, "global_counter") - 6.0).abs() < 1e-9);
+    assert!((state_value(&eval5, "arm_50") - 0.0).abs() < 1e-9);
+    assert!((state_value(&eval5, "floor_pnl") - 0.0).abs() < 1e-9);
+    assert!((state_value(&eval5, "seen_peak_liq_pnl") - 0.0).abs() < 1e-9);
+    assert!(
+        eval5
+            .trace
+            .state_before
+            .iter()
+            .find(|v| v.id == "arm_50")
+            .expect("arm_50")
+            .value
+            .abs()
+            < 1e-9
+    );
+    assert!(
+        eval5
+            .trace
+            .state_before
+            .iter()
+            .find(|v| v.id == "floor_pnl")
+            .expect("floor_pnl")
+            .value
+            .abs()
+            < 1e-9
+    );
+    assert!(
+        (eval5
+            .trace
+            .state_before
+            .iter()
+            .find(|v| v.id == "global_counter")
+            .expect("global_counter")
+            .value
+            - 5.0)
+            .abs()
+            < 1e-9
+    );
+}
+
+#[test]
+fn missing_accounting_snapshot_fails_closed_when_policy_uses_accounting_operands() {
+    let program = RulesProgram {
+        indicators: vec![close_indicator()],
+        states: Vec::new(),
+        rules: vec![PolicyRule {
+            id: "cost_stop".into(),
+            condition: BoolExpr::And {
+                conditions: vec![
+                    BoolExpr::PositionIs {
+                        state: PositionState::Long,
+                    },
+                    BoolExpr::Compare {
+                        comparison: CompareOp::Lte,
+                        left: NumericExpr::CostReturnBps,
+                        right: constant(-100.0),
+                    },
+                ],
+            },
+            target: PolicyTarget::Weight {
+                value: constant(0.0),
+            },
+        }],
+        fallback: PolicyTarget::Hold,
+        signal_expiry: PolicySignalExpiry::EndOfRange,
+        condition_roles: Vec::new(),
+    };
+    let mut evaluator =
+        RulesEvaluator::new(&definition(program), market(), CandleInterval::H1).expect("compile");
+    let bar0 = observation(0, 100);
+    evaluator.observe(&bar0, cash(), None).expect("bar0");
+
+    // Passing `long(...)` without `accounting` must fail closed with InvalidConfig
+    let bar1 = observation(1, 98);
+    let err = evaluator
+        .observe(&bar1, long(bar1.candle.open_time_utc), None)
+        .expect_err("missing accounting must fail closed");
+    assert!(matches!(err, LabError::InvalidConfig(_)));
+}
+
+fn parse_ts(rfc3339: &str) -> UtcTimestamp {
+    UtcTimestamp(
+        chrono::DateTime::parse_from_rfc3339(rfc3339)
+            .expect("valid rfc3339 timestamp")
+            .with_timezone(&chrono::Utc),
+    )
+}
+
+#[test]
+fn first_eligible_execution_open_and_order_signal_expiry_resolve_latency_collision() {
+    let def = definition(RulesProgram {
+        indicators: vec![close_indicator()],
+        states: Vec::new(),
+        rules: Vec::new(),
+        fallback: PolicyTarget::Hold,
+        signal_expiry: PolicySignalExpiry::DecisionBars { bars: 1 },
+        condition_roles: Vec::new(),
+    });
+    let rev = FrozenPolicyRevision {
+        reference: PolicyRevisionRef {
+            policy_id: crate::contracts::PolicyId::new("policy-scalp").expect("id"),
+            revision_id: crate::contracts::PolicyRevisionId::new("rev-scalp").expect("rev"),
+            definition_digest: crate::contracts::ContentHash::of_value(&def).expect("digest"),
+        },
+        revision_number: 1,
+        parent_revision_id: None,
+        family: crate::contracts::StrategyKind::Other,
+        origin: crate::contracts::PolicyOrigin::User,
+        definition: def,
+    };
+    let evaluator =
+        PolicyEvaluator::compile_frozen_revision(&rev, market(), CandleInterval::M1).expect("eval");
+    let t0 = parse_ts("2026-10-31T01:10:00Z");
+    let range_end = parse_ts("2026-10-31T02:00:00Z");
+
+    // 1. latency_ms == 0: order_signal_expiry is byte-for-byte identical to signal_expiry
+    let sig_exp = evaluator
+        .signal_expiry(t0, CandleInterval::M1, range_end)
+        .expect("sig_exp");
+    let ord_exp_zero = evaluator
+        .order_signal_expiry(t0, t0, CandleInterval::M1, CandleInterval::M1, range_end)
+        .expect("ord_exp_zero");
+    assert_eq!(sig_exp, ord_exp_zero);
+    assert_eq!(ord_exp_zero, parse_ts("2026-10-31T01:11:00Z"));
+
+    // 2. M1/M1 with latency_ms == 250 (reproducing XRP M1 Scalp PAPER v1):
+    let effective_250ms = UtcTimestamp(t0.0 + chrono::Duration::milliseconds(250));
+    let first_open_m1 =
+        first_eligible_execution_open(t0, effective_250ms, CandleInterval::M1).expect("first_open");
+    assert_eq!(first_open_m1, parse_ts("2026-10-31T01:11:00Z"));
+    let ord_exp_250ms = evaluator
+        .order_signal_expiry(
+            t0,
+            effective_250ms,
+            CandleInterval::M1,
+            CandleInterval::M1,
+            range_end,
+        )
+        .expect("ord_exp_250ms");
+    assert_eq!(ord_exp_250ms, parse_ts("2026-10-31T01:12:00Z"));
+    assert!(first_open_m1 >= effective_250ms && first_open_m1 < ord_exp_250ms);
+
+    // 3. M5/M5 vs M5/M1 with latency_ms == 60_000 (1 minute):
+    let effective_60s = UtcTimestamp(t0.0 + chrono::Duration::seconds(60));
+    let ord_exp_m5_m5 = evaluator
+        .order_signal_expiry(
+            t0,
+            effective_60s,
+            CandleInterval::M5,
+            CandleInterval::M5,
+            range_end,
+        )
+        .expect("m5/m5");
+    assert_eq!(ord_exp_m5_m5, parse_ts("2026-10-31T01:20:00Z"));
+    let ord_exp_m5_m1 = evaluator
+        .order_signal_expiry(
+            t0,
+            effective_60s,
+            CandleInterval::M5,
+            CandleInterval::M1,
+            range_end,
+        )
+        .expect("m5/m1");
+    assert_eq!(ord_exp_m5_m1, parse_ts("2026-10-31T01:16:00Z"));
+}
+
+#[test]
+fn completed_bar_microstructure_and_execution_context_operands_evaluate_accurately() {
+    let program = RulesProgram {
+        indicators: vec![close_indicator()],
+        states: vec![
+            PolicyState {
+                id: "seen_range_bps".into(),
+                initial: 0.0,
+                scope: PolicyStateScope::Global,
+                next: NumericExpr::BarRangeBps,
+            },
+            PolicyState {
+                id: "seen_body_bps".into(),
+                initial: 0.0,
+                scope: PolicyStateScope::Global,
+                next: NumericExpr::BarBodyBps,
+            },
+            PolicyState {
+                id: "seen_clv".into(),
+                initial: 0.0,
+                scope: PolicyStateScope::Global,
+                next: NumericExpr::CloseLocation,
+            },
+            PolicyState {
+                id: "seen_fills".into(),
+                initial: 0.0,
+                scope: PolicyStateScope::Episode,
+                next: NumericExpr::EpisodeFillCount,
+            },
+            PolicyState {
+                id: "seen_last_px".into(),
+                initial: 0.0,
+                scope: PolicyStateScope::Episode,
+                next: NumericExpr::LastFillPrice,
+            },
+            PolicyState {
+                id: "seen_secs_since_fill".into(),
+                initial: 0.0,
+                scope: PolicyStateScope::Episode,
+                next: NumericExpr::SecondsSinceLastFill,
+            },
+            PolicyState {
+                id: "seen_move_bps".into(),
+                initial: 0.0,
+                scope: PolicyStateScope::Episode,
+                next: NumericExpr::MoveSinceLastFillBps,
+            },
+        ],
+        rules: Vec::new(),
+        fallback: PolicyTarget::Hold,
+        signal_expiry: PolicySignalExpiry::EndOfRange,
+        condition_roles: Vec::new(),
+    };
+    let mut evaluator =
+        RulesEvaluator::new(&definition(program), market(), CandleInterval::H1).expect("compile");
+
+    // Bar 0 in Cash: open=1000, high=1025, low=975, close=1000 -> range_bps = 50/1000*10000 = 500, body_bps = 0, clv = (1000-975)/50 = 0.5
+    let mut bar0 = observation(0, 1_000);
+    bar0.candle.open = PriceKrw::new(Decimal::from(1_000)).expect("open");
+    bar0.candle.high = PriceKrw::new(Decimal::from(1_025)).expect("high");
+    bar0.candle.low = PriceKrw::new(Decimal::from(975)).expect("low");
+    let eval0 = evaluator
+        .observe(&bar0, cash(), None)
+        .expect("bar0")
+        .expect("ready");
+    assert!((state_value(&eval0, "seen_range_bps") - 500.0).abs() < 1e-9);
+    assert!((state_value(&eval0, "seen_body_bps") - 0.0).abs() < 1e-9);
+    assert!((state_value(&eval0, "seen_clv") - 0.5).abs() < 1e-9);
+    assert!((state_value(&eval0, "seen_fills") - 0.0).abs() < 1e-9);
+
+    // Bar 1 in Long: open=1000, high=1060, low=1000, close=1050; fill happened at bar1.open_time_utc @ 1000 KRW
+    let mut bar1 = observation(1, 1_050);
+    bar1.candle.open = PriceKrw::new(Decimal::from(1_000)).expect("open");
+    bar1.candle.high = PriceKrw::new(Decimal::from(1_060)).expect("high");
+    bar1.candle.low = PriceKrw::new(Decimal::from(1_000)).expect("low");
+    let mut pos1 = long(bar1.candle.open_time_utc);
+    pos1.execution = Some(crate::strategy::ExecutionContextSnapshot {
+        episode_fill_count: 2,
+        episode_buy_fill_count: 2,
+        episode_sell_fill_count: 0,
+        last_fill_price: Some(PriceKrw::new(Decimal::from(1_000)).expect("px")),
+        last_fill_qty: Some(AssetQuantity::new(Decimal::ONE).expect("qty")),
+        last_fill_at: Some(bar1.candle.open_time_utc),
+        last_fill_side: Some(crate::contracts::Side::Buy),
+        has_pending_order: false,
+        pending_remaining_notional_krw: QuoteAmount::new(Decimal::ZERO).expect("zero"),
+        pending_partially_filled: false,
+    });
+    let eval1 = evaluator
+        .observe(&bar1, pos1, None)
+        .expect("bar1")
+        .expect("ready");
+    // range_bps = (1060 - 1000) / 1050 * 10000 = 571.428571...
+    assert!((state_value(&eval1, "seen_range_bps") - (60.0 / 1_050.0 * 10_000.0)).abs() < 1e-6);
+    // body_bps = (1050 - 1000) / 1000 * 10000 = 500.0
+    assert!((state_value(&eval1, "seen_body_bps") - 500.0).abs() < 1e-9);
+    // clv = (1050 - 1000) / (1060 - 1000) = 50 / 60 = 0.833333...
+    assert!((state_value(&eval1, "seen_clv") - (50.0 / 60.0)).abs() < 1e-6);
+    assert!((state_value(&eval1, "seen_fills") - 2.0).abs() < 1e-9);
+    assert!((state_value(&eval1, "seen_last_px") - 1_000.0).abs() < 1e-9);
+    assert!((state_value(&eval1, "seen_secs_since_fill") - 3_600.0).abs() < 1e-9);
+    assert!((state_value(&eval1, "seen_move_bps") - 500.0).abs() < 1e-9);
 }

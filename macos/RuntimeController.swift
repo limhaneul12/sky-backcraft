@@ -188,6 +188,19 @@ final class RuntimeController {
         process.arguments = command.prefixArguments + [
             "tunnel", "--url", "http://127.0.0.1:\(configuration.port)", "--no-autoupdate"
         ]
+        let allowedEnvKeys: Set<String> = [
+            "PATH", "HOME", "TMPDIR", "USER", "LOGNAME", "SHELL", "LANG",
+            "SSL_CERT_FILE", "SSL_CERT_DIR",
+            "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
+            "http_proxy", "https_proxy", "no_proxy", "all_proxy",
+            "SKY_BACKCRAFT_TEST_MARKERS"
+        ]
+        process.environment = ProcessInfo.processInfo.environment.filter { key, _ in
+            allowedEnvKeys.contains(key)
+                || key.hasPrefix("LC_")
+                || key.hasPrefix("XPC_")
+                || key.hasPrefix("__CF")
+        }
         process.standardOutput = pipe
         process.standardError = pipe
         tunnel = process

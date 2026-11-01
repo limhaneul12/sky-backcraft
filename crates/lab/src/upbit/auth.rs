@@ -319,6 +319,16 @@ impl fmt::Display for UpbitCredentials {
     }
 }
 
+impl Drop for UpbitCredentials {
+    fn drop(&mut self) {
+        self.access_key
+            .replace_range(.., &"\0".repeat(self.access_key.len()));
+        self.secret_key
+            .replace_range(.., &"\0".repeat(self.secret_key.len()));
+        std::hint::black_box((self.access_key.as_str(), self.secret_key.as_str()));
+    }
+}
+
 /// Verify that a target URL strictly matches the allowed host prefix.
 ///
 /// # Errors
@@ -554,6 +564,11 @@ pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
     outer.update(opad);
     outer.update(inner_hash);
     let outer_hash = outer.finalize();
+
+    k.fill(0);
+    ipad.fill(0);
+    opad.fill(0);
+    std::hint::black_box((&k, &ipad, &opad));
 
     outer_hash.into()
 }

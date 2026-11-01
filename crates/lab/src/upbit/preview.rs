@@ -25,6 +25,10 @@ pub const MIN_NOTIONAL_KRW: Decimal = Decimal::from_parts(5000, 0, 0, false, 0);
 pub const DEFAULT_UPBIT_FEE_RATE: Decimal = Decimal::from_parts(5, 0, 0, false, 4);
 /// Default preview time-to-live: 60 seconds.
 pub const PREVIEW_TTL_SECONDS: i64 = 60;
+/// Minimum stop distance ratio (`15 bps` = `0.15%`, greater than 3x round-trip 10 bps fee).
+pub const MIN_STOP_DISTANCE_RATIO: Decimal = Decimal::from_parts(15, 0, 0, false, 4);
+/// Upbit coin volume decimal scale (`0.00000001`).
+pub const UPBIT_VOLUME_SCALE: u32 = 8;
 
 /// Preview errors.
 #[derive(Debug, thiserror::Error)]
@@ -43,6 +47,8 @@ pub enum PreviewError {
     UnexpectedVolume,
     #[error("Unexpected price provided for market-sell ('market') order")]
     UnexpectedPrice,
+    #[error("Invalid stop-distance risk sizing: {0}")]
+    InvalidStopSizing(String),
     #[error("Order notional {notional_krw} KRW is below Upbit minimum {min_krw} KRW")]
     UnderMinimumNotional {
         notional_krw: Decimal,
@@ -80,6 +86,10 @@ pub struct OrderPreviewRequest {
     pub current_krw_balance: Option<Decimal>,
     #[serde(default)]
     pub current_coin_balance: Option<Decimal>,
+    #[serde(default)]
+    pub stop_price: Option<Decimal>,
+    #[serde(default)]
+    pub max_loss_krw: Option<Decimal>,
 }
 
 /// Validated order preview output.
@@ -106,9 +116,9 @@ impl OrderPreview {
     /// # Errors
     /// Returns `PreviewError` on any validation failure.
     pub fn build(req: OrderPreviewRequest, now: DateTime<Utc>) -> Result<Self, PreviewError> {
-        // 1. Market allowlist check
+        // 1. Canonical Upbit KRW market check (KRW-<SYMBOL>)
         let market = req.market.to_uppercase();
-        if !matches!(market.as_str(), "KRW-BTC" | "KRW-ETH" | "KRW-XRP") {
+        if crate::contracts::MarketId::parse_upbit(&market).is_err() {
             return Err(PreviewError::DisallowedMarket(req.market));
         }
 
@@ -123,18 +133,22 @@ impl OrderPreview {
         let (price, volume, notional) = match ord_type.as_str() {
             "limit" => {
                 let p = req.price.ok_or(PreviewError::MissingPrice)?;
-                let v = req.volume.ok_or(PreviewError::MissingVolume)?;
                 if p <= Decimal::ZERO {
                     return Err(PreviewError::MissingPrice);
                 }
-                if v <= Decimal::ZERO {
-                    return Err(PreviewError::MissingVolume);
-                }
                 validate_krw_tick_size(p)?;
+                let v =
+                    resolve_limit_volume(&side, p, req.volume, req.stop_price, req.max_loss_krw)?;
                 let notional = p * v;
                 (Some(p), Some(v), notional)
             }
             "price" => {
+                if req.stop_price.is_some() || req.max_loss_krw.is_some() {
+                    return Err(PreviewError::InvalidStopSizing(
+                        "stop_price and max_loss_krw are only supported for limit bid orders"
+                            .into(),
+                    ));
+                }
                 // Market buy: price is total KRW amount, volume must be None
                 if req.volume.is_some() {
                     return Err(PreviewError::UnexpectedVolume);
@@ -146,6 +160,12 @@ impl OrderPreview {
                 (Some(p), None, p)
             }
             "market" => {
+                if req.stop_price.is_some() || req.max_loss_krw.is_some() {
+                    return Err(PreviewError::InvalidStopSizing(
+                        "stop_price and max_loss_krw are only supported for limit bid orders"
+                            .into(),
+                    ));
+                }
                 // Market sell: volume is coin quantity, price must be None
                 if req.price.is_some() {
                     return Err(PreviewError::UnexpectedPrice);
@@ -246,6 +266,80 @@ impl OrderPreview {
                 actual: self.preview_digest.clone(),
             })
         }
+    }
+}
+
+fn resolve_limit_volume(
+    side: &str,
+    price: Decimal,
+    explicit_volume: Option<Decimal>,
+    stop_price: Option<Decimal>,
+    max_loss_krw: Option<Decimal>,
+) -> Result<Decimal, PreviewError> {
+    if stop_price.is_none() && max_loss_krw.is_none() {
+        let volume = explicit_volume.ok_or(PreviewError::MissingVolume)?;
+        if volume <= Decimal::ZERO {
+            return Err(PreviewError::MissingVolume);
+        }
+        return Ok(volume);
+    }
+
+    if side != "bid" {
+        return Err(PreviewError::InvalidStopSizing(
+            "stop_price and max_loss_krw are only supported for limit bid orders".into(),
+        ));
+    }
+    let (Some(stop), Some(max_loss)) = (stop_price, max_loss_krw) else {
+        return Err(PreviewError::InvalidStopSizing(
+            "both stop_price and max_loss_krw are required for stop-distance sizing".into(),
+        ));
+    };
+    if stop <= Decimal::ZERO {
+        return Err(PreviewError::InvalidStopSizing(
+            "stop_price must be positive".into(),
+        ));
+    }
+    if stop >= price {
+        return Err(PreviewError::InvalidStopSizing(format!(
+            "stop_price ({stop}) must be strictly below limit bid price ({price})"
+        )));
+    }
+    validate_krw_tick_size(stop)?;
+    if max_loss <= Decimal::ZERO {
+        return Err(PreviewError::InvalidStopSizing(
+            "max_loss_krw must be positive".into(),
+        ));
+    }
+
+    let stop_distance = price - stop;
+    if stop_distance < price * MIN_STOP_DISTANCE_RATIO {
+        return Err(PreviewError::InvalidStopSizing(format!(
+            "stop distance ({stop_distance} KRW) is tighter than minimum 15 bps of entry price ({price} KRW)"
+        )));
+    }
+
+    // Fee-inclusive loss per 1.0 coin unit stopped out at stop_price (entry + exit 5 bps fee).
+    let unit_loss_krw = stop_distance + ((price + stop) * DEFAULT_UPBIT_FEE_RATE);
+    let sized_volume = (max_loss / unit_loss_krw)
+        .round_dp_with_strategy(UPBIT_VOLUME_SCALE, rust_decimal::RoundingStrategy::ToZero);
+    if sized_volume <= Decimal::ZERO {
+        return Err(PreviewError::InvalidStopSizing(
+            "max_loss_krw is too small to size a positive 8-decimal coin volume".into(),
+        ));
+    }
+
+    if let Some(volume) = explicit_volume {
+        if volume <= Decimal::ZERO {
+            return Err(PreviewError::MissingVolume);
+        }
+        if volume > sized_volume {
+            return Err(PreviewError::InvalidStopSizing(format!(
+                "explicit volume ({volume}) exceeds max_loss_krw risk-sized cap ({sized_volume})"
+            )));
+        }
+        Ok(volume)
+    } else {
+        Ok(sized_volume)
     }
 }
 
@@ -391,6 +485,8 @@ mod tests {
             volume: Some(Decimal::new(1, 2)), // 0.01 BTC
             current_krw_balance: Some(Decimal::new(2_000_000, 0)),
             current_coin_balance: None,
+            stop_price: None,
+            max_loss_krw: None,
         };
         let preview = OrderPreview::build(req, Utc::now()).unwrap();
         assert_eq!(preview.status, "PREVIEW_VALIDATED");
@@ -409,13 +505,31 @@ mod tests {
             volume: Some(Decimal::new(1, 5)), // 0.00001 BTC = 950 KRW < 5,000 KRW
             current_krw_balance: None,
             current_coin_balance: None,
+            stop_price: None,
+            max_loss_krw: None,
         };
         assert!(OrderPreview::build(req, Utc::now()).is_err());
     }
 
     #[test]
     fn test_preview_reject_disallowed_market() {
-        let req = OrderPreviewRequest {
+        let disallowed = OrderPreviewRequest {
+            market: "USDT-BTC".into(),
+            side: "bid".into(),
+            ord_type: "limit".into(),
+            price: Some(Decimal::new(150, 0)),
+            volume: Some(Decimal::new(100, 0)),
+            current_krw_balance: None,
+            current_coin_balance: None,
+            stop_price: None,
+            max_loss_krw: None,
+        };
+        assert!(matches!(
+            OrderPreview::build(disallowed, Utc::now()),
+            Err(PreviewError::DisallowedMarket(_))
+        ));
+
+        let valid_altcoin = OrderPreviewRequest {
             market: "KRW-DOGE".into(),
             side: "bid".into(),
             ord_type: "limit".into(),
@@ -423,8 +537,10 @@ mod tests {
             volume: Some(Decimal::new(100, 0)),
             current_krw_balance: None,
             current_coin_balance: None,
+            stop_price: None,
+            max_loss_krw: None,
         };
-        assert!(OrderPreview::build(req, Utc::now()).is_err());
+        assert!(OrderPreview::build(valid_altcoin, Utc::now()).is_ok());
     }
 
     #[test]
@@ -437,10 +553,95 @@ mod tests {
             volume: Some(Decimal::new(1, 0)), // 1 ETH = 3,500,000 KRW
             current_krw_balance: Some(Decimal::new(100_000, 0)), // only 100k
             current_coin_balance: None,
+            stop_price: None,
+            max_loss_krw: None,
         };
         assert!(matches!(
             OrderPreview::build(req, Utc::now()),
             Err(PreviewError::InsufficientKrw { .. })
         ));
+    }
+
+    #[test]
+    fn test_preview_stop_distance_risk_sizing_derives_fee_inclusive_volume() {
+        // Entry = 100,000,000 KRW, Stop = 99,000,000 KRW (1% = 100 bps stop distance).
+        // Unit loss = (100M - 99M) + (100M + 99M) * 0.0005 = 1,099,500 KRW / BTC.
+        // Max loss = 50,000 KRW -> 50,000 / 1,099,500 = 0.04547521 BTC (rounded down to 8 dp).
+        let req = OrderPreviewRequest {
+            market: "KRW-BTC".into(),
+            side: "bid".into(),
+            ord_type: "limit".into(),
+            price: Some(Decimal::new(100_000_000, 0)),
+            volume: None,
+            current_krw_balance: Some(Decimal::new(10_000_000, 0)),
+            current_coin_balance: None,
+            stop_price: Some(Decimal::new(99_000_000, 0)),
+            max_loss_krw: Some(Decimal::new(50_000, 0)),
+        };
+        let preview = OrderPreview::build(req, Utc::now()).unwrap();
+        let expected_volume = Decimal::from_str_exact("0.04547521").unwrap();
+        assert_eq!(preview.volume, Some(expected_volume));
+        assert_eq!(
+            preview.calculated_notional_krw,
+            Decimal::from_str_exact("4547521.00000000").unwrap()
+        );
+        let realized_loss_if_stopped = expected_volume * Decimal::new(1_099_500, 0);
+        assert!(realized_loss_if_stopped <= Decimal::new(50_000, 0));
+        assert!(preview.verify_digest().is_ok());
+    }
+
+    #[test]
+    fn test_preview_stop_distance_rejects_tight_stop_and_excess_explicit_volume() {
+        // 10 bps stop (< 15 bps minimum) must be rejected.
+        let tight_stop = OrderPreviewRequest {
+            market: "KRW-BTC".into(),
+            side: "bid".into(),
+            ord_type: "limit".into(),
+            price: Some(Decimal::new(100_000_000, 0)),
+            volume: None,
+            current_krw_balance: None,
+            current_coin_balance: None,
+            stop_price: Some(Decimal::new(99_900_000, 0)),
+            max_loss_krw: Some(Decimal::new(50_000, 0)),
+        };
+        assert!(matches!(
+            OrderPreview::build(tight_stop, Utc::now()),
+            Err(PreviewError::InvalidStopSizing(_))
+        ));
+
+        // Explicit volume exceeding risk-sized cap must be rejected.
+        let excess_volume = OrderPreviewRequest {
+            market: "KRW-BTC".into(),
+            side: "bid".into(),
+            ord_type: "limit".into(),
+            price: Some(Decimal::new(100_000_000, 0)),
+            volume: Some(Decimal::new(1, 1)), // 0.1 BTC > 0.04547521 BTC cap
+            current_krw_balance: None,
+            current_coin_balance: None,
+            stop_price: Some(Decimal::new(99_000_000, 0)),
+            max_loss_krw: Some(Decimal::new(50_000, 0)),
+        };
+        assert!(matches!(
+            OrderPreview::build(excess_volume, Utc::now()),
+            Err(PreviewError::InvalidStopSizing(_))
+        ));
+    }
+
+    #[test]
+    fn test_daytrader_rules_example_validates_against_policy_contract() {
+        let example_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/examples/policy-create-daytrader-rules.json");
+        let raw = std::fs::read_to_string(&example_path).unwrap();
+        let write: crate::contracts::PolicyWrite = serde_json::from_str(&raw).unwrap();
+        match write {
+            crate::contracts::PolicyWrite::Create { definition, .. } => {
+                definition.validate().unwrap();
+            }
+            crate::contracts::PolicyWrite::Revise { .. }
+            | crate::contracts::PolicyWrite::Sweep { .. }
+            | crate::contracts::PolicyWrite::Preflight { .. } => {
+                panic!("expected PolicyWrite::Create in policy-create-daytrader-rules.json");
+            }
+        }
     }
 }

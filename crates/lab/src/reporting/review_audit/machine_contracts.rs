@@ -163,6 +163,7 @@ fn risk_policies_match(left: &AutomationRiskPolicy, right: &AutomationRiskPolicy
         && left.max_asset_exposure_krw == right.max_asset_exposure_krw
         && left.max_daily_loss_krw == right.max_daily_loss_krw
         && left.activation_loss_limit_krw == right.activation_loss_limit_krw
+        && left.hard_stop_loss_bps == right.hard_stop_loss_bps
         && left.max_open_orders == right.max_open_orders
         && left.max_orders_per_interval == right.max_orders_per_interval
         && left.max_balance_age_seconds == right.max_balance_age_seconds

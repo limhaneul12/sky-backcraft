@@ -390,12 +390,7 @@ impl UpbitPrivateClient {
             ));
         };
         let authorization = credentials.sign_request(None)?;
-        let mut header =
-            reqwest::header::HeaderValue::try_from(authorization.as_str()).map_err(|_| {
-                ClientError::InvalidParams("invalid private authorization header".into())
-            })?;
-        header.set_sensitive(true);
-        Ok(header)
+        sensitive_auth_header(&authorization)
     }
 
     /// Fetch account balances (`GET /v1/accounts`).
@@ -416,7 +411,7 @@ impl UpbitPrivateClient {
             TransportMode::Live(creds) => {
                 let url = format!("{}/v1/accounts", self.base_url);
                 self.verify_request_host(&url)?;
-                let auth_header = creds.sign_request(None)?;
+                let auth_header = sensitive_auth_header(&creds.sign_request(None)?)?;
 
                 self.throttle().await?;
                 let res = self
@@ -479,7 +474,7 @@ impl UpbitPrivateClient {
                 let query = format!("market={market}");
                 let url = format!("{}/v1/orders/chance?{query}", self.base_url);
                 self.verify_request_host(&url)?;
-                let auth_header = creds.sign_request(Some(&query))?;
+                let auth_header = sensitive_auth_header(&creds.sign_request(Some(&query))?)?;
 
                 self.throttle().await?;
                 let res = self
@@ -639,7 +634,7 @@ impl UpbitPrivateClient {
             TransportMode::Live(creds) => {
                 let url = format!("{}/v1/order?{query}", self.base_url);
                 self.verify_request_host(&url)?;
-                let auth_header = creds.sign_request(Some(&query))?;
+                let auth_header = sensitive_auth_header(&creds.sign_request(Some(&query))?)?;
 
                 self.throttle().await?;
                 let res = self
@@ -734,7 +729,7 @@ impl UpbitPrivateClient {
         let TransportMode::Live(credentials) = &self.mode else {
             return Err(ClientError::LiveTradingDisabled);
         };
-        let authorization = credentials.sign_request(Some(&query))?;
+        let authorization = sensitive_auth_header(&credentials.sign_request(Some(&query))?)?;
         self.throttle().await?;
         let response = self
             .http
@@ -847,7 +842,7 @@ impl UpbitPrivateClient {
             format!("{}{path}", self.base_url)
         };
         self.verify_request_host(&url)?;
-        let authorization = credentials.sign_request(Some(query))?;
+        let authorization = sensitive_auth_header(&credentials.sign_request(Some(query))?)?;
         self.throttle().await?;
         let mut request = self
             .http
@@ -1054,7 +1049,7 @@ impl UpbitPrivateClient {
             TransportMode::Live(creds) => {
                 let url = format!("{}{path}?{query}", self.base_url);
                 self.verify_request_host(&url)?;
-                let auth_header = creds.sign_request(Some(query))?;
+                let auth_header = sensitive_auth_header(&creds.sign_request(Some(query))?)?;
 
                 self.throttle().await?;
                 let res = self
@@ -1135,7 +1130,7 @@ impl UpbitPrivateClient {
                     .collect::<Vec<_>>()
                     .join("&");
 
-                let auth_header = creds.sign_request(Some(&query_string))?;
+                let auth_header = sensitive_auth_header(&creds.sign_request(Some(&query_string))?)?;
 
                 self.throttle().await?;
                 let res = self
@@ -1240,6 +1235,13 @@ impl crate::automation::VenueAdapter for UpbitPrivateClient {
     ) -> crate::automation::VenueFuture<'a, UpbitOrderDetail> {
         Box::pin(self.cancel_automation_order(uuid))
     }
+}
+
+fn sensitive_auth_header(value: &str) -> Result<reqwest::header::HeaderValue, ClientError> {
+    let mut header = reqwest::header::HeaderValue::try_from(value)
+        .map_err(|_| ClientError::InvalidParams("invalid private authorization header".into()))?;
+    header.set_sensitive(true);
+    Ok(header)
 }
 
 fn automation_wire(request: &AutomationOrderRequest) -> Result<UpbitOrderRequest, ClientError> {

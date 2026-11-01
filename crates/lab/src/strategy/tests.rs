@@ -23,20 +23,15 @@ fn price(value: i64) -> PriceKrw {
     PriceKrw::new(decimal(value)).expect("synthetic price")
 }
 fn cash() -> PositionView {
-    PositionView {
-        actual_qty: AssetQuantity::new(Decimal::ZERO).unwrap(),
-        actual_weight: Weight::new(Decimal::ZERO).unwrap(),
-        episode_opened_at: None,
-        held_decision_bars: None,
-    }
+    PositionView::cash().unwrap()
 }
 fn long(opened: UtcTimestamp, held: u64, weight: &str) -> PositionView {
-    PositionView {
-        actual_qty: AssetQuantity::new(Decimal::ONE).unwrap(),
-        actual_weight: Weight::new(Decimal::from_str(weight).unwrap()).unwrap(),
-        episode_opened_at: Some(opened),
-        held_decision_bars: Some(held),
-    }
+    PositionView::basic(
+        AssetQuantity::new(Decimal::ONE).unwrap(),
+        Weight::new(Decimal::from_str(weight).unwrap()).unwrap(),
+        Some(opened),
+        Some(held),
+    )
 }
 
 /// `SYNTHETIC_TEST_ONLY`: hand-authored OHLC, never market-performance evidence.
@@ -102,6 +97,10 @@ fn verified_h1_gap_coverage() -> VerifiedProviderCoverage {
     .expect("verified H1 coverage")
 }
 
+#[allow(
+    clippy::large_types_passed_by_value,
+    reason = "PositionView is stack-only Copy to avoid per-bar heap allocations"
+)]
 fn run(
     spec: StrategySpec,
     closes: &[(i64, i64, i64)],

@@ -582,6 +582,7 @@ fn live_policy_definition() -> PolicyDefinition {
                 }],
                 states: vec![PolicyState {
                     id: "memory".into(),
+                    scope: crate::contracts::PolicyStateScope::Global,
                     initial: 0.0,
                     next: NumericExpr::State {
                         id: "memory".into(),
@@ -614,6 +615,7 @@ fn live_risk() -> TestResult<crate::contracts::AutomationRiskPolicy> {
         max_asset_exposure_krw: QuoteAmount::new(Decimal::from(100_000))?,
         max_daily_loss_krw: QuoteAmount::new(Decimal::from(100_000))?,
         activation_loss_limit_krw: Some(QuoteAmount::new(Decimal::from(LIVE_LOSS_LIMIT_KRW))?),
+        hard_stop_loss_bps: None,
         max_open_orders: 1,
         max_orders_per_interval: 1,
         max_balance_age_seconds: 3_600,
@@ -723,12 +725,7 @@ async fn seed_causal_live_buy(
         constituent_ids: Vec::new(),
     };
     let mut checkpoint = AutomationCheckpoint::compile(policy, market, CandleInterval::M1)?;
-    let position = crate::strategy::PositionView {
-        actual_qty: AssetQuantity::new(Decimal::ZERO)?,
-        actual_weight: Weight::new(Decimal::ZERO)?,
-        episode_opened_at: None,
-        held_decision_bars: None,
-    };
+    let position = crate::strategy::PositionView::cash()?;
     let evaluation = checkpoint
         .observe(&observation, position)?
         .ok_or("one completed Close bar should evaluate the synthetic Rules policy")?;

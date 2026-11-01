@@ -12,8 +12,9 @@ description: Sky Backcraft의 기존 독립 모델·공유 포트폴리오·regi
 
 - 현재 MCP 도구/스키마를 확인한다. 주어진 `run_id`가 있으면 바로 조회한다. 없으면 `history_query(action="runs")`에서 찾고 후보가 여럿이면 날짜·시장·정책으로 좁힌다. 표시 이름이나 과거 예제 ID로 추정하지 않는다.
 - 먼저 실행의 capital_mode와 종류를 확인한다. 독립 모델 실행은 `result_query({action:"summary", run_id})`, 공유 portfolio run은 `portfolio_summary`와 `portfolio_backtest(get)`을 사용한다. 공유 실행이 일반 runs 이력에서 안 보이면 `portfolio_backtest(list)`로 찾는다. 조회 종류를 바꾸기 위해 새 run을 만들지 않는다.
-- 독립 summary의 `market`, `strategy`, `policy_ref`, `status`, `initial_cash`, `terminal_equity`, `total_return_ratio`, `total_fees`, `fill_count`, `closed_positions`, `open_positions`, 사유를 사용한다. family가 같아도 다른 revision/model은 별개다. 독립 모델의 기말자산을 합쳐 공유 포트폴리오 수익률로 보고하지 않는다. 공유 실행은 실제 한 cash pool의 결과를 읽는다.
+- 독립 summary의 `market`, `strategy`, `policy_ref`, `status`, `initial_cash`, `terminal_equity`, `total_return_ratio`, `total_fees`, `fill_count`, `closed_positions`, `open_positions`, `win_rate`, `payoff_ratio_r`, `breakeven_win_rate`, `max_consecutive_losses`, 사유를 사용한다. review의 `equity_metrics`에서는 수익률·MDD·Sharpe·Sortino와 함께 과적합/낙폭 깊이 지표인 `calmar`(연환산 수익률 ÷ 최대낙폭)와 `ulcer_index`(구간 전체 고점 대비 낙폭의 RMS)를 확인할 수 있다. family가 같아도 다른 revision/model은 별개다. 독립 모델의 기말자산을 합쳐 공유 포트폴리오 수익률로 보고하지 않는다. 공유 실행은 실제 한 cash pool의 결과를 읽는다.
 - `total_return_ratio`는 비율이다. 퍼센트 표시는 ×100하고 원본 JSON 값과 단위를 보존한다. `null`과 `financial_null_reason`은 0/무손실로 바꾸지 않는다. 반대로 실제 완료됐지만 매매가 없었던 모델의 0 수익률은 차단 모델과 구분한다.
+- 승률(Win rate) 해석 시 단독 수치로 우열을 단정하지 않고 손익비 `R`(평균 이익 ÷ 평균 손실 또는 목표/손절 비율)에 따른 **손익분기 승률 `1 / (1 + R)`**(예: `2R`이면 `33.3%`, `1.5R`이면 `40.0%`, `1R`이면 `50.0%`) 및 표본 수(`closed_positions`)와 함께 대조한다. 관측 승률이 손익분기 승률의 `±5%p` 이내면 `"손익분기 근처(동전 던지기에 가까움)"`로 명시한다. 어떤 종목·정책·신호도 `"매수 추천"`이나 `"승리 전략"`으로 포장하지 않고 항상 `"동결된 규칙/조건과 일치함"`으로 서술한다.
 - 상세 확인이 필요할 때만 `result_query(action="costs", run_id, model_id)` 또는 `action="ledger"`를 사용한다. ledger 인자는 `query` 안에 넣는다:
 
 ```text

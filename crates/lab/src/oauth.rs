@@ -8,7 +8,7 @@
 //! owner-approved authorization-code exchange completes PKCE; refresh never reopens it.
 
 use crate::database::DatabaseHandle;
-use crate::storage::{NewOAuthClientRecord, StoredOAuthClientRecord};
+use crate::storage::{NewOAuthClientRecord, NewOAuthRefreshGrantRecord, StoredOAuthClientRecord};
 use crate::upbit::live_order_control::{
     LiveOrderControlAction, LiveOrderControlOutcome, LiveOrderControlRequest,
     LiveOrderControlService,
@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 
 const MAX_CLIENTS: usize = 64;
 const MAX_PENDING_APPROVALS: usize = 128;
+const MAX_PENDING_APPROVALS_PER_CLIENT: usize = 8;
 const MAX_CODES: usize = 128;
 const MAX_TOKENS: usize = 128;
 const APPROVAL_TTL: Duration = Duration::from_mins(10);
@@ -180,6 +181,8 @@ struct Grants {
     clients: HashMap<String, Client>,
     next_registration_order: u64,
     reserved_client_evictions: HashSet<String>,
+    reserved_token_pairs: usize,
+    persisted_refresh_clients: HashMap<String, Instant>,
     pending: HashMap<String, PendingApproval>,
     codes: HashMap<String, AuthorizationCode>,
     tokens: HashMap<String, AccessToken>,
@@ -438,6 +441,13 @@ impl OAuthState {
                 move |store| store.load_oauth_clients(&issuer, MAX_CLIENTS)
             })
             .await?;
+        let now_secs = chrono::Utc::now().timestamp();
+        let active_refresh_clients = database
+            .call("oauth_load_active_refresh_clients", {
+                let issuer = self.inner.public_url.clone();
+                move |store| store.load_oauth_active_refresh_client_expiries(&issuer, now_secs)
+            })
+            .await?;
 
         let mut restored = Vec::with_capacity(stored_clients.len());
         let mut previous_sequence = 0_u64;
@@ -452,6 +462,7 @@ impl OAuthState {
             restored.push(stored);
         }
 
+        let now_instant = Instant::now();
         let mut grants = self.inner.grants.lock().map_err(|_| {
             crate::contracts::LabError::Internal("OAuth grant lock poisoned".into())
         })?;
@@ -488,6 +499,18 @@ impl OAuthState {
                 .next_registration_order
                 .max(client.registration_order.saturating_add(1));
             grants.clients.insert(client_id, client);
+        }
+        for (client_id, expires_at_epoch_secs) in active_refresh_clients {
+            if grants.clients.contains_key(&client_id) {
+                let remaining_secs =
+                    u64::try_from(expires_at_epoch_secs.saturating_sub(now_secs)).unwrap_or(0);
+                if remaining_secs > 0 {
+                    let duration = Duration::from_secs(remaining_secs).min(REFRESH_TOKEN_TTL);
+                    grants
+                        .persisted_refresh_clients
+                        .insert(client_id, now_instant + duration);
+                }
+            }
         }
         drop(grants);
 
@@ -759,6 +782,8 @@ impl Grants {
         self.tokens.retain(|_, value| value.expires_at > now);
         self.refresh_tokens
             .retain(|_, value| value.expires_at > now);
+        self.persisted_refresh_clients
+            .retain(|_, expires_at| *expires_at > now);
     }
 
     fn client_eviction_candidate(&self, client_id: &str) -> Result<Option<String>, ()> {
@@ -828,6 +853,7 @@ impl Grants {
             }
             self.clients.remove(&evict_client_id);
             self.reserved_client_evictions.remove(&evict_client_id);
+            self.persisted_refresh_clients.remove(&evict_client_id);
             self.pending
                 .retain(|_, pending| pending.client_id != evict_client_id);
         }
@@ -850,6 +876,10 @@ impl Grants {
                 .refresh_tokens
                 .values()
                 .any(|grant| grant.client_id == client_id)
+            || self
+                .persisted_refresh_clients
+                .get(client_id)
+                .is_some_and(|&expires_at| expires_at > Instant::now())
     }
 
     fn insert_pending_bounded(
@@ -860,14 +890,49 @@ impl Grants {
         if !self.clients.contains_key(&pending.client_id) {
             return Err(());
         }
-        if self.pending.len() >= MAX_PENDING_APPROVALS
-            && let Some(oldest) = self
+        let client_pending_count = self
+            .pending
+            .values()
+            .filter(|approval| approval.client_id == pending.client_id)
+            .count();
+        if client_pending_count >= MAX_PENDING_APPROVALS_PER_CLIENT
+            && let Some(oldest_same_client) = self
                 .pending
                 .iter()
+                .filter(|(_, approval)| approval.client_id == pending.client_id)
                 .min_by_key(|(_, approval)| approval.expires_at)
-                .map(|(flow_id, _)| flow_id.clone())
+                .map(|(id, _)| id.clone())
         {
-            self.pending.remove(&oldest);
+            self.pending.remove(&oldest_same_client);
+        }
+        if self.pending.len() >= MAX_PENDING_APPROVALS {
+            let mut counts_by_client: HashMap<&str, usize> = HashMap::new();
+            for approval in self.pending.values() {
+                *counts_by_client
+                    .entry(approval.client_id.as_str())
+                    .or_insert(0) += 1;
+            }
+            if let Some(evict_id) = self
+                .pending
+                .iter()
+                .max_by(|(left_id, left), (right_id, right)| {
+                    let left_count = counts_by_client
+                        .get(left.client_id.as_str())
+                        .copied()
+                        .unwrap_or(0);
+                    let right_count = counts_by_client
+                        .get(right.client_id.as_str())
+                        .copied()
+                        .unwrap_or(0);
+                    left_count
+                        .cmp(&right_count)
+                        .then_with(|| right.expires_at.cmp(&left.expires_at))
+                        .then_with(|| right_id.cmp(left_id))
+                })
+                .map(|(id, _)| id.clone())
+            {
+                self.pending.remove(&evict_id);
+            }
         }
         self.pending.insert(flow_id, pending);
         Ok(())
@@ -941,7 +1006,13 @@ impl Grants {
             self.codes.remove(request.code);
             return Err(GrantError::InvalidGrant);
         }
-        if self.tokens.len() >= MAX_TOKENS || self.refresh_tokens.len() >= MAX_TOKENS {
+        if self.tokens.len().saturating_add(self.reserved_token_pairs) >= MAX_TOKENS
+            || self
+                .refresh_tokens
+                .len()
+                .saturating_add(self.reserved_token_pairs)
+                >= MAX_TOKENS
+        {
             return Err(GrantError::Capacity);
         }
         let Some(grant) = self.codes.remove(request.code) else {
@@ -973,7 +1044,7 @@ impl Grants {
         request: RefreshRequest<'_>,
         issued: IssuedTokenPair,
         now: Instant,
-    ) -> Result<OAuthPermissions, GrantError> {
+    ) -> Result<(OAuthPermissions, AccessToken), GrantError> {
         self.prune(now);
         if !self.clients.contains_key(request.client_id) {
             return Err(GrantError::InvalidGrant);
@@ -994,16 +1065,17 @@ impl Grants {
         {
             return Err(GrantError::InvalidScope);
         }
-        if self.tokens.len() >= MAX_TOKENS {
+        if self.tokens.len().saturating_add(self.reserved_token_pairs) >= MAX_TOKENS {
             return Err(GrantError::Capacity);
         }
         let Some(grant) = self.refresh_tokens.remove(request.refresh_token) else {
             return Err(GrantError::InvalidGrant);
         };
+        let permissions = grant.permissions;
         self.tokens.insert(
             issued.access_token,
             AccessToken {
-                permissions: grant.permissions,
+                permissions,
                 client_id: request.client_id.into(),
                 resource: request.expected_resource.into(),
                 expires_at: now + TOKEN_TTL,
@@ -1012,13 +1084,13 @@ impl Grants {
         self.refresh_tokens.insert(
             issued.refresh_token,
             AccessToken {
-                permissions: grant.permissions,
+                permissions,
                 client_id: request.client_id.into(),
                 resource: request.expected_resource.into(),
                 expires_at: now + REFRESH_TOKEN_TTL,
             },
         );
-        Ok(grant.permissions)
+        Ok((permissions, grant))
     }
 
     #[cfg(test)]
@@ -1381,9 +1453,8 @@ async fn approve(State(state): State<OAuthState>, RawForm(body): RawForm) -> Res
         ) {
             Ok(redirect) => redirect,
             Err(GrantError::AccessDenied) => {
-                return (
+                return consent_response_with_status(
                     StatusCode::UNAUTHORIZED,
-                    [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
                     r#"<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>승인 실패</title></head>
 <body style="font-family:-apple-system,sans-serif;max-width:560px;margin:60px auto;padding:0 20px;line-height:1.6">
 <h2 style="color:#d32f2f">승인 코드가 올바르지 않습니다</h2>
@@ -1394,9 +1465,9 @@ async fn approve(State(state): State<OAuthState>, RawForm(body): RawForm) -> Res
 <li>연결하려는 프로그램(ChatGPT, Cursor, Claude Desktop 등)에서 다시 연결을 시도하여 열리는 새 승인 창에 붙여넣으세요.</li>
 </ol>
 <p style="color:#888;font-size:13px">※ 앱이 재시작되면 보안을 위해 승인 코드가 새로 생성됩니다.</p>
-</body></html>"#,
-                )
-                    .into_response();
+</body></html>"#
+                        .into(),
+                );
             }
             Err(error) => return grant_error_response(error),
         }
@@ -1409,13 +1480,30 @@ async fn approve(State(state): State<OAuthState>, RawForm(body): RawForm) -> Res
             ("iss", &state.inner.public_url),
         ],
     );
-    Redirect::to(&location).into_response()
+    let mut response = Redirect::to(&location).into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    headers.insert(
+        header::PRAGMA,
+        axum::http::HeaderValue::from_static("no-cache"),
+    );
+    headers.insert(
+        header::HeaderName::from_static("referrer-policy"),
+        axum::http::HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        header::HeaderName::from_static("x-content-type-options"),
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    response
 }
 
 async fn approve_get() -> Response {
-    (
+    consent_response_with_status(
         StatusCode::OK,
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
         r#"<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>Sky Backcraft 승인 안내</title></head>
 <body style="font-family:-apple-system,sans-serif;max-width:560px;margin:60px auto;padding:0 20px;line-height:1.6">
 <h2>새로고침되었거나 만료된 승인 페이지입니다</h2>
@@ -1425,9 +1513,9 @@ async fn approve_get() -> Response {
 <li>연결하려는 프로그램(ChatGPT, Cursor, Claude Desktop 등)에서 다시 <strong>Connect</strong>를 눌러 새로운 승인 창을 띄워주세요.</li>
 <li>macOS 상단 메뉴 막대의 Sky Backcraft 아이콘 &gt; <strong>'OAuth 로그인 코드 복사'</strong>를 클릭하여 복사된 64자리 코드를 새 창에 붙여넣어 주세요.</li>
 </ol>
-</body></html>"#,
+</body></html>"#
+            .into(),
     )
-        .into_response()
 }
 
 async fn token(State(state): State<OAuthState>, RawForm(body): RawForm) -> Response {
@@ -1438,7 +1526,7 @@ async fn token(State(state): State<OAuthState>, RawForm(body): RawForm) -> Respo
         return oauth_error(StatusCode::BAD_REQUEST, "invalid_request");
     };
     if params.get("grant_type").map(String::as_str) == Some("refresh_token") {
-        return refresh_token(&state, &params);
+        return refresh_token(&state, &params).await;
     }
     if params.get("grant_type").map(String::as_str) != Some("authorization_code") {
         return oauth_error(StatusCode::BAD_REQUEST, "unsupported_grant_type");
@@ -1494,6 +1582,30 @@ async fn token(State(state): State<OAuthState>, RawForm(body): RawForm) -> Respo
         discard_unreturned_tokens(&state, &access_token, &refresh_token);
         return oauth_error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable");
     }
+    let Ok(client_database) = state
+        .inner
+        .client_database
+        .lock()
+        .map(|bound| bound.clone())
+    else {
+        discard_unreturned_tokens(&state, &access_token, &refresh_token);
+        return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
+    };
+    if let Some(database) = &client_database
+        && persist_refresh_grant(
+            &state,
+            database,
+            client_id,
+            &state.inner.resource,
+            permissions,
+            &refresh_token,
+        )
+        .await
+        .is_err()
+    {
+        discard_unreturned_tokens(&state, &access_token, &refresh_token);
+        return oauth_error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable");
+    }
     token_response(
         StatusCode::OK,
         &serde_json::json!({
@@ -1506,7 +1618,7 @@ async fn token(State(state): State<OAuthState>, RawForm(body): RawForm) -> Respo
     )
 }
 
-fn refresh_token(state: &OAuthState, params: &HashMap<String, String>) -> Response {
+async fn refresh_token(state: &OAuthState, params: &HashMap<String, String>) -> Response {
     let requested_permissions = match params.get("scope") {
         Some(scope) => match OAuthPermissions::parse(
             Some(scope),
@@ -1524,33 +1636,75 @@ fn refresh_token(state: &OAuthState, params: &HashMap<String, String>) -> Respon
     ) else {
         return oauth_error(StatusCode::BAD_REQUEST, "invalid_request");
     };
-    let Ok(access_token) = random_token(32) else {
+    let (Ok(access_token), Ok(next_refresh)) = (random_token(32), random_token(32)) else {
         return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
     };
-    let Ok(next_refresh) = random_token(32) else {
+    let Ok(memory_rotation) = rotate_in_memory_refresh(
+        state,
+        RefreshRequest {
+            requested_permissions,
+            refresh_token,
+            client_id,
+            resource,
+            expected_resource: &state.inner.resource,
+        },
+        IssuedTokenPair {
+            access_token: access_token.clone(),
+            refresh_token: next_refresh.clone(),
+        },
+    ) else {
         return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
     };
-    let permissions = {
-        let Ok(mut grants) = state.inner.grants.lock() else {
-            return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
-        };
-        match grants.rotate_refresh(
-            RefreshRequest {
+    let Ok(client_database) = state.inner.client_database.lock().map(|b| b.clone()) else {
+        return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
+    };
+    let permissions = match memory_rotation {
+        Ok((permissions, previous_grant)) => {
+            if let Some(database) = &client_database
+                && rotate_persistent_refresh_grant(
+                    state,
+                    database,
+                    refresh_token,
+                    &next_refresh,
+                    client_id,
+                    &state.inner.resource,
+                    requested_permissions,
+                )
+                .await
+                .is_err()
+            {
+                restore_failed_refresh_rotation(
+                    state,
+                    &access_token,
+                    &next_refresh,
+                    refresh_token,
+                    previous_grant,
+                );
+                return oauth_error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable");
+            }
+            permissions
+        }
+        Err(GrantError::InvalidGrant) => {
+            let Some(database) = &client_database else {
+                return grant_error_response(GrantError::InvalidGrant);
+            };
+            match rotate_persistent_refresh_after_restart(PersistentRefreshContext {
+                state,
+                database,
                 requested_permissions,
                 refresh_token,
                 client_id,
                 resource,
-                expected_resource: &state.inner.resource,
-            },
-            IssuedTokenPair {
-                access_token: access_token.clone(),
-                refresh_token: next_refresh.clone(),
-            },
-            Instant::now(),
-        ) {
-            Ok(permissions) => permissions,
-            Err(error) => return grant_error_response(error),
+                access_token: &access_token,
+                next_refresh: &next_refresh,
+            })
+            .await
+            {
+                Ok(permissions) => permissions,
+                Err(error) => return grant_error_response(error),
+            }
         }
+        Err(error) => return grant_error_response(error),
     };
     token_response(
         StatusCode::OK,
@@ -1562,6 +1716,257 @@ fn refresh_token(state: &OAuthState, params: &HashMap<String, String>) -> Respon
             "refresh_token": next_refresh
         }),
     )
+}
+
+fn rotate_in_memory_refresh(
+    state: &OAuthState,
+    request: RefreshRequest<'_>,
+    issued: IssuedTokenPair,
+) -> Result<Result<(OAuthPermissions, AccessToken), GrantError>, ()> {
+    let mut grants = state.inner.grants.lock().map_err(|_| ())?;
+    Ok(grants.rotate_refresh(request, issued, Instant::now()))
+}
+
+fn restore_failed_refresh_rotation(
+    state: &OAuthState,
+    access_token: &str,
+    next_refresh: &str,
+    refresh_token: &str,
+    previous_grant: AccessToken,
+) {
+    if let Ok(mut grants) = state.inner.grants.lock() {
+        grants.tokens.remove(access_token);
+        grants.refresh_tokens.remove(next_refresh);
+        if grants.clients.contains_key(&previous_grant.client_id)
+            && grants
+                .refresh_tokens
+                .len()
+                .saturating_add(grants.reserved_token_pairs)
+                < MAX_TOKENS
+        {
+            grants
+                .refresh_tokens
+                .insert(refresh_token.to_owned(), previous_grant);
+        }
+    }
+}
+
+fn token_sha256_hex(token: &str) -> String {
+    crate::contracts::ContentHash::of_bytes(token.as_bytes())
+        .as_str()
+        .to_owned()
+}
+
+fn epoch_now_and_refresh_expiry() -> (i64, i64) {
+    let now = chrono::Utc::now().timestamp();
+    let ttl = i64::try_from(REFRESH_TOKEN_TTL.as_secs()).unwrap_or(30 * 24 * 3_600);
+    (now, now.saturating_add(ttl))
+}
+
+async fn persist_refresh_grant(
+    state: &OAuthState,
+    database: &DatabaseHandle,
+    client_id: &str,
+    resource: &str,
+    permissions: OAuthPermissions,
+    refresh_token: &str,
+) -> Result<(), crate::contracts::LabError> {
+    let (now_secs, expires_at_epoch_secs) = epoch_now_and_refresh_expiry();
+    let record = NewOAuthRefreshGrantRecord {
+        issuer: state.inner.public_url.clone(),
+        token_sha256: token_sha256_hex(refresh_token),
+        client_id: client_id.into(),
+        resource: resource.into(),
+        scope: permissions.scope().into(),
+        expires_at_epoch_secs,
+    };
+    database
+        .call("oauth_store_refresh_grant", move |store| {
+            store.store_oauth_refresh_grant(&record, now_secs, MAX_TOKENS)
+        })
+        .await?;
+    if let Ok(mut grants) = state.inner.grants.lock()
+        && grants.clients.contains_key(client_id)
+    {
+        grants
+            .persisted_refresh_clients
+            .insert(client_id.into(), Instant::now() + REFRESH_TOKEN_TTL);
+    }
+    Ok(())
+}
+
+async fn rotate_persistent_refresh_grant(
+    state: &OAuthState,
+    database: &DatabaseHandle,
+    old_refresh: &str,
+    next_refresh: &str,
+    client_id: &str,
+    resource: &str,
+    requested_permissions: Option<OAuthPermissions>,
+) -> Result<Option<crate::storage::StoredOAuthRefreshGrantRecord>, crate::contracts::LabError> {
+    let (now_secs, expires_at_epoch_secs) = epoch_now_and_refresh_expiry();
+    let issuer = state.inner.public_url.clone();
+    let old_sha = token_sha256_hex(old_refresh);
+    let requested_scope = requested_permissions.map(|perm| perm.scope().to_owned());
+    let next = NewOAuthRefreshGrantRecord {
+        issuer: issuer.clone(),
+        token_sha256: token_sha256_hex(next_refresh),
+        client_id: client_id.into(),
+        resource: resource.into(),
+        scope: String::new(),
+        expires_at_epoch_secs,
+    };
+    database
+        .call("oauth_rotate_refresh_grant", move |store| {
+            store.rotate_oauth_refresh_grant(
+                &issuer,
+                &old_sha,
+                &next,
+                requested_scope.as_deref(),
+                now_secs,
+            )
+        })
+        .await
+}
+
+struct PersistentRefreshContext<'a> {
+    state: &'a OAuthState,
+    database: &'a DatabaseHandle,
+    requested_permissions: Option<OAuthPermissions>,
+    refresh_token: &'a str,
+    client_id: &'a str,
+    resource: &'a str,
+    access_token: &'a str,
+    next_refresh: &'a str,
+}
+
+fn reserve_persistent_refresh_slot(state: &OAuthState, client_id: &str) -> Result<(), GrantError> {
+    let mut grants = state
+        .inner
+        .grants
+        .lock()
+        .map_err(|_| GrantError::Capacity)?;
+    grants.prune(Instant::now());
+    if !grants.clients.contains_key(client_id) {
+        return Err(GrantError::InvalidGrant);
+    }
+    if grants
+        .tokens
+        .len()
+        .saturating_add(grants.reserved_token_pairs)
+        >= MAX_TOKENS
+        || grants
+            .refresh_tokens
+            .len()
+            .saturating_add(grants.reserved_token_pairs)
+            >= MAX_TOKENS
+    {
+        return Err(GrantError::Capacity);
+    }
+    grants.reserved_token_pairs = grants.reserved_token_pairs.saturating_add(1);
+    Ok(())
+}
+
+async fn rotate_persistent_refresh_after_restart(
+    ctx: PersistentRefreshContext<'_>,
+) -> Result<OAuthPermissions, GrantError> {
+    if ctx.resource != ctx.state.inner.resource {
+        return Err(GrantError::InvalidGrant);
+    }
+    reserve_persistent_refresh_slot(ctx.state, ctx.client_id)?;
+    let rotation_result = rotate_persistent_refresh_grant(
+        ctx.state,
+        ctx.database,
+        ctx.refresh_token,
+        ctx.next_refresh,
+        ctx.client_id,
+        ctx.resource,
+        ctx.requested_permissions,
+    )
+    .await;
+    finalize_persistent_refresh_after_restart(&ctx, rotation_result)
+}
+
+fn finalize_persistent_refresh_after_restart(
+    ctx: &PersistentRefreshContext<'_>,
+    rotation_result: Result<
+        Option<crate::storage::StoredOAuthRefreshGrantRecord>,
+        crate::contracts::LabError,
+    >,
+) -> Result<OAuthPermissions, GrantError> {
+    let now = Instant::now();
+    let mut grants = ctx
+        .state
+        .inner
+        .grants
+        .lock()
+        .map_err(|_| GrantError::Capacity)?;
+    grants.reserved_token_pairs = grants.reserved_token_pairs.saturating_sub(1);
+    grants.prune(now);
+    let stored = match rotation_result {
+        Ok(Some(stored)) => stored,
+        Ok(None) => {
+            if !grants
+                .refresh_tokens
+                .values()
+                .any(|grant| grant.client_id == ctx.client_id)
+            {
+                grants.persisted_refresh_clients.remove(ctx.client_id);
+            }
+            return Err(GrantError::InvalidGrant);
+        }
+        Err(_) => return Err(GrantError::Capacity),
+    };
+    let Some(permissions) = OAuthPermissions::parse(
+        Some(&stored.scope),
+        ctx.state.inner.consent_policy.supports_trading_scopes(),
+    ) else {
+        return Err(GrantError::InvalidGrant);
+    };
+    if ctx
+        .requested_permissions
+        .is_some_and(|req| req != permissions)
+    {
+        return Err(GrantError::InvalidScope);
+    }
+    if !grants.clients.contains_key(ctx.client_id) {
+        return Err(GrantError::InvalidGrant);
+    }
+    if grants
+        .tokens
+        .len()
+        .saturating_add(grants.reserved_token_pairs)
+        >= MAX_TOKENS
+        || grants
+            .refresh_tokens
+            .len()
+            .saturating_add(grants.reserved_token_pairs)
+            >= MAX_TOKENS
+    {
+        return Err(GrantError::Capacity);
+    }
+    grants
+        .persisted_refresh_clients
+        .insert(ctx.client_id.into(), now + REFRESH_TOKEN_TTL);
+    grants.tokens.insert(
+        ctx.access_token.into(),
+        AccessToken {
+            permissions,
+            client_id: ctx.client_id.into(),
+            resource: ctx.state.inner.resource.clone(),
+            expires_at: now + TOKEN_TTL,
+        },
+    );
+    grants.refresh_tokens.insert(
+        ctx.next_refresh.into(),
+        AccessToken {
+            permissions,
+            client_id: ctx.client_id.into(),
+            resource: ctx.state.inner.resource.clone(),
+            expires_at: now + REFRESH_TOKEN_TTL,
+        },
+    );
+    Ok(permissions)
 }
 
 fn consent_page(
@@ -1625,8 +2030,12 @@ fn token_response(status: StatusCode, value: &impl Serialize) -> Response {
 }
 
 fn consent_response(body: String) -> Response {
+    consent_response_with_status(StatusCode::OK, body)
+}
+
+fn consent_response_with_status(status: StatusCode, body: String) -> Response {
     Response::builder()
-        .status(StatusCode::OK)
+        .status(status)
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
         .header(header::CACHE_CONTROL, "no-store")
         .header(header::PRAGMA, "no-cache")
@@ -1647,6 +2056,7 @@ fn json_response(status: StatusCode, value: &impl Serialize) -> Response {
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "application/json")
+        .header("x-content-type-options", "nosniff")
         .body(axum::body::Body::from(body))
         .unwrap_or_else(|_| Response::new(axum::body::Body::empty()))
 }
@@ -1769,14 +2179,13 @@ fn random_token(byte_count: usize) -> Result<String, ()> {
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    let mut difference = left.len() ^ right.len();
-    let length = left.len().max(right.len());
-    for index in 0..length {
-        difference |= usize::from(
-            left.get(index).copied().unwrap_or(0) ^ right.get(index).copied().unwrap_or(0),
-        );
+    let left_digest = Sha256::digest(left);
+    let right_digest = Sha256::digest(right);
+    let mut difference = u8::from(left.len() != right.len());
+    for (left_byte, right_byte) in left_digest.iter().zip(right_digest.iter()) {
+        difference |= std::hint::black_box(*left_byte ^ *right_byte);
     }
-    difference == 0
+    std::hint::black_box(difference) == 0
 }
 
 fn is_base64url_byte(byte: u8) -> bool {
@@ -2151,8 +2560,8 @@ mod tests {
         assert!(grants.tokens.is_empty());
     }
 
-    #[test]
-    fn access_capacity_rejection_preserves_refresh_token() {
+    #[tokio::test]
+    async fn access_capacity_rejection_preserves_refresh_token() {
         let state = OAuthState::new("https://skybackcraft.store", "owner-code-123456".into())
             .unwrap_or_else(|error| unreachable!("valid test state: {error}"));
         let now = Instant::now();
@@ -2179,7 +2588,7 @@ mod tests {
             "resource=https://skybackcraft.store/mcp"
         ))
         .unwrap_or_else(|()| unreachable!("valid test form"));
-        let response = refresh_token(&state, &params);
+        let response = refresh_token(&state, &params).await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let grants = state
             .inner

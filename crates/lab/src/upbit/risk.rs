@@ -71,15 +71,11 @@ pub struct RiskConfig {
 
 impl Default for RiskConfig {
     fn default() -> Self {
-        let mut allowed = HashSet::new();
-        allowed.insert("KRW-BTC".to_string());
-        allowed.insert("KRW-ETH".to_string());
-        allowed.insert("KRW-XRP".to_string());
         Self {
             max_single_order_krw: Decimal::new(5_000_000, 0), // 5,000,000 KRW
             max_daily_volume_krw: Decimal::new(50_000_000, 0), // 50,000,000 KRW
             min_order_interval_ms: 3_000,                     // 3 seconds
-            allowed_markets: allowed,
+            allowed_markets: HashSet::new(),
         }
     }
 }
@@ -344,7 +340,10 @@ impl RiskGuard {
         }
 
         // 2. Market allowlist check
-        if !self.config.allowed_markets.contains(market) {
+        if crate::contracts::MarketId::parse_upbit(market).is_err()
+            || (!self.config.allowed_markets.is_empty()
+                && !self.config.allowed_markets.contains(market))
+        {
             return Err(RiskError::DisallowedMarket(market.to_string()));
         }
 

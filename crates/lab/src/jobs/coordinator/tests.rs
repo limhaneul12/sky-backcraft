@@ -407,6 +407,7 @@ async fn shared_public_feed_drives_paper_and_mock_from_one_confirmed_candle()
             max_asset_exposure_krw: QuoteAmount::new(Decimal::from(100_000))?,
             max_daily_loss_krw: QuoteAmount::new(Decimal::from(100_000))?,
             activation_loss_limit_krw: None,
+            hard_stop_loss_bps: None,
             max_open_orders: 1,
             max_orders_per_interval: 1,
             max_balance_age_seconds: 3_600,

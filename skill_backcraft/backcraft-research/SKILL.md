@@ -65,7 +65,7 @@ tuples의 wire 형식은 `{"kind":"tuples","tuples":[{"entry_length":{"integer":
 3. 실행도 요청받았고 admission이 허용되면 같은 요청으로 `action: "create"`를 실행한다. 템플릿에 dynamic
    cost model(`costs.dynamic`)이 있으면 cost sweep과 조합할 수 없다(create가
    거절한다) — 고정 모델로 스윕하거나 스윕을 생략한다.
-4. 진행 조회: `get`(요약: status/completed_runs/selected_folds), `cases`,
+4. 진행 조회: `get`(요약: status/completed_runs/selected_folds 및 `winner_consistency_ratio` — 완료된 평가 폴드 중 최다 선정 후보의 일관성 비율), `cases`,
    `comparisons`(fold·scenario·후보별 net_pnl/MDD/turnover), `pause`,
    `resume`. walk-forward는 fold마다 selection으로 winner를 확정한 뒤
    evaluation을 실행한다. winner가 확정된 fold의 evaluation은 winner 변경 없이

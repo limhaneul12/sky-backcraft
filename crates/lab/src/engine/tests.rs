@@ -1942,3 +1942,599 @@ fn h1_m15_m5_policy_runs_on_m1_for_derived_and_native_layouts() {
             .expect("future source stays outside witness")
     );
 }
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "end-to-end engine verification covers R3-A cost-basis profit protection, Episode state reset, and independent verify_run audit"
+)]
+fn r3a_cost_basis_profit_protection_runs_and_passes_independent_verify_run() {
+    let origin = time("2025-01-01T23:00:00Z");
+    let bars_spec = [
+        // (open_offset_hours, open_price, close_price)
+        (0_i64, "1000", "1000"), // 23:00..00:00 warmup
+        (1, "1000", "1000"),     // 00:00..01:00 -> Cash decision: enter 0.5 weight
+        (2, "1000", "1030"), // 01:00..02:00 -> Buy fill @ 1000 (01:00 open); close 1030 -> arm_50=1, floor_pnl=0.5*peak_liq_pnl
+        (3, "1030", "1012"), // 02:00..03:00 -> Close 1012 drops below 50% protected net PnL -> exit to 0.0
+        (4, "1012", "1012"), // 03:00..04:00 -> Sell fill @ 1012 (03:00 open); Cash decision: Episode state resets & re-enters!
+        (5, "1012", "1015"), // 04:00..05:00 -> Buy fill @ 1012 (04:00 open); Episode 2 holds
+    ];
+    let raw = crate::contracts::RawObjectRef {
+        id: crate::contracts::RawObjectId::from_seed("raw-r3a-h1"),
+        relative_path: "raw/raw-r3a-h1".into(),
+        source_url: "https://example.invalid/raw-r3a-h1".into(),
+        fetched_at: time("2025-01-02T06:00:00Z"),
+        persisted_at: time("2025-01-02T06:00:00Z"),
+        http_status: 200,
+        remaining_req: None,
+        raw_sha256: ContentHash::of_bytes(b"raw-r3a-h1"),
+        compressed_sha256: ContentHash::of_bytes(b"gzip-raw-r3a-h1"),
+        raw_bytes: 1,
+        compressed_bytes: 1,
+        origin: MarketDataOrigin::SyntheticTestOnly,
+        transport: None,
+    };
+    let observations: Vec<CandleObservation> = bars_spec
+        .into_iter()
+        .map(|(h, o, c)| {
+            let open_t = UtcTimestamp(origin.0 + chrono::Duration::hours(h));
+            let close_t = UtcTimestamp(open_t.0 + chrono::Duration::hours(1));
+            let open_p = price(o);
+            let close_p = price(c);
+            let high_p = PriceKrw::new(open_p.get().max(close_p.get())).expect("high");
+            let low_p = PriceKrw::new(open_p.get().min(close_p.get())).expect("low");
+            let candle = CandleRecord {
+                market: "KRW-BTC".into(),
+                interval: CandleInterval::H1,
+                open_time_utc: open_t,
+                close_time_utc: close_t,
+                open: open_p,
+                high: high_p,
+                low: low_p,
+                close: close_p,
+                volume: qty("1000"),
+                quote_turnover: amount("1000000"),
+                completed: true,
+            };
+            let digest = crate::contracts::observation_digest(&candle).expect("digest");
+            CandleObservation {
+                id: crate::contracts::ObservationId::from_seed(digest.as_str()),
+                candle,
+                content_digest: digest,
+                raw_object_ids: vec![raw.id.clone()],
+                constituent_ids: Vec::new(),
+            }
+        })
+        .collect();
+    let mut dataset = mtf_dataset("dataset-r3a-h1", observations);
+    dataset.manifest.raw_objects = vec![raw];
+    let dataset_digests =
+        crate::contracts::dataset_digests(&dataset).expect("canonical dataset digests");
+    dataset.manifest.id = crate::contracts::dataset_id(&dataset_digests);
+    dataset.manifest.semantic_digest = dataset_digests.semantic;
+    dataset.manifest.provenance_digest = dataset_digests.provenance;
+    let definition = PolicyDefinition {
+        schema_version: "1.0".into(),
+        name: "r3a_cost_basis_profit_protect".into(),
+        description: "SYNTHETIC_TEST_ONLY".into(),
+        program: PolicyProgram::Rules {
+            program: RulesProgram {
+                condition_roles: Vec::new(),
+                indicators: vec![PolicyIndicator {
+                    id: "close".into(),
+                    indicator: PolicyIndicatorKind::Close,
+                    source_interval: None,
+                }],
+                states: vec![
+                    crate::contracts::PolicyState {
+                        id: "arm_50".into(),
+                        scope: crate::contracts::PolicyStateScope::Episode,
+                        initial: 0.0,
+                        next: NumericExpr::If {
+                            condition: Box::new(BoolExpr::And {
+                                conditions: vec![
+                                    BoolExpr::PositionIs {
+                                        state: crate::contracts::PositionState::Long,
+                                    },
+                                    BoolExpr::Compare {
+                                        comparison: CompareOp::Gte,
+                                        left: NumericExpr::LiquidationNetPnlKrw,
+                                        right: NumericExpr::RoundTripCostKrw,
+                                    },
+                                ],
+                            }),
+                            then_value: Box::new(NumericExpr::Constant { value: 1.0 }),
+                            else_value: Box::new(NumericExpr::State {
+                                id: "arm_50".into(),
+                            }),
+                        },
+                    },
+                    crate::contracts::PolicyState {
+                        id: "floor_pnl".into(),
+                        scope: crate::contracts::PolicyStateScope::Episode,
+                        initial: 0.0,
+                        next: NumericExpr::If {
+                            condition: Box::new(BoolExpr::Compare {
+                                comparison: CompareOp::Gte,
+                                left: NumericExpr::State {
+                                    id: "arm_50".into(),
+                                },
+                                right: NumericExpr::Constant { value: 0.5 },
+                            }),
+                            then_value: Box::new(NumericExpr::Max {
+                                left: Box::new(NumericExpr::State {
+                                    id: "floor_pnl".into(),
+                                }),
+                                right: Box::new(NumericExpr::Mul {
+                                    left: Box::new(NumericExpr::PeakLiquidationNetPnlKrw),
+                                    right: Box::new(NumericExpr::Constant { value: 0.5 }),
+                                }),
+                            }),
+                            else_value: Box::new(NumericExpr::Constant { value: 0.0 }),
+                        },
+                    },
+                ],
+                rules: vec![
+                    PolicyRule {
+                        id: "r3a_profit_protect_exit".into(),
+                        condition: BoolExpr::And {
+                            conditions: vec![
+                                BoolExpr::PositionIs {
+                                    state: crate::contracts::PositionState::Long,
+                                },
+                                BoolExpr::Compare {
+                                    comparison: CompareOp::Gte,
+                                    left: NumericExpr::State {
+                                        id: "arm_50".into(),
+                                    },
+                                    right: NumericExpr::Constant { value: 0.5 },
+                                },
+                                BoolExpr::Compare {
+                                    comparison: CompareOp::Lte,
+                                    left: NumericExpr::LiquidationNetPnlKrw,
+                                    right: NumericExpr::State {
+                                        id: "floor_pnl".into(),
+                                    },
+                                },
+                            ],
+                        },
+                        target: PolicyTarget::Weight {
+                            value: NumericExpr::Constant { value: 0.0 },
+                        },
+                    },
+                    PolicyRule {
+                        id: "enter_long".into(),
+                        condition: BoolExpr::PositionIs {
+                            state: crate::contracts::PositionState::Cash,
+                        },
+                        target: PolicyTarget::Weight {
+                            value: NumericExpr::Constant { value: 0.5 },
+                        },
+                    },
+                ],
+                fallback: PolicyTarget::Hold,
+                signal_expiry: PolicySignalExpiry::EndOfRange,
+            },
+        },
+    };
+    let reference = PolicyRevisionRef {
+        policy_id: crate::contracts::PolicyId::new("policy-r3a-test").expect("policy id"),
+        revision_id: crate::contracts::PolicyRevisionId::new("policy-rev-r3a-1").expect("rev id"),
+        definition_digest: ContentHash::of_value(&definition).expect("digest"),
+    };
+    let frozen = FrozenPolicyRevision {
+        reference: reference.clone(),
+        revision_number: 1,
+        parent_revision_id: None,
+        family: StrategyKind::Other,
+        origin: PolicyOrigin::User,
+        definition,
+    };
+    let (base, _, _, _, _) = buy_and_hold_fixture();
+    let mut spec = base.spec;
+    spec.schema_version = "3.0".into();
+    spec.dataset_ids = vec![dataset.manifest.id.clone()];
+    spec.range = UtcRange::new(time("2025-01-02T00:00:00Z"), time("2025-01-02T05:00:00Z"))
+        .expect("eval range");
+    spec.market_rules.valid_range = spec.range;
+    spec.strategies.clear();
+    spec.policy_selections = vec![reference];
+    spec.causal_execution = Some(CausalExecutionPolicy::DeclaredPolicyWarmup);
+    spec.capital_mode = Some(crate::contracts::CapitalMode::IndependentModels);
+    spec.decision_interval = CandleInterval::H1;
+    spec.execution_resolution = CandleInterval::H1;
+    let fee_5bps = BasisPoints::new(decimal("5")).expect("5 bps");
+    let zero_bps = BasisPoints::new(Decimal::ZERO).expect("0 bps");
+    spec.costs = CostPolicy {
+        buy_fee_bps: fee_5bps,
+        sell_fee_bps: fee_5bps,
+        maker_fee_bps: fee_5bps,
+        half_spread_bps: zero_bps,
+        slippage_bps: zero_bps,
+        impact_bps: zero_bps,
+        assumption_label: "r3a 5bps test".into(),
+        dynamic: None,
+    };
+    let plan = crate::planning::resolve_with_policies(
+        &spec,
+        std::slice::from_ref(&dataset),
+        None,
+        std::slice::from_ref(&frozen),
+    )
+    .expect("resolve plan");
+    let run_id = RunId::from_seed("run-r3a-test");
+    let ledger = run_model(
+        &plan,
+        std::slice::from_ref(&dataset),
+        None,
+        &run_id,
+        &plan.admissions[0],
+        1,
+        &|| false,
+    )
+    .expect("run_model succeeds");
+    assert_eq!(ledger.status, ModelStatus::Completed);
+    // Should have bought at 01:00, exited via r3a_profit_protect_exit at 03:00, and re-entered at 04:00
+    assert!(
+        ledger.signals.iter().any(|s| {
+            s.policy_trace
+                .as_ref()
+                .and_then(|t| t.matched_rule_id.as_deref())
+                == Some("r3a_profit_protect_exit")
+        }),
+        "expected r3a_profit_protect_exit signal in model ledger"
+    );
+    let mut bundle = crate::contracts::RunBundle {
+        manifest: crate::contracts::RunManifest {
+            schema_version: SCHEMA_VERSION.into(),
+            run_id: run_id.clone(),
+            job_id: crate::contracts::JobId::from_seed("job-r3a-test"),
+            attempt_id: crate::contracts::AttemptId::from_seed("attempt-r3a-test"),
+            created_at: time("2025-01-02T05:00:00Z"),
+            code_revision: None,
+            source_digest: ContentHash::of_bytes(b"source-r3a"),
+            lockfile_digest: ContentHash::of_bytes(b"lock-r3a"),
+            toolchain: "rust-1.98.0".into(),
+            engine_version: crate::contracts::ENGINE_VERSION.into(),
+            indicator_version: crate::contracts::INDICATOR_VERSION.into(),
+            rounding_version: crate::contracts::ROUNDING_VERSION.into(),
+            mode: "HISTORICAL_REPLAY".into(),
+            historical_availability_model: "BAR_CLOSE_ASSUMED".into(),
+            execution_origin: "SIMULATED_ONLY".into(),
+            fill_observed: false,
+            origin: MarketDataOrigin::SyntheticTestOnly,
+            numeric_tolerance: crate::contracts::NUMERIC_TOLERANCE.to_string(),
+            metric_tolerance: 1e-10,
+            start_policy: "START_FROM_CASH".into(),
+            account_mode: "INDEPENDENT_ASSET_STRATEGY".into(),
+            assumptions: vec!["r3a test".into()],
+        },
+        plan,
+        datasets: vec![dataset],
+        evidence: None,
+        models: vec![ledger],
+        semantic_digest: ContentHash::of_bytes(b"placeholder"),
+    };
+    bundle.semantic_digest =
+        crate::reporting::semantic_digest(&bundle).expect("semantic digest succeeds");
+    let verification = crate::reporting::verify_run(&bundle);
+    assert_eq!(
+        verification.status,
+        crate::contracts::ValidationStatus::Pass,
+        "independent verify_run failed: {:?}",
+        verification.findings
+    );
+}
+
+fn build_scalp_latency_observations_and_dataset() -> (Vec<CandleObservation>, DatasetSnapshot) {
+    let origin = time("2025-01-01T23:00:00Z");
+    let bars_spec = [
+        (0, "1000", "1000"), // 23:00..00:00 warmup
+        (1, "1000", "1000"), // 00:00..01:00 -> Cash decision at 01:00 requests Buy 0.5
+        (2, "1000", "1030"), // 01:00..02:00 -> Buy fill @ 1000 at 02:00 open!
+        (3, "1030", "1060"), // 02:00..03:00 -> Long decision at 03:00 triggers tp_exit
+        (4, "1060", "1040"), // 03:00..04:00 -> Sell fill @ 1040 at 04:00 open!
+        (5, "1040", "1040"), // 04:00..05:00 -> terminal bar
+    ];
+    let raw = crate::contracts::RawObjectRef {
+        id: crate::contracts::RawObjectId::from_seed("raw-scalp-latency"),
+        relative_path: "raw/raw-scalp-latency".into(),
+        source_url: "https://example.invalid/raw-scalp-latency".into(),
+        fetched_at: time("2025-01-02T05:00:00Z"),
+        persisted_at: time("2025-01-02T05:00:00Z"),
+        http_status: 200,
+        remaining_req: None,
+        raw_sha256: ContentHash::of_bytes(b"raw-scalp-latency"),
+        compressed_sha256: ContentHash::of_bytes(b"gzip-raw-scalp-latency"),
+        raw_bytes: 1,
+        compressed_bytes: 1,
+        origin: MarketDataOrigin::SyntheticTestOnly,
+        transport: None,
+    };
+    let observations: Vec<CandleObservation> = bars_spec
+        .into_iter()
+        .map(|(h, o, c)| {
+            let open_t = UtcTimestamp(origin.0 + chrono::Duration::hours(h));
+            let close_t = UtcTimestamp(open_t.0 + chrono::Duration::hours(1));
+            let open_p = price(o);
+            let close_p = price(c);
+            let high_p = PriceKrw::new(open_p.get().max(close_p.get())).expect("high");
+            let low_p = PriceKrw::new(open_p.get().min(close_p.get())).expect("low");
+            let candle = CandleRecord {
+                market: "KRW-BTC".into(),
+                interval: CandleInterval::H1,
+                open_time_utc: open_t,
+                close_time_utc: close_t,
+                open: open_p,
+                high: high_p,
+                low: low_p,
+                close: close_p,
+                volume: qty("1000"),
+                quote_turnover: amount("1000000"),
+                completed: true,
+            };
+            let digest = crate::contracts::observation_digest(&candle).expect("digest");
+            CandleObservation {
+                id: crate::contracts::ObservationId::from_seed(digest.as_str()),
+                candle,
+                content_digest: digest,
+                raw_object_ids: vec![raw.id.clone()],
+                constituent_ids: Vec::new(),
+            }
+        })
+        .collect();
+    let mut dataset = mtf_dataset("dataset-scalp-latency", observations.clone());
+    dataset.manifest.raw_objects = vec![raw];
+    let dataset_digests =
+        crate::contracts::dataset_digests(&dataset).expect("canonical dataset digests");
+    dataset.manifest.id = crate::contracts::dataset_id(&dataset_digests);
+    dataset.manifest.semantic_digest = dataset_digests.semantic;
+    dataset.manifest.provenance_digest = dataset_digests.provenance;
+    (observations, dataset)
+}
+
+fn build_scalp_latency_plan(dataset: &DatasetSnapshot) -> ResolvedPlan {
+    let definition = PolicyDefinition {
+        schema_version: "1.0".into(),
+        name: "scalp_one_bar_expiry_with_latency".into(),
+        description: "SYNTHETIC_TEST_ONLY".into(),
+        program: PolicyProgram::Rules {
+            program: RulesProgram {
+                condition_roles: Vec::new(),
+                indicators: vec![PolicyIndicator {
+                    id: "close".into(),
+                    indicator: PolicyIndicatorKind::Close,
+                    source_interval: None,
+                }],
+                states: Vec::new(),
+                rules: vec![
+                    PolicyRule {
+                        id: "tp_exit".into(),
+                        condition: BoolExpr::And {
+                            conditions: vec![
+                                BoolExpr::PositionIs {
+                                    state: crate::contracts::PositionState::Long,
+                                },
+                                BoolExpr::Compare {
+                                    comparison: CompareOp::Gte,
+                                    left: NumericExpr::LiquidationNetReturnBps,
+                                    right: NumericExpr::Constant { value: 200.0 },
+                                },
+                            ],
+                        },
+                        target: PolicyTarget::Weight {
+                            value: NumericExpr::Constant { value: 0.0 },
+                        },
+                    },
+                    PolicyRule {
+                        id: "enter_long".into(),
+                        condition: BoolExpr::PositionIs {
+                            state: crate::contracts::PositionState::Cash,
+                        },
+                        target: PolicyTarget::Weight {
+                            value: NumericExpr::Constant { value: 0.5 },
+                        },
+                    },
+                ],
+                fallback: PolicyTarget::Hold,
+                signal_expiry: PolicySignalExpiry::DecisionBars { bars: 1 },
+            },
+        },
+    };
+    let reference = PolicyRevisionRef {
+        policy_id: crate::contracts::PolicyId::new("policy-scalp-lat").expect("policy id"),
+        revision_id: crate::contracts::PolicyRevisionId::new("policy-rev-scalp-lat-1")
+            .expect("rev id"),
+        definition_digest: ContentHash::of_value(&definition).expect("digest"),
+    };
+    let frozen = FrozenPolicyRevision {
+        reference: reference.clone(),
+        revision_number: 1,
+        parent_revision_id: None,
+        family: StrategyKind::Other,
+        origin: PolicyOrigin::User,
+        definition,
+    };
+    let (base, _, _, _, _) = buy_and_hold_fixture();
+    let mut spec = base.spec;
+    spec.schema_version = "3.0".into();
+    spec.dataset_ids = vec![dataset.manifest.id.clone()];
+    spec.range = UtcRange::new(time("2025-01-02T00:00:00Z"), time("2025-01-02T05:00:00Z"))
+        .expect("eval range");
+    spec.market_rules.valid_range = spec.range;
+    spec.strategies.clear();
+    spec.policy_selections = vec![reference];
+    spec.causal_execution = Some(CausalExecutionPolicy::DeclaredPolicyWarmup);
+    spec.capital_mode = Some(crate::contracts::CapitalMode::IndependentModels);
+    spec.decision_interval = CandleInterval::H1;
+    spec.execution_resolution = CandleInterval::H1;
+    spec.latency_ms = 250;
+    let fee_5bps = BasisPoints::new(decimal("5")).expect("5 bps");
+    let zero_bps = BasisPoints::new(Decimal::ZERO).expect("0 bps");
+    spec.costs = CostPolicy {
+        buy_fee_bps: fee_5bps,
+        sell_fee_bps: fee_5bps,
+        maker_fee_bps: fee_5bps,
+        half_spread_bps: zero_bps,
+        slippage_bps: zero_bps,
+        impact_bps: zero_bps,
+        assumption_label: "scalp latency test".into(),
+        dynamic: None,
+    };
+    crate::planning::resolve_with_policies(
+        &spec,
+        std::slice::from_ref(dataset),
+        None,
+        std::slice::from_ref(&frozen),
+    )
+    .expect("resolve plan")
+}
+
+#[test]
+fn subbar_latency_with_one_bar_signal_expiry_fills_at_next_bar_open_and_passes_audit() {
+    let (_, dataset) = build_scalp_latency_observations_and_dataset();
+    let plan = build_scalp_latency_plan(&dataset);
+    let run_id = RunId::from_seed("run-scalp-lat-test");
+    let ledger = run_model(
+        &plan,
+        std::slice::from_ref(&dataset),
+        None,
+        &run_id,
+        &plan.admissions[0],
+        1,
+        &|| false,
+    )
+    .expect("run_model succeeds");
+    assert_eq!(ledger.status, ModelStatus::Completed);
+    assert!(
+        ledger.fills.iter().any(|f| f.side == Side::Buy),
+        "expected Buy fill under sub-bar latency + DecisionBars(1)"
+    );
+    assert!(
+        ledger.fills.iter().any(|f| f.side == Side::Sell),
+        "expected Sell fill under sub-bar latency + DecisionBars(1)"
+    );
+    assert!(
+        ledger
+            .orders
+            .iter()
+            .filter(|o| o.created_at < time("2025-01-02T04:00:00Z"))
+            .all(|o| o.reason != ReasonCode::SignalExpired),
+        "no non-terminal order should expire due to signal-expiry/latency collision: {:?}",
+        ledger.orders
+    );
+
+    let mut bundle = crate::contracts::RunBundle {
+        manifest: crate::contracts::RunManifest {
+            schema_version: SCHEMA_VERSION.into(),
+            run_id,
+            job_id: crate::contracts::JobId::from_seed("job-scalp-lat-test"),
+            attempt_id: crate::contracts::AttemptId::from_seed("attempt-scalp-lat-test"),
+            created_at: time("2025-01-02T04:00:00Z"),
+            code_revision: None,
+            source_digest: ContentHash::of_bytes(b"source-scalp-lat"),
+            lockfile_digest: ContentHash::of_bytes(b"lock-scalp-lat"),
+            toolchain: "rust-1.98.0".into(),
+            engine_version: crate::contracts::ENGINE_VERSION.into(),
+            indicator_version: crate::contracts::INDICATOR_VERSION.into(),
+            rounding_version: crate::contracts::ROUNDING_VERSION.into(),
+            mode: "HISTORICAL_REPLAY".into(),
+            historical_availability_model: "BAR_CLOSE_ASSUMED".into(),
+            execution_origin: "SIMULATED_ONLY".into(),
+            fill_observed: false,
+            origin: MarketDataOrigin::SyntheticTestOnly,
+            numeric_tolerance: crate::contracts::NUMERIC_TOLERANCE.to_string(),
+            metric_tolerance: 1e-10,
+            start_policy: "START_FROM_CASH".into(),
+            account_mode: "INDEPENDENT_ASSET_STRATEGY".into(),
+            assumptions: vec!["scalp latency test".into()],
+        },
+        plan,
+        datasets: vec![dataset],
+        evidence: None,
+        models: vec![ledger],
+        semantic_digest: ContentHash::of_bytes(b"placeholder"),
+    };
+    bundle.semantic_digest =
+        crate::reporting::semantic_digest(&bundle).expect("semantic digest succeeds");
+    let verification = crate::reporting::verify_run(&bundle);
+    assert_eq!(
+        verification.status,
+        crate::contracts::ValidationStatus::Pass,
+        "independent verify_run failed: {:?}",
+        verification.findings
+    );
+}
+
+#[test]
+fn position_view_preserves_episode_accounting_and_execution_snapshots_after_fill_drain() {
+    let (obs, dataset) = build_scalp_latency_observations_and_dataset();
+    let plan = build_scalp_latency_plan(&dataset);
+    let adm = &plan.admissions[0];
+    let binding = crate::contracts::strategy_binding(&plan, adm).expect("binding");
+    let mut state = super::EngineState::new(
+        RunId::from_seed("run-scalp-drain-test"),
+        adm,
+        binding.clone(),
+        plan.spec.initial_cash,
+        1,
+    )
+    .expect("engine state");
+    let mut eval_runner = crate::policy_engine::PolicyEvaluator::compile(
+        binding,
+        &plan,
+        adm.market.clone(),
+        plan.spec.decision_interval,
+    )
+    .expect("compile evaluator");
+    let cash = crate::strategy::PositionView::cash().expect("cash");
+    eval_runner.observe(&obs[0], cash, None).expect("warmup");
+    let evaluation = eval_runner
+        .observe(&obs[1], cash, None)
+        .expect("eval")
+        .expect("ready");
+    let zero_w = Weight::new(Decimal::ZERO).expect("zero");
+    let exp = time("2025-01-02T03:00:00Z");
+    let sig_idx = state
+        .push_signal(&obs[1], &evaluation, zero_w, exp)
+        .expect("push signal");
+    let half_w = Weight::new(decimal("0.5")).expect("w");
+    let eff = time("2025-01-02T01:00:00Z");
+    let mut pending = state
+        .create_pending(
+            sig_idx,
+            half_w,
+            &obs[1],
+            &obs[1],
+            decimal("500"),
+            eff,
+            exp,
+            &plan,
+        )
+        .expect("create pending");
+    assert!(pending.is_some(), "pending order must be created");
+    let cap_w = Weight::new(Decimal::ONE).expect("cap");
+    state
+        .process_pending_at(&mut pending, &obs[2], &obs[1], cap_w, &plan, true)
+        .expect("process pending fill");
+    assert_eq!(state.fills.len(), 1);
+    let close_at = obs[2].candle.close_time_utc;
+    let marked_before = state.account.mark(obs[2].candle.close).expect("mark");
+    let view_before = state
+        .position_view(marked_before, &obs[2], None, &plan, close_at)
+        .expect("view before drain");
+    let drained_fills = std::mem::take(&mut state.fills);
+    assert_eq!(drained_fills.len(), 1);
+    assert!(state.fills.is_empty());
+
+    let marked_after = state.account.mark(obs[2].candle.close).expect("mark");
+    let view_after = state
+        .position_view(marked_after, &obs[2], None, &plan, close_at)
+        .expect("view after drain");
+    assert_eq!(view_before.execution, view_after.execution);
+    assert_eq!(view_before.accounting, view_after.accounting);
+    let exec_snap = view_after.execution.expect("execution snapshot");
+    let acc_snap = view_after.accounting.expect("accounting snapshot");
+    assert_eq!(exec_snap.episode_fill_count, 1);
+    assert!(acc_snap.allocated_entry_fee_krw.get() > Decimal::ZERO);
+}
